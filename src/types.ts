@@ -102,6 +102,7 @@ export type EngineSnapshot = {
   dspSettings: DspSettings;
   generation: number;
   underrunCallbacks: number;
+  outputSampleRate?: number | null;
   error: string | null;
   outputDevice?: string | null;
 };
@@ -134,6 +135,7 @@ export const EMPTY_ENGINE: EngineSnapshot = {
   },
   generation: 0,
   underrunCallbacks: 0,
+  outputSampleRate: null,
   error: null,
   outputDevice: null,
 };

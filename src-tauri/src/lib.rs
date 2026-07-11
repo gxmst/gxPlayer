@@ -29,6 +29,17 @@ use source_runtime::SourceRuntime;
 
 pub(crate) const SANDBOX_LABEL: &str = "lx-sandbox";
 
+pub(crate) fn isolated_smoke_data_root() -> Option<PathBuf> {
+    (std::env::var_os("GX_PHASE1_LX_POC").is_some()
+        || std::env::var_os("GX_PHASE2_AUTO_EXIT").is_some()
+        || std::env::var_os("GX_PHASE3_AUTO_EXIT").is_some())
+    .then(|| {
+        std::env::temp_dir()
+            .join("gxplayer-smoke")
+            .join(std::process::id().to_string())
+    })
+}
+
 pub(crate) struct LxPocState {
     pub(crate) script_path: PathBuf,
     progress: Mutex<LxPocProgress>,
@@ -640,7 +651,7 @@ pub fn run() {
             progress: Mutex::new(LxPocProgress::default()),
         })
         .setup(|app| {
-            let app_data = app.path().app_data_dir()?;
+            let app_data = isolated_smoke_data_root().unwrap_or(app.path().app_data_dir()?);
             app.manage(LibraryStore::open(app_data.join("library.sqlite3"))?);
             let source_root = app_data.join("sources");
             let mut source_store = SourceStore::open(source_root)?;

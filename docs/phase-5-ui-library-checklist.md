@@ -2,6 +2,8 @@
 
 Status: passed on Windows 11, 2026-07-12.
 
+Post-acceptance review found and corrected a 44.1-to-48 kHz playback starvation bug plus mid-width window/layout defects. See `project-review-2026-07-12.md`; the review also records that daily full-track LX playback remains a product gap even though the isolated runtime PoC passes.
+
 ## Product direction implemented
 
 - Default `music` mode is transparent DSP bypass. The UI describes this honestly as engine-level transparent passthrough rather than claiming shared-mode device bit-perfect output.

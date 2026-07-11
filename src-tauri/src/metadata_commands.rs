@@ -213,11 +213,14 @@ async fn cache_preview(
         .filter(char::is_ascii_alphanumeric)
         .take(80)
         .collect::<String>();
-    let root = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| error.to_string())?
-        .join("preview-cache");
+    let root = crate::isolated_smoke_data_root()
+        .map(|root| root.join("preview-cache"))
+        .unwrap_or(
+            app.path()
+                .app_cache_dir()
+                .map_err(|error| error.to_string())?
+                .join("preview-cache"),
+        );
     let destination = root.join(format!("{}-{safe_id}.{extension}", track.provider_id));
     if destination
         .metadata()

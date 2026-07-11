@@ -93,6 +93,7 @@ pub struct EngineSnapshot {
     pub dsp_settings: DspSettings,
     pub generation: u64,
     pub underrun_callbacks: u64,
+    pub output_sample_rate: Option<u32>,
     pub error: Option<String>,
     pub output_device: Option<String>,
 }
@@ -110,6 +111,7 @@ impl Default for EngineSnapshot {
             dsp_settings: DspSettings::default(),
             generation: 0,
             underrun_callbacks: 0,
+            output_sample_rate: None,
             error: None,
             output_device: None,
         }
@@ -296,6 +298,7 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
     let mut session: Option<PlaybackSession> = None;
 
     loop {
+        let mut backpressured = false;
         let mut shutdown = false;
         loop {
             match commands.try_recv() {
@@ -353,7 +356,8 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
             }
 
             match active.pump() {
-                Ok(PumpResult::Progress) | Ok(PumpResult::Backpressure) => {
+                Ok(result @ (PumpResult::Progress | PumpResult::Backpressure)) => {
+                    backpressured = matches!(result, PumpResult::Backpressure);
                     model.status = if model.intent_playing && active.has_started() {
                         PlaybackStatus::Playing
                     } else if model.intent_playing {
@@ -389,7 +393,13 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
         publish_snapshot(&model, session.as_ref(), &shared_snapshot);
 
         if session.is_some() {
-            if let Ok(command) = commands.recv_timeout(Duration::from_millis(4))
+            if backpressured {
+                if let Ok(command) = commands.recv_timeout(Duration::from_millis(4))
+                    && handle_command(command, &mut model, &mut session)
+                {
+                    break;
+                }
+            } else if let Ok(command) = commands.try_recv()
                 && handle_command(command, &mut model, &mut session)
             {
                 break;
@@ -570,6 +580,7 @@ fn publish_snapshot(
         .map(PlaybackSession::position_seconds)
         .unwrap_or(model.start_seconds);
     let underruns = session.map_or(0, PlaybackSession::underruns);
+    let output_sample_rate = session.map(|session| session.output_sample_rate);
     *destination.lock().unwrap() = EngineSnapshot {
         status: model.status,
         queue: model.queue.iter().map(|item| item.public.clone()).collect(),
@@ -581,6 +592,7 @@ fn publish_snapshot(
         dsp_settings: model.dsp_settings.clone(),
         generation: model.generation,
         underrun_callbacks: underruns,
+        output_sample_rate,
         error: model.error.clone(),
         output_device: model.output_device.clone(),
     };

@@ -11,10 +11,20 @@ use gx_contracts::PlaybackStatus;
 use gx_dsp::{DspSettings, EqBand};
 
 fn main() -> Result<()> {
-    let path = env::args()
-        .nth(1)
+    let mut args = env::args().skip(1);
+    let path = args
+        .next()
         .map(PathBuf::from)
         .context("usage: engine-smoke <audio-file>")?;
+    if args.next().as_deref() == Some("--stability") {
+        let seconds = args
+            .next()
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .context("stability duration must be an integer number of seconds")?
+            .unwrap_or(25);
+        return run_stability(path, seconds);
+    }
     let engine = LocalAudioEngine::new()?;
     let output_devices = engine.output_devices()?;
     if output_devices.is_empty() {
@@ -185,6 +195,42 @@ fn main() -> Result<()> {
     );
     drop(engine);
     fs::remove_file(short_path)?;
+    Ok(())
+}
+
+fn run_stability(path: PathBuf, seconds: u64) -> Result<()> {
+    let engine = LocalAudioEngine::new()?;
+    engine.load(vec![path])?;
+    let started = wait_for(&engine, "stability playback", |state| {
+        state.status == PlaybackStatus::Playing
+    })?;
+    println!(
+        "GX_ENGINE_STABILITY_STARTED output_rate={:?} position={:.3}",
+        started.output_sample_rate, started.position_seconds
+    );
+    for _ in 0..seconds {
+        thread::sleep(Duration::from_secs(1));
+        let snapshot = engine.snapshot();
+        if snapshot.status == PlaybackStatus::Failed {
+            bail!("stability playback failed: {:?}", snapshot.error);
+        }
+        if snapshot.status == PlaybackStatus::Stopped {
+            break;
+        }
+    }
+    let final_state = engine.snapshot();
+    println!(
+        "GX_ENGINE_STABILITY_OK position={:.3} underruns={} output_rate={:?}",
+        final_state.position_seconds,
+        final_state.underrun_callbacks,
+        final_state.output_sample_rate
+    );
+    if final_state.underrun_callbacks != 0 {
+        bail!(
+            "stability playback reported {} underrun callbacks",
+            final_state.underrun_callbacks
+        );
+    }
     Ok(())
 }
 

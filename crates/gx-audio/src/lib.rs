@@ -639,6 +639,30 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn resampler_preserves_long_form_duration() {
+        let input_rate = 44_100u32;
+        let output_rate = 48_000u32;
+        let channels = 2usize;
+        let input_frames = input_rate as usize * 30;
+        let mut adapter = RateAdapter::new(input_rate, output_rate, channels).unwrap();
+        let mut output_samples = 0usize;
+        let packet = vec![0.1f32; 1024 * channels];
+        let mut remaining = input_frames;
+        while remaining > 0 {
+            let frames = remaining.min(1024);
+            output_samples += adapter.process(&packet[..frames * channels]).unwrap().len();
+            remaining -= frames;
+        }
+        output_samples += adapter.finish().unwrap().len();
+        let output_frames = output_samples / channels;
+        let expected = output_rate as usize * 30;
+        assert!(
+            output_frames.abs_diff(expected) < 2048,
+            "resampler produced {output_frames} frames, expected approximately {expected}"
+        );
+    }
+
     fn temporary_wav_path() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

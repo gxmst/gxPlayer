@@ -14,10 +14,11 @@
       {
         "title": "gxplayer",
         "decorations": false,
+        "center": true,
         "minWidth": 720,
         "minHeight": 560,
-        "width": 800,
-        "height": 600
+        "width": 1100,
+        "height": 688
       }
     ],
     "security": {

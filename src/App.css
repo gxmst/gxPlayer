@@ -105,7 +105,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .sidebar-collapsed .sidebar nav button, .sidebar-collapsed .sidebar-playlists button { grid-template-columns: 1fr; text-align: center; }
 
 .content { grid-column: 2; grid-row: 2; min-width: 0; overflow: auto; scrollbar-color: rgba(255,255,255,.15) transparent; }
-.page { width: min(1240px, 100%); min-height: 100%; margin: 0 auto; padding: 38px 42px 60px; }
+.page { width: min(1240px, 100%); min-height: 100%; margin: 0 auto; padding: 38px 42px 140px; }
 .eyebrow { margin: 0 0 9px; color: var(--accent); font: 650 11px "JetBrains Mono Variable"; letter-spacing: .15em; }
 h1, h2, h3 { font-family: "Space Grotesk Variable", "Noto Sans SC Variable", sans-serif; }
 h1 { margin: 0; font-size: clamp(30px, 4vw, 48px); line-height: 1.05; letter-spacing: -.035em; }
@@ -261,7 +261,7 @@ input[type="range"] { min-height: 0; height: 4px; padding: 0; border: 0; border-
 @keyframes record-spin { to { transform: rotate(360deg); } }
 @keyframes orbit-pulse { 50% { border-color: color-mix(in srgb, var(--accent) 70%, transparent); box-shadow: 0 0 34px color-mix(in srgb, var(--accent) 12%, transparent); } }
 
-@media (max-width: 980px) {
+@media (max-width: 1200px) {
   .app-shell { grid-template-columns: 72px minmax(0,1fr); }
   .sidebar button strong, .sidebar-playlists > p, .engine-health span { display: none; }
   .sidebar nav button, .sidebar-playlists button { grid-template-columns: 1fr; text-align: center; }
@@ -271,9 +271,15 @@ input[type="range"] { min-height: 0; height: 4px; padding: 0; border: 0; border-
   .page { padding-inline: 24px; }
   .hero-panel { grid-template-columns: 1fr; }
   .mini-stage { display: none; }
-  .now-grid, .stage-panel { grid-template-columns: 1fr; }
   .sound-stage { width: min(400px, 80%); margin: auto; }
-  .player-bar { grid-template-columns: minmax(160px,.8fr) minmax(340px,1.4fr) minmax(150px,.7fr); gap: 10px; }
+  .player-bar { grid-template-columns: minmax(145px,.8fr) minmax(270px,1.4fr) minmax(135px,.7fr); gap: 8px; }
+  .player-track .cover { width: 46px; height: 46px; }
+  .player-track { grid-template-columns: 46px minmax(0,1fr); }
+  .player-tools > input { width: 72px; }
+}
+
+@media (max-width: 900px) {
+  .now-grid, .stage-panel { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {

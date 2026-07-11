@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import "@fontsource-variable/space-grotesk";
 import "@fontsource-variable/noto-sans-sc";
@@ -30,6 +30,13 @@ const NAV_ITEMS: Array<{ id: ViewId; icon: string; label: string }> = [
   { id: "sources", icon: "◈", label: "音源管理" },
   { id: "settings", icon: "⚙", label: "设置与备份" },
 ];
+
+function initialView(): ViewId {
+  const requested = new URLSearchParams(window.location.search).get("view") as ViewId | null;
+  return requested && ["discovery", "search", "library", "favorites", "playlist", "sources", "settings", "now-playing"].includes(requested)
+    ? requested
+    : "discovery";
+}
 
 function formatTime(seconds: number | null): string {
   if (seconds === null || !Number.isFinite(seconds)) return "--:--";
@@ -99,7 +106,7 @@ function Cover({ artwork, title, className = "" }: { artwork?: string | null; ti
 
 function App() {
   const [snapshot, setSnapshot] = useState<EngineSnapshot>(EMPTY_ENGINE);
-  const [view, setView] = useState<ViewId>("discovery");
+  const [view, setView] = useState<ViewId>(initialView);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [message, setMessage] = useState("");
   const [accent, setAccent] = useState(FALLBACK_ACCENT);
@@ -163,6 +170,23 @@ function App() {
   };
 
   useEffect(() => {
+    const placeWindow = async () => {
+      const monitor = await currentMonitor();
+      if (!monitor) return;
+      const logicalWidth = monitor.size.width / monitor.scaleFactor;
+      const logicalHeight = monitor.size.height / monitor.scaleFactor;
+      let width = Math.min(1280, logicalWidth * 0.88);
+      let height = width / 1.6;
+      const maximumHeight = logicalHeight * 0.86;
+      if (height > maximumHeight) {
+        height = maximumHeight;
+        width = height * 1.6;
+      }
+      const appWindow = getCurrentWindow();
+      await appWindow.setSize(new LogicalSize(Math.floor(width), Math.floor(height)));
+      await appWindow.center();
+    };
+    void placeWindow().catch(() => undefined);
     void invoke("ui_ready").catch((error) => setMessage(String(error)));
     void refreshLibrary().catch((error) => setMessage(String(error)));
     void refreshSources().catch((error) => setMessage(String(error)));

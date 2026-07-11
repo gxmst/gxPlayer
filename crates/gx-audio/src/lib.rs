@@ -1,5 +1,7 @@
 //! Headless native audio primitives used by the Phase -1 local playback PoC.
 
+pub mod engine;
+
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};

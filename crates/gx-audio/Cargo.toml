@@ -12,4 +12,5 @@ crossbeam-channel.workspace = true
 gx-contracts = { path = "../gx-contracts" }
 ringbuf.workspace = true
 rubato.workspace = true
+serde.workspace = true
 symphonia.workspace = true

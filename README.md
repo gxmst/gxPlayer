@@ -13,7 +13,7 @@ Phase -1 is complete:
 - Hidden Tauri LX sandbox verified with an unchanged community script, synchronous crypto/RSA no-padding, minimal capability, and SSRF/privilege rejection.
 - Thread, state-machine, data, and LX contracts are recorded in `docs/architecture`.
 
-Phase 0 is next: a persistent headless local playback engine plus a deliberately minimal development UI for file selection, play/pause, seek, volume, and queue progression.
+Phase 0 is complete: the persistent headless local playback engine and deliberately minimal development UI support file selection, play/pause, accurate local seek, worker-side volume, previous/next, and automatic queue progression. Phase 1 is next: a transparent-bypass DSP frame and parametric EQ.
 
 ## Development
 

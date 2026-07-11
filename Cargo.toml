@@ -6,6 +6,7 @@ members = [
     "crates/gx-streaming",
     "pocs/local-playback",
     "pocs/http-stream",
+    "pocs/engine-smoke",
     "src-tauri",
 ]
 

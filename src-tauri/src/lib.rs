@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::{AppHandle, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
+use gx_audio::engine::{EngineSnapshot, LocalAudioEngine};
+
 const SANDBOX_LABEL: &str = "lx-sandbox";
 
 struct LxPocState {
@@ -52,6 +54,92 @@ fn require_window(window: &WebviewWindow, expected: &str) -> Result<(), String> 
 fn main_only_probe(window: WebviewWindow) -> Result<&'static str, String> {
     require_window(&window, "main")?;
     Ok("main-only")
+}
+
+#[tauri::command]
+fn ui_ready(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
+    require_window(&window, "main")?;
+    println!("GX_PHASE0_UI_READY");
+    if std::env::var_os("GX_PHASE0_UI_SMOKE").is_some() {
+        app.exit(0);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn player_load_local(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    let paths = paths.into_iter().map(PathBuf::from).collect();
+    engine.load(paths).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_play(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine.play().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_pause(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine.pause().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_seek(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    seconds: f64,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine.seek(seconds).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_set_volume(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    volume: f32,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine.set_volume(volume).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_next(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine.next().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_previous(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine.previous().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_snapshot(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+) -> Result<EngineSnapshot, String> {
+    require_window(&window, "main")?;
+    Ok(engine.snapshot())
 }
 
 #[tauri::command]
@@ -277,8 +365,11 @@ fn phase1_script_path() -> PathBuf {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let audio_engine = LocalAudioEngine::new().expect("failed to create local audio engine");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .manage(audio_engine)
         .manage(LxPocState {
             script_path: phase1_script_path(),
             progress: Mutex::new(LxPocProgress::default()),
@@ -298,6 +389,15 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             main_only_probe,
+            ui_ready,
+            player_load_local,
+            player_play,
+            player_pause,
+            player_seek,
+            player_set_volume,
+            player_next,
+            player_previous,
+            player_snapshot,
             sandbox_ready,
             lx_http_request,
             lx_send,

@@ -11,6 +11,7 @@ cpal.workspace = true
 crossbeam-channel.workspace = true
 gx-contracts = { path = "../gx-contracts" }
 gx-dsp = { path = "../gx-dsp" }
+gx-streaming = { path = "../gx-streaming" }
 ringbuf.workspace = true
 rubato.workspace = true
 serde.workspace = true

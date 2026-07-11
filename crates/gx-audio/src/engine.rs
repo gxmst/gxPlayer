@@ -1,5 +1,5 @@
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -9,14 +9,18 @@ use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
-use gx_contracts::PlaybackStatus;
+use gx_contracts::{MediaType, PlaybackStatus, ResolvedMediaRequest};
 use gx_dsp::{DspChain, DspSettings};
+use gx_streaming::HttpMediaSource;
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use serde::Serialize;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::errors::Error as SymphoniaError;
 
-use super::{OpenedMedia, RateAdapter, choose_output_config, open_media, seek_media};
+use super::{
+    OpenedMedia, RateAdapter, choose_output_config, open_media, open_media_source, seek_media,
+    seek_media_coarse,
+};
 
 const COMMAND_CAPACITY: usize = 64;
 const RING_SECONDS: f64 = 0.75;
@@ -25,9 +29,22 @@ const PREBUFFER_SECONDS: f64 = 0.12;
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueItem {
-    pub path: PathBuf,
+    pub location: String,
     pub title: String,
     pub duration_seconds: Option<f64>,
+    pub online: bool,
+}
+
+#[derive(Clone)]
+enum PlaybackSource {
+    Local(PathBuf),
+    Online(ResolvedMediaRequest),
+}
+
+#[derive(Clone)]
+struct EngineQueueItem {
+    public: QueueItem,
+    source: PlaybackSource,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -63,7 +80,7 @@ impl Default for EngineSnapshot {
 }
 
 enum EngineCommand {
-    Load(Vec<PathBuf>),
+    Load(Vec<EngineQueueItem>),
     Play,
     Pause,
     Seek(f64),
@@ -100,7 +117,25 @@ impl LocalAudioEngine {
         if paths.is_empty() {
             bail!("at least one local audio path is required");
         }
-        self.send(EngineCommand::Load(paths))
+        self.send(EngineCommand::Load(
+            paths.into_iter().map(local_queue_item).collect(),
+        ))
+    }
+
+    pub fn load_resolved(&self, request: ResolvedMediaRequest, title: String) -> Result<()> {
+        if request.media_type == MediaType::Hls {
+            bail!("HLS playback is not supported in v1");
+        }
+        let location = request.redacted_for_log();
+        self.send(EngineCommand::Load(vec![EngineQueueItem {
+            public: QueueItem {
+                location,
+                title,
+                duration_seconds: None,
+                online: true,
+            },
+            source: PlaybackSource::Online(request),
+        }]))
     }
 
     pub fn play(&self) -> Result<()> {
@@ -159,7 +194,7 @@ impl Drop for LocalAudioEngine {
 }
 
 struct WorkerModel {
-    queue: Vec<QueueItem>,
+    queue: Vec<EngineQueueItem>,
     index: Option<usize>,
     status: PlaybackStatus,
     intent_playing: bool,
@@ -220,7 +255,7 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                 model.status = PlaybackStatus::Loading;
                 publish_snapshot(&model, None, &shared_snapshot);
                 match PlaybackSession::new(
-                    &item.path,
+                    &item.source,
                     model.start_seconds,
                     model.volume,
                     model.dsp_settings.clone(),
@@ -310,8 +345,8 @@ fn handle_command(
     session: &mut Option<PlaybackSession>,
 ) -> bool {
     match command {
-        EngineCommand::Load(paths) => {
-            model.queue = paths.into_iter().map(queue_item).collect();
+        EngineCommand::Load(items) => {
+            model.queue = items;
             model.index = (!model.queue.is_empty()).then_some(0);
             model.start_seconds = 0.0;
             model.intent_playing = true;
@@ -340,7 +375,7 @@ fn handle_command(
         }
         EngineCommand::Seek(seconds) => {
             if let Some(index) = model.index {
-                let duration = model.queue[index].duration_seconds;
+                let duration = model.queue[index].public.duration_seconds;
                 model.start_seconds = duration.map_or(seconds, |value| seconds.min(value));
                 model.reload_requested = true;
                 model.status = PlaybackStatus::Loading;
@@ -404,7 +439,7 @@ fn handle_command(
     false
 }
 
-fn queue_item(path: PathBuf) -> QueueItem {
+fn local_queue_item(path: PathBuf) -> EngineQueueItem {
     let title = path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -413,10 +448,14 @@ fn queue_item(path: PathBuf) -> QueueItem {
     let duration_seconds = super::probe_local_file(&path)
         .ok()
         .and_then(|info| info.duration_seconds);
-    QueueItem {
-        path,
-        title,
-        duration_seconds,
+    EngineQueueItem {
+        public: QueueItem {
+            location: path.display().to_string(),
+            title,
+            duration_seconds,
+            online: false,
+        },
+        source: PlaybackSource::Local(path),
     }
 }
 
@@ -428,14 +467,15 @@ fn publish_snapshot(
     let duration_seconds = model
         .index
         .and_then(|index| model.queue.get(index))
-        .and_then(|item| item.duration_seconds);
+        .and_then(|item| item.public.duration_seconds)
+        .or_else(|| session.and_then(PlaybackSession::duration_seconds));
     let position_seconds = session
         .map(PlaybackSession::position_seconds)
         .unwrap_or(model.start_seconds);
     let underruns = session.map_or(0, PlaybackSession::underruns);
     *destination.lock().unwrap() = EngineSnapshot {
         status: model.status,
-        queue: model.queue.clone(),
+        queue: model.queue.iter().map(|item| item.public.clone()).collect(),
         queue_index: model.index,
         position_seconds,
         duration_seconds,
@@ -476,17 +516,31 @@ struct PlaybackSession {
     flushed: bool,
     intent_playing: bool,
     stream_playing: bool,
+    seek_discard_frames: usize,
 }
 
 impl PlaybackSession {
     fn new(
-        path: &Path,
+        source: &PlaybackSource,
         start_seconds: f64,
         volume: f32,
         dsp_settings: DspSettings,
     ) -> Result<Self> {
-        let mut media = open_media(path)?;
-        seek_media(&mut media, start_seconds)?;
+        let (media, seek_discard_frames) = match source {
+            PlaybackSource::Local(path) => {
+                let mut media = open_media(path)?;
+                seek_media(&mut media, start_seconds)?;
+                (media, 0)
+            }
+            PlaybackSource::Online(request) => {
+                let extension = media_extension(&request.media_type);
+                let description = request.redacted_for_log();
+                let http = HttpMediaSource::new(request.clone())?;
+                let mut media = open_media_source(Box::new(http), extension, &description)?;
+                let discard = seek_media_coarse(&mut media, start_seconds)?;
+                (media, discard)
+            }
+        };
         let sample_rate = media
             .codec_params
             .sample_rate
@@ -556,6 +610,7 @@ impl PlaybackSession {
             flushed: false,
             intent_playing: true,
             stream_playing: false,
+            seek_discard_frames,
         })
     }
 
@@ -603,7 +658,7 @@ impl PlaybackSession {
                 self.eof = true;
                 return Ok(PumpResult::Progress);
             }
-            Err(error) => return Err(error).context("failed to read local media packet"),
+            Err(error) => return Err(error).context("failed to read media packet"),
         };
         if packet.track_id() != self.media.track_id {
             return Ok(PumpResult::Progress);
@@ -611,7 +666,7 @@ impl PlaybackSession {
         let decoded = match self.media.decoder.decode(&packet) {
             Ok(decoded) => decoded,
             Err(SymphoniaError::DecodeError(_)) => return Ok(PumpResult::Progress),
-            Err(error) => return Err(error).context("failed to decode local media packet"),
+            Err(error) => return Err(error).context("failed to decode media packet"),
         };
         if self.sample_buffer.is_none() {
             self.sample_buffer = Some(SampleBuffer::<f32>::new(
@@ -624,7 +679,17 @@ impl PlaybackSession {
             .as_mut()
             .expect("sample buffer initialized");
         buffer.copy_interleaved_ref(decoded);
-        self.pending = self.rate_adapter.process(buffer.samples())?;
+        let mut samples = buffer.samples();
+        if self.seek_discard_frames > 0 {
+            let frames = samples.len() / self.source_channels;
+            let discard = frames.min(self.seek_discard_frames);
+            samples = &samples[discard * self.source_channels..];
+            self.seek_discard_frames -= discard;
+            if samples.is_empty() {
+                return Ok(PumpResult::Progress);
+            }
+        }
+        self.pending = self.rate_adapter.process(samples)?;
         self.dsp_chain
             .process_interleaved_in_place(&mut self.pending)?;
         apply_volume(&mut self.pending, self.volume);
@@ -671,6 +736,17 @@ impl PlaybackSession {
 
     fn underruns(&self) -> u64 {
         self.underrun_callbacks.load(Ordering::Relaxed)
+    }
+}
+
+fn media_extension(media_type: &MediaType) -> Option<&'static str> {
+    match media_type {
+        MediaType::Mp3 => Some("mp3"),
+        MediaType::Flac => Some("flac"),
+        MediaType::Aac => Some("aac"),
+        MediaType::Ogg => Some("ogg"),
+        MediaType::Wav => Some("wav"),
+        MediaType::Hls | MediaType::Unknown => None,
     }
 }
 

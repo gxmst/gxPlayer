@@ -255,6 +255,58 @@ input[type="range"] {
   font: 0.78rem Consolas, monospace;
 }
 
+.source-panel {
+  margin-top: 18px;
+}
+
+.source-panel ul {
+  margin: 12px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.source-import-row {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.source-import-row > input {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid #383b48;
+  border-radius: 8px;
+  background: #11131a;
+  padding: 9px 11px;
+  color: #e6e8ef;
+}
+
+.resolver-payload {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+  color: #aeb3c0;
+}
+
+.resolver-payload textarea {
+  min-height: 180px;
+  resize: vertical;
+  border: 1px solid #383b48;
+  border-radius: 8px;
+  background: #11131a;
+  padding: 12px;
+  color: #e6e8ef;
+  font: 0.78rem/1.5 Consolas, monospace;
+}
+
+.resolver-payload select {
+  border: 1px solid #383b48;
+  border-radius: 8px;
+  background: #11131a;
+  padding: 9px 11px;
+  color: #e6e8ef;
+}
+
 @media (max-width: 760px) {
   .dev-shell {
     width: min(100% - 28px, 1040px);

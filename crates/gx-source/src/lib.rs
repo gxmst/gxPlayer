@@ -28,6 +28,25 @@ pub struct ManagedSource {
     pub origin: String,
     pub imported_at_ms: u64,
     pub metadata: ScriptMetadata,
+    #[serde(default = "default_true")]
+    pub updates_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceBackup {
+    pub version: u32,
+    pub active_source_id: Option<String>,
+    pub sources: Vec<BackupSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupSource {
+    pub origin: String,
+    pub fallback_name: String,
+    pub updates_enabled: bool,
+    pub script: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +66,10 @@ pub enum SourceStoreError {
     InvalidScript,
     #[error("source '{0}' does not exist")]
     SourceNotFound(String),
+    #[error("unsupported source backup version {0}")]
+    InvalidBackupVersion(u32),
+    #[error("source backup exceeds the allowed source count or total size")]
+    BackupTooLarge,
     #[error("source storage I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("source storage JSON failed: {0}")]
@@ -103,6 +126,7 @@ impl SourceStore {
             origin: origin.into(),
             imported_at_ms: unix_time_ms(),
             metadata,
+            updates_enabled: true,
         };
         self.config.sources.push(source.clone());
         if self.config.active_source_id.is_none() {
@@ -127,6 +151,34 @@ impl SourceStore {
         }
         self.config.active_source_id = Some(id.into());
         self.persist()
+    }
+
+    pub fn set_updates_enabled(&mut self, id: &str, enabled: bool) -> Result<(), SourceStoreError> {
+        let source = self
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == id)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
+        source.updates_enabled = enabled;
+        self.persist()
+    }
+
+    pub fn active_updates_enabled(&self) -> bool {
+        self.config
+            .active_source_id
+            .as_deref()
+            .and_then(|id| self.config.sources.iter().find(|source| source.id == id))
+            .is_some_and(|source| source.updates_enabled)
+    }
+
+    pub fn updates_enabled(&self, id: &str) -> Result<bool, SourceStoreError> {
+        self.config
+            .sources
+            .iter()
+            .find(|source| source.id == id)
+            .map(|source| source.updates_enabled)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))
     }
 
     pub fn remove(&mut self, id: &str) -> Result<(), SourceStoreError> {
@@ -162,6 +214,93 @@ impl SourceStore {
         Ok(Some((source, script)))
     }
 
+    pub fn script_by_id(&self, id: &str) -> Result<(ManagedSource, String), SourceStoreError> {
+        let source = self
+            .config
+            .sources
+            .iter()
+            .find(|source| source.id == id)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?
+            .clone();
+        let script = fs::read_to_string(&source.script_path)?;
+        Ok((source, script))
+    }
+
+    pub fn export_backup(&self) -> Result<SourceBackup, SourceStoreError> {
+        let sources = self
+            .config
+            .sources
+            .iter()
+            .map(|source| {
+                Ok(BackupSource {
+                    origin: source.origin.clone(),
+                    fallback_name: source.metadata.name.clone(),
+                    updates_enabled: source.updates_enabled,
+                    script: fs::read_to_string(&source.script_path)?,
+                })
+            })
+            .collect::<Result<Vec<_>, SourceStoreError>>()?;
+        Ok(SourceBackup {
+            version: 1,
+            active_source_id: self.config.active_source_id.clone(),
+            sources,
+        })
+    }
+
+    pub fn restore_backup(&mut self, backup: SourceBackup) -> Result<(), SourceStoreError> {
+        if backup.version != 1 {
+            return Err(SourceStoreError::InvalidBackupVersion(backup.version));
+        }
+        if backup.sources.len() > 64
+            || backup
+                .sources
+                .iter()
+                .map(|source| source.script.len())
+                .sum::<usize>()
+                > 20 * 1024 * 1024
+        {
+            return Err(SourceStoreError::BackupTooLarge);
+        }
+        for source in &backup.sources {
+            validate_script(&source.script)?;
+        }
+        let mut restored = Vec::with_capacity(backup.sources.len());
+        for source in backup.sources {
+            let id = script_id(source.script.as_bytes());
+            if restored
+                .iter()
+                .any(|existing: &ManagedSource| existing.id == id)
+            {
+                continue;
+            }
+            let script_path = self.root.join("scripts").join(format!("{id}.js"));
+            fs::write(&script_path, source.script.as_bytes())?;
+            restored.push(ManagedSource {
+                id,
+                script_path,
+                origin: source.origin,
+                imported_at_ms: unix_time_ms(),
+                metadata: parse_script_metadata(&source.script, &source.fallback_name),
+                updates_enabled: source.updates_enabled,
+            });
+        }
+        for old in &self.config.sources {
+            if old.script_path.starts_with(&self.root)
+                && !restored
+                    .iter()
+                    .any(|source| source.script_path == old.script_path)
+            {
+                let _ = fs::remove_file(&old.script_path);
+            }
+        }
+        self.config.sources = restored;
+        self.config.active_source_id = backup
+            .active_source_id
+            .filter(|id| self.config.sources.iter().any(|source| &source.id == id))
+            .or_else(|| self.config.sources.first().map(|source| source.id.clone()));
+        self.persist()
+    }
+
     fn persist(&self) -> Result<(), SourceStoreError> {
         let bytes = serde_json::to_vec_pretty(&self.config)?;
         let temporary = self.root.join("sources.json.tmp");
@@ -169,6 +308,10 @@ impl SourceStore {
         fs::rename(temporary, self.root.join("sources.json"))?;
         Ok(())
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn parse_script_metadata(script: &str, fallback_name: &str) -> ScriptMetadata {
@@ -250,11 +393,17 @@ mod tests {
         assert_eq!(first.metadata.name, "Source A");
         let second = store.import_script(script_b, "test:b", "b.js").unwrap();
         store.activate(&second.id).unwrap();
+        store.set_updates_enabled(&second.id, false).unwrap();
+        assert!(!store.active_updates_enabled());
+        let backup = store.export_backup().unwrap();
         assert_eq!(store.active_script().unwrap().unwrap().0.id, second.id);
         store.remove(&second.id).unwrap();
         assert_eq!(store.active_script().unwrap().unwrap().0.id, first.id);
+        store.restore_backup(backup).unwrap();
+        assert_eq!(store.active_script().unwrap().unwrap().0.id, second.id);
+        assert!(!store.active_updates_enabled());
         drop(store);
-        assert_eq!(SourceStore::open(&root).unwrap().list().len(), 1);
+        assert_eq!(SourceStore::open(&root).unwrap().list().len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 

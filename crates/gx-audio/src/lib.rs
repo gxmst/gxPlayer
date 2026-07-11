@@ -19,7 +19,7 @@ use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, CodecParameters, Decoder, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
@@ -315,9 +315,21 @@ where
 fn open_media(path: &Path) -> Result<OpenedMedia> {
     let file = File::open(path)
         .with_context(|| format!("failed to open local media {}", path.display()))?;
-    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    open_media_source(
+        Box::new(file),
+        path.extension().and_then(|value| value.to_str()),
+        &format!("local media {}", path.display()),
+    )
+}
+
+fn open_media_source(
+    source: Box<dyn MediaSource>,
+    extension: Option<&str>,
+    description: &str,
+) -> Result<OpenedMedia> {
+    let stream = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+    if let Some(extension) = extension {
         hint.with_extension(extension);
     }
 
@@ -328,7 +340,7 @@ fn open_media(path: &Path) -> Result<OpenedMedia> {
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .with_context(|| format!("failed to probe media format for {}", path.display()))?;
+        .with_context(|| format!("failed to probe media format for {description}"))?;
     let format = probed.format;
     let track = format
         .default_track()
@@ -348,6 +360,24 @@ fn open_media(path: &Path) -> Result<OpenedMedia> {
         track_id,
         codec_params,
     })
+}
+
+fn seek_media_coarse(media: &mut OpenedMedia, seconds: f64) -> Result<usize> {
+    if seconds <= 0.0 {
+        return Ok(0);
+    }
+    let seeked = media
+        .format
+        .seek(
+            SeekMode::Coarse,
+            SeekTo::Time {
+                time: seconds.into(),
+                track_id: Some(media.track_id),
+            },
+        )
+        .with_context(|| format!("failed to coarse-seek to {seconds:.3}s"))?;
+    media.decoder.reset();
+    Ok(seeked.required_ts.saturating_sub(seeked.actual_ts) as usize)
 }
 
 fn seek_media(media: &mut OpenedMedia, seconds: f64) -> Result<()> {

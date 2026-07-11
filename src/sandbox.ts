@@ -13,6 +13,8 @@ type LxHttpResponse = {
 };
 
 let requestHandler: RequestHandler | null = null;
+let currentGeneration = 0;
+let pocMode = false;
 
 const EVENT_NAMES = {
   request: "request",
@@ -41,14 +43,15 @@ function fromWordArray(value: CryptoJS.lib.WordArray): Buffer {
   return output;
 }
 
-function installLxContract(): void {
+function installLxContract(scriptInfo?: Record<string, unknown>): void {
+  requestHandler = null;
   Object.assign(globalThis, { Buffer });
   Object.assign(globalThis, {
     lx: {
       EVENT_NAMES,
       version: "2.0.0",
       env: "desktop",
-      currentScriptInfo: {
+      currentScriptInfo: scriptInfo ?? {
         name: "Phase-1 community compatibility script",
         version: "external",
         author: "external",
@@ -83,7 +86,7 @@ function installLxContract(): void {
         if (eventName !== EVENT_NAMES.inited && eventName !== EVENT_NAMES.updateAlert) {
           return Promise.reject(new Error(`Unsupported event: ${eventName}`));
         }
-        return invoke("lx_send", { eventName, data });
+        return invoke("lx_send", { eventName, data, generation: currentGeneration });
       },
       utils: {
         crypto: {
@@ -142,25 +145,63 @@ function installLxContract(): void {
 }
 
 Object.assign(window, {
-  async __gxRunCommunityScript(script: string) {
+  async __gxRunCommunityScript(
+    script: string,
+    context: {
+      generation?: number;
+      poc?: boolean;
+      scriptInfo?: Record<string, unknown>;
+      config?: Record<string, unknown>;
+    } = {},
+  ) {
+    currentGeneration = context.generation ?? 0;
+    pocMode = context.poc ?? false;
     try {
-      installLxContract();
+      installLxContract(context.scriptInfo);
       Object.assign(globalThis, {
-        ls: { api: { addr: "http://gx.invalid/", pass: "" } },
+        ls: context.config ?? { api: { addr: "http://gx.invalid/", pass: "" } },
       });
       await (0, eval)(script);
     } catch (error) {
-      await invoke("lx_poc_failure", { stage: "community-script", error: String(error) });
+      if (pocMode) {
+        await invoke("lx_poc_failure", { stage: "community-script", error: String(error) });
+      } else {
+        await invoke("lx_runtime_failure", {
+          generation: currentGeneration,
+          stage: "community-script",
+          error: String(error),
+        });
+      }
     }
   },
-  async __gxDispatchRequest(payload: unknown) {
+  async __gxDispatchRequest(requestId: string | unknown, payload?: unknown, generation?: number) {
+    const isPocRequest = payload === undefined;
+    const actualPayload = isPocRequest ? requestId : payload;
     try {
       if (!requestHandler) throw new Error("Request event is not defined");
-      const raw = await requestHandler(payload);
+      const raw = await requestHandler(actualPayload);
       const result = typeof raw === "string" ? { url: raw, type: "128k" } : raw;
-      await invoke("lx_poc_result", { result });
+      if (isPocRequest || pocMode) {
+        await invoke("lx_poc_result", { result });
+      } else {
+        await invoke("lx_runtime_result", {
+          requestId,
+          generation: generation ?? currentGeneration,
+          result,
+          error: null,
+        });
+      }
     } catch (error) {
-      await invoke("lx_poc_failure", { stage: "music-url", error: String(error) });
+      if (isPocRequest || pocMode) {
+        await invoke("lx_poc_failure", { stage: "music-url", error: String(error) });
+      } else {
+        await invoke("lx_runtime_result", {
+          requestId,
+          generation: generation ?? currentGeneration,
+          result: null,
+          error: String(error),
+        });
+      }
     }
   },
   async __gxRunCryptoSelfTest() {
@@ -195,16 +236,50 @@ Object.assign(window, {
     }
   },
   async __gxRunSecuritySelfTest() {
-    const results = { mainCommandBlocked: false, openerBlocked: false, ssrfBlocked: false };
+    const results = {
+      mainCommandBlocked: false,
+      sourceCommandBlocked: false,
+      openerBlocked: false,
+      newWindowBlocked: false,
+      fileBlocked: false,
+      shellBlocked: false,
+      clipboardBlocked: false,
+      ssrfBlocked: false,
+    };
     try {
       await invoke("main_only_probe");
     } catch {
       results.mainCommandBlocked = true;
     }
     try {
+      await invoke("source_list");
+    } catch {
+      results.sourceCommandBlocked = true;
+    }
+    try {
       await invoke("plugin:opener|open_url", { url: "https://example.com" });
     } catch {
       results.openerBlocked = true;
+    }
+    try {
+      results.newWindowBlocked = window.open("https://example.com", "_blank") === null;
+    } catch {
+      results.newWindowBlocked = true;
+    }
+    try {
+      await invoke("plugin:fs|read_text_file", { path: "C:\\Windows\\win.ini" });
+    } catch {
+      results.fileBlocked = true;
+    }
+    try {
+      await invoke("plugin:shell|execute", { program: "cmd.exe", args: ["/c", "ver"] });
+    } catch {
+      results.shellBlocked = true;
+    }
+    try {
+      await invoke("plugin:clipboard-manager|read_text");
+    } catch {
+      results.clipboardBlocked = true;
     }
     try {
       await invoke("lx_http_request", { url: "http://127.0.0.1/private", options: {} });

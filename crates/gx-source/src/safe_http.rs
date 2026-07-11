@@ -3,7 +3,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, LOCATION};
+use reqwest::header::{
+    AUTHORIZATION, COOKIE, HeaderMap, HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION,
+};
 use reqwest::{Method, StatusCode, Url};
 use thiserror::Error;
 
@@ -80,7 +82,11 @@ pub fn execute(mut request: SafeHttpRequest) -> Result<SafeHttpResponse, SafeHtt
             if redirect_count == MAX_REDIRECTS {
                 return Err(SafeHttpError::TooManyRedirects);
             }
-            request.url = redirect_target(&request.url, &response)?;
+            let next_url = redirect_target(&request.url, &response)?;
+            if !same_origin(&request.url, &next_url) {
+                strip_sensitive_headers(&mut request.headers);
+            }
+            request.url = next_url;
             if response.status() == StatusCode::SEE_OTHER
                 || ((response.status() == StatusCode::MOVED_PERMANENTLY
                     || response.status() == StatusCode::FOUND)
@@ -94,6 +100,21 @@ pub fn execute(mut request: SafeHttpRequest) -> Result<SafeHttpResponse, SafeHtt
         return read_response(response, request.max_response_bytes);
     }
     Err(SafeHttpError::TooManyRedirects)
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn strip_sensitive_headers(headers: &mut Vec<(String, String)>) {
+    headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case(AUTHORIZATION.as_str())
+            && !name.eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str())
+            && !name.eq_ignore_ascii_case(COOKIE.as_str())
+    });
 }
 
 pub fn validate_and_resolve(url: &Url) -> Result<SocketAddr, SafeHttpError> {
@@ -194,6 +215,10 @@ fn private_ipv6(address: Ipv6Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::thread;
+
     use super::*;
 
     #[test]
@@ -214,5 +239,54 @@ mod tests {
             validate_and_resolve(&Url::parse("https://user:pass@example.com/").unwrap()),
             Err(SafeHttpError::CredentialsDenied)
         ));
+    }
+
+    #[test]
+    fn cross_origin_redirects_drop_credentials() {
+        assert!(same_origin(
+            &Url::parse("https://example.com/a").unwrap(),
+            &Url::parse("https://EXAMPLE.com/b").unwrap()
+        ));
+        assert!(!same_origin(
+            &Url::parse("https://example.com/a").unwrap(),
+            &Url::parse("http://example.com/b").unwrap()
+        ));
+        let mut headers = vec![
+            ("Authorization".into(), "secret".into()),
+            ("cookie".into(), "secret".into()),
+            ("Referer".into(), "https://example.com".into()),
+        ];
+        strip_sensitive_headers(&mut headers);
+        assert_eq!(
+            headers,
+            vec![("Referer".into(), "https://example.com".into())]
+        );
+    }
+
+    #[test]
+    fn bounded_reader_rejects_oversized_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678",
+                )
+                .unwrap();
+        });
+        let response = Client::builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .unwrap();
+        assert!(matches!(
+            read_response(response, 4),
+            Err(SafeHttpError::ResponseTooLarge(4))
+        ));
+        server.join().unwrap();
     }
 }

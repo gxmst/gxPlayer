@@ -8,4 +8,4 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 gx-contracts = { path = "../../crates/gx-contracts" }
-gx-streaming = { path = "../../crates/gx-streaming" }
+gx-streaming = { path = "../../crates/gx-streaming", features = ["test-private-network"] }

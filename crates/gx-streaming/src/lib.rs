@@ -4,6 +4,8 @@
 //! asks the source to restart at a byte offset when Symphonia performs a seek.
 
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
+#[cfg(feature = "test-private-network")]
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -12,9 +14,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, SendTimeoutError, bounded};
 use gx_contracts::ResolvedMediaRequest;
+use gx_source::safe_http::validate_and_resolve;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{ACCEPT_RANGES, CONTENT_RANGE, HeaderName, HeaderValue, RANGE};
+use reqwest::header::{
+    ACCEPT_RANGES, AUTHORIZATION, CONTENT_RANGE, COOKIE, HeaderName, HeaderValue, LOCATION,
+    PROXY_AUTHORIZATION, RANGE,
+};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -26,6 +32,7 @@ use symphonia::core::probe::Hint;
 const CHUNK_SIZE: usize = 64 * 1024;
 const CHANNEL_CAPACITY: usize = 8;
 const MAX_RECONNECTS: u64 = 3;
+const MAX_MEDIA_REDIRECTS: usize = 10;
 
 #[derive(Debug, Default)]
 pub struct StreamMetrics {
@@ -89,7 +96,6 @@ struct WorkerState {
 
 pub struct HttpMediaSource {
     request: ResolvedMediaRequest,
-    client: Client,
     worker: Option<WorkerState>,
     current_chunk: Vec<u8>,
     chunk_offset: usize,
@@ -105,16 +111,10 @@ impl HttpMediaSource {
         if request.is_expired_at(unix_time_ms()) {
             bail!("resolved media request has expired and must be resolved again");
         }
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .context("failed to build streaming HTTP client")?;
         let metrics = Arc::new(StreamMetrics::default());
         let placeholder_url = request.url.clone();
         let mut source = Self {
             request,
-            client,
             worker: None,
             current_chunk: Vec::new(),
             chunk_offset: 0,
@@ -147,14 +147,12 @@ impl HttpMediaSource {
         let (ready_sender, ready_receiver) = bounded(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let request = self.request_for_restart();
-        let client = self.client.clone();
         let metrics = Arc::clone(&self.metrics);
         let cancel_for_worker = Arc::clone(&cancel);
         let handle = thread::Builder::new()
             .name("gx-http-stream".into())
             .spawn(move || {
                 network_worker(
-                    client,
                     request,
                     offset,
                     sender,
@@ -400,7 +398,6 @@ pub fn decode_http_window(
 }
 
 fn network_worker(
-    client: Client,
     request: ResolvedMediaRequest,
     initial_offset: u64,
     sender: crossbeam_channel::Sender<StreamMessage>,
@@ -423,7 +420,7 @@ fn network_worker(
             metrics.range_requests.fetch_add(1, Ordering::Relaxed);
         }
 
-        let response = match send_request(&client, &request, active_url.clone(), offset) {
+        let response = match send_request(&request, active_url.clone(), offset) {
             Ok(response) => response,
             Err(error) => {
                 if !ready_sent {
@@ -535,25 +532,91 @@ fn network_worker(
 }
 
 fn send_request(
-    client: &Client,
     request: &ResolvedMediaRequest,
-    url: reqwest::Url,
+    mut url: reqwest::Url,
     offset: u64,
 ) -> Result<Response, String> {
-    let mut builder = client.get(url);
-    for header in &request.headers {
-        let name = HeaderName::from_bytes(header.name.as_bytes())
-            .map_err(|error| format!("invalid media request header name: {error}"))?;
-        let value = HeaderValue::from_str(&header.value)
-            .map_err(|error| format!("invalid media request header value: {error}"))?;
-        builder = builder.header(name, value);
+    let mut headers = request.headers.clone();
+    for redirect_count in 0..=MAX_MEDIA_REDIRECTS {
+        let resolved = resolve_media_destination(&url)
+            .map_err(|error| format!("media destination denied: {error}"))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| "media URL has no host".to_owned())?;
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .resolve(host, resolved)
+            .build()
+            .map_err(|error| format!("failed to build pinned media client: {error}"))?;
+        let mut builder = client.get(url.clone());
+        for header in &headers {
+            let name = HeaderName::from_bytes(header.name.as_bytes())
+                .map_err(|error| format!("invalid media request header name: {error}"))?;
+            let value = HeaderValue::from_str(&header.value)
+                .map_err(|error| format!("invalid media request header value: {error}"))?;
+            builder = builder.header(name, value);
+        }
+        if offset > 0 {
+            builder = builder.header(RANGE, format!("bytes={offset}-"));
+        }
+        let response = builder
+            .send()
+            .map_err(|error| format!("media request failed: {error}"))?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        if redirect_count == MAX_MEDIA_REDIRECTS {
+            return Err("media redirect limit exceeded".into());
+        }
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "media redirect has no valid Location header".to_owned())?;
+        let next = url
+            .join(location)
+            .map_err(|_| "media redirect Location is invalid".to_owned())?;
+        if !same_origin(&url, &next) {
+            headers.retain(|header| {
+                !header.name.eq_ignore_ascii_case(AUTHORIZATION.as_str())
+                    && !header
+                        .name
+                        .eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str())
+                    && !header.name.eq_ignore_ascii_case(COOKIE.as_str())
+            });
+        }
+        url = next;
     }
-    if offset > 0 {
-        builder = builder.header(RANGE, format!("bytes={offset}-"));
+    Err("media redirect limit exceeded".into())
+}
+
+fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn resolve_media_destination(url: &reqwest::Url) -> Result<std::net::SocketAddr, String> {
+    match validate_and_resolve(url) {
+        Ok(address) => Ok(address),
+        #[cfg(feature = "test-private-network")]
+        Err(_) => {
+            let host = url
+                .host_str()
+                .ok_or_else(|| "media URL has no host".to_owned())?;
+            let ip = host
+                .parse::<IpAddr>()
+                .map_err(|_| "test private-network bypass only accepts IP literals".to_owned())?;
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| "media URL has no port".to_owned())?;
+            Ok(SocketAddr::new(ip, port))
+        }
+        #[cfg(not(feature = "test-private-network"))]
+        Err(error) => Err(error.to_string()),
     }
-    builder
-        .send()
-        .map_err(|error| format!("media request failed: {error}"))
 }
 
 fn response_total_len(response: &Response, offset: u64) -> Option<u64> {
@@ -603,5 +666,27 @@ mod tests {
     fn signed_seek_math_rejects_underflow() {
         assert_eq!(add_signed(10, -4).unwrap(), 6);
         assert!(add_signed(3, -4).is_err());
+    }
+
+    #[cfg(not(feature = "test-private-network"))]
+    #[test]
+    fn production_media_policy_rejects_private_destinations() {
+        let error = resolve_media_destination(
+            &reqwest::Url::parse("http://127.0.0.1/private.mp3").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("private"));
+    }
+
+    #[test]
+    fn media_origins_include_scheme_host_and_port() {
+        assert!(same_origin(
+            &reqwest::Url::parse("https://example.com/a").unwrap(),
+            &reqwest::Url::parse("https://EXAMPLE.com:443/b").unwrap()
+        ));
+        assert!(!same_origin(
+            &reqwest::Url::parse("https://example.com/a").unwrap(),
+            &reqwest::Url::parse("http://example.com/a").unwrap()
+        ));
     }
 }

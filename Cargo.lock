@@ -1620,6 +1620,7 @@ dependencies = [
  "crossbeam-channel",
  "gx-contracts",
  "gx-dsp",
+ "gx-streaming",
  "ringbuf",
  "rubato",
  "serde",
@@ -1662,6 +1663,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "gx-contracts",
+ "gx-source",
  "reqwest",
  "symphonia",
 ]
@@ -1673,6 +1675,7 @@ dependencies = [
  "gx-audio",
  "gx-contracts",
  "gx-dsp",
+ "gx-source",
  "reqwest",
  "serde",
  "serde_json",
@@ -1680,6 +1683,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "url",
 ]
 
 [[package]]

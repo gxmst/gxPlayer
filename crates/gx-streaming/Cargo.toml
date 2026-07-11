@@ -5,9 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+test-private-network = []
+
 [dependencies]
 anyhow.workspace = true
 crossbeam-channel.workspace = true
 gx-contracts = { path = "../gx-contracts" }
+gx-source = { path = "../gx-source" }
 reqwest.workspace = true
 symphonia.workspace = true

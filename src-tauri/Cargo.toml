@@ -27,4 +27,6 @@ serde_json.workspace = true
 gx-contracts = { path = "../crates/gx-contracts" }
 gx-audio = { path = "../crates/gx-audio" }
 gx-dsp = { path = "../crates/gx-dsp" }
+gx-source = { path = "../crates/gx-source" }
 reqwest.workspace = true
+url.workspace = true

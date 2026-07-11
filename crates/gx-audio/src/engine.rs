@@ -10,6 +10,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use gx_contracts::PlaybackStatus;
+use gx_dsp::{DspChain, DspSettings};
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use serde::Serialize;
 use symphonia::core::audio::SampleBuffer;
@@ -38,6 +39,7 @@ pub struct EngineSnapshot {
     pub position_seconds: f64,
     pub duration_seconds: Option<f64>,
     pub volume: f32,
+    pub dsp_settings: DspSettings,
     pub generation: u64,
     pub underrun_callbacks: u64,
     pub error: Option<String>,
@@ -52,6 +54,7 @@ impl Default for EngineSnapshot {
             position_seconds: 0.0,
             duration_seconds: None,
             volume: 1.0,
+            dsp_settings: DspSettings::default(),
             generation: 0,
             underrun_callbacks: 0,
             error: None,
@@ -65,6 +68,7 @@ enum EngineCommand {
     Pause,
     Seek(f64),
     SetVolume(f32),
+    SetDspSettings(DspSettings),
     Next,
     Previous,
     Shutdown,
@@ -121,6 +125,11 @@ impl LocalAudioEngine {
         self.send(EngineCommand::SetVolume(volume.clamp(0.0, 1.0)))
     }
 
+    pub fn set_dsp_settings(&self, settings: DspSettings) -> Result<()> {
+        DspChain::new(48_000, 2, settings.clone())?;
+        self.send(EngineCommand::SetDspSettings(settings))
+    }
+
     pub fn next(&self) -> Result<()> {
         self.send(EngineCommand::Next)
     }
@@ -157,6 +166,7 @@ struct WorkerModel {
     reload_requested: bool,
     start_seconds: f64,
     volume: f32,
+    dsp_settings: DspSettings,
     generation: u64,
     error: Option<String>,
 }
@@ -171,6 +181,7 @@ impl Default for WorkerModel {
             reload_requested: false,
             start_seconds: 0.0,
             volume: 1.0,
+            dsp_settings: DspSettings::default(),
             generation: 0,
             error: None,
         }
@@ -208,7 +219,12 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
             if let Some(item) = model.index.and_then(|index| model.queue.get(index)) {
                 model.status = PlaybackStatus::Loading;
                 publish_snapshot(&model, None, &shared_snapshot);
-                match PlaybackSession::new(&item.path, model.start_seconds, model.volume) {
+                match PlaybackSession::new(
+                    &item.path,
+                    model.start_seconds,
+                    model.volume,
+                    model.dsp_settings.clone(),
+                ) {
                     Ok(mut next_session) => {
                         if !model.intent_playing {
                             next_session.pause();
@@ -345,6 +361,16 @@ fn handle_command(
                 *session = None;
             }
         }
+        EngineCommand::SetDspSettings(settings) => {
+            model.dsp_settings = settings;
+            if let Some(active) = session.as_ref() {
+                model.start_seconds = active.position_seconds();
+                model.reload_requested = true;
+                model.status = PlaybackStatus::Loading;
+                model.generation += 1;
+                *session = None;
+            }
+        }
         EngineCommand::Next => {
             if let Some(index) = model.index
                 && index + 1 < model.queue.len()
@@ -414,6 +440,7 @@ fn publish_snapshot(
         position_seconds,
         duration_seconds,
         volume: model.volume,
+        dsp_settings: model.dsp_settings.clone(),
         generation: model.generation,
         underrun_callbacks: underruns,
         error: model.error.clone(),
@@ -429,6 +456,7 @@ enum PumpResult {
 struct PlaybackSession {
     media: OpenedMedia,
     rate_adapter: RateAdapter,
+    dsp_chain: DspChain,
     sample_buffer: Option<SampleBuffer<f32>>,
     producer: HeapProd<f32>,
     stream: Stream,
@@ -451,7 +479,12 @@ struct PlaybackSession {
 }
 
 impl PlaybackSession {
-    fn new(path: &Path, start_seconds: f64, volume: f32) -> Result<Self> {
+    fn new(
+        path: &Path,
+        start_seconds: f64,
+        volume: f32,
+        dsp_settings: DspSettings,
+    ) -> Result<Self> {
         let mut media = open_media(path)?;
         seek_media(&mut media, start_seconds)?;
         let sample_rate = media
@@ -497,10 +530,12 @@ impl PlaybackSession {
             },
         )?;
         let rate_adapter = RateAdapter::new(sample_rate, output_sample_rate, channels)?;
+        let dsp_chain = DspChain::new(output_sample_rate, channels, dsp_settings)?;
 
         Ok(Self {
             media,
             rate_adapter,
+            dsp_chain,
             sample_buffer: None,
             producer,
             stream,
@@ -547,6 +582,8 @@ impl PlaybackSession {
         if self.eof {
             if !self.flushed {
                 self.pending = self.rate_adapter.finish()?;
+                self.dsp_chain
+                    .process_interleaved_in_place(&mut self.pending)?;
                 apply_volume(&mut self.pending, self.volume);
                 self.flushed = true;
                 if !self.pending.is_empty() {
@@ -588,6 +625,8 @@ impl PlaybackSession {
             .expect("sample buffer initialized");
         buffer.copy_interleaved_ref(decoded);
         self.pending = self.rate_adapter.process(buffer.samples())?;
+        self.dsp_chain
+            .process_interleaved_in_place(&mut self.pending)?;
         apply_volume(&mut self.pending, self.volume);
         Ok(PumpResult::Progress)
     }
@@ -678,40 +717,86 @@ where
 {
     let stream = device.build_output_stream(
         config,
-        move |output: &mut [T], _| {
-            let enabled = counters.enabled.load(Ordering::Acquire);
-            let mut starved = false;
-            let mut consumed = 0u64;
-            for target in output {
-                let sample = match consumer.try_pop() {
-                    Some(value) => {
-                        counters.queued_samples.fetch_sub(1, Ordering::Release);
-                        consumed += 1;
-                        value
-                    }
-                    None => {
-                        starved = enabled;
-                        0.0
-                    }
-                };
-                *target = T::from_sample(sample);
-            }
-            counters
-                .played_samples
-                .fetch_add(consumed, Ordering::Relaxed);
-            if starved {
-                counters.underruns.fetch_add(1, Ordering::Relaxed);
-            }
-        },
+        move |output: &mut [T], _| render_output_callback(output, &mut consumer, &counters),
         |error| eprintln!("audio output stream error: {error}"),
         None,
     )?;
     Ok(stream)
 }
 
+#[inline]
+fn render_output_callback<T>(
+    output: &mut [T],
+    consumer: &mut HeapCons<f32>,
+    counters: &OutputCallbackCounters,
+) where
+    T: Sample + SizedSample + FromSample<f32>,
+{
+    let enabled = counters.enabled.load(Ordering::Acquire);
+    let mut starved = false;
+    let mut consumed = 0u64;
+    for target in output {
+        let sample = match consumer.try_pop() {
+            Some(value) => {
+                counters.queued_samples.fetch_sub(1, Ordering::Release);
+                consumed += 1;
+                value
+            }
+            None => {
+                starved = enabled;
+                0.0
+            }
+        };
+        *target = T::from_sample(sample);
+    }
+    counters
+        .played_samples
+        .fetch_add(consumed, Ordering::Relaxed);
+    if starved {
+        counters.underruns.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
     use super::*;
+
+    thread_local! {
+        static TRACK_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct CountingAllocator;
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            TRACK_ALLOCATIONS.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            TRACK_ALLOCATIONS.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.realloc(pointer, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
 
     #[test]
     fn volume_is_identity_at_one_and_scales_elsewhere() {
@@ -722,5 +807,28 @@ mod tests {
         let mut scaled = vec![-0.5, 0.25];
         apply_volume(&mut scaled, 0.5);
         assert_eq!(scaled, vec![-0.25, 0.125]);
+    }
+
+    #[test]
+    fn audio_callback_path_allocates_nothing_and_uses_only_atomics() {
+        let ring = HeapRb::<f32>::new(256);
+        let (mut producer, mut consumer) = ring.split();
+        for value in 0..128 {
+            producer.try_push(value as f32 / 128.0).unwrap();
+        }
+        let counters = OutputCallbackCounters {
+            queued_samples: Arc::new(AtomicUsize::new(128)),
+            played_samples: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
+            enabled: Arc::new(AtomicBool::new(true)),
+        };
+        let mut output = [0.0f32; 128];
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        TRACK_ALLOCATIONS.with(|enabled| enabled.set(true));
+        render_output_callback(&mut output, &mut consumer, &counters);
+        TRACK_ALLOCATIONS.with(|enabled| enabled.set(false));
+        assert_eq!(ALLOCATION_COUNT.with(Cell::get), 0);
+        assert_eq!(counters.played_samples.load(Ordering::Relaxed), 128);
+        assert_eq!(counters.underruns.load(Ordering::Relaxed), 0);
     }
 }

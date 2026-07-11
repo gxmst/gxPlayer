@@ -87,11 +87,50 @@ h1 {
 }
 
 .now-playing,
+.dsp-panel,
 .queue-panel {
   border: 1px solid #2f313b;
   border-radius: 14px;
   background: #191b23;
   padding: 24px;
+}
+
+.dsp-panel {
+  margin-bottom: 16px;
+}
+
+.dsp-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.switch-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #c5c9d4;
+}
+
+.eq-control {
+  display: grid;
+  grid-template-columns: 150px 1fr 80px;
+  align-items: center;
+  gap: 14px;
+  margin-top: 22px;
+}
+
+.eq-control output {
+  color: #cfd4e2;
+  font: 0.82rem Consolas, monospace;
+  text-align: right;
+}
+
+.dsp-note {
+  margin: 16px 0 0;
+  color: #858b9d;
+  font-size: 0.82rem;
 }
 
 .track-copy h2 {

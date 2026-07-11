@@ -1057,6 +1057,7 @@ dependencies = [
  "anyhow",
  "gx-audio",
  "gx-contracts",
+ "gx-dsp",
 ]
 
 [[package]]
@@ -1618,6 +1619,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "gx-contracts",
+ "gx-dsp",
  "ringbuf",
  "rubato",
  "serde",
@@ -1632,6 +1634,14 @@ dependencies = [
  "serde_json",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "gx-dsp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1651,6 +1661,7 @@ version = "0.1.0"
 dependencies = [
  "gx-audio",
  "gx-contracts",
+ "gx-dsp",
  "reqwest",
  "serde",
  "serde_json",

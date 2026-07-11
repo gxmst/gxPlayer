@@ -10,3 +10,4 @@ repository.workspace = true
 anyhow.workspace = true
 gx-audio = { path = "../../crates/gx-audio" }
 gx-contracts = { path = "../../crates/gx-contracts" }
+gx-dsp = { path = "../../crates/gx-dsp" }

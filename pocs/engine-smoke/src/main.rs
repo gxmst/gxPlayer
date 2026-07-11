@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use gx_audio::engine::{EngineSnapshot, LocalAudioEngine};
 use gx_contracts::PlaybackStatus;
+use gx_dsp::{DspSettings, EqBand};
 
 fn main() -> Result<()> {
     let path = env::args()
@@ -71,6 +72,33 @@ fn main() -> Result<()> {
         previous.queue.len(),
         previous.underrun_callbacks
     );
+
+    engine.set_dsp_settings(DspSettings {
+        enabled: true,
+        eq_enabled: true,
+        eq_bands: vec![EqBand::peak(1_000.0, 9.0, 1.0)],
+    })?;
+    let eq_on = wait_for(&engine, "EQ enable", |state| {
+        state.status == PlaybackStatus::Playing
+            && state.dsp_settings.enabled
+            && state.dsp_settings.eq_enabled
+            && state.dsp_settings.eq_bands[0].gain_db == 9.0
+    })?;
+    println!("EQ enabled at {:.3}s", eq_on.position_seconds);
+
+    engine.seek(40.0)?;
+    let eq_seeked = wait_for(&engine, "seek with EQ enabled", |state| {
+        state.status == PlaybackStatus::Playing
+            && state.dsp_settings.enabled
+            && state.position_seconds >= 40.0
+    })?;
+    println!("EQ seek passed at {:.3}s", eq_seeked.position_seconds);
+
+    engine.set_dsp_settings(DspSettings::default())?;
+    let bypassed = wait_for(&engine, "DSP bypass", |state| {
+        state.status == PlaybackStatus::Playing && !state.dsp_settings.enabled
+    })?;
+    println!("DSP bypass restored at {:.3}s", bypassed.position_seconds);
 
     let short_path = write_short_wav()?;
     engine.load(vec![short_path.clone(), short_path.clone()])?;

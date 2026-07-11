@@ -18,6 +18,20 @@ type QueueItem = {
   durationSeconds: number | null;
 };
 
+type EqBand = {
+  enabled: boolean;
+  kind: "peak" | "low_shelf" | "high_shelf" | "low_pass" | "high_pass";
+  frequencyHz: number;
+  gainDb: number;
+  q: number;
+};
+
+type DspSettings = {
+  enabled: boolean;
+  eqEnabled: boolean;
+  eqBands: EqBand[];
+};
+
 type EngineSnapshot = {
   status: PlaybackStatus;
   queue: QueueItem[];
@@ -25,6 +39,7 @@ type EngineSnapshot = {
   positionSeconds: number;
   durationSeconds: number | null;
   volume: number;
+  dspSettings: DspSettings;
   generation: number;
   underrunCallbacks: number;
   error: string | null;
@@ -37,6 +52,11 @@ const EMPTY_STATE: EngineSnapshot = {
   positionSeconds: 0,
   durationSeconds: null,
   volume: 1,
+  dspSettings: {
+    enabled: false,
+    eqEnabled: false,
+    eqBands: [{ enabled: true, kind: "peak", frequencyHz: 1000, gainDb: 0, q: 1 }],
+  },
   generation: 0,
   underrunCallbacks: 0,
   error: null,
@@ -115,6 +135,13 @@ function App() {
     setDragPosition(null);
     await run("player_seek", { seconds: value });
   };
+
+  const setDsp = async (settings: DspSettings) => {
+    setSnapshot((state) => ({ ...state, dspSettings: settings }));
+    await run("player_set_dsp_settings", { settings });
+  };
+
+  const firstBand = snapshot.dspSettings.eqBands[0] ?? EMPTY_STATE.dspSettings.eqBands[0];
 
   return (
     <main className="dev-shell">
@@ -216,6 +243,62 @@ function App() {
           <span>Queue</span>
           <strong>{snapshot.queue.length}</strong>
         </div>
+      </section>
+
+      <section className="dsp-panel">
+        <div className="dsp-heading">
+          <div>
+            <p className="eyebrow">Phase 1</p>
+            <h3>透明旁路 + 单段参量 EQ 验证</h3>
+          </div>
+          <label className="switch-row">
+            <input
+              type="checkbox"
+              checked={snapshot.dspSettings.enabled}
+              onChange={(event) =>
+                setDsp({ ...snapshot.dspSettings, enabled: event.target.checked })
+              }
+            />
+            DSP 总开关
+          </label>
+        </div>
+        <label className="switch-row">
+          <input
+            type="checkbox"
+            checked={snapshot.dspSettings.eqEnabled}
+            disabled={!snapshot.dspSettings.enabled}
+            onChange={(event) =>
+              setDsp({ ...snapshot.dspSettings, eqEnabled: event.target.checked })
+            }
+          />
+          参量 EQ
+        </label>
+        <label className="eq-control">
+          <span>1 kHz 峰值增益</span>
+          <input
+            type="range"
+            min={-12}
+            max={12}
+            step={0.5}
+            value={firstBand.gainDb}
+            disabled={!snapshot.dspSettings.enabled || !snapshot.dspSettings.eqEnabled}
+            onChange={(event) => {
+              const band = { ...firstBand, gainDb: Number(event.target.value) };
+              setSnapshot((state) => ({
+                ...state,
+                dspSettings: { ...state.dspSettings, eqBands: [band] },
+              }));
+            }}
+            onPointerUp={(event) => {
+              const band = { ...firstBand, gainDb: Number(event.currentTarget.value) };
+              void setDsp({ ...snapshot.dspSettings, eqBands: [band] });
+            }}
+          />
+          <output>{firstBand.gainDb.toFixed(1)} dB</output>
+        </label>
+        <p className="dsp-note">
+          DSP 关闭时工作线程在任何采样操作前直接返回；自动测试按 f32 位模式比较输入输出。
+        </p>
       </section>
 
       <section className="queue-panel">

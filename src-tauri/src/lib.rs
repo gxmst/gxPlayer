@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tauri::{AppHandle, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use gx_audio::engine::{EngineSnapshot, LocalAudioEngine};
+use gx_dsp::DspSettings;
 
 const SANDBOX_LABEL: &str = "lx-sandbox";
 
@@ -113,6 +114,18 @@ fn player_set_volume(
 ) -> Result<(), String> {
     require_window(&window, "main")?;
     engine.set_volume(volume).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_set_dsp_settings(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    settings: DspSettings,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine
+        .set_dsp_settings(settings)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -395,6 +408,7 @@ pub fn run() {
             player_pause,
             player_seek,
             player_set_volume,
+            player_set_dsp_settings,
             player_next,
             player_previous,
             player_snapshot,

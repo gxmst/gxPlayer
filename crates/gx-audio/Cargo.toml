@@ -10,6 +10,7 @@ anyhow.workspace = true
 cpal.workspace = true
 crossbeam-channel.workspace = true
 gx-contracts = { path = "../gx-contracts" }
+gx-dsp = { path = "../gx-dsp" }
 ringbuf.workspace = true
 rubato.workspace = true
 serde.workspace = true

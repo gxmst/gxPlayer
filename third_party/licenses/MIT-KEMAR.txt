@@ -1,0 +1,15 @@
+MIT Media Lab KEMAR HRTF measurements
+
+Authors: Bill Gardner and Keith Martin
+Source: https://sound.media.mit.edu/resources/KEMAR/
+Embedded data: compact.zip, elevation 0 degrees, azimuth 30 degrees, 44.1 kHz HRIR
+
+Copyright 1994 by the MIT Media Laboratory.
+
+The upstream archive states:
+
+"It is provided free with no restrictions on use, provided the authors are cited when the data
+is used in any research or commercial application."
+
+GXPlayer embeds the left and right 128-sample impulse responses as signed PCM constants and
+resamples them during DSP-chain construction.

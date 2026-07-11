@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use gx_audio::engine::{EngineSnapshot, LocalAudioEngine};
 use gx_contracts::PlaybackStatus;
-use gx_dsp::{DspSettings, EqBand};
+use gx_dsp::{CrossfeedSettings, DspSettings, EqBand, HrtfSettings, LimiterSettings};
 
 fn main() -> Result<()> {
     let path = env::args()
@@ -16,6 +16,11 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .context("usage: engine-smoke <audio-file>")?;
     let engine = LocalAudioEngine::new()?;
+    let output_devices = engine.output_devices()?;
+    if output_devices.is_empty() {
+        bail!("no output devices were enumerated");
+    }
+    println!("output devices: {output_devices:?}");
     engine.load(vec![path.clone(), path])?;
 
     let playing = wait_for(&engine, "initial playback", |state| {
@@ -77,6 +82,7 @@ fn main() -> Result<()> {
         enabled: true,
         eq_enabled: true,
         eq_bands: vec![EqBand::peak(1_000.0, 9.0, 1.0)],
+        ..DspSettings::default()
     })?;
     let eq_on = wait_for(&engine, "EQ enable", |state| {
         state.status == PlaybackStatus::Playing
@@ -93,6 +99,87 @@ fn main() -> Result<()> {
             && state.position_seconds >= 40.0
     })?;
     println!("EQ seek passed at {:.3}s", eq_seeked.position_seconds);
+
+    let spatial = DspSettings {
+        enabled: true,
+        crossfeed: CrossfeedSettings {
+            enabled: true,
+            ..CrossfeedSettings::default()
+        },
+        hrtf: HrtfSettings {
+            enabled: true,
+            ..HrtfSettings::default()
+        },
+        limiter: LimiterSettings {
+            enabled: true,
+            ..LimiterSettings::default()
+        },
+        ..DspSettings::default()
+    };
+    engine.set_dsp_settings(spatial)?;
+    let spatial_on = wait_for(&engine, "spatial DSP enable", |state| {
+        state.status == PlaybackStatus::Playing
+            && state.dsp_settings.crossfeed.enabled
+            && state.dsp_settings.hrtf.enabled
+            && state.dsp_settings.limiter.enabled
+    })?;
+    println!("spatial DSP enabled at {:.3}s", spatial_on.position_seconds);
+    engine.seek(50.0)?;
+    let spatial_seeked = wait_for(&engine, "seek with spatial DSP enabled", |state| {
+        state.status == PlaybackStatus::Playing
+            && state.dsp_settings.hrtf.enabled
+            && state.position_seconds >= 50.0
+    })?;
+    thread::sleep(Duration::from_secs(2));
+    let spatial_stable = engine.snapshot();
+    if spatial_stable.underrun_callbacks != 0 {
+        bail!(
+            "spatial playback reported {} underrun callbacks",
+            spatial_stable.underrun_callbacks
+        );
+    }
+    println!(
+        "spatial seek/stability passed at {:.3}s, underruns={}",
+        spatial_seeked.position_seconds, spatial_stable.underrun_callbacks
+    );
+
+    let original_device = spatial_stable.output_device.clone();
+    let selected_device = output_devices
+        .iter()
+        .find(|name| Some(name.as_str()) != original_device.as_deref())
+        .cloned()
+        .unwrap_or_else(|| output_devices[0].clone());
+    let before_device_generation = spatial_stable.generation;
+    engine.set_output_device(Some(selected_device.clone()))?;
+    let switched = wait_for(&engine, "output device switch", |state| {
+        state.status == PlaybackStatus::Playing
+            && state.output_device.as_deref() == Some(selected_device.as_str())
+            && state.generation > before_device_generation
+    })?;
+    println!(
+        "output device switch passed: device={selected_device:?}, position={:.3}s",
+        switched.position_seconds
+    );
+
+    engine.set_output_device(Some("GXPlayer definitely missing output device".into()))?;
+    let invalid = wait_for_status(&engine, "invalid output device", PlaybackStatus::Failed)?;
+    let invalid_error = invalid.error.as_deref().unwrap_or_default();
+    if !invalid_error.contains("unavailable") {
+        bail!("invalid output device returned an unclear error: {invalid_error:?}");
+    }
+    println!("invalid output device rejected clearly: {invalid_error}");
+
+    engine.set_output_device(original_device.clone())?;
+    let recovered = wait_for_after_generation(
+        &engine,
+        "output device recovery",
+        invalid.generation,
+        |state| state.status == PlaybackStatus::Playing && state.output_device == original_device,
+    )?;
+    println!(
+        "output device recovery passed at {:.3}s",
+        recovered.position_seconds
+    );
 
     engine.set_dsp_settings(DspSettings::default())?;
     let bypassed = wait_for(&engine, "DSP bypass", |state| {
@@ -112,6 +199,46 @@ fn main() -> Result<()> {
     drop(engine);
     fs::remove_file(short_path)?;
     Ok(())
+}
+
+fn wait_for_after_generation(
+    engine: &LocalAudioEngine,
+    label: &str,
+    previous_generation: u64,
+    predicate: impl Fn(&EngineSnapshot) -> bool,
+) -> Result<EngineSnapshot> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = engine.snapshot();
+        if snapshot.generation > previous_generation && predicate(&snapshot) {
+            return Ok(snapshot);
+        }
+        if snapshot.generation > previous_generation && snapshot.status == PlaybackStatus::Failed {
+            bail!("{label} failed: {:?}", snapshot.error);
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for {label}; last state: {snapshot:#?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_status(
+    engine: &LocalAudioEngine,
+    label: &str,
+    status: PlaybackStatus,
+) -> Result<EngineSnapshot> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = engine.snapshot();
+        if snapshot.status == status {
+            return Ok(snapshot);
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for {label}; last state: {snapshot:#?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn wait_for(

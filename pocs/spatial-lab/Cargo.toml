@@ -1,12 +1,12 @@
 [package]
-name = "gx-dsp"
+name = "spatial-lab"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+gx-dsp = { path = "../../crates/gx-dsp" }
 serde.workspace = true
-rustfft.workspace = true
-thiserror.workspace = true
+serde_json.workspace = true

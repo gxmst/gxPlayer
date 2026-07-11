@@ -2,99 +2,17 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
+import {
+  EMPTY_ENGINE,
+  type CatalogTrack,
+  type DspSettings,
+  type EngineSnapshot,
+  type ListedSource,
+  type LyricDocument,
+  type RuntimeStatus,
+} from "./types";
 
-type PlaybackStatus =
-  | "idle"
-  | "loading"
-  | "playing"
-  | "paused"
-  | "buffering"
-  | "stopped"
-  | "failed";
-
-type QueueItem = {
-  location: string;
-  title: string;
-  durationSeconds: number | null;
-  online: boolean;
-};
-
-type RuntimeStatus = {
-  generation: number;
-  state: "no_source" | "initializing" | "ready" | "failed";
-  activeSourceId: string | null;
-  capabilities: unknown;
-  error: string | null;
-};
-
-type ListedSource = {
-  id: string;
-  origin: string;
-  metadata: { name: string; version: string; author: string };
-  active: boolean;
-  updatesEnabled: boolean;
-};
-
-type CatalogTrack = {
-  providerId: string;
-  providerTrackId: string;
-  title: string;
-  artist: string;
-  album: string;
-  durationMs: number | null;
-  artworkUrl: string | null;
-  resolverPayload: unknown;
-  preview: unknown | null;
-};
-
-type LyricDocument = {
-  instrumental: boolean;
-  lines: Array<{ timestampMs: number | null; text: string }>;
-};
-
-type EqBand = {
-  enabled: boolean;
-  kind: "peak" | "low_shelf" | "high_shelf" | "low_pass" | "high_pass";
-  frequencyHz: number;
-  gainDb: number;
-  q: number;
-};
-
-type DspSettings = {
-  enabled: boolean;
-  eqEnabled: boolean;
-  eqBands: EqBand[];
-};
-
-type EngineSnapshot = {
-  status: PlaybackStatus;
-  queue: QueueItem[];
-  queueIndex: number | null;
-  positionSeconds: number;
-  durationSeconds: number | null;
-  volume: number;
-  dspSettings: DspSettings;
-  generation: number;
-  underrunCallbacks: number;
-  error: string | null;
-};
-
-const EMPTY_STATE: EngineSnapshot = {
-  status: "idle",
-  queue: [],
-  queueIndex: null,
-  positionSeconds: 0,
-  durationSeconds: null,
-  volume: 1,
-  dspSettings: {
-    enabled: false,
-    eqEnabled: false,
-    eqBands: [{ enabled: true, kind: "peak", frequencyHz: 1000, gainDb: 0, q: 1 }],
-  },
-  generation: 0,
-  underrunCallbacks: 0,
-  error: null,
-};
+const EMPTY_STATE = EMPTY_ENGINE;
 
 function formatTime(seconds: number | null): string {
   if (seconds === null || !Number.isFinite(seconds)) return "--:--";
@@ -128,11 +46,15 @@ function App() {
   const [catalogTracks, setCatalogTracks] = useState<CatalogTrack[]>([]);
   const [selectedCatalogTrack, setSelectedCatalogTrack] = useState<CatalogTrack | null>(null);
   const [lyrics, setLyrics] = useState<LyricDocument | null>(null);
+  const [outputDevices, setOutputDevices] = useState<string[]>([]);
   const lyricLineRefs = useRef<Array<HTMLParagraphElement | null>>([]);
 
   useEffect(() => {
     void invoke("ui_ready").catch((error) => setMessage(String(error)));
     void refreshSources();
+    void invoke<string[]>("player_output_devices")
+      .then(setOutputDevices)
+      .catch((error) => setMessage(String(error)));
   }, []);
 
   const refreshSources = async () => {
@@ -406,6 +328,24 @@ function App() {
           <span>Queue</span>
           <strong>{snapshot.queue.length}</strong>
         </div>
+        <label className="device-select">
+          <span>输出设备</span>
+          <select
+            value={snapshot.outputDevice ?? ""}
+            onChange={(event) => {
+              const name = event.target.value || null;
+              setSnapshot((state) => ({ ...state, outputDevice: name }));
+              void run("player_set_output_device", { name });
+            }}
+          >
+            <option value="">系统默认设备</option>
+            {outputDevices.map((device) => (
+              <option key={device} value={device}>
+                {device}
+              </option>
+            ))}
+          </select>
+        </label>
       </section>
 
       <section className="dsp-panel">
@@ -462,6 +402,101 @@ function App() {
         <p className="dsp-note">
           DSP 关闭时工作线程在任何采样操作前直接返回；自动测试按 f32 位模式比较输入输出。
         </p>
+        <div className="spatial-controls">
+          <div>
+            <p className="eyebrow">Phase 4</p>
+            <h3>Crossfeed + MIT KEMAR 立体声 HRTF</h3>
+          </div>
+          <label className="switch-row">
+            <input
+              type="checkbox"
+              checked={snapshot.dspSettings.crossfeed.enabled}
+              disabled={!snapshot.dspSettings.enabled}
+              onChange={(event) =>
+                setDsp({
+                  ...snapshot.dspSettings,
+                  crossfeed: { ...snapshot.dspSettings.crossfeed, enabled: event.target.checked },
+                })
+              }
+            />
+            Crossfeed
+          </label>
+          <label className="eq-control">
+            <span>Crossfeed 强度</span>
+            <input
+              type="range"
+              min={0}
+              max={0.5}
+              step={0.01}
+              value={snapshot.dspSettings.crossfeed.amount}
+              disabled={!snapshot.dspSettings.enabled || !snapshot.dspSettings.crossfeed.enabled}
+              onChange={(event) =>
+                setSnapshot((state) => ({
+                  ...state,
+                  dspSettings: {
+                    ...state.dspSettings,
+                    crossfeed: { ...state.dspSettings.crossfeed, amount: Number(event.target.value) },
+                  },
+                }))
+              }
+              onPointerUp={(event) =>
+                setDsp({
+                  ...snapshot.dspSettings,
+                  crossfeed: {
+                    ...snapshot.dspSettings.crossfeed,
+                    amount: Number(event.currentTarget.value),
+                  },
+                })
+              }
+            />
+            <output>{snapshot.dspSettings.crossfeed.amount.toFixed(2)}</output>
+          </label>
+          <label className="switch-row">
+            <input
+              type="checkbox"
+              checked={snapshot.dspSettings.hrtf.enabled}
+              disabled={!snapshot.dspSettings.enabled}
+              onChange={(event) =>
+                setDsp({
+                  ...snapshot.dspSettings,
+                  hrtf: { ...snapshot.dspSettings.hrtf, enabled: event.target.checked },
+                  limiter: { ...snapshot.dspSettings.limiter, enabled: event.target.checked },
+                })
+              }
+            />
+            立体声 HRTF（±30°）
+          </label>
+          <label className="eq-control">
+            <span>HRTF 干湿比</span>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={snapshot.dspSettings.hrtf.mix}
+              disabled={!snapshot.dspSettings.enabled || !snapshot.dspSettings.hrtf.enabled}
+              onChange={(event) =>
+                setSnapshot((state) => ({
+                  ...state,
+                  dspSettings: {
+                    ...state.dspSettings,
+                    hrtf: { ...state.dspSettings.hrtf, mix: Number(event.target.value) },
+                  },
+                }))
+              }
+              onPointerUp={(event) =>
+                setDsp({
+                  ...snapshot.dspSettings,
+                  hrtf: { ...snapshot.dspSettings.hrtf, mix: Number(event.currentTarget.value) },
+                })
+              }
+            />
+            <output>{Math.round(snapshot.dspSettings.hrtf.mix * 100)}%</output>
+          </label>
+          <p className="dsp-note">
+            通用 HRTF 存在前后混淆、染色与个体差异；本档位用于盲测选优，不承诺适合所有人。
+          </p>
+        </div>
       </section>
 
       <section className="queue-panel">

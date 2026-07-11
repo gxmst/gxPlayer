@@ -133,6 +133,14 @@ h1 {
   font-size: 0.82rem;
 }
 
+.spatial-controls {
+  display: grid;
+  gap: 12px;
+  margin-top: 22px;
+  border-top: 1px solid #30333f;
+  padding-top: 18px;
+}
+
 .track-copy h2 {
   margin: 12px 0 6px;
   font-size: 1.55rem;
@@ -212,6 +220,21 @@ input[type="range"] {
   border-radius: 10px;
   background: #171920;
   padding: 14px;
+}
+
+.device-select {
+  display: grid;
+  gap: 0.45rem;
+  min-width: 15rem;
+}
+
+.device-select span {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.device-select select {
+  max-width: 24rem;
 }
 
 .diagnostics span {

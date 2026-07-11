@@ -1,6 +1,6 @@
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -24,7 +24,7 @@ use super::{
 
 const COMMAND_CAPACITY: usize = 64;
 const RING_SECONDS: f64 = 0.75;
-const PREBUFFER_SECONDS: f64 = 0.12;
+const PREBUFFER_SECONDS: f64 = 0.5;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +60,7 @@ pub struct EngineSnapshot {
     pub generation: u64,
     pub underrun_callbacks: u64,
     pub error: Option<String>,
+    pub output_device: Option<String>,
 }
 
 impl Default for EngineSnapshot {
@@ -75,6 +76,7 @@ impl Default for EngineSnapshot {
             generation: 0,
             underrun_callbacks: 0,
             error: None,
+            output_device: None,
         }
     }
 }
@@ -86,6 +88,7 @@ enum EngineCommand {
     Seek(f64),
     SetVolume(f32),
     SetDspSettings(DspSettings),
+    SetOutputDevice(Option<String>),
     Next,
     Previous,
     Shutdown,
@@ -177,6 +180,25 @@ impl LocalAudioEngine {
         self.snapshot.lock().unwrap().clone()
     }
 
+    pub fn output_devices(&self) -> Result<Vec<String>> {
+        let host = cpal::default_host();
+        let mut names = host
+            .output_devices()
+            .context("failed to enumerate output devices")?
+            .filter_map(|device| device.name().ok())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    pub fn set_output_device(&self, name: Option<String>) -> Result<()> {
+        if name.as_ref().is_some_and(|name| name.len() > 500) {
+            bail!("output device name exceeds the size limit");
+        }
+        self.send(EngineCommand::SetOutputDevice(name))
+    }
+
     fn send(&self, command: EngineCommand) -> Result<()> {
         self.commands
             .send(command)
@@ -204,6 +226,7 @@ struct WorkerModel {
     dsp_settings: DspSettings,
     generation: u64,
     error: Option<String>,
+    output_device: Option<String>,
 }
 
 impl Default for WorkerModel {
@@ -219,6 +242,7 @@ impl Default for WorkerModel {
             dsp_settings: DspSettings::default(),
             generation: 0,
             error: None,
+            output_device: None,
         }
     }
 }
@@ -259,6 +283,7 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                     model.start_seconds,
                     model.volume,
                     model.dsp_settings.clone(),
+                    model.output_device.as_deref(),
                 ) {
                     Ok(mut next_session) => {
                         if !model.intent_playing {
@@ -406,6 +431,19 @@ fn handle_command(
                 *session = None;
             }
         }
+        EngineCommand::SetOutputDevice(name) => {
+            model.output_device = name;
+            if model.index.is_some() {
+                if let Some(active) = session.as_ref() {
+                    model.start_seconds = active.position_seconds();
+                }
+                model.reload_requested = true;
+                model.status = PlaybackStatus::Loading;
+                model.error = None;
+                model.generation += 1;
+                *session = None;
+            }
+        }
         EngineCommand::Next => {
             if let Some(index) = model.index
                 && index + 1 < model.queue.len()
@@ -484,6 +522,7 @@ fn publish_snapshot(
         generation: model.generation,
         underrun_callbacks: underruns,
         error: model.error.clone(),
+        output_device: model.output_device.clone(),
     };
 }
 
@@ -500,7 +539,6 @@ struct PlaybackSession {
     sample_buffer: Option<SampleBuffer<f32>>,
     producer: HeapProd<f32>,
     stream: Stream,
-    queued_samples: Arc<AtomicUsize>,
     played_samples: Arc<AtomicU64>,
     underrun_callbacks: Arc<AtomicU64>,
     callback_enabled: Arc<AtomicBool>,
@@ -525,6 +563,7 @@ impl PlaybackSession {
         start_seconds: f64,
         volume: f32,
         dsp_settings: DspSettings,
+        output_device_name: Option<&str>,
     ) -> Result<Self> {
         let (mut media, seek_discard_frames) = match source {
             PlaybackSource::Local(path) => {
@@ -556,9 +595,16 @@ impl PlaybackSession {
             .map(|frames| frames as f64 / sample_rate as f64);
 
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .context("no default audio output device is available")?;
+        let device = match output_device_name {
+            Some(name) => host
+                .output_devices()
+                .context("failed to enumerate output devices")?
+                .find(|device| device.name().ok().as_deref() == Some(name))
+                .with_context(|| format!("output device '{name}' is unavailable"))?,
+            None => host
+                .default_output_device()
+                .context("no default audio output device is available")?,
+        };
         let supported = choose_output_config(&device, sample_rate, channels as u16)?;
         let sample_format = supported.sample_format();
         let config: StreamConfig = supported.into();
@@ -567,7 +613,6 @@ impl PlaybackSession {
             ((output_sample_rate as f64 * channels as f64 * RING_SECONDS) as usize).max(4096);
         let ring = HeapRb::<f32>::new(ring_capacity);
         let (producer, consumer) = ring.split();
-        let queued_samples = Arc::new(AtomicUsize::new(0));
         let played_samples = Arc::new(AtomicU64::new(0));
         let underrun_callbacks = Arc::new(AtomicU64::new(0));
         let callback_enabled = Arc::new(AtomicBool::new(false));
@@ -577,7 +622,6 @@ impl PlaybackSession {
             sample_format,
             consumer,
             OutputCallbackCounters {
-                queued_samples: Arc::clone(&queued_samples),
                 played_samples: Arc::clone(&played_samples),
                 underruns: Arc::clone(&underrun_callbacks),
                 enabled: Arc::clone(&callback_enabled),
@@ -601,7 +645,6 @@ impl PlaybackSession {
             sample_buffer: None,
             producer,
             stream,
-            queued_samples,
             played_samples,
             underrun_callbacks,
             callback_enabled,
@@ -626,11 +669,9 @@ impl PlaybackSession {
         if self.pending_offset < self.pending.len() {
             while self.pending_offset < self.pending.len() {
                 let sample = self.pending[self.pending_offset];
-                self.queued_samples.fetch_add(1, Ordering::Release);
                 match self.producer.try_push(sample) {
                     Ok(()) => self.pending_offset += 1,
                     Err(_) => {
-                        self.queued_samples.fetch_sub(1, Ordering::Release);
                         self.maybe_start()?;
                         return Ok(PumpResult::Backpressure);
                     }
@@ -654,7 +695,7 @@ impl PlaybackSession {
                 }
             }
             self.maybe_start()?;
-            if self.queued_samples.load(Ordering::Acquire) == 0 {
+            if self.producer.is_empty() {
                 return Ok(PumpResult::Ended);
             }
             return Ok(PumpResult::Backpressure);
@@ -705,7 +746,7 @@ impl PlaybackSession {
     }
 
     fn maybe_start(&mut self) -> Result<()> {
-        let enough = self.queued_samples.load(Ordering::Acquire) >= self.prebuffer_samples;
+        let enough = self.producer.occupied_len() >= self.prebuffer_samples;
         if self.intent_playing && !self.stream_playing && (enough || self.eof) {
             self.callback_enabled.store(true, Ordering::Release);
             self.stream.play()?;
@@ -769,7 +810,6 @@ fn apply_volume(samples: &mut [f32], volume: f32) {
 
 #[derive(Clone)]
 struct OutputCallbackCounters {
-    queued_samples: Arc<AtomicUsize>,
     played_samples: Arc<AtomicU64>,
     underruns: Arc<AtomicU64>,
     enabled: Arc<AtomicBool>,
@@ -822,7 +862,6 @@ fn render_output_callback<T>(
     for target in output {
         let sample = match consumer.try_pop() {
             Some(value) => {
-                counters.queued_samples.fetch_sub(1, Ordering::Release);
                 consumed += 1;
                 value
             }
@@ -901,7 +940,6 @@ mod tests {
             producer.try_push(value as f32 / 128.0).unwrap();
         }
         let counters = OutputCallbackCounters {
-            queued_samples: Arc::new(AtomicUsize::new(128)),
             played_samples: Arc::new(AtomicU64::new(0)),
             underruns: Arc::new(AtomicU64::new(0)),
             enabled: Arc::new(AtomicBool::new(true)),

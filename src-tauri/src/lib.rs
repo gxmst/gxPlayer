@@ -191,6 +191,27 @@ fn player_snapshot(
 }
 
 #[tauri::command]
+fn player_output_devices(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+) -> Result<Vec<String>, String> {
+    require_window(&window, "main")?;
+    engine.output_devices().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_set_output_device(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    name: Option<String>,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine
+        .set_output_device(name)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn sandbox_ready(
     window: WebviewWindow,
     runtime: tauri::State<SourceRuntime>,
@@ -479,6 +500,8 @@ pub fn run() {
             player_next,
             player_previous,
             player_snapshot,
+            player_output_devices,
+            player_set_output_device,
             sandbox_ready,
             source_list,
             source_status,

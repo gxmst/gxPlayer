@@ -1641,6 +1641,7 @@ dependencies = [
 name = "gx-dsp"
 version = "0.1.0"
 dependencies = [
+ "rustfft",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -3955,6 +3956,16 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "spatial-lab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gx-dsp",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

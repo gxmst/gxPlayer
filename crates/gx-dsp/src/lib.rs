@@ -8,6 +8,19 @@ use std::f64::consts::PI;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod kemar;
+mod spatial;
+
+use spatial::{CrossfeedProcessor, LinkedLimiter, StereoHrtf};
+pub use spatial::{CrossfeedSettings, HrtfSettings, LimiterSettings};
+
+type ProcessorSet = (
+    ParametricEq,
+    Option<CrossfeedProcessor>,
+    Option<StereoHrtf>,
+    Option<LinkedLimiter>,
+);
+
 #[cfg(test)]
 use std::alloc::{GlobalAlloc, Layout, System};
 #[cfg(test)]
@@ -89,6 +102,12 @@ pub struct DspSettings {
     pub enabled: bool,
     pub eq_enabled: bool,
     pub eq_bands: Vec<EqBand>,
+    #[serde(default)]
+    pub crossfeed: CrossfeedSettings,
+    #[serde(default)]
+    pub hrtf: HrtfSettings,
+    #[serde(default)]
+    pub limiter: LimiterSettings,
 }
 
 impl Default for DspSettings {
@@ -97,6 +116,9 @@ impl Default for DspSettings {
             enabled: false,
             eq_enabled: false,
             eq_bands: vec![EqBand::peak(1_000.0, 0.0, 1.0)],
+            crossfeed: CrossfeedSettings::default(),
+            hrtf: HrtfSettings::default(),
+            limiter: LimiterSettings::default(),
         }
     }
 }
@@ -115,6 +137,22 @@ pub enum DspError {
     InvalidQ(f32),
     #[error("EQ gain {0} dB must be in the range -30..=30")]
     InvalidGain(f32),
+    #[error("Crossfeed amount {0} must be in the range 0..=0.5")]
+    InvalidCrossfeedAmount(f32),
+    #[error("Crossfeed delay {0} ms must be in the range 0.05..=1")]
+    InvalidCrossfeedDelay(f32),
+    #[error("Crossfeed cutoff {0} Hz is invalid")]
+    InvalidCrossfeedCutoff(f32),
+    #[error("HRTF mix {0} must be in the range 0..=1")]
+    InvalidHrtfMix(f32),
+    #[error("HRTF output gain {0} dB must be in the range -24..=6")]
+    InvalidHrtfGain(f32),
+    #[error("limiter ceiling {0} dB must be in the range -12..=0")]
+    InvalidLimiterCeiling(f32),
+    #[error("limiter release {0} ms must be in the range 10..=1000")]
+    InvalidLimiterRelease(f32),
+    #[error("Crossfeed and stereo HRTF require exactly two channels, got {0}")]
+    UnsupportedSpatialChannels(usize),
 }
 
 pub struct DspChain {
@@ -122,6 +160,9 @@ pub struct DspChain {
     channels: usize,
     settings: DspSettings,
     equalizer: ParametricEq,
+    crossfeed: Option<CrossfeedProcessor>,
+    hrtf: Option<StereoHrtf>,
+    limiter: Option<LinkedLimiter>,
 }
 
 impl DspChain {
@@ -132,12 +173,16 @@ impl DspChain {
         if channels == 0 {
             return Err(DspError::InvalidChannels);
         }
-        let equalizer = ParametricEq::new(sample_rate, channels, &settings.eq_bands)?;
+        let (equalizer, crossfeed, hrtf, limiter) =
+            build_processors(sample_rate, channels, &settings)?;
         Ok(Self {
             sample_rate,
             channels,
             settings,
             equalizer,
+            crossfeed,
+            hrtf,
+            limiter,
         })
     }
 
@@ -146,10 +191,22 @@ impl DspChain {
     }
 
     pub fn set_settings(&mut self, settings: DspSettings) -> Result<(), DspError> {
-        let equalizer = ParametricEq::new(self.sample_rate, self.channels, &settings.eq_bands)?;
+        let (equalizer, crossfeed, hrtf, limiter) =
+            build_processors(self.sample_rate, self.channels, &settings)?;
         self.equalizer = equalizer;
+        self.crossfeed = crossfeed;
+        self.hrtf = hrtf;
+        self.limiter = limiter;
         self.settings = settings;
         Ok(())
+    }
+
+    pub fn latency_frames(&self) -> usize {
+        if self.settings.enabled && self.settings.hrtf.enabled {
+            128
+        } else {
+            0
+        }
     }
 
     pub fn process_interleaved_in_place(&mut self, pcm: &mut [f32]) -> Result<(), DspError> {
@@ -165,8 +222,44 @@ impl DspChain {
         if self.settings.eq_enabled {
             self.equalizer.process_interleaved_in_place(pcm);
         }
+        if let Some(crossfeed) = &mut self.crossfeed {
+            crossfeed.process(pcm);
+        }
+        if let Some(hrtf) = &mut self.hrtf {
+            hrtf.process(pcm);
+        }
+        if let Some(limiter) = &mut self.limiter {
+            limiter.process(pcm, self.channels);
+        }
         Ok(())
     }
+}
+
+fn build_processors(
+    sample_rate: u32,
+    channels: usize,
+    settings: &DspSettings,
+) -> Result<ProcessorSet, DspError> {
+    if (settings.crossfeed.enabled || settings.hrtf.enabled) && channels != 2 {
+        return Err(DspError::UnsupportedSpatialChannels(channels));
+    }
+    let equalizer = ParametricEq::new(sample_rate, channels, &settings.eq_bands)?;
+    let crossfeed = settings
+        .crossfeed
+        .enabled
+        .then(|| CrossfeedProcessor::new(sample_rate, &settings.crossfeed))
+        .transpose()?;
+    let hrtf = settings
+        .hrtf
+        .enabled
+        .then(|| StereoHrtf::new(sample_rate, &settings.hrtf))
+        .transpose()?;
+    let limiter = settings
+        .limiter
+        .enabled
+        .then(|| LinkedLimiter::new(sample_rate, &settings.limiter))
+        .transpose()?;
+    Ok((equalizer, crossfeed, hrtf, limiter))
 }
 
 struct ParametricEq {
@@ -329,6 +422,8 @@ impl BiquadState {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[test]
@@ -340,6 +435,7 @@ mod tests {
                 enabled: false,
                 eq_enabled: true,
                 eq_bands: vec![EqBand::peak(1_000.0, 12.0, 0.7)],
+                ..DspSettings::default()
             },
         )
         .unwrap();
@@ -364,6 +460,7 @@ mod tests {
                 enabled: true,
                 eq_enabled: false,
                 eq_bands: vec![EqBand::peak(1_000.0, 12.0, 0.7)],
+                ..DspSettings::default()
             },
         )
         .unwrap();
@@ -412,6 +509,7 @@ mod tests {
                 enabled: true,
                 eq_enabled: true,
                 eq_bands: vec![EqBand::peak(1_000.0, 6.0, 1.0)],
+                ..DspSettings::default()
             },
         )
         .unwrap();
@@ -435,6 +533,7 @@ mod tests {
                 enabled: true,
                 eq_enabled: true,
                 eq_bands: vec![EqBand::peak(1_000.0, 6.0, 1.0)],
+                ..DspSettings::default()
             },
         )
         .unwrap();
@@ -473,6 +572,7 @@ mod tests {
                         q: 0.7,
                     },
                 ],
+                ..DspSettings::default()
             },
         )
         .unwrap();
@@ -496,6 +596,7 @@ mod tests {
                 enabled: true,
                 eq_enabled: true,
                 eq_bands: Vec::new(),
+                ..DspSettings::default()
             },
         )
         .unwrap();
@@ -508,7 +609,216 @@ mod tests {
         );
     }
 
+    #[test]
+    fn crossfeed_impulse_uses_bounded_delayed_low_pass_crosstalk() {
+        let settings = DspSettings {
+            enabled: true,
+            crossfeed: CrossfeedSettings {
+                enabled: true,
+                amount: 0.2,
+                delay_ms: 0.25,
+                cutoff_hz: 700.0,
+            },
+            ..DspSettings::default()
+        };
+        let mut chain = DspChain::new(48_000, 2, settings).unwrap();
+        let mut impulse = vec![0.0f32; 128];
+        impulse[1] = 1.0;
+        chain.process_interleaved_in_place(&mut impulse).unwrap();
+        assert!((impulse[1] - 0.9).abs() < 1.0e-6);
+        let delayed_frame = 12;
+        assert_eq!(impulse[(delayed_frame - 1) * 2], 0.0);
+        assert!(impulse[delayed_frame * 2] > 0.0);
+        assert!(impulse.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn hrtf_impulse_matches_embedded_kemar_golden_samples() {
+        let settings = DspSettings {
+            enabled: true,
+            hrtf: HrtfSettings {
+                enabled: true,
+                mix: 1.0,
+                output_gain_db: 0.0,
+            },
+            ..DspSettings::default()
+        };
+        let mut chain = DspChain::new(44_100, 2, settings).unwrap();
+        assert_eq!(chain.latency_frames(), 128);
+        let mut impulse = vec![0.0f32; 512 * 2];
+        impulse[0] = 1.0;
+        chain.process_interleaved_in_place(&mut impulse).unwrap();
+        let first = 128 * 2;
+        assert!((impulse[first] - kemar::NEAR_EAR_30[0] as f32 / 32768.0).abs() < 1.0e-5);
+        assert!((impulse[first + 1] - kemar::FAR_EAR_30[0] as f32 / 32768.0).abs() < 1.0e-5);
+        let left_energy = impulse
+            .iter()
+            .step_by(2)
+            .map(|sample| sample * sample)
+            .sum::<f32>();
+        let right_energy = impulse
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|sample| sample * sample)
+            .sum::<f32>();
+        assert!(left_energy > right_energy * 4.0);
+        let near_impulse = (0..128)
+            .map(|index| impulse[(128 + index) * 2])
+            .collect::<Vec<_>>();
+        for (frequency, expected_db) in [
+            (250.0, -4.316_937),
+            (1_000.0, -1.542_039),
+            (8_000.0, -7.298_68),
+        ] {
+            let measured_db = response_db(&near_impulse, frequency, 44_100.0);
+            assert!((measured_db - expected_db).abs() < 0.02);
+        }
+        let near_peak = near_impulse
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
+            .unwrap()
+            .0;
+        let far_peak = (0..128)
+            .max_by(|left, right| {
+                impulse[(128 + *left) * 2 + 1]
+                    .abs()
+                    .total_cmp(&impulse[(128 + *right) * 2 + 1].abs())
+            })
+            .unwrap();
+        assert!(
+            near_peak < far_peak,
+            "near ear should receive the impulse before the far ear"
+        );
+    }
+
+    #[test]
+    fn spatial_processing_is_chunk_invariant() {
+        let settings = enabled_spatial_settings();
+        let mut whole = DspChain::new(48_000, 2, settings.clone()).unwrap();
+        let mut chunked = DspChain::new(48_000, 2, settings).unwrap();
+        let mut input = (0..8192)
+            .map(|index| (index as f32 * 0.017).sin() * 0.4)
+            .collect::<Vec<_>>();
+        let mut chunks = input.clone();
+        whole.process_interleaved_in_place(&mut input).unwrap();
+        for chunk in chunks.chunks_mut(74) {
+            chunked.process_interleaved_in_place(chunk).unwrap();
+        }
+        for (left, right) in input.into_iter().zip(chunks) {
+            assert!((left - right).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn linked_limiter_respects_ceiling_without_channel_imbalance() {
+        let settings = DspSettings {
+            enabled: true,
+            limiter: LimiterSettings {
+                enabled: true,
+                ceiling_db: -1.0,
+                ..LimiterSettings::default()
+            },
+            ..DspSettings::default()
+        };
+        let mut chain = DspChain::new(48_000, 2, settings).unwrap();
+        let mut pcm = vec![2.0, -1.0, -2.0, 1.0];
+        chain.process_interleaved_in_place(&mut pcm).unwrap();
+        let ceiling = 10.0f32.powf(-1.0 / 20.0);
+        assert!(pcm.iter().all(|sample| sample.abs() <= ceiling + 1.0e-6));
+        assert!((pcm[0].abs() / pcm[1].abs() - 2.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn full_spatial_chain_allocates_nothing_during_processing() {
+        let mut chain = DspChain::new(48_000, 2, enabled_spatial_settings()).unwrap();
+        let mut pcm = vec![0.1f32; 4096];
+        chain.process_interleaved_in_place(&mut pcm).unwrap();
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        TRACK_ALLOCATIONS.with(|enabled| enabled.set(true));
+        chain.process_interleaved_in_place(&mut pcm).unwrap();
+        TRACK_ALLOCATIONS.with(|enabled| enabled.set(false));
+        assert_eq!(ALLOCATION_COUNT.with(Cell::get), 0);
+    }
+
+    #[test]
+    fn spatial_chain_supports_common_sample_rates_with_bounded_cpu() {
+        for sample_rate in [44_100, 48_000, 96_000] {
+            let mut chain = DspChain::new(sample_rate, 2, enabled_spatial_settings()).unwrap();
+            let mut pcm = vec![0.05f32; sample_rate as usize * 2];
+            let started = Instant::now();
+            chain.process_interleaved_in_place(&mut pcm).unwrap();
+            assert!(pcm.iter().all(|sample| sample.is_finite()));
+            assert!(
+                started.elapsed().as_secs_f32() < 5.0,
+                "{sample_rate} Hz spatial processing exceeded the debug-build CPU budget"
+            );
+        }
+    }
+
+    #[test]
+    fn spatial_settings_reject_non_stereo_and_invalid_ranges() {
+        let settings = DspSettings {
+            enabled: true,
+            hrtf: HrtfSettings {
+                enabled: true,
+                ..HrtfSettings::default()
+            },
+            ..DspSettings::default()
+        };
+        assert!(matches!(
+            DspChain::new(48_000, 1, settings),
+            Err(DspError::UnsupportedSpatialChannels(1))
+        ));
+        let settings = DspSettings {
+            crossfeed: CrossfeedSettings {
+                enabled: true,
+                amount: 0.75,
+                ..CrossfeedSettings::default()
+            },
+            ..DspSettings::default()
+        };
+        assert!(matches!(
+            DspChain::new(48_000, 2, settings),
+            Err(DspError::InvalidCrossfeedAmount(_))
+        ));
+    }
+
+    fn enabled_spatial_settings() -> DspSettings {
+        DspSettings {
+            enabled: true,
+            crossfeed: CrossfeedSettings {
+                enabled: true,
+                ..CrossfeedSettings::default()
+            },
+            hrtf: HrtfSettings {
+                enabled: true,
+                ..HrtfSettings::default()
+            },
+            limiter: LimiterSettings {
+                enabled: true,
+                ..LimiterSettings::default()
+            },
+            ..DspSettings::default()
+        }
+    }
+
     fn rms(samples: &[f32]) -> f32 {
         (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    fn response_db(impulse: &[f32], frequency: f32, sample_rate: f32) -> f32 {
+        let (real, imaginary) = impulse.iter().enumerate().fold(
+            (0.0f32, 0.0f32),
+            |(real, imaginary), (index, sample)| {
+                let phase = -std::f32::consts::TAU * frequency * index as f32 / sample_rate;
+                (
+                    real + sample * phase.cos(),
+                    imaginary + sample * phase.sin(),
+                )
+            },
+        );
+        20.0 * real.hypot(imaginary).log10()
     }
 }

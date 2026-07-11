@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
-use gx_audio::engine::{EngineSnapshot, LocalAudioEngine};
+use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine};
 use gx_contracts::ResolvedMediaRequest;
 use gx_dsp::DspSettings;
+use gx_library::{LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistSummary};
 use gx_source::{SourceStore, safe_http};
 
 mod metadata_commands;
@@ -93,11 +94,160 @@ fn ui_ready(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
 fn player_load_local(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
+    library: tauri::State<LibraryStore>,
     paths: Vec<String>,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
-    let paths = paths.into_iter().map(PathBuf::from).collect();
+    let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    let tracks = paths
+        .iter()
+        .map(|path| {
+            let info = gx_audio::probe_local_file(path).map_err(|error| error.to_string())?;
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("未命名曲目");
+            let (filename_artist, filename_title) = stem
+                .split_once(" - ")
+                .map_or(("", stem), |(artist, title)| (artist, title));
+            Ok(NewTrack {
+                path: path.display().to_string(),
+                title: info.title.unwrap_or_else(|| filename_title.to_owned()),
+                artist: info.artist.unwrap_or_else(|| filename_artist.to_owned()),
+                album: info.album.unwrap_or_default(),
+                duration_seconds: info.duration_seconds,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    library
+        .add_tracks(&tracks)
+        .map_err(|error| error.to_string())?;
     engine.load(paths).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_tracks(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+) -> Result<Vec<LibraryTrack>, String> {
+    require_window(&window, "main")?;
+    library
+        .list_tracks(10_000)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_favorites(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+) -> Result<Vec<LibraryTrack>, String> {
+    require_window(&window, "main")?;
+    library.list_favorites().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_set_favorite(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    track_id: i64,
+    favorite: bool,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .set_favorite(track_id, favorite)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_playlists(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+) -> Result<Vec<PlaylistSummary>, String> {
+    require_window(&window, "main")?;
+    library.list_playlists().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_create_playlist(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    name: String,
+) -> Result<PlaylistSummary, String> {
+    require_window(&window, "main")?;
+    library
+        .create_playlist(&name)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_delete_playlist(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    playlist_id: i64,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .delete_playlist(playlist_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_playlist_tracks(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    playlist_id: i64,
+) -> Result<Vec<LibraryTrack>, String> {
+    require_window(&window, "main")?;
+    library
+        .playlist_tracks(playlist_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_add_to_playlist(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    playlist_id: i64,
+    track_id: i64,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .add_to_playlist(playlist_id, track_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_remove_from_playlist(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    playlist_id: i64,
+    track_id: i64,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .remove_from_playlist(playlist_id, track_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_export_backup(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+) -> Result<LibraryBackup, String> {
+    require_window(&window, "main")?;
+    library.export_backup().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_restore_backup(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    backup: LibraryBackup,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .restore_backup(&backup)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -160,6 +310,18 @@ fn player_set_dsp_settings(
     require_window(&window, "main")?;
     engine
         .set_dsp_settings(settings)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_set_audio_mode(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    mode: AudioMode,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine
+        .set_audio_mode(mode)
         .map_err(|error| error.to_string())
 }
 
@@ -478,7 +640,9 @@ pub fn run() {
             progress: Mutex::new(LxPocProgress::default()),
         })
         .setup(|app| {
-            let source_root = app.path().app_data_dir()?.join("sources");
+            let app_data = app.path().app_data_dir()?;
+            app.manage(LibraryStore::open(app_data.join("library.sqlite3"))?);
+            let source_root = app_data.join("sources");
             let mut source_store = SourceStore::open(source_root)?;
             if let Some(path) = std::env::var_os("GX_PHASE2_LX_SCRIPT") {
                 source_store.import_file(&PathBuf::from(path))?;
@@ -496,12 +660,24 @@ pub fn run() {
             player_pause,
             player_seek,
             player_set_volume,
+            player_set_audio_mode,
             player_set_dsp_settings,
             player_next,
             player_previous,
             player_snapshot,
             player_output_devices,
             player_set_output_device,
+            library_tracks,
+            library_favorites,
+            library_set_favorite,
+            library_playlists,
+            library_create_playlist,
+            library_delete_playlist,
+            library_playlist_tracks,
+            library_add_to_playlist,
+            library_remove_from_playlist,
+            library_export_backup,
+            library_restore_backup,
             sandbox_ready,
             source_list,
             source_status,

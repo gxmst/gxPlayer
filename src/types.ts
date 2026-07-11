@@ -56,6 +56,24 @@ export type LyricDocument = {
   lines: Array<{ timestampMs: number | null; text: string }>;
 };
 
+export type LibraryTrack = {
+  id: number;
+  path: string;
+  title: string;
+  artist: string;
+  album: string;
+  durationSeconds: number | null;
+  favorite: boolean;
+  addedAtMs: number;
+};
+
+export type PlaylistSummary = {
+  id: number;
+  name: string;
+  trackCount: number;
+  createdAtMs: number;
+};
+
 export type EqBand = {
   enabled: boolean;
   kind: "peak" | "low_shelf" | "high_shelf" | "low_pass" | "high_pass";
@@ -80,6 +98,7 @@ export type EngineSnapshot = {
   positionSeconds: number;
   durationSeconds: number | null;
   volume: number;
+  audioMode: "music" | "cinema_game";
   dspSettings: DspSettings;
   generation: number;
   underrunCallbacks: number;
@@ -87,7 +106,15 @@ export type EngineSnapshot = {
   outputDevice?: string | null;
 };
 
-export type ViewId = "discovery" | "search" | "library" | "sources" | "now-playing";
+export type ViewId =
+  | "discovery"
+  | "search"
+  | "library"
+  | "favorites"
+  | "playlist"
+  | "sources"
+  | "settings"
+  | "now-playing";
 
 export const EMPTY_ENGINE: EngineSnapshot = {
   status: "idle",
@@ -96,6 +123,7 @@ export const EMPTY_ENGINE: EngineSnapshot = {
   positionSeconds: 0,
   durationSeconds: null,
   volume: 1,
+  audioMode: "music",
   dspSettings: {
     enabled: false,
     eqEnabled: false,

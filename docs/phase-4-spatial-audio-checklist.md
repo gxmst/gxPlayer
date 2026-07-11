@@ -1,8 +1,8 @@
 # Phase 4 spatial audio acceptance
 
-Status: objective checks passed on Windows 11, 2026-07-11; final subjective gate is pending.
+Status: accepted with an architect-authorized product-positioning adjustment on 2026-07-12.
 
-Phase 5 must not begin until a human completes the blind identification and at least 30 minutes of listening notes required by the v1.1 architecture brief.
+The objective gate passed. The user then completed the blind test and preferred the bypass presentation, so the spatial chain is retained as an optional cinema/game mode rather than treated as the default music path. The architect explicitly waived the former subjective-pass requirement and authorized Phase 5 to begin.
 
 ## Delivered
 
@@ -53,7 +53,7 @@ GX_PHASE3_LYRICS_OK lines=45
 GX_PHASE3_SEARCH_PLAY_LYRICS_OK position=0.242 underruns=0
 ```
 
-## Pending subjective gate
+## Subjective result and product decision
 
 A 12-trial randomized A/B package was generated at:
 
@@ -63,11 +63,25 @@ C:\Users\super\AppData\Local\Temp\gxplayer-spatial-blind-phase4
 
 It contains dry/spatial references, randomized trial WAV files, `trials.json`, hidden scoring answers, and `listening-notes.md`.
 
-Required human steps:
+The user's 12 responses were:
 
-1. Listen on headphones at a safe, fixed volume without opening `answers.json`.
-2. Record 12 A/B identifications in a JSON string array, then run `cargo run -p spatial-lab -- score <directory> <responses.json>`.
-3. Listen for at least 30 minutes and complete the supplied notes for front/back confusion, externalization, coloration, fatigue, and preferred mix.
-4. Decide whether the experience is acceptable or requires HRTF/mix tuning, then record the decision here.
+```text
+ABAAABAAAABB
+```
 
-Until those steps are complete, Phase 4 is not accepted and Phase 5 is blocked by the architecture brief's self-check marathon rule.
+Scoring marker:
+
+```text
+GX_PHASE4_BLIND_SCORE correct=11 total=12 accuracy=91.7%
+```
+
+The user could reliably distinguish the processing but reported that bypass had the better soundstage and that the spatial version did not improve music listening. This is treated as a useful negative product result, not as a failed technical implementation.
+
+Final positioning:
+
+- Default `music` mode is transparent DSP bypass.
+- Optional `cinema_game` mode enables Crossfeed, stereo HRTF, and the linked limiter.
+- Parametric EQ is not exposed as a product feature.
+- The mode interface remains extensible for future switch-style processing modes.
+
+Phase 4 is accepted under this revised positioning. Phase 5 may proceed.

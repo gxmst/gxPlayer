@@ -6,9 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use gx_audio::engine::{EngineSnapshot, LocalAudioEngine};
+use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine};
 use gx_contracts::PlaybackStatus;
-use gx_dsp::{CrossfeedSettings, DspSettings, EqBand, HrtfSettings, LimiterSettings};
+use gx_dsp::{DspSettings, EqBand};
 
 fn main() -> Result<()> {
     let path = env::args()
@@ -100,25 +100,10 @@ fn main() -> Result<()> {
     })?;
     println!("EQ seek passed at {:.3}s", eq_seeked.position_seconds);
 
-    let spatial = DspSettings {
-        enabled: true,
-        crossfeed: CrossfeedSettings {
-            enabled: true,
-            ..CrossfeedSettings::default()
-        },
-        hrtf: HrtfSettings {
-            enabled: true,
-            ..HrtfSettings::default()
-        },
-        limiter: LimiterSettings {
-            enabled: true,
-            ..LimiterSettings::default()
-        },
-        ..DspSettings::default()
-    };
-    engine.set_dsp_settings(spatial)?;
+    engine.set_audio_mode(AudioMode::CinemaGame)?;
     let spatial_on = wait_for(&engine, "spatial DSP enable", |state| {
         state.status == PlaybackStatus::Playing
+            && state.audio_mode == AudioMode::CinemaGame
             && state.dsp_settings.crossfeed.enabled
             && state.dsp_settings.hrtf.enabled
             && state.dsp_settings.limiter.enabled
@@ -181,9 +166,11 @@ fn main() -> Result<()> {
         recovered.position_seconds
     );
 
-    engine.set_dsp_settings(DspSettings::default())?;
+    engine.set_audio_mode(AudioMode::Music)?;
     let bypassed = wait_for(&engine, "DSP bypass", |state| {
-        state.status == PlaybackStatus::Playing && !state.dsp_settings.enabled
+        state.status == PlaybackStatus::Playing
+            && state.audio_mode == AudioMode::Music
+            && !state.dsp_settings.enabled
     })?;
     println!("DSP bypass restored at {:.3}s", bypassed.position_seconds);
 

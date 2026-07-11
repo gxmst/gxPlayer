@@ -20,12 +20,15 @@ use symphonia::core::codecs::{CODEC_TYPE_NULL, CodecParameters, Decoder, Decoder
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
-use symphonia::core::meta::MetadataOptions;
+use symphonia::core::meta::{MetadataOptions, StandardTagKey};
 use symphonia::core::probe::Hint;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalMediaInfo {
     pub path: PathBuf,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
     pub sample_rate: u32,
     pub channels: u16,
     pub duration_seconds: Option<f64>,
@@ -70,7 +73,7 @@ struct OpenedMedia {
 
 pub fn probe_local_file(path: impl AsRef<Path>) -> Result<LocalMediaInfo> {
     let path = path.as_ref();
-    let opened = open_media(path)?;
+    let mut opened = open_media(path)?;
     let sample_rate = opened
         .codec_params
         .sample_rate
@@ -85,8 +88,28 @@ pub fn probe_local_file(path: impl AsRef<Path>) -> Result<LocalMediaInfo> {
         .n_frames
         .map(|frames| frames as f64 / sample_rate as f64);
 
+    let metadata = opened.format.metadata().current().map(|revision| {
+        let value = |key| {
+            revision
+                .tags()
+                .iter()
+                .find(|tag| tag.std_key == Some(key))
+                .map(|tag| tag.value.to_string())
+                .filter(|value| !value.trim().is_empty())
+        };
+        (
+            value(StandardTagKey::TrackTitle),
+            value(StandardTagKey::Artist),
+            value(StandardTagKey::Album),
+        )
+    });
+    let (title, artist, album) = metadata.unwrap_or_default();
+
     Ok(LocalMediaInfo {
         path: path.to_path_buf(),
+        title,
+        artist,
+        album,
         sample_rate,
         channels,
         duration_seconds,

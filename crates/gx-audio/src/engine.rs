@@ -10,10 +10,10 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use gx_contracts::{MediaType, PlaybackStatus, ResolvedMediaRequest};
-use gx_dsp::{DspChain, DspSettings};
+use gx_dsp::{CrossfeedSettings, DspChain, DspSettings, HrtfSettings, LimiterSettings};
 use gx_streaming::HttpMediaSource;
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::errors::Error as SymphoniaError;
 
@@ -33,6 +33,39 @@ pub struct QueueItem {
     pub title: String,
     pub duration_seconds: Option<f64>,
     pub online: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioMode {
+    #[default]
+    Music,
+    CinemaGame,
+}
+
+impl AudioMode {
+    fn dsp_settings(self) -> DspSettings {
+        match self {
+            Self::Music => DspSettings::default(),
+            Self::CinemaGame => DspSettings {
+                enabled: true,
+                eq_enabled: false,
+                crossfeed: CrossfeedSettings {
+                    enabled: true,
+                    ..CrossfeedSettings::default()
+                },
+                hrtf: HrtfSettings {
+                    enabled: true,
+                    ..HrtfSettings::default()
+                },
+                limiter: LimiterSettings {
+                    enabled: true,
+                    ..LimiterSettings::default()
+                },
+                ..DspSettings::default()
+            },
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -56,6 +89,7 @@ pub struct EngineSnapshot {
     pub position_seconds: f64,
     pub duration_seconds: Option<f64>,
     pub volume: f32,
+    pub audio_mode: AudioMode,
     pub dsp_settings: DspSettings,
     pub generation: u64,
     pub underrun_callbacks: u64,
@@ -72,6 +106,7 @@ impl Default for EngineSnapshot {
             position_seconds: 0.0,
             duration_seconds: None,
             volume: 1.0,
+            audio_mode: AudioMode::Music,
             dsp_settings: DspSettings::default(),
             generation: 0,
             underrun_callbacks: 0,
@@ -87,6 +122,7 @@ enum EngineCommand {
     Pause,
     Seek(f64),
     SetVolume(f32),
+    SetAudioMode(AudioMode),
     SetDspSettings(DspSettings),
     SetOutputDevice(Option<String>),
     Next,
@@ -168,6 +204,12 @@ impl LocalAudioEngine {
         self.send(EngineCommand::SetDspSettings(settings))
     }
 
+    pub fn set_audio_mode(&self, mode: AudioMode) -> Result<()> {
+        let settings = mode.dsp_settings();
+        DspChain::new(48_000, 2, settings.clone())?;
+        self.send(EngineCommand::SetAudioMode(mode))
+    }
+
     pub fn next(&self) -> Result<()> {
         self.send(EngineCommand::Next)
     }
@@ -223,6 +265,7 @@ struct WorkerModel {
     reload_requested: bool,
     start_seconds: f64,
     volume: f32,
+    audio_mode: AudioMode,
     dsp_settings: DspSettings,
     generation: u64,
     error: Option<String>,
@@ -239,6 +282,7 @@ impl Default for WorkerModel {
             reload_requested: false,
             start_seconds: 0.0,
             volume: 1.0,
+            audio_mode: AudioMode::Music,
             dsp_settings: DspSettings::default(),
             generation: 0,
             error: None,
@@ -421,6 +465,18 @@ fn handle_command(
                 *session = None;
             }
         }
+        EngineCommand::SetAudioMode(mode) => {
+            model.audio_mode = mode;
+            model.dsp_settings = mode.dsp_settings();
+            if let Some(active) = session.as_ref() {
+                model.start_seconds = active.position_seconds();
+                model.reload_requested = true;
+                model.status = PlaybackStatus::Loading;
+                model.error = None;
+                model.generation += 1;
+                *session = None;
+            }
+        }
         EngineCommand::SetDspSettings(settings) => {
             model.dsp_settings = settings;
             if let Some(active) = session.as_ref() {
@@ -478,14 +534,17 @@ fn handle_command(
 }
 
 fn local_queue_item(path: PathBuf) -> EngineQueueItem {
-    let title = path
+    let fallback_title = path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("Untitled")
         .to_owned();
-    let duration_seconds = super::probe_local_file(&path)
-        .ok()
-        .and_then(|info| info.duration_seconds);
+    let info = super::probe_local_file(&path).ok();
+    let title = info
+        .as_ref()
+        .and_then(|info| info.title.clone())
+        .unwrap_or(fallback_title);
+    let duration_seconds = info.and_then(|info| info.duration_seconds);
     EngineQueueItem {
         public: QueueItem {
             location: path.display().to_string(),
@@ -518,6 +577,7 @@ fn publish_snapshot(
         position_seconds,
         duration_seconds,
         volume: model.volume,
+        audio_mode: model.audio_mode,
         dsp_settings: model.dsp_settings.clone(),
         generation: model.generation,
         underrun_callbacks: underruns,

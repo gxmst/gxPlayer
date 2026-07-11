@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "lx-sandbox",
+  "description": "Minimal capability for the untrusted LX source-script sandbox",
+  "windows": ["lx-sandbox"],
+  "permissions": []
+}

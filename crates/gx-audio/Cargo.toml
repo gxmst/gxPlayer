@@ -1,0 +1,15 @@
+[package]
+name = "gx-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cpal.workspace = true
+crossbeam-channel.workspace = true
+gx-contracts = { path = "../gx-contracts" }
+ringbuf.workspace = true
+rubato.workspace = true
+symphonia.workspace = true

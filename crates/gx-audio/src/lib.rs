@@ -65,6 +65,7 @@ struct OpenedMedia {
     decoder: Box<dyn Decoder>,
     track_id: u32,
     codec_params: CodecParameters,
+    prefetched_samples: Vec<f32>,
 }
 
 pub fn probe_local_file(path: impl AsRef<Path>) -> Result<LocalMediaInfo> {
@@ -341,7 +342,7 @@ fn open_media_source(
             &MetadataOptions::default(),
         )
         .with_context(|| format!("failed to probe media format for {description}"))?;
-    let format = probed.format;
+    let mut format = probed.format;
     let track = format
         .default_track()
         .context("media contains no default audio track")?;
@@ -349,16 +350,44 @@ fn open_media_source(
         bail!("default track has no supported codec");
     }
     let track_id = track.id;
-    let codec_params = track.codec_params.clone();
-    let decoder = symphonia::default::get_codecs()
+    let mut codec_params = track.codec_params.clone();
+    let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &DecoderOptions::default())
         .context("failed to create audio decoder")?;
+
+    let mut prefetched_samples = Vec::new();
+    if codec_params.sample_rate.is_none() || codec_params.channels.is_none() {
+        loop {
+            let packet = format
+                .next_packet()
+                .context("failed to inspect media audio parameters")?;
+            if packet.track_id() != track_id {
+                continue;
+            }
+            match decoder.decode(&packet) {
+                Ok(decoded) => {
+                    codec_params.sample_rate = Some(decoded.spec().rate);
+                    codec_params.channels = Some(decoded.spec().channels);
+                    let mut buffer =
+                        SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+                    buffer.copy_interleaved_ref(decoded);
+                    prefetched_samples.extend_from_slice(buffer.samples());
+                    break;
+                }
+                Err(SymphoniaError::DecodeError(_)) => continue,
+                Err(error) => {
+                    return Err(error).context("failed to inspect media audio parameters");
+                }
+            }
+        }
+    }
 
     Ok(OpenedMedia {
         format,
         decoder,
         track_id,
         codec_params,
+        prefetched_samples,
     })
 }
 
@@ -377,6 +406,7 @@ fn seek_media_coarse(media: &mut OpenedMedia, seconds: f64) -> Result<usize> {
         )
         .with_context(|| format!("failed to coarse-seek to {seconds:.3}s"))?;
     media.decoder.reset();
+    media.prefetched_samples.clear();
     Ok(seeked.required_ts.saturating_sub(seeked.actual_ts) as usize)
 }
 
@@ -395,6 +425,7 @@ fn seek_media(media: &mut OpenedMedia, seconds: f64) -> Result<()> {
         )
         .with_context(|| format!("failed to seek to {seconds:.3}s"))?;
     media.decoder.reset();
+    media.prefetched_samples.clear();
     Ok(())
 }
 
@@ -402,6 +433,12 @@ fn decode_samples(
     media: &mut OpenedMedia,
     mut consume: impl FnMut(&[f32]) -> Result<bool>,
 ) -> Result<()> {
+    if !media.prefetched_samples.is_empty() {
+        let prefetched = std::mem::take(&mut media.prefetched_samples);
+        if !consume(&prefetched)? {
+            return Ok(());
+        }
+    }
     let mut sample_buffer = None;
 
     loop {

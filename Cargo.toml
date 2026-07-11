@@ -7,8 +7,10 @@ members = [
     "pocs/local-playback",
     "pocs/http-stream",
     "pocs/engine-smoke",
+    "pocs/metadata-smoke",
     "crates/gx-dsp",
     "crates/gx-source",
+    "crates/gx-metadata",
     "src-tauri",
 ]
 

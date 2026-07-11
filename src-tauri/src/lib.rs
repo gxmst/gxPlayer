@@ -10,9 +10,14 @@ use gx_contracts::ResolvedMediaRequest;
 use gx_dsp::DspSettings;
 use gx_source::{SourceStore, safe_http};
 
+mod metadata_commands;
 mod source_commands;
 mod source_runtime;
 
+use metadata_commands::{
+    maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
+    metadata_play_preview, metadata_search,
+};
 use source_commands::{
     lx_http_request, lx_runtime_failure, lx_runtime_result, lx_send, source_activate,
     source_export_backup, source_import_file, source_import_url, source_list, source_reload,
@@ -80,6 +85,7 @@ fn ui_ready(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     if std::env::var_os("GX_PHASE0_UI_SMOKE").is_some() {
         app.exit(0);
     }
+    maybe_start_phase3_smoke(&app);
     Ok(())
 }
 
@@ -485,6 +491,11 @@ pub fn run() {
             source_export_backup,
             source_restore_backup,
             source_resolve,
+            metadata_search,
+            metadata_chart,
+            metadata_lyrics,
+            metadata_find_replacements,
+            metadata_play_preview,
             lx_http_request,
             lx_send,
             lx_runtime_result,

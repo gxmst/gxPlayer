@@ -259,6 +259,37 @@ input[type="range"] {
   margin-top: 18px;
 }
 
+.metadata-panel {
+  margin-top: 18px;
+}
+
+.catalog-results small {
+  display: block;
+  margin-top: 4px;
+  color: #858b9d;
+}
+
+.lyric-view {
+  max-height: 320px;
+  overflow: auto;
+  margin-top: 16px;
+  border-radius: 10px;
+  background: #11131a;
+  padding: 14px 18px;
+  text-align: center;
+}
+
+.lyric-view p {
+  margin: 8px 0;
+  color: #777e91;
+  transition: color 120ms ease, transform 120ms ease;
+}
+
+.lyric-view p.active {
+  color: #f4f5ff;
+  transform: scale(1.03);
+}
+
 .source-panel ul {
   margin: 12px 0;
   padding: 0;

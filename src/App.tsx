@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
@@ -33,6 +33,23 @@ type ListedSource = {
   metadata: { name: string; version: string; author: string };
   active: boolean;
   updatesEnabled: boolean;
+};
+
+type CatalogTrack = {
+  providerId: string;
+  providerTrackId: string;
+  title: string;
+  artist: string;
+  album: string;
+  durationMs: number | null;
+  artworkUrl: string | null;
+  resolverPayload: unknown;
+  preview: unknown | null;
+};
+
+type LyricDocument = {
+  instrumental: boolean;
+  lines: Array<{ timestampMs: number | null; text: string }>;
 };
 
 type EqBand = {
@@ -107,6 +124,11 @@ function App() {
   const [sourceUrl, setSourceUrl] = useState("");
   const [sourceBackup, setSourceBackup] = useState("");
   const [resolverSourceId, setResolverSourceId] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [catalogTracks, setCatalogTracks] = useState<CatalogTrack[]>([]);
+  const [selectedCatalogTrack, setSelectedCatalogTrack] = useState<CatalogTrack | null>(null);
+  const [lyrics, setLyrics] = useState<LyricDocument | null>(null);
+  const lyricLineRefs = useRef<Array<HTMLParagraphElement | null>>([]);
 
   useEffect(() => {
     void invoke("ui_ready").catch((error) => setMessage(String(error)));
@@ -215,6 +237,74 @@ function App() {
   };
 
   const firstBand = snapshot.dspSettings.eqBands[0] ?? EMPTY_STATE.dspSettings.eqBands[0];
+  const activeLyricIndex = useMemo(() => {
+    if (!lyrics) return -1;
+    const positionMs = snapshot.positionSeconds * 1000;
+    let active = -1;
+    lyrics.lines.forEach((line, index) => {
+      if (line.timestampMs !== null && line.timestampMs <= positionMs) active = index;
+    });
+    return active;
+  }, [lyrics, snapshot.positionSeconds]);
+
+  useEffect(() => {
+    if (activeLyricIndex >= 0) {
+      lyricLineRefs.current[activeLyricIndex]?.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }, [activeLyricIndex]);
+
+  const searchMetadata = async () => {
+    if (!searchQuery.trim()) return;
+    try {
+      const tracks = await invoke<CatalogTrack[]>("metadata_search", {
+        query: searchQuery.trim(),
+        limit: 15,
+      });
+      setCatalogTracks(tracks);
+      setMessage(tracks.length ? "" : "没有搜索结果。");
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+
+  const loadChart = async () => {
+    try {
+      setCatalogTracks(await invoke<CatalogTrack[]>("metadata_chart", { limit: 25 }));
+      setMessage("");
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+
+  const playCatalogTrack = async (wanted: CatalogTrack) => {
+    try {
+      const selected = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>(
+        "metadata_play_preview",
+        { wanted, candidates: catalogTracks },
+      );
+      setSelectedCatalogTrack(selected.track);
+      let lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
+          title: selected.track.title,
+          artist: selected.track.artist,
+          durationMs: selected.track.durationMs,
+        });
+      if (!lyricDocument && selected.replacedProviderId) {
+        lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
+          title: wanted.title,
+          artist: wanted.artist,
+          durationMs: wanted.durationMs,
+        });
+      }
+      setLyrics(lyricDocument);
+      setMessage(
+        selected.replacedProviderId
+          ? `原平台不可播，已自动切换到 ${selected.track.providerId}。`
+          : "",
+      );
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
 
   return (
     <main className="dev-shell">
@@ -387,6 +477,67 @@ function App() {
               </li>
             ))}
           </ol>
+        )}
+      </section>
+
+      <section className="queue-panel metadata-panel">
+        <div className="dsp-heading">
+          <div>
+            <p className="eyebrow">Phase 3</p>
+            <h3>元数据搜索、榜单、跨平台预览与歌词</h3>
+          </div>
+          <button onClick={loadChart}>中国区热门榜</button>
+        </div>
+        <div className="source-import-row">
+          <input
+            aria-label="搜索歌曲"
+            placeholder="歌名或歌手"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void searchMetadata();
+            }}
+          />
+          <button className="primary" onClick={searchMetadata} disabled={!searchQuery.trim()}>
+            搜索
+          </button>
+        </div>
+        <ol className="catalog-results">
+          {catalogTracks.map((track) => (
+            <li key={`${track.providerId}:${track.providerTrackId}`}>
+              <span>
+                <strong>{track.title}</strong>
+                <small>
+                  {track.artist} · {track.album || "未知专辑"} · {track.providerId}
+                </small>
+              </span>
+              <button onClick={() => playCatalogTrack(track)}>播放</button>
+            </li>
+          ))}
+        </ol>
+        {selectedCatalogTrack && (
+          <div className="lyric-view" aria-live="polite">
+            <h4>
+              {selectedCatalogTrack.title} — {selectedCatalogTrack.artist}
+            </h4>
+            {lyrics?.instrumental ? (
+              <p>纯音乐</p>
+            ) : lyrics?.lines.length ? (
+              lyrics.lines.map((line, index) => (
+                <p
+                  className={index === activeLyricIndex ? "active" : ""}
+                  key={`${line.timestampMs}-${index}`}
+                  ref={(element) => {
+                    lyricLineRefs.current[index] = element;
+                  }}
+                >
+                  {line.text}
+                </p>
+              ))
+            ) : (
+              <p>暂无歌词</p>
+            )}
+          </div>
         )}
       </section>
 

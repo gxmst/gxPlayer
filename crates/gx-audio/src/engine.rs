@@ -526,7 +526,7 @@ impl PlaybackSession {
         volume: f32,
         dsp_settings: DspSettings,
     ) -> Result<Self> {
-        let (media, seek_discard_frames) = match source {
+        let (mut media, seek_discard_frames) = match source {
             PlaybackSource::Local(path) => {
                 let mut media = open_media(path)?;
                 seek_media(&mut media, start_seconds)?;
@@ -583,8 +583,16 @@ impl PlaybackSession {
                 enabled: Arc::clone(&callback_enabled),
             },
         )?;
-        let rate_adapter = RateAdapter::new(sample_rate, output_sample_rate, channels)?;
-        let dsp_chain = DspChain::new(output_sample_rate, channels, dsp_settings)?;
+        let mut rate_adapter = RateAdapter::new(sample_rate, output_sample_rate, channels)?;
+        let mut dsp_chain = DspChain::new(output_sample_rate, channels, dsp_settings)?;
+        let prefetched = std::mem::take(&mut media.prefetched_samples);
+        let mut pending = if prefetched.is_empty() {
+            Vec::new()
+        } else {
+            rate_adapter.process(&prefetched)?
+        };
+        dsp_chain.process_interleaved_in_place(&mut pending)?;
+        apply_volume(&mut pending, volume);
 
         Ok(Self {
             media,
@@ -603,7 +611,7 @@ impl PlaybackSession {
             duration_seconds,
             prebuffer_samples: (output_sample_rate as f64 * channels as f64 * PREBUFFER_SECONDS)
                 as usize,
-            pending: Vec::new(),
+            pending,
             pending_offset: 0,
             volume,
             eof: false,

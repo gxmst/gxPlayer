@@ -28,6 +28,12 @@ import {
   type PlaybackStartResult,
 } from "./lib/uiState";
 import {
+  deriveTransportCapabilities,
+  isTransportAction,
+  type TransportAction,
+  type TransportCapabilities,
+} from "./lib/transport";
+import {
   type CacheEntryView,
   type CacheStatus,
   type CatalogTrack,
@@ -532,6 +538,8 @@ function App() {
   const playlistRef = useRef(playlist);
   const playlistIndexRef = useRef(playlistIndex);
   const snapshotRef = useRef(snapshot);
+  const mediaActionHandlerRef = useRef<(action: TransportAction) => void>(() => undefined);
+  const transportCapabilitiesRef = useRef({ signature: "", revision: 0 });
   playlistRef.current = playlist;
   playlistIndexRef.current = playlistIndex;
   snapshotRef.current = snapshot;
@@ -736,13 +744,12 @@ function App() {
     return () => document.removeEventListener("mousedown", onPointerDown);
   }, [suggestionOpen]);
 
-  // Windows SMTC / media keys: next & previous are owned by the frontend playlist.
+  // Windows SMTC / taskbar controls share the same frontend-owned transport path.
   useEffect(() => {
     let disposed = false;
     const unlisten = listen<string>("gx-media", (event) => {
       if (disposed) return;
-      if (event.payload === "next") void handleTransportNext();
-      else if (event.payload === "previous") void handleTransportPrevious();
+      if (isTransportAction(event.payload)) mediaActionHandlerRef.current(event.payload);
     });
     return () => {
       disposed = true;
@@ -792,6 +799,37 @@ function App() {
   }, [currentLibraryTrack?.path]);
   // Loading only while a session is opening — failed must not look like "still playing".
   const isPlaying = snapshot.status === "playing" || snapshot.status === "loading";
+  const hasEngineCurrent = currentQueueItem !== null;
+  useEffect(() => {
+    const useFrontendQueue = playlist.length > 0;
+    const hasFrontendCurrent = playlistIndex !== null
+      && playlistIndex >= 0
+      && playlistIndex < playlist.length;
+    const flags = deriveTransportCapabilities({
+      queueLength: useFrontendQueue ? playlist.length : snapshot.queue.length,
+      currentIndex: useFrontendQueue ? playlistIndex : snapshot.queueIndex,
+      // The play action can start the first frontend entry even before an index
+      // has been committed to the engine.
+      hasCurrent: hasEngineCurrent || hasFrontendCurrent || useFrontendQueue,
+      playMode: snapshot.playMode,
+    });
+    const signature = `${Number(flags.hasCurrent)}:${Number(flags.canPrevious)}:${Number(flags.canNext)}`;
+    if (transportCapabilitiesRef.current.signature === signature) return;
+
+    const revision = transportCapabilitiesRef.current.revision + 1;
+    transportCapabilitiesRef.current = { signature, revision };
+    const capabilities: TransportCapabilities = { revision, ...flags };
+    void invoke("player_set_transport_capabilities", { capabilities }).catch((error) => {
+      console.warn("[GXPlayer] transport capability sync failed", error);
+    });
+  }, [
+    hasEngineCurrent,
+    playlist.length,
+    playlistIndex,
+    snapshot.playMode,
+    snapshot.queue.length,
+    snapshot.queueIndex,
+  ]);
   const shownPosition = dragPosition ?? pendingSeek?.target ?? snapshot.positionSeconds;
   const shownVolume = volumeDraft ?? snapshot.volume;
   const measuredSourceSpec = formatSourceSpec(snapshot);
@@ -1982,18 +2020,45 @@ function App() {
   };
 
   const handlePlayPause = async () => {
-    if (isPlaying) {
+    const currentSnapshot = snapshotRef.current;
+    const currentlyPlaying = currentSnapshot.status === "playing" || currentSnapshot.status === "loading";
+    if (currentlyPlaying) {
       await run("player_pause");
       return;
     }
     const entries = playlistRef.current;
-    if (!currentQueueItem && entries.length) {
+    const engineItem = currentSnapshot.queueIndex === null
+      ? null
+      : currentSnapshot.queue[currentSnapshot.queueIndex] ?? null;
+    if (!engineItem && entries.length) {
       const index = playlistIndexRef.current ?? 0;
       setPlaylistIndex(index);
       await playPlaylistEntry(entries, index, { allowPreviewFallback: true });
       return;
     }
     await run("player_play");
+  };
+
+  mediaActionHandlerRef.current = (action) => {
+    switch (action) {
+      case "play":
+        if (snapshotRef.current.status !== "playing" && snapshotRef.current.status !== "loading") {
+          void handlePlayPause();
+        }
+        break;
+      case "pause":
+        void run("player_pause");
+        break;
+      case "toggle":
+        void handlePlayPause();
+        break;
+      case "next":
+        void handleTransportNext();
+        break;
+      case "previous":
+        void handleTransportPrevious();
+        break;
+    }
   };
 
   const renderTrackRow = (track: LibraryTrack, index: number, list: LibraryTrack[], playlistId?: number) => (

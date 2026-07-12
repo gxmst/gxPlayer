@@ -20,7 +20,10 @@ mod metadata_commands;
 mod product_commands;
 mod source_commands;
 mod source_runtime;
+mod taskbar_toolbar;
+mod transport;
 mod window_state;
+mod windows_identity;
 
 use cache_commands::{
     cache_clear, cache_list_entries, cache_online_favorites, cache_remove_by_quality,
@@ -117,6 +120,17 @@ fn ui_ready(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
         app.exit(0);
     }
     maybe_start_phase3_smoke(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn player_set_transport_capabilities(
+    window: WebviewWindow,
+    state: tauri::State<transport::TransportState>,
+    capabilities: transport::TransportCapabilities,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    state.set_capabilities(capabilities);
     Ok(())
 }
 
@@ -893,12 +907,14 @@ fn create_lx_sandbox(app: &AppHandle) -> tauri::Result<WebviewWindow> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    windows_identity::initialize();
     let audio_engine = LocalAudioEngine::new().expect("failed to create local audio engine");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(audio_engine)
         .manage(ResolveCancellationRegistry::default())
         .manage(media_session::MediaSessionState::default())
+        .manage(transport::TransportState::default())
         .manage(LxPocState {
             script_path: phase1_script_path(),
             progress: Mutex::new(LxPocProgress::default()),
@@ -957,6 +973,10 @@ pub fn run() {
             create_lx_sandbox(app.handle())?;
             create_system_tray(app.handle())?;
 
+            if let Err(error) = taskbar_toolbar::install(app.handle().clone()) {
+                eprintln!("GX_TASKBAR unavailable: {error}");
+            }
+
             if let Some(main) = app.get_webview_window("main") {
                 // Fail soft: still show with tauri.conf fallback size if monitor probe fails.
                 if let Err(error) = place_and_show_main_window(&main, &app_data) {
@@ -990,6 +1010,7 @@ pub fn run() {
             player_reorder_queue,
             player_clear_queue,
             player_snapshot,
+            player_set_transport_capabilities,
             player_output_devices,
             player_set_output_device,
             player_media_action,

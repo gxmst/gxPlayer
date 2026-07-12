@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gx_audio::engine::{EngineSnapshot, LocalAudioEngine, QueueItem};
 use gx_contracts::PlaybackStatus;
@@ -21,7 +21,15 @@ use souvlaki::{
 };
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::transport::{TransportAction, dispatch};
+
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_QUIT,
+};
+
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
+const WINDOWS_MESSAGE_PUMP_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_SEEK_SECONDS: f64 = 10.0;
 
 #[derive(Debug, Clone, Default)]
@@ -139,7 +147,7 @@ pub fn spawn_media_session(app: AppHandle) {
         .ok();
 }
 
-fn main_hwnd(app: &AppHandle) -> Result<*mut std::ffi::c_void, String> {
+pub(crate) fn main_hwnd(app: &AppHandle) -> Result<*mut std::ffi::c_void, String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "main window missing".to_owned())?;
@@ -200,15 +208,17 @@ fn run_media_session(app: AppHandle) -> Result<(), String> {
         .map_err(|error| format!("MediaControls::attach: {error:?}"))?;
 
     let default_cover = default_cover_url(&app);
-    controls
-        .set_metadata(MediaMetadata {
+    set_metadata_best_effort(
+        &mut controls,
+        MediaMetadata {
             title: Some("GXPlayer"),
             artist: Some("就绪"),
             album: Some("GXPlayer"),
             cover_url: default_cover.as_deref(),
             duration: None,
-        })
-        .map_err(|error| format!("initial SMTC metadata: {error:?}"))?;
+        },
+        "initial SMTC metadata",
+    )?;
     controls
         .set_playback(MediaPlayback::Stopped)
         .map_err(|error| format!("initial SMTC playback: {error:?}"))?;
@@ -217,97 +227,138 @@ fn run_media_session(app: AppHandle) -> Result<(), String> {
     let mut last_metadata_key = String::new();
     let mut last_status = None;
     let mut last_position = f64::NEG_INFINITY;
+    let mut next_snapshot = Instant::now();
     loop {
-        thread::sleep(SNAPSHOT_INTERVAL);
-        let Some(engine) = app.try_state::<LocalAudioEngine>() else {
-            continue;
-        };
-        let snapshot = engine.snapshot();
-        let _ = app.emit("gx-player-snapshot", &snapshot);
-
-        let item = snapshot
-            .queue_index
-            .and_then(|index| snapshot.queue.get(index));
-        let override_metadata = item.and_then(|item| {
-            app.state::<MediaSessionState>()
-                .matching_override(&snapshot, item)
-        });
-        let metadata_key = metadata_key(&snapshot, item, override_metadata.as_ref());
-        if metadata_key != last_metadata_key {
-            let metadata =
-                resolve_metadata(&app, &snapshot, item, override_metadata, &default_cover);
-            let duration = metadata
-                .duration_seconds
-                .or(snapshot.duration_seconds)
-                .filter(|value| value.is_finite() && *value > 0.0)
-                .map(Duration::from_secs_f64);
-            if let Err(error) = controls.set_metadata(MediaMetadata {
-                title: Some(&metadata.title),
-                artist: Some(&metadata.artist),
-                album: Some(&metadata.album),
-                cover_url: metadata.cover_url.as_deref().or(default_cover.as_deref()),
-                duration,
-            }) {
-                eprintln!("GX_SMTC set_metadata: {error:?}");
-            }
-            if let Some(window) = app.get_webview_window("main") {
-                let title = window_title(&metadata.title, &metadata.artist);
-                let _ = window.set_title(&title);
-            }
-            last_metadata_key = metadata_key;
+        #[cfg(windows)]
+        if pump_windows_messages() {
+            eprintln!("GX_SMTC received WM_QUIT; stopping media session");
+            return Ok(());
         }
 
-        let status = playback_label(snapshot.status);
-        let position = if snapshot.position_seconds.is_finite() {
-            snapshot.position_seconds.max(0.0)
-        } else {
-            0.0
-        };
-        if last_status != Some(status)
-            || !last_position.is_finite()
-            || (position - last_position).abs() >= 0.2
-        {
-            let progress = Some(MediaPosition(Duration::from_secs_f64(position)));
-            let playback = match status {
-                "playing" => MediaPlayback::Playing { progress },
-                "paused" => MediaPlayback::Paused { progress },
-                _ => MediaPlayback::Stopped,
+        if Instant::now() >= next_snapshot {
+            next_snapshot = Instant::now() + SNAPSHOT_INTERVAL;
+            let Some(engine) = app.try_state::<LocalAudioEngine>() else {
+                eprintln!("GX_SMTC snapshot skipped: audio engine unavailable");
+                thread::sleep(WINDOWS_MESSAGE_PUMP_INTERVAL);
+                continue;
             };
-            if let Err(error) = controls.set_playback(playback) {
-                eprintln!("GX_SMTC set_playback: {error:?}");
+            let snapshot = engine.snapshot();
+            if let Err(error) = app.emit("gx-player-snapshot", &snapshot) {
+                eprintln!("GX_SMTC snapshot event failed: {error}");
             }
-            last_status = Some(status);
-            last_position = position;
+
+            let item = snapshot
+                .queue_index
+                .and_then(|index| snapshot.queue.get(index));
+            let override_metadata = item.and_then(|item| {
+                app.state::<MediaSessionState>()
+                    .matching_override(&snapshot, item)
+            });
+            let metadata_key = metadata_key(&snapshot, item, override_metadata.as_ref());
+            if metadata_key != last_metadata_key {
+                let metadata =
+                    resolve_metadata(&app, &snapshot, item, override_metadata, &default_cover);
+                let duration = metadata
+                    .duration_seconds
+                    .or(snapshot.duration_seconds)
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .map(Duration::from_secs_f64);
+                if let Err(error) = set_metadata_best_effort(
+                    &mut controls,
+                    MediaMetadata {
+                        title: Some(&metadata.title),
+                        artist: Some(&metadata.artist),
+                        album: Some(&metadata.album),
+                        cover_url: metadata.cover_url.as_deref().or(default_cover.as_deref()),
+                        duration,
+                    },
+                    "SMTC set_metadata",
+                ) {
+                    eprintln!("GX_SMTC set_metadata text failed: {error}");
+                }
+                if let Some(window) = app.get_webview_window("main") {
+                    let title = window_title(&metadata.title, &metadata.artist);
+                    if let Err(error) = window.set_title(&title) {
+                        eprintln!("GX_SMTC window title update failed: {error}");
+                    }
+                }
+                last_metadata_key = metadata_key;
+            }
+
+            let status = playback_label(snapshot.status);
+            let position = if snapshot.position_seconds.is_finite() {
+                snapshot.position_seconds.max(0.0)
+            } else {
+                0.0
+            };
+            if last_status != Some(status)
+                || !last_position.is_finite()
+                || (position - last_position).abs() >= 0.2
+            {
+                let progress = Some(MediaPosition(Duration::from_secs_f64(position)));
+                let playback = match status {
+                    "playing" => MediaPlayback::Playing { progress },
+                    "paused" => MediaPlayback::Paused { progress },
+                    _ => MediaPlayback::Stopped,
+                };
+                if let Err(error) = controls.set_playback(playback) {
+                    eprintln!("GX_SMTC set_playback: {error:?}");
+                }
+                last_status = Some(status);
+                last_position = position;
+            }
         }
+        thread::sleep(WINDOWS_MESSAGE_PUMP_INTERVAL);
     }
 }
 
+fn set_metadata_best_effort(
+    controls: &mut MediaControls,
+    metadata: MediaMetadata<'_>,
+    context: &str,
+) -> Result<(), String> {
+    let text_metadata = MediaMetadata {
+        cover_url: None,
+        ..metadata.clone()
+    };
+    controls
+        .set_metadata(text_metadata)
+        .map_err(|error| format!("{context} text: {error:?}"))?;
+    if metadata.cover_url.is_some()
+        && let Err(error) = controls.set_metadata(metadata)
+    {
+        eprintln!("GX_SMTC {context} cover skipped: {error:?}");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pump_windows_messages() -> bool {
+    unsafe {
+        let mut message = MSG::default();
+        while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+            if message.message == WM_QUIT {
+                return true;
+            }
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    false
+}
+
 fn handle_media_control_event(app: &AppHandle, event: MediaControlEvent) {
+    eprintln!("GX_SMTC event received: {event:?}");
     let Some(engine) = app.try_state::<LocalAudioEngine>() else {
+        eprintln!("GX_SMTC event dropped: audio engine unavailable");
         return;
     };
     let result: Result<(), String> = match event {
-        MediaControlEvent::Toggle => if matches!(
-            engine.snapshot().status,
-            PlaybackStatus::Playing | PlaybackStatus::Loading
-        ) {
-            engine.pause()
-        } else {
-            engine.play()
-        }
-        .map_err(|error| error.to_string()),
-        MediaControlEvent::Play => engine.play().map_err(|error| error.to_string()),
-        MediaControlEvent::Pause | MediaControlEvent::Stop => {
-            engine.pause().map_err(|error| error.to_string())
-        }
-        MediaControlEvent::Next => {
-            let _ = app.emit("gx-media", "next");
-            Ok(())
-        }
-        MediaControlEvent::Previous => {
-            let _ = app.emit("gx-media", "previous");
-            Ok(())
-        }
+        MediaControlEvent::Toggle => dispatch(app, TransportAction::Toggle),
+        MediaControlEvent::Play => dispatch(app, TransportAction::Play),
+        MediaControlEvent::Pause | MediaControlEvent::Stop => dispatch(app, TransportAction::Pause),
+        MediaControlEvent::Next => dispatch(app, TransportAction::Next),
+        MediaControlEvent::Previous => dispatch(app, TransportAction::Previous),
         MediaControlEvent::SetPosition(MediaPosition(position)) => engine
             .seek(position.as_secs_f64())
             .map_err(|error| error.to_string()),
@@ -493,9 +544,26 @@ fn default_cover_url(app: &AppHandle) -> Option<String> {
 
 fn file_url(path: &Path) -> String {
     let absolute = path.canonicalize().unwrap_or_else(|_| PathBuf::from(path));
-    url::Url::from_file_path(&absolute)
-        .map(|url| url.to_string())
-        .unwrap_or_else(|_| format!("file://{}", absolute.display()))
+    #[cfg(windows)]
+    {
+        // souvlaki 0.8 strips this prefix and passes the remainder to StorageFile,
+        // which requires a native absolute Windows path with backslashes.
+        let path = absolute.to_string_lossy();
+        let native = if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{path}")
+        } else if let Some(path) = path.strip_prefix(r"\\?\") {
+            path.to_owned()
+        } else {
+            path.into_owned()
+        };
+        format!("file://{native}")
+    }
+    #[cfg(not(windows))]
+    {
+        url::Url::from_file_path(&absolute)
+            .map(|url| url.to_string())
+            .unwrap_or_else(|_| format!("file://{}", absolute.display()))
+    }
 }
 
 #[cfg(test)]
@@ -541,5 +609,22 @@ mod tests {
         assert_eq!(window_title("Song", "Artist"), "Song — Artist · GXPlayer");
         assert_eq!(window_title("Song", ""), "Song · GXPlayer");
         assert_eq!(window_title("GXPlayer", "就绪"), "GXPlayer");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn souvlaki_file_url_preserves_a_native_windows_path() {
+        assert_eq!(
+            file_url(Path::new(r"C:\GXPlayer\cover.png")),
+            r"file://C:\GXPlayer\cover.png"
+        );
+        assert_eq!(
+            file_url(Path::new(r"\\?\C:\GXPlayer\cover.png")),
+            r"file://C:\GXPlayer\cover.png"
+        );
+        assert_eq!(
+            file_url(Path::new(r"\\?\UNC\server\share\cover.png")),
+            r"file://\\server\share\cover.png"
+        );
     }
 }

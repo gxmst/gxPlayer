@@ -4,12 +4,12 @@ use std::fs;
 use std::path::PathBuf;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use gx_audio::engine::LocalAudioEngine;
 use gx_library::{HistoryEntry, LibraryStore, LibraryTrack, NewHistoryEntry};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State, WebviewWindow};
 
 use crate::require_window;
+use crate::transport::{TransportAction, dispatch};
 use crate::window_state::{self, WindowState};
 
 #[derive(Debug, Clone, Serialize)]
@@ -241,26 +241,9 @@ pub fn backup_read_file(window: WebviewWindow, path: String) -> Result<String, S
 #[tauri::command]
 pub fn player_media_action(
     window: WebviewWindow,
-    engine: State<'_, LocalAudioEngine>,
+    app: AppHandle,
     action: String,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
-    match action.as_str() {
-        "play" => engine.play().map_err(|e| e.to_string()),
-        "pause" => engine.pause().map_err(|e| e.to_string()),
-        "toggle" => {
-            let status = engine.snapshot().status;
-            if matches!(
-                status,
-                gx_contracts::PlaybackStatus::Playing | gx_contracts::PlaybackStatus::Loading
-            ) {
-                engine.pause().map_err(|e| e.to_string())
-            } else {
-                engine.play().map_err(|e| e.to_string())
-            }
-        }
-        "next" => engine.next().map_err(|e| e.to_string()),
-        "previous" => engine.previous().map_err(|e| e.to_string()),
-        _ => Err(format!("unknown media action: {action}")),
-    }
+    dispatch(&app, TransportAction::try_from(action.as_str())?)
 }

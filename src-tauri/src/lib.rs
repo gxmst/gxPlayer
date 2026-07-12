@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine};
 use gx_contracts::ResolvedMediaRequest;
@@ -588,6 +588,41 @@ fn phase1_script_path() -> PathBuf {
         })
 }
 
+/// Size and show the main window before first paint.
+/// Adaptive 16:10 from the active monitor (cap 1280×86% height), matching the former
+/// frontend placeWindow — but done here so the UI does not open small then jump larger.
+fn place_and_show_main_window(window: &WebviewWindow) -> tauri::Result<()> {
+    let monitor = window
+        .current_monitor()?
+        .or(window.primary_monitor()?);
+
+    if let Some(monitor) = monitor {
+        let scale = monitor.scale_factor();
+        let physical = monitor.size();
+        let logical_width = physical.width as f64 / scale;
+        let logical_height = physical.height as f64 / scale;
+
+        let mut width = (logical_width * 0.88).min(1280.0);
+        let mut height = width / 1.6;
+        let maximum_height = logical_height * 0.86;
+        if height > maximum_height {
+            height = maximum_height;
+            width = height * 1.6;
+        }
+
+        // Keep within the configured floor so extreme monitors still feel usable.
+        width = width.max(720.0);
+        height = height.max(560.0);
+
+        window.set_size(LogicalSize::new(width.floor(), height.floor()))?;
+    }
+
+    let _ = window.center();
+    window.show()?;
+    let _ = window.set_focus();
+    Ok(())
+}
+
 fn create_lx_sandbox(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let sandbox =
         WebviewWindowBuilder::new(app, SANDBOX_LABEL, WebviewUrl::App("sandbox.html".into()))
@@ -660,6 +695,14 @@ pub fn run() {
             }
             app.manage(SourceRuntime::new(source_store));
             create_lx_sandbox(app.handle())?;
+
+            if let Some(main) = app.get_webview_window("main") {
+                // Fail soft: still show with tauri.conf fallback size if monitor probe fails.
+                if let Err(error) = place_and_show_main_window(&main) {
+                    eprintln!("main window placement failed: {error}");
+                    let _ = main.show();
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

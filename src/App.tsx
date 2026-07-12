@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import "@fontsource-variable/space-grotesk";
 import "@fontsource-variable/noto-sans-sc";
@@ -21,7 +21,21 @@ import {
 type SearchState = "idle" | "loading" | "ready" | "empty" | "error";
 type AudioMode = EngineSnapshot["audioMode"];
 
-const FALLBACK_ACCENT = "#ff5566";
+/** Premium rose — clean on dark glass; used when there is no artwork. */
+const FALLBACK_ACCENT = "#e85a71";
+/** Curated accents only — never raw hash hues that land on muddy yellow-green. */
+const PREMIUM_PALETTE = [
+  "#e85a71",
+  "#7b8cff",
+  "#5ec8c8",
+  "#c77dff",
+  "#ff8e6e",
+  "#6ec8ff",
+  "#f0a0c0",
+  "#8ad4a0",
+  "#d4a06a",
+  "#a78bfa",
+] as const;
 const NAV_ITEMS: Array<{ id: ViewId; icon: string; label: string }> = [
   { id: "discovery", icon: "⌂", label: "探索" },
   { id: "search", icon: "⌕", label: "搜索" },
@@ -48,42 +62,136 @@ function initials(title: string): string {
   return [...(title.trim() || "GX")].slice(0, 2).join("").toUpperCase();
 }
 
-function fallbackAccent(key: string): string {
+function hashString(key: string): number {
   let hash = 0;
   for (const character of key) hash = (hash * 31 + character.charCodeAt(0)) | 0;
-  const hue = Math.abs(hash) % 360;
-  return `hsl(${hue} 72% 62%)`;
+  return Math.abs(hash);
 }
 
+function fallbackAccent(key: string): string {
+  if (!key.trim()) return FALLBACK_ACCENT;
+  return PREMIUM_PALETTE[hashString(key) % PREMIUM_PALETTE.length];
+}
+
+type Rgb = { r: number; g: number; b: number };
+type Hsl = { h: number; s: number; l: number };
+
+function rgbToHsl(r: number, g: number, b: number): Hsl {
+  const red = r / 255;
+  const green = g / 255;
+  const blue = b / 255;
+  const max = Math.max(red, green, blue);
+  const min = Math.min(red, green, blue);
+  const lightness = (max + min) / 2;
+  if (max === min) return { h: 0, s: 0, l: lightness };
+  const delta = max - min;
+  const saturation = lightness > 0.5 ? delta / (2 - max - min) : delta / (max + min);
+  let hue = 0;
+  if (max === red) hue = ((green - blue) / delta + (green < blue ? 6 : 0)) / 6;
+  else if (max === green) hue = ((blue - red) / delta + 2) / 6;
+  else hue = ((red - green) / delta + 4) / 6;
+  return { h: hue * 360, s: saturation, l: lightness };
+}
+
+function hslToRgb(h: number, s: number, l: number): Rgb {
+  const hue = ((h % 360) + 360) % 360;
+  const saturation = Math.min(1, Math.max(0, s));
+  const lightness = Math.min(1, Math.max(0, l));
+  if (saturation === 0) {
+    const gray = Math.round(lightness * 255);
+    return { r: gray, g: gray, b: gray };
+  }
+  const q = lightness < 0.5 ? lightness * (1 + saturation) : lightness + saturation - lightness * saturation;
+  const p = 2 * lightness - q;
+  const toChannel = (t: number) => {
+    let value = t;
+    if (value < 0) value += 1;
+    if (value > 1) value -= 1;
+    if (value < 1 / 6) return p + (q - p) * 6 * value;
+    if (value < 1 / 2) return q;
+    if (value < 2 / 3) return p + (q - p) * (2 / 3 - value) * 6;
+    return p;
+  };
+  const hk = hue / 360;
+  return {
+    r: Math.round(toChannel(hk + 1 / 3) * 255),
+    g: Math.round(toChannel(hk) * 255),
+    b: Math.round(toChannel(hk - 1 / 3) * 255),
+  };
+}
+
+/** Push any extracted color into a clean, luminous accent range for dark UI. */
+function polishAccent(r: number, g: number, b: number): string {
+  const { h, s, l } = rgbToHsl(r, g, b);
+  // Floor saturation/lightness so accents stay vivid on glass; cap so they never scream.
+  const nextS = Math.min(0.78, Math.max(0.52, s < 0.2 ? 0.58 : s * 1.12));
+  const nextL = Math.min(0.66, Math.max(0.52, l < 0.35 ? 0.58 : l > 0.72 ? 0.6 : l));
+  const polished = hslToRgb(h, nextS, nextL);
+  return `rgb(${polished.r} ${polished.g} ${polished.b})`;
+}
+
+/**
+ * Extract a vivid, clean dominant accent from cover art.
+ * Prefers saturated mid-lightness pixels over full-image averages that go muddy/dark.
+ */
 async function accentFromArtwork(url: string | null, key: string): Promise<string> {
-  if (!url) return fallbackAccent(key);
+  if (!url) return FALLBACK_ACCENT;
   return new Promise((resolve) => {
     const image = new Image();
     image.crossOrigin = "anonymous";
     image.onload = () => {
       try {
+        const size = 64;
         const canvas = document.createElement("canvas");
-        canvas.width = 32;
-        canvas.height = 32;
+        canvas.width = size;
+        canvas.height = size;
         const context = canvas.getContext("2d", { willReadFrequently: true });
         if (!context) return resolve(fallbackAccent(key));
-        context.drawImage(image, 0, 0, 32, 32);
-        const pixels = context.getImageData(0, 0, 32, 32).data;
-        let best = { score: -1, red: 255, green: 85, blue: 102 };
-        for (let index = 0; index < pixels.length; index += 16) {
-          const red = pixels[index];
-          const green = pixels[index + 1];
-          const blue = pixels[index + 2];
-          const max = Math.max(red, green, blue);
-          const min = Math.min(red, green, blue);
-          const saturation = max - min;
-          const lightness = (max + min) / 2;
-          const score = saturation * 1.8 - Math.abs(lightness - 150);
-          if (lightness > 55 && score > best.score) best = { score, red, green, blue };
+        context.drawImage(image, 0, 0, size, size);
+        const { data } = context.getImageData(0, 0, size, size);
+
+        // 36 hue bins × weighted RGB accumulation for dominant vibrant color.
+        const bins = Array.from({ length: 36 }, () => ({
+          weight: 0,
+          r: 0,
+          g: 0,
+          b: 0,
+        }));
+
+        for (let index = 0; index < data.length; index += 4) {
+          const alpha = data[index + 3];
+          if (alpha < 200) continue;
+          const red = data[index];
+          const green = data[index + 1];
+          const blue = data[index + 2];
+          const { h, s, l } = rgbToHsl(red, green, blue);
+          // Drop near-black, near-white, and low-chroma mud.
+          if (l < 0.12 || l > 0.9 || s < 0.12) continue;
+          // Prefer saturated mid-tones; lightly de-weight yellow-green mud bands.
+          const chroma = s * (1 - Math.abs(l - 0.52) * 1.4);
+          const mudPenalty = h >= 55 && h <= 100 && s < 0.45 ? 0.35 : 1;
+          const score = chroma * chroma * mudPenalty;
+          if (score < 0.01) continue;
+          const bin = Math.min(35, Math.floor(h / 10));
+          bins[bin].weight += score;
+          bins[bin].r += red * score;
+          bins[bin].g += green * score;
+          bins[bin].b += blue * score;
         }
-        const lift = Math.max(1, 90 / Math.max(best.red, best.green, best.blue));
+
+        let best = bins[0];
+        for (const bin of bins) {
+          if (bin.weight > best.weight) best = bin;
+        }
+
+        if (best.weight < 0.05) return resolve(fallbackAccent(key));
+
         resolve(
-          `rgb(${Math.min(255, best.red * lift)} ${Math.min(255, best.green * lift)} ${Math.min(255, best.blue * lift)})`,
+          polishAccent(
+            Math.round(best.r / best.weight),
+            Math.round(best.g / best.weight),
+            Math.round(best.b / best.weight),
+          ),
         );
       } catch {
         resolve(fallbackAccent(key));
@@ -170,23 +278,8 @@ function App() {
   };
 
   useEffect(() => {
-    const placeWindow = async () => {
-      const monitor = await currentMonitor();
-      if (!monitor) return;
-      const logicalWidth = monitor.size.width / monitor.scaleFactor;
-      const logicalHeight = monitor.size.height / monitor.scaleFactor;
-      let width = Math.min(1280, logicalWidth * 0.88);
-      let height = width / 1.6;
-      const maximumHeight = logicalHeight * 0.86;
-      if (height > maximumHeight) {
-        height = maximumHeight;
-        width = height * 1.6;
-      }
-      const appWindow = getCurrentWindow();
-      await appWindow.setSize(new LogicalSize(Math.floor(width), Math.floor(height)));
-      await appWindow.center();
-    };
-    void placeWindow().catch(() => undefined);
+    // Window size is set once in Rust (setup) before first show — do not resize here
+    // or the app will open at tauri.conf size then jump larger after React mounts.
     void invoke("ui_ready").catch((error) => setMessage(String(error)));
     void refreshLibrary().catch((error) => setMessage(String(error)));
     void refreshSources().catch((error) => setMessage(String(error)));
@@ -232,6 +325,8 @@ function App() {
 
   useEffect(() => {
     let disposed = false;
+    // No artwork → fixed premium default (never muddy hash hues).
+    // With artwork → extract; key only used if extraction fails.
     void accentFromArtwork(currentArtwork, `${currentTitle}:${currentArtist}`).then((color) => {
       if (!disposed) setAccent(color);
     });
@@ -508,12 +603,17 @@ function App() {
               <button onClick={() => setView("now-playing")}>打开播放页</button>
             </div>
           </div>
-          <div className="mini-stage" aria-label={`当前音效模式：${snapshot.audioMode === "music" ? "原声音乐" : "影院游戏"}`}>
+          <div
+            className={`mini-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"}`}
+            aria-label={`当前音效模式：${snapshot.audioMode === "music" ? "原声音乐" : "影院游戏"}`}
+          >
+            <div className="stage-glow" aria-hidden="true" />
+            <div className="stage-orbit stage-orbit-outer" />
+            <div className="stage-orbit stage-orbit-inner" />
             <span className="stage-listener">你</span>
             <i className="speaker speaker-left" />
             <i className="speaker speaker-right" />
-            <div className="stage-orbit" />
-            <strong>{snapshot.audioMode === "music" ? "原声" : "空间"}</strong>
+            <strong className="stage-badge">{snapshot.audioMode === "music" ? "原声" : "空间"}</strong>
           </div>
         </section>
         <section className="section-block panel-enter delay-1">
@@ -567,7 +667,27 @@ function App() {
       <div className="page now-playing-page">
         <div className="now-grid">
           <section className="record-column"><div className={`record ${isPlaying ? "spinning" : ""}`}><Cover artwork={currentArtwork} title={currentTitle} className="record-cover" /><span className="record-hole" /></div><p className="eyebrow">NOW PLAYING</p><h1>{currentTitle}</h1><p className="artist-line">{currentArtist}</p></section>
-          <section className="stage-panel"><div className={`sound-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"}`} aria-label="声场模式盘"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><span className="listener">你</span><i className="stage-speaker front-left"><b>FL</b></i><i className="stage-speaker front-right"><b>FR</b></i><i className="stage-speaker rear-left"><b>RL</b></i><i className="stage-speaker rear-right"><b>RR</b></i></div><div className="mode-copy"><p className="eyebrow">SOUND MODE</p><h2>{snapshot.audioMode === "music" ? "原声 / 音乐" : "影院 / 游戏"}</h2><p>{snapshot.audioMode === "music" ? "透明直通，不添加空间处理。你的盲测首选。" : "Crossfeed + 立体声 HRTF，仅在需要空间感时开启。"}</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></div></section>
+          <section className="stage-panel">
+            <div className={`sound-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"}`} aria-label="声场模式盘">
+              <div className="stage-field" aria-hidden="true" />
+              <div className="stage-ring stage-ring-outer" aria-hidden="true" />
+              <div className="orbit orbit-one" />
+              <div className="orbit orbit-two" />
+              <div className="stage-ring stage-ring-core" aria-hidden="true" />
+              <span className="listener">你</span>
+              <i className="stage-speaker front-left"><b>FL</b></i>
+              <i className="stage-speaker front-right"><b>FR</b></i>
+              <i className="stage-speaker rear-left"><b>RL</b></i>
+              <i className="stage-speaker rear-right"><b>RR</b></i>
+              <span className="stage-mode-chip">{snapshot.audioMode === "music" ? "直通" : "空间"}</span>
+            </div>
+            <div className="mode-copy">
+              <p className="eyebrow">SOUND MODE</p>
+              <h2>{snapshot.audioMode === "music" ? "原声 / 音乐" : "影院 / 游戏"}</h2>
+              <p>{snapshot.audioMode === "music" ? "透明直通，不添加空间处理。你的盲测首选。" : "Crossfeed + 立体声 HRTF，仅在需要空间感时开启。"}</p>
+              <ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} />
+            </div>
+          </section>
         </div>
         <section className="lyrics-panel"><div className="lyrics-scroll">{lyrics?.instrumental ? <p className="lyric active">纯音乐</p> : lyrics?.lines.length ? lyrics.lines.map((line, index) => <p className={`lyric ${index === activeLyricIndex ? "active" : ""}`} key={`${line.timestampMs}-${index}`} ref={(element) => { lyricRefs.current[index] = element; }}>{line.text}</p>) : <div className="lyrics-empty"><strong>歌词会出现在这里</strong><span>在线预览会自动匹配同步歌词。</span></div>}</div></section>
       </div>
@@ -577,9 +697,13 @@ function App() {
   return (
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`} style={{ "--accent": accent } as CSSProperties}>
       <div className="ambient-light" aria-hidden="true" />
+      <div className="ambient-light ambient-light-secondary" aria-hidden="true" />
+      <div className="shell-noise" aria-hidden="true" />
       <header className="top-bar" data-tauri-drag-region>
-        <button className="menu-button" onClick={() => setSidebarCollapsed((value) => !value)} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>☰</button>
-        <button className="logo" onClick={() => setView("discovery")} aria-label="返回探索页"><span>GX</span></button>
+        <div className="brand-cluster">
+          <button className="menu-button" onClick={() => setSidebarCollapsed((value) => !value)} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>☰</button>
+          <button className="logo" onClick={() => setView("discovery")} aria-label="返回探索页"><span>GX</span></button>
+        </div>
         <div className="global-search">
           <span aria-hidden="true">⌕</span>
           <input aria-label="搜索歌曲、歌手、专辑" placeholder="搜索歌曲、歌手、专辑…" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} onFocus={() => searchQuery.trim() && setSuggestionOpen(true)} onKeyDown={onSearchKeyDown} />
@@ -592,7 +716,9 @@ function App() {
             <button className="view-all" onMouseDown={(event) => event.preventDefault()} onClick={() => void submitSearch()}>查看“{searchQuery}”的全部结果 <span>→</span></button>
           </div>}
         </div>
-        <button className={`mode-pill ${snapshot.audioMode === "cinema_game" ? "active" : ""}`} onClick={() => setView("now-playing")}><span>⊙</span>{snapshot.audioMode === "music" ? "原声" : "空间"}</button>
+        <div className="top-bar-trail">
+          <button className={`mode-pill ${snapshot.audioMode === "cinema_game" ? "active" : ""}`} onClick={() => setView("now-playing")}><span>⊙</span>{snapshot.audioMode === "music" ? "原声" : "空间"}</button>
+        </div>
         <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label="关闭">×</button></div>
       </header>
 
@@ -607,9 +733,83 @@ function App() {
       {(message || snapshot.error) && <div className="toast" role="status"><span>!</span><p>{snapshot.error ?? message}</p><button onClick={() => setMessage("")} aria-label="关闭提示">×</button></div>}
 
       <footer className="player-bar">
-        <button className="player-track" onClick={() => setView("now-playing")}><Cover artwork={currentArtwork} title={currentTitle} /><span><strong>{currentTitle}</strong><small>{currentArtist}</small></span></button>
-        <div className="player-center"><div className="transport"><button onClick={() => void run("player_previous")} aria-label="上一首">◀</button><button className="play-button" onClick={() => void run(isPlaying ? "player_pause" : "player_play")} disabled={!currentQueueItem} aria-label={isPlaying ? "暂停" : "播放"}>{isPlaying ? "Ⅱ" : "▶"}</button><button onClick={() => void run("player_next")} aria-label="下一首">▶</button></div><div className="timeline"><time>{formatTime(shownPosition)}</time><input aria-label="播放进度" type="range" min={0} max={Math.max(snapshot.durationSeconds ?? 0, 0.01)} step={0.05} value={Math.min(shownPosition, Math.max(snapshot.durationSeconds ?? 0, 0.01))} disabled={!currentQueueItem || !snapshot.durationSeconds} onChange={(event) => setDragPosition(Number(event.target.value))} onPointerUp={(event) => void commitSeek(Number(event.currentTarget.value))} onKeyUp={(event) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) void commitSeek(Number(event.currentTarget.value)); }} /><time>{formatTime(snapshot.durationSeconds)}</time></div></div>
-        <div className="player-tools"><span aria-hidden="true">♩</span><input aria-label="音量" type="range" min={0} max={1} step={0.01} value={snapshot.volume} onChange={(event) => setSnapshot((state) => ({ ...state, volume: Number(event.target.value) }))} onPointerUp={(event) => void run("player_set_volume", { volume: Number(event.currentTarget.value) })} /><button className={snapshot.audioMode === "cinema_game" ? "active" : ""} onClick={() => void setAudioMode(snapshot.audioMode === "music" ? "cinema_game" : "music")} aria-label="切换音效模式">⊙</button><button onClick={() => setView("settings")} aria-label="更多设置">•••</button></div>
+        <button className="player-track" onClick={() => setView("now-playing")}>
+          <Cover artwork={currentArtwork} title={currentTitle} />
+          <span>
+            <strong>{currentTitle}</strong>
+            <small>{currentArtist}</small>
+          </span>
+        </button>
+        <div className="player-center">
+          <div className="transport">
+            <button type="button" className="transport-btn" onClick={() => void run("player_previous")} aria-label="上一首">
+              <span className="glyph-prev" aria-hidden="true" />
+            </button>
+            <button type="button" className="play-button" onClick={() => void run(isPlaying ? "player_pause" : "player_play")} disabled={!currentQueueItem} aria-label={isPlaying ? "暂停" : "播放"}>
+              <span className={isPlaying ? "glyph-pause" : "glyph-play"} aria-hidden="true" />
+            </button>
+            <button type="button" className="transport-btn" onClick={() => void run("player_next")} aria-label="下一首">
+              <span className="glyph-next" aria-hidden="true" />
+            </button>
+          </div>
+          <div className="timeline">
+            <time>{formatTime(shownPosition)}</time>
+            <input
+              aria-label="播放进度"
+              type="range"
+              className="seek-slider"
+              min={0}
+              max={Math.max(snapshot.durationSeconds ?? 0, 0.01)}
+              step={0.05}
+              value={Math.min(shownPosition, Math.max(snapshot.durationSeconds ?? 0, 0.01))}
+              disabled={!currentQueueItem || !snapshot.durationSeconds}
+              style={
+                {
+                  "--fill": `${snapshot.durationSeconds ? (Math.min(shownPosition, snapshot.durationSeconds) / snapshot.durationSeconds) * 100 : 0}%`,
+                } as CSSProperties
+              }
+              onChange={(event) => setDragPosition(Number(event.target.value))}
+              onPointerUp={(event) => void commitSeek(Number(event.currentTarget.value))}
+              onKeyUp={(event) => {
+                if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) void commitSeek(Number(event.currentTarget.value));
+              }}
+            />
+            <time>{formatTime(snapshot.durationSeconds)}</time>
+          </div>
+        </div>
+        <div className="player-tools">
+          <div className="volume-cluster">
+            <span className="volume-icon" aria-hidden="true" />
+            <input
+              aria-label="音量"
+              type="range"
+              className="volume-slider"
+              min={0}
+              max={1}
+              step={0.01}
+              value={snapshot.volume}
+              style={{ "--fill": `${snapshot.volume * 100}%` } as CSSProperties}
+              onChange={(event) => setSnapshot((state) => ({ ...state, volume: Number(event.target.value) }))}
+              onPointerUp={(event) => void run("player_set_volume", { volume: Number(event.currentTarget.value) })}
+            />
+          </div>
+          <button
+            type="button"
+            className={`tool-btn ${snapshot.audioMode === "cinema_game" ? "active" : ""}`}
+            onClick={() => void setAudioMode(snapshot.audioMode === "music" ? "cinema_game" : "music")}
+            aria-label="切换音效模式"
+            title={snapshot.audioMode === "music" ? "原声直通" : "影院/游戏空间"}
+          >
+            <span className="glyph-spatial" aria-hidden="true" />
+          </button>
+          <button type="button" className="tool-btn more-btn" onClick={() => setView("settings")} aria-label="更多设置" title="设置与备份">
+            <span className="more-dots" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+            </span>
+          </button>
+        </div>
       </footer>
     </div>
   );
@@ -628,7 +828,20 @@ function LoadingState() {
 }
 
 function ModeButtons({ mode, onChange }: { mode: AudioMode; onChange: (mode: AudioMode) => Promise<void> }) {
-  return <div className="mode-buttons" role="radiogroup" aria-label="音效模式"><button role="radio" aria-checked={mode === "music"} className={mode === "music" ? "active" : ""} onClick={() => void onChange("music")}><span>♫</span><strong>原声 / 音乐</strong><small>透明直通</small></button><button role="radio" aria-checked={mode === "cinema_game"} className={mode === "cinema_game" ? "active" : ""} onClick={() => void onChange("cinema_game")}><span>◎</span><strong>影院 / 游戏</strong><small>可选空间处理</small></button></div>;
+  return (
+    <div className="mode-buttons" role="radiogroup" aria-label="音效模式">
+      <button role="radio" aria-checked={mode === "music"} className={mode === "music" ? "active" : ""} onClick={() => void onChange("music")}>
+        <span>♫</span>
+        <strong>原声 / 音乐</strong>
+        <small>默认 · 透明直通</small>
+      </button>
+      <button role="radio" aria-checked={mode === "cinema_game"} className={mode === "cinema_game" ? "active" : ""} onClick={() => void onChange("cinema_game")}>
+        <span>◎</span>
+        <strong>影院 / 游戏</strong>
+        <small>可选 · 空间处理</small>
+      </button>
+    </div>
+  );
 }
 
 function SuggestionGroup({ label, children }: { label: string; children: ReactNode }) {

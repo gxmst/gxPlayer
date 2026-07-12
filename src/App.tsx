@@ -442,6 +442,7 @@ function App() {
   const {
     alwaysOnTop,
     miniMode,
+    isMaximized,
     sidebarCollapsed,
     setSidebarCollapsed,
     toggleAlwaysOnTop,
@@ -2555,7 +2556,7 @@ function App() {
   };
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${miniMode ? "mini-mode" : ""}`} style={{ "--accent": accent } as CSSProperties}>
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${miniMode ? "mini-mode" : ""} ${isMaximized ? "is-maximized" : ""}`} style={{ "--accent": accent } as CSSProperties}>
       <div className="ambient-light" aria-hidden="true" />
       <div className="ambient-light ambient-light-secondary" aria-hidden="true" />
       <div className="shell-noise" aria-hidden="true" />
@@ -2687,7 +2688,7 @@ function App() {
 
       <aside className="sidebar">
         <nav>{NAV_ITEMS.map((item) => <button className={view === item.id ? "active" : ""} onClick={() => navigateTo(item.id)} key={item.id} title={item.label}><span>{item.icon}</span><strong>{item.label}</strong></button>)}</nav>
-        <div className="sidebar-playlists"><p>歌单</p>{playlists.slice(0, 8).map((playlist) => <button key={playlist.id} className={activePlaylist?.id === playlist.id && view === "playlist" ? "active" : ""} onClick={() => void openPlaylist(playlist)} title={playlist.name}><span>♬</span><strong>{playlist.name}</strong></button>)}</div>
+        <div className="sidebar-playlists"><p><span>创建的歌单</span><small>{playlists.length}</small></p>{playlists.slice(0, 8).map((playlist) => <button key={playlist.id} className={activePlaylist?.id === playlist.id && view === "playlist" ? "active" : ""} onClick={() => void openPlaylist(playlist)} title={playlist.name}><span>♬</span><strong>{playlist.name}</strong></button>)}</div>
         <div className="engine-health"><i className={snapshot.status === "failed" ? "bad" : ""} /><span><strong>Rust Engine</strong><small>{snapshot.status === "failed" ? "需要处理" : `${snapshot.underrunCallbacks} underrun`}</small></span></div>
       </aside>
 
@@ -2707,6 +2708,28 @@ function App() {
       )}
 
       <footer className="player-bar">
+        <div className="player-progress-rail">
+          <input
+            aria-label="播放进度"
+            type="range"
+            className="seek-slider"
+            min={0}
+            max={Math.max(snapshot.durationSeconds ?? 0, 0.01)}
+            step={0.05}
+            value={Math.min(shownPosition, Math.max(snapshot.durationSeconds ?? 0, 0.01))}
+            disabled={!currentQueueItem || !snapshot.durationSeconds}
+            style={
+              {
+                "--fill": `${snapshot.durationSeconds ? (Math.min(shownPosition, snapshot.durationSeconds) / snapshot.durationSeconds) * 100 : 0}%`,
+              } as CSSProperties
+            }
+            onChange={(event) => setDragPosition(Number(event.target.value))}
+            onPointerUp={(event) => void commitSeek(Number(event.currentTarget.value))}
+            onKeyUp={(event) => {
+              if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) void commitSeek(Number(event.currentTarget.value));
+            }}
+          />
+        </div>
         <button className={`player-track ${isPlaying ? "is-playing" : ""}`} onClick={() => navigateTo("now-playing")}>
           <span className={`player-cover-wrap ${isPlaying ? "live" : ""}`}>
             <Cover artwork={currentArtwork} title={currentTitle} />
@@ -2738,28 +2761,9 @@ function App() {
               <span className="glyph-next" aria-hidden="true" />
             </button>
           </div>
-          <div className="timeline">
+          <div className="timeline player-time-row">
             <time>{formatTime(shownPosition)}</time>
-            <input
-              aria-label="播放进度"
-              type="range"
-              className="seek-slider"
-              min={0}
-              max={Math.max(snapshot.durationSeconds ?? 0, 0.01)}
-              step={0.05}
-              value={Math.min(shownPosition, Math.max(snapshot.durationSeconds ?? 0, 0.01))}
-              disabled={!currentQueueItem || !snapshot.durationSeconds}
-              style={
-                {
-                  "--fill": `${snapshot.durationSeconds ? (Math.min(shownPosition, snapshot.durationSeconds) / snapshot.durationSeconds) * 100 : 0}%`,
-                } as CSSProperties
-              }
-              onChange={(event) => setDragPosition(Number(event.target.value))}
-              onPointerUp={(event) => void commitSeek(Number(event.currentTarget.value))}
-              onKeyUp={(event) => {
-                if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) void commitSeek(Number(event.currentTarget.value));
-              }}
-            />
+            <span aria-hidden="true" />
             <time>{formatTime(snapshot.durationSeconds)}</time>
           </div>
         </div>

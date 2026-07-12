@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 export function useWindowPreferences(onError: (error: unknown) => void) {
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
   const [miniMode, setMiniMode] = useState(false);
+  const [isMaximized, setIsMaximized] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => window.innerWidth <= 1200);
   const miniModeRef = useRef(miniMode);
   const saveTimer = useRef<number | null>(null);
@@ -13,6 +14,12 @@ export function useWindowPreferences(onError: (error: unknown) => void) {
   errorHandler.current = onError;
 
   useEffect(() => {
+    const appWindow = getCurrentWindow();
+    const syncMaximized = () => {
+      void appWindow.isMaximized().then(setIsMaximized).catch(() => undefined);
+    };
+    syncMaximized();
+
     void invoke<{ alwaysOnTop?: boolean; miniMode?: boolean }>("window_get_state")
       .then((state) => {
         setAlwaysOnTop(Boolean(state.alwaysOnTop));
@@ -26,8 +33,11 @@ export function useWindowPreferences(onError: (error: unknown) => void) {
         void invoke("window_save_state", { miniMode: miniModeRef.current }).catch(() => undefined);
       }, 400);
     };
-    const resized = getCurrentWindow().onResized(scheduleSave);
-    const moved = getCurrentWindow().onMoved(scheduleSave);
+    const resized = appWindow.onResized(() => {
+      syncMaximized();
+      scheduleSave();
+    });
+    const moved = appWindow.onMoved(scheduleSave);
     return () => {
       void resized.then((dispose) => dispose());
       void moved.then((dispose) => dispose());
@@ -62,6 +72,7 @@ export function useWindowPreferences(onError: (error: unknown) => void) {
   return {
     alwaysOnTop,
     miniMode,
+    isMaximized,
     sidebarCollapsed,
     setSidebarCollapsed,
     toggleAlwaysOnTop,

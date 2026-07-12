@@ -232,6 +232,7 @@ function Cover({ artwork, title, className = "" }: { artwork?: string | null; ti
 function App() {
   const [snapshot, setSnapshot] = useState<EngineSnapshot>(EMPTY_ENGINE);
   const [view, setView] = useState<ViewId>(initialView);
+  const [viewHistory, setViewHistory] = useState<ViewId[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [message, setMessage] = useState("");
   const [accent, setAccent] = useState(FALLBACK_ACCENT);
@@ -368,6 +369,21 @@ function App() {
         return { title: "还没有可用音源", copy: "导入 LX 音源脚本后，在线歌曲才能解析为整首播放。" };
     }
   })();
+
+  const navigateTo = (next: ViewId) => {
+    if (next === view) return;
+    setViewHistory((history) => [...history, view].slice(-32));
+    setView(next);
+  };
+
+  const navigateBack = () => {
+    setViewHistory((history) => {
+      const previous = history[history.length - 1];
+      if (!previous) return history;
+      setView(previous);
+      return history.slice(0, -1);
+    });
+  };
 
   useEffect(() => {
     if (!pendingSeek) return;
@@ -515,7 +531,7 @@ function App() {
 
       setSelectedCatalogTrack(selectedTrack);
       setLyrics(null);
-      setView("now-playing");
+      navigateTo("now-playing");
       setMessage(playbackMessage);
       try {
         const lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
@@ -626,7 +642,7 @@ function App() {
     const query = (queryOverride ?? searchQuery).trim();
     if (!query) return;
     setSuggestionOpen(false);
-    setView("search");
+    navigateTo("search");
     setSearchState("loading");
     const results = await run<CatalogTrack[]>("metadata_search", { query, limit: 40 });
     if (results !== undefined) {
@@ -673,7 +689,7 @@ function App() {
       await refreshLibrary();
       setActivePlaylist(playlist);
       setPlaylistTracks([]);
-      setView("playlist");
+      navigateTo("playlist");
     }
   };
 
@@ -682,7 +698,7 @@ function App() {
     if (tracks) {
       setActivePlaylist(playlist);
       setPlaylistTracks(tracks);
-      setView("playlist");
+      navigateTo("playlist");
     }
   };
 
@@ -796,7 +812,7 @@ function App() {
             <p>默认原声直通。需要电影和游戏的空间感时，再打开影院/游戏模式。</p>
             <div className="hero-actions">
               <button className="primary" onClick={chooseFiles}>导入本地音乐</button>
-              <button onClick={() => setView("now-playing")}>打开播放页</button>
+              <button onClick={() => navigateTo("now-playing")}>打开播放页</button>
             </div>
           </div>
           <div
@@ -813,7 +829,7 @@ function App() {
           </div>
         </section>
         <section className="section-block panel-enter delay-1">
-          <div className="section-heading"><div><p className="eyebrow">RECENTLY ADDED</p><h2>最近加入</h2></div><button onClick={() => setView("library")}>查看曲库 →</button></div>
+          <div className="section-heading"><div><p className="eyebrow">RECENTLY ADDED</p><h2>最近加入</h2></div><button onClick={() => navigateTo("library")}>查看曲库 →</button></div>
           {library.length ? renderTrackRows(library.slice(0, 6)) : <EmptyState title="曲库还是空的" copy="导入熟悉的音乐，从原声模式开始。" action="选择音乐" onAction={chooseFiles} />}
         </section>
         <section className="playlist-strip panel-enter delay-2">
@@ -823,7 +839,7 @@ function App() {
             <label className="playlist-card create-card"><span>＋</span><input aria-label="新歌单名称" placeholder="新歌单" value={newPlaylistName} onChange={(event) => setNewPlaylistName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createPlaylist(); }} /><button onClick={() => void createPlaylist()} disabled={!newPlaylistName.trim()}>创建</button></label>
           </div>
         </section>
-        {chartTracks.length > 0 && <section className="section-block panel-enter delay-2"><div className="section-heading"><div><p className="eyebrow">DISCOVER</p><h2>正在流行</h2></div><button onClick={() => { setSearchResults(chartTracks); setSearchQuery("中国区热门"); setView("search"); }}>查看全部 →</button></div>{renderCatalogRows(chartTracks.slice(0, 6))}</section>}
+        {chartTracks.length > 0 && <section className="section-block panel-enter delay-2"><div className="section-heading"><div><p className="eyebrow">DISCOVER</p><h2>正在流行</h2></div><button onClick={() => { setSearchResults(chartTracks); setSearchQuery("中国区热门"); navigateTo("search"); }}>查看全部 →</button></div>{renderCatalogRows(chartTracks.slice(0, 6))}</section>}
       </div>
     );
 
@@ -840,7 +856,7 @@ function App() {
     }
 
     if (view === "playlist") return (
-      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistTracks.length} 首音乐`} action={activePlaylist ? <button className="danger" onClick={async () => { await run("library_delete_playlist", { playlistId: activePlaylist.id }); setView("discovery"); setActivePlaylist(null); await refreshLibrary(); }}>删除歌单</button> : undefined} />{playlistTracks.length && activePlaylist ? renderTrackRows(playlistTracks, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把想听的歌加进来。" action="去曲库" onAction={() => setView("library")} />}</div>
+      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistTracks.length} 首音乐`} action={activePlaylist ? <button className="danger" onClick={async () => { await run("library_delete_playlist", { playlistId: activePlaylist.id }); navigateTo("discovery"); setActivePlaylist(null); await refreshLibrary(); }}>删除歌单</button> : undefined} />{playlistTracks.length && activePlaylist ? renderTrackRows(playlistTracks, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把想听的歌加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
     );
 
     if (view === "sources") return (
@@ -899,7 +915,8 @@ function App() {
       <header className="top-bar" data-tauri-drag-region>
         <div className="brand-cluster">
           <button className="menu-button" onClick={() => setSidebarCollapsed((value) => !value)} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>☰</button>
-          <button className="logo" onClick={() => setView("discovery")} aria-label="返回探索页"><span>GX</span></button>
+          <button className="logo" onClick={() => navigateTo("discovery")} aria-label="返回探索页"><span>GX</span></button>
+          <button className="history-back" onClick={navigateBack} disabled={!viewHistory.length} aria-label="返回上一页" title="返回上一页">‹</button>
         </div>
         <div className="global-search">
           <span aria-hidden="true">⌕</span>
@@ -914,13 +931,13 @@ function App() {
           </div>}
         </div>
         <div className="top-bar-trail">
-          <button className={`mode-pill ${snapshot.audioMode === "cinema_game" ? "active" : ""}`} onClick={() => setView("now-playing")}><span>⊙</span>{snapshot.audioMode === "music" ? "原声" : "空间"}</button>
+          <button className={`mode-pill ${snapshot.audioMode === "cinema_game" ? "active" : ""}`} onClick={() => navigateTo("now-playing")}><span>⊙</span>{snapshot.audioMode === "music" ? "原声" : "空间"}</button>
         </div>
         <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label="关闭">×</button></div>
       </header>
 
       <aside className="sidebar">
-        <nav>{NAV_ITEMS.map((item) => <button className={view === item.id ? "active" : ""} onClick={() => setView(item.id)} key={item.id} title={item.label}><span>{item.icon}</span><strong>{item.label}</strong></button>)}</nav>
+        <nav>{NAV_ITEMS.map((item) => <button className={view === item.id ? "active" : ""} onClick={() => navigateTo(item.id)} key={item.id} title={item.label}><span>{item.icon}</span><strong>{item.label}</strong></button>)}</nav>
         <div className="sidebar-playlists"><p>歌单</p>{playlists.slice(0, 8).map((playlist) => <button key={playlist.id} className={activePlaylist?.id === playlist.id && view === "playlist" ? "active" : ""} onClick={() => void openPlaylist(playlist)} title={playlist.name}><span>♬</span><strong>{playlist.name}</strong></button>)}</div>
         <div className="engine-health"><i className={snapshot.status === "failed" ? "bad" : ""} /><span><strong>Rust Engine</strong><small>{snapshot.status === "failed" ? "需要处理" : `${snapshot.underrunCallbacks} underrun`}</small></span></div>
       </aside>
@@ -932,7 +949,7 @@ function App() {
       {(message || snapshot.error) && <div className="toast" role="status"><span>!</span><p>{snapshot.error ?? message}</p><button onClick={() => setMessage("")} aria-label="关闭提示">×</button></div>}
 
       <footer className="player-bar">
-        <button className="player-track" onClick={() => setView("now-playing")}>
+        <button className="player-track" onClick={() => navigateTo("now-playing")}>
           <Cover artwork={currentArtwork} title={currentTitle} />
           <span>
             <strong>{currentTitle}</strong>
@@ -1002,7 +1019,7 @@ function App() {
           >
             <span className="glyph-spatial" aria-hidden="true" />
           </button>
-          <button type="button" className="tool-btn more-btn" onClick={() => setView("settings")} aria-label="更多设置" title="设置与备份">
+          <button type="button" className="tool-btn more-btn" onClick={() => navigateTo("settings")} aria-label="更多设置" title="设置与备份">
             <span className="more-dots" aria-hidden="true">
               <i />
               <i />

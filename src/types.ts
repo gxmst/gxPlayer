@@ -69,6 +69,25 @@ export type CacheStatus = {
   pinnedCount: number;
 };
 
+/** Offline/cache list row — never includes absolute disk paths. */
+export type CacheEntryView = {
+  providerId: string;
+  providerTrackId: string;
+  quality: string;
+  title: string;
+  artist: string;
+  album: string;
+  byteLen: number;
+  sourceSampleRate: number | null;
+  sourceBitDepth: number | null;
+  sourceChannels: number | null;
+  mediaType: string;
+  pinned: boolean;
+  lastAccessedAtMs: number;
+  completedAtMs: number;
+  fileName: string;
+};
+
 export type LyricDocument = {
   instrumental: boolean;
   lines: Array<{ timestampMs: number | null; text: string }>;
@@ -136,6 +155,7 @@ export type ViewId =
   | "search"
   | "library"
   | "favorites"
+  | "offline"
   | "playlist"
   | "sources"
   | "settings"

@@ -970,6 +970,21 @@ select {
   transition: background 0.15s;
 }
 
+.track-row.cache-row {
+  grid-template-columns: minmax(0, 1fr) 72px 70px 36px 36px 36px;
+}
+
+.cache-quality-badge {
+  justify-self: end;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-mute);
+  font: 10px/1.2 "Geist Mono Variable", monospace;
+  white-space: nowrap;
+}
+
 .track-row:last-child {
   border-bottom: 0;
 }

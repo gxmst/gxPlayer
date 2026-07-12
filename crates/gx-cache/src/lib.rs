@@ -277,6 +277,54 @@ impl CacheStore {
         Ok(self.status())
     }
 
+    /// Remove multiple entries by key (skips missing keys).
+    pub fn remove_entries(&self, keys: &[CacheKey]) -> Result<CacheStatus> {
+        {
+            let mut state = self.inner.lock().unwrap();
+            for key in keys {
+                let id = cache_id(key);
+                if let Some(entry) = state.manifest.entries.get(&id).cloned()
+                    && remove_entry_files(&entry)
+                {
+                    state.manifest.entries.remove(&id);
+                }
+            }
+            persist_manifest(&state)?;
+        }
+        Ok(self.status())
+    }
+
+    /// Remove all completed cache entries of a given quality tier (e.g. `128k`).
+    /// Pinned favorites are kept unless `include_pinned` is true.
+    pub fn remove_by_quality(&self, quality: &str, include_pinned: bool) -> Result<CacheStatus> {
+        let quality = quality.trim();
+        if quality.is_empty() {
+            bail!("quality is required");
+        }
+        {
+            let mut state = self.inner.lock().unwrap();
+            let ids = state
+                .manifest
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.key.quality.eq_ignore_ascii_case(quality)
+                        && (include_pinned || !entry.pinned)
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for id in ids {
+                if let Some(entry) = state.manifest.entries.get(&id).cloned()
+                    && remove_entry_files(&entry)
+                {
+                    state.manifest.entries.remove(&id);
+                }
+            }
+            persist_manifest(&state)?;
+        }
+        Ok(self.status())
+    }
+
     pub fn set_limit_bytes(&self, limit_bytes: u64) -> Result<CacheStatus> {
         if !(1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&limit_bytes) {
             bail!("cache limit must be between 1 MiB and 1 TiB");

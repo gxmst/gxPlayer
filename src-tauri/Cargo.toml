@@ -34,3 +34,5 @@ gx-library = { path = "../crates/gx-library" }
 reqwest.workspace = true
 regex.workspace = true
 url.workspace = true
+base64 = "0.22"
+souvlaki = "0.8"

@@ -102,6 +102,19 @@ export type LibraryTrack = {
   durationSeconds: number | null;
   favorite: boolean;
   addedAtMs: number;
+  missing?: boolean;
+};
+
+export type HistoryEntry = {
+  id: number;
+  playedAtMs: number;
+  kind: string;
+  title: string;
+  artist: string;
+  path: string | null;
+  providerId: string | null;
+  providerTrackId: string | null;
+  quality: string | null;
 };
 
 export type PlaylistSummary = {
@@ -156,6 +169,7 @@ export type ViewId =
   | "library"
   | "favorites"
   | "offline"
+  | "history"
   | "playlist"
   | "sources"
   | "settings"

@@ -132,6 +132,32 @@ pub fn cache_remove_entry(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+pub fn cache_remove_entries(
+    window: WebviewWindow,
+    cache: tauri::State<'_, CacheStore>,
+    keys: Vec<CacheKey>,
+) -> Result<CacheStatus, String> {
+    require_window(&window, "main")?;
+    if keys.len() > 5_000 {
+        return Err("一次最多删除 5000 条缓存".into());
+    }
+    cache.remove_entries(&keys).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn cache_remove_by_quality(
+    window: WebviewWindow,
+    cache: tauri::State<'_, CacheStore>,
+    quality: String,
+    include_pinned: Option<bool>,
+) -> Result<CacheStatus, String> {
+    require_window(&window, "main")?;
+    cache
+        .remove_by_quality(&quality, include_pinned.unwrap_or(false))
+        .map_err(|error| error.to_string())
+}
+
 /// Play a completed cache entry via the local path (no LX resolve).
 #[tauri::command]
 pub fn player_play_cache_entry(

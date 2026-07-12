@@ -34,6 +34,13 @@ pub struct LocalMediaInfo {
     pub duration_seconds: Option<f64>,
 }
 
+/// Embedded cover art extracted from a local file (JPEG/PNG bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedCover {
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PlaybackOptions {
     pub start_seconds: f64,
@@ -113,6 +120,51 @@ pub fn probe_local_file(path: impl AsRef<Path>) -> Result<LocalMediaInfo> {
         sample_rate,
         channels,
         duration_seconds,
+    })
+}
+
+/// Read the first embedded cover picture from a local audio file, if any.
+pub fn extract_embedded_cover(path: impl AsRef<Path>) -> Result<Option<EmbeddedCover>> {
+    use symphonia::core::meta::StandardVisualKey;
+    let path = path.as_ref();
+    let mut opened = open_media(path)?;
+    // Prefer format-level metadata visuals.
+    if let Some(revision) = opened.format.metadata().current()
+        && let Some(cover) = pick_visual(revision.visuals())
+    {
+        return Ok(Some(cover));
+    }
+    // Some containers only expose visuals on the probe metadata queue.
+    while !opened.format.metadata().is_latest() {
+        opened.format.metadata().skip_to_latest();
+        if let Some(revision) = opened.format.metadata().current()
+            && let Some(cover) = pick_visual(revision.visuals())
+        {
+            return Ok(Some(cover));
+        }
+    }
+    let _ = StandardVisualKey::FrontCover;
+    Ok(None)
+}
+
+fn pick_visual(visuals: &[symphonia::core::meta::Visual]) -> Option<EmbeddedCover> {
+    let preferred = visuals.iter().find(|visual| {
+        visual
+            .usage
+            .is_some_and(|usage| usage == symphonia::core::meta::StandardVisualKey::FrontCover)
+    });
+    let visual = preferred.or_else(|| visuals.first())?;
+    let mime = if visual.media_type.trim().is_empty() {
+        "image/jpeg".into()
+    } else {
+        visual.media_type.clone()
+    };
+    if visual.data.is_empty() {
+        return None;
+    }
+    Some(EmbeddedCover {
+        mime,
+        data: visual.data.to_vec(),
     })
 }
 

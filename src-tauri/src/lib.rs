@@ -14,14 +14,22 @@ use gx_library::{LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistSu
 use gx_source::{SourceStore, safe_http};
 
 mod cache_commands;
+mod media_session;
 mod metadata_commands;
+mod product_commands;
 mod source_commands;
 mod source_runtime;
+mod window_state;
 
 use cache_commands::{
-    cache_clear, cache_list_entries, cache_online_favorites, cache_remove_entry,
-    cache_reset_directory, cache_set_directory, cache_set_limit, cache_set_online_favorite,
-    cache_status, player_play_cache_entry,
+    cache_clear, cache_list_entries, cache_online_favorites, cache_remove_by_quality,
+    cache_remove_entries, cache_remove_entry, cache_reset_directory, cache_set_directory,
+    cache_set_limit, cache_set_online_favorite, cache_status, player_play_cache_entry,
+};
+use product_commands::{
+    backup_read_file, backup_write_file, library_clear_history, library_embedded_cover,
+    library_history, library_record_history, library_scan_missing, player_media_action,
+    window_get_state, window_save_state, window_set_always_on_top, window_set_mini_mode,
 };
 use metadata_commands::{
     maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
@@ -691,33 +699,35 @@ fn phase1_script_path() -> PathBuf {
 }
 
 /// Size and show the main window before first paint.
-/// Adaptive 16:10 from the active monitor (cap 1280×86% height), matching the former
-/// frontend placeWindow — but done here so the UI does not open small then jump larger.
-fn place_and_show_main_window(window: &WebviewWindow) -> tauri::Result<()> {
-    let monitor = window.current_monitor()?.or(window.primary_monitor()?);
+/// Restores saved geometry when present; otherwise adaptive 16:10 from the monitor.
+fn place_and_show_main_window(window: &WebviewWindow, app_data: &std::path::Path) -> tauri::Result<()> {
+    let saved = window_state::load(app_data);
+    if saved.width.is_some() || saved.mini_mode {
+        window_state::apply_to_window(window, &saved);
+    } else {
+        let monitor = window.current_monitor()?.or(window.primary_monitor()?);
+        if let Some(monitor) = monitor {
+            let scale = monitor.scale_factor();
+            let physical = monitor.size();
+            let logical_width = physical.width as f64 / scale;
+            let logical_height = physical.height as f64 / scale;
 
-    if let Some(monitor) = monitor {
-        let scale = monitor.scale_factor();
-        let physical = monitor.size();
-        let logical_width = physical.width as f64 / scale;
-        let logical_height = physical.height as f64 / scale;
+            let mut width = (logical_width * 0.88).min(1280.0);
+            let mut height = width / 1.6;
+            let maximum_height = logical_height * 0.86;
+            if height > maximum_height {
+                height = maximum_height;
+                width = height * 1.6;
+            }
 
-        let mut width = (logical_width * 0.88).min(1280.0);
-        let mut height = width / 1.6;
-        let maximum_height = logical_height * 0.86;
-        if height > maximum_height {
-            height = maximum_height;
-            width = height * 1.6;
+            width = width.max(720.0);
+            height = height.max(560.0);
+
+            window.set_size(LogicalSize::new(width.floor(), height.floor()))?;
         }
-
-        // Keep within the configured floor so extreme monitors still feel usable.
-        width = width.max(720.0);
-        height = height.max(560.0);
-
-        window.set_size(LogicalSize::new(width.floor(), height.floor()))?;
+        let _ = window.center();
     }
 
-    let _ = window.center();
     window.show()?;
     let _ = window.set_focus();
     Ok(())
@@ -878,10 +888,11 @@ pub fn run() {
             app.manage(SourceRuntime::new(source_store));
             create_lx_sandbox(app.handle())?;
             create_system_tray(app.handle())?;
+            media_session::spawn_media_session(app.handle().clone());
 
             if let Some(main) = app.get_webview_window("main") {
                 // Fail soft: still show with tauri.conf fallback size if monitor probe fails.
-                if let Err(error) = place_and_show_main_window(&main) {
+                if let Err(error) = place_and_show_main_window(&main, &app_data) {
                     eprintln!("main window placement failed: {error}");
                     let _ = main.show();
                 }
@@ -910,6 +921,7 @@ pub fn run() {
             player_snapshot,
             player_output_devices,
             player_set_output_device,
+            player_media_action,
             library_tracks,
             library_favorites,
             library_set_favorite,
@@ -921,6 +933,17 @@ pub fn run() {
             library_remove_from_playlist,
             library_export_backup,
             library_restore_backup,
+            library_scan_missing,
+            library_history,
+            library_clear_history,
+            library_record_history,
+            library_embedded_cover,
+            window_get_state,
+            window_save_state,
+            window_set_always_on_top,
+            window_set_mini_mode,
+            backup_write_file,
+            backup_read_file,
             sandbox_ready,
             source_list,
             source_status,
@@ -947,14 +970,16 @@ pub fn run() {
             lx_poc_result,
             lx_crypto_result,
             lx_security_result,
-            lx_poc_failure
-            ,cache_status,
+            lx_poc_failure,
+            cache_status,
             cache_set_limit,
             cache_set_directory,
             cache_reset_directory,
             cache_clear,
             cache_list_entries,
             cache_remove_entry,
+            cache_remove_entries,
+            cache_remove_by_quality,
             cache_online_favorites,
             cache_set_online_favorite,
             player_play_cache_entry

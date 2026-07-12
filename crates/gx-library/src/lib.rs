@@ -17,6 +17,34 @@ pub struct LibraryTrack {
     pub duration_seconds: Option<f64>,
     pub favorite: bool,
     pub added_at_ms: i64,
+    /// True when the file is missing on disk (filled by scan, not stored).
+    #[serde(default)]
+    pub missing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    pub id: i64,
+    pub played_at_ms: i64,
+    pub kind: String,
+    pub title: String,
+    pub artist: String,
+    pub path: Option<String>,
+    pub provider_id: Option<String>,
+    pub provider_track_id: Option<String>,
+    pub quality: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewHistoryEntry<'a> {
+    pub kind: &'a str,
+    pub title: &'a str,
+    pub artist: &'a str,
+    pub path: Option<&'a str>,
+    pub provider_id: Option<&'a str>,
+    pub provider_track_id: Option<&'a str>,
+    pub quality: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +122,19 @@ impl LibraryStore {
                track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                position INTEGER NOT NULL,
                PRIMARY KEY (playlist_id, track_id)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS play_history (
+               id INTEGER PRIMARY KEY,
+               played_at_ms INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               title TEXT NOT NULL,
+               artist TEXT NOT NULL DEFAULT '',
+               path TEXT,
+               provider_id TEXT,
+               provider_track_id TEXT,
+               quality TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_play_history_played_at ON play_history(played_at_ms DESC);",
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -254,6 +294,70 @@ impl LibraryStore {
         )
     }
 
+    /// Mark library tracks whose files no longer exist on disk.
+    pub fn scan_missing(&self) -> Result<Vec<LibraryTrack>> {
+        let mut tracks = self.list_tracks(10_000)?;
+        for track in &mut tracks {
+            track.missing = !Path::new(&track.path).is_file();
+        }
+        Ok(tracks)
+    }
+
+    pub fn record_history(&self, entry: NewHistoryEntry<'_>) -> Result<()> {
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "INSERT INTO play_history(played_at_ms, kind, title, artist, path, provider_id, provider_track_id, quality)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                now_ms(),
+                entry.kind,
+                entry.title,
+                entry.artist,
+                entry.path,
+                entry.provider_id,
+                entry.provider_track_id,
+                entry.quality
+            ],
+        )?;
+        // Keep the latest 500 entries.
+        connection.execute(
+            "DELETE FROM play_history WHERE id NOT IN (
+               SELECT id FROM play_history ORDER BY played_at_ms DESC LIMIT 500
+             )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_history(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id, played_at_ms, kind, title, artist, path, provider_id, provider_track_id, quality
+             FROM play_history ORDER BY played_at_ms DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit.min(500) as i64], |row| {
+            Ok(HistoryEntry {
+                id: row.get(0)?,
+                played_at_ms: row.get(1)?,
+                kind: row.get(2)?,
+                title: row.get(3)?,
+                artist: row.get(4)?,
+                path: row.get(5)?,
+                provider_id: row.get(6)?,
+                provider_track_id: row.get(7)?,
+                quality: row.get(8)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn clear_history(&self) -> Result<()> {
+        let connection = self.connection.lock().unwrap();
+        connection.execute("DELETE FROM play_history", [])?;
+        Ok(())
+    }
+
     pub fn export_backup(&self) -> Result<LibraryBackup> {
         let tracks = self.list_tracks(10_000)?;
         let playlists = self
@@ -345,6 +449,7 @@ fn query_tracks<P: rusqlite::Params>(
             duration_seconds: row.get(5)?,
             favorite: row.get(6)?,
             added_at_ms: row.get(7)?,
+            missing: false,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()

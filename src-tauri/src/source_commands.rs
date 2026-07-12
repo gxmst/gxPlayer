@@ -304,6 +304,14 @@ fn play_online_track(
     quality: Option<String>,
     source_id: Option<String>,
 ) -> Result<OnlinePlaybackResult, String> {
+    // Constraint 2 audit trail: each call is one on-demand resolve (never batch at enqueue).
+    println!(
+        "GX_ONLINE_RESOLVE provider={} id={} title={} quality={}",
+        track.provider_id,
+        track.provider_track_id,
+        track.title,
+        quality.as_deref().unwrap_or("auto")
+    );
     if let Some((source, _)) = lx_identity(&track) {
         let capabilities = app.state::<SourceRuntime>().status().capabilities;
         for attempt in quality_attempts(&capabilities, source, quality.as_deref()) {

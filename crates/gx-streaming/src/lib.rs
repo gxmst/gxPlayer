@@ -6,21 +6,21 @@
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 #[cfg(feature = "test-private-network")]
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use crossbeam_channel::{Receiver, SendTimeoutError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, bounded};
 use gx_cache::{CacheWritePlan, CacheWriter};
-use gx_contracts::ResolvedMediaRequest;
+use gx_contracts::{HttpHeader, ResolvedMediaRequest};
 use gx_source::safe_http::validate_and_resolve;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{
-    ACCEPT_RANGES, AUTHORIZATION, CONTENT_RANGE, COOKIE, HeaderName, HeaderValue, LOCATION,
-    PROXY_AUTHORIZATION, RANGE,
+    ACCEPT_RANGES, AUTHORIZATION, CONTENT_RANGE, COOKIE, ETAG, HeaderName, HeaderValue, IF_RANGE,
+    LAST_MODIFIED, LOCATION, PROXY_AUTHORIZATION, RANGE,
 };
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
@@ -34,6 +34,9 @@ const CHUNK_SIZE: usize = 64 * 1024;
 const CHANNEL_CAPACITY: usize = 8;
 const MAX_RECONNECTS: u64 = 3;
 const MAX_MEDIA_REDIRECTS: usize = 10;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Default)]
 pub struct StreamMetrics {
@@ -89,10 +92,17 @@ struct ReadyInfo {
     supports_range: bool,
 }
 
+#[derive(Clone)]
+struct EffectiveRequest {
+    url: reqwest::Url,
+    headers: Vec<HttpHeader>,
+}
+
 struct WorkerState {
     receiver: Receiver<StreamMessage>,
     cancel: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+    effective_request: Arc<Mutex<EffectiveRequest>>,
 }
 
 pub struct HttpMediaSource {
@@ -164,30 +174,47 @@ impl HttpMediaSource {
         let (ready_sender, ready_receiver) = bounded(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let request = self.request_for_restart();
+        let effective_request = Arc::new(Mutex::new(EffectiveRequest {
+            url: request.url.clone(),
+            headers: request.headers.clone(),
+        }));
         let metrics = Arc::clone(&self.metrics);
         let cancel_for_worker = Arc::clone(&cancel);
+        let effective_for_worker = Arc::clone(&effective_request);
         let cache_writer = (offset == 0)
             .then(|| self.cache_plan.as_ref().and_then(CacheWritePlan::begin))
             .flatten();
         let handle = thread::Builder::new()
             .name("gx-http-stream".into())
             .spawn(move || {
-                network_worker(
+                network_worker(NetworkWorkerArgs {
                     request,
-                    offset,
+                    initial_offset: offset,
                     sender,
                     ready_sender,
-                    cancel_for_worker,
+                    cancel: cancel_for_worker,
                     metrics,
                     cache_writer,
-                );
+                    effective_request: effective_for_worker,
+                });
             })
             .context("failed to spawn HTTP streaming worker")?;
 
-        let ready = ready_receiver
-            .recv_timeout(Duration::from_secs(10))
-            .context("HTTP streaming worker did not become ready")?
-            .map_err(anyhow::Error::msg)?;
+        let ready = match ready_receiver.recv_timeout(WORKER_MESSAGE_TIMEOUT) {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(error)) => {
+                cancel.store(true, Ordering::Release);
+                self.apply_effective_request(&effective_request);
+                reclaim_worker(handle);
+                return Err(anyhow::Error::msg(error));
+            }
+            Err(error) => {
+                cancel.store(true, Ordering::Release);
+                reclaim_worker(handle);
+                return Err(error).context("HTTP streaming worker did not become ready");
+            }
+        };
+        self.apply_effective_request(&effective_request);
         self.final_url = ready.final_url;
         self.total_len = ready.total_len;
         self.supports_range = ready.supports_range;
@@ -199,6 +226,7 @@ impl HttpMediaSource {
             receiver,
             cancel,
             handle,
+            effective_request,
         });
         Ok(())
     }
@@ -213,13 +241,29 @@ impl HttpMediaSource {
         if let Some(worker) = self.worker.take() {
             worker.cancel.store(true, Ordering::Release);
             drop(worker.receiver);
-            // Dropping a JoinHandle detaches the worker. A blocking socket read cannot be
-            // synchronously cancelled by reqwest's blocking API; the worker observes cancellation
-            // before the next read or bounded-channel send. Phase 0 will own workers in a runtime
-            // with explicit cancellation and shutdown accounting.
-            drop(worker.handle);
+            self.apply_effective_request(&worker.effective_request);
+            // Blocking reqwest reads are bounded by STREAM_IDLE_TIMEOUT. Join asynchronously so
+            // Pause/Seek/Drop never stalls the engine thread while the old socket unwinds, while
+            // still reclaiming every worker instead of permanently detaching it.
+            reclaim_worker(worker.handle);
         }
     }
+
+    fn apply_effective_request(&mut self, effective: &Mutex<EffectiveRequest>) {
+        if let Ok(effective) = effective.lock() {
+            self.request.url = effective.url.clone();
+            self.request.headers = effective.headers.clone();
+            self.final_url = effective.url.clone();
+        }
+    }
+}
+
+fn reclaim_worker(handle: JoinHandle<()>) {
+    let _ = thread::Builder::new()
+        .name("gx-http-worker-reaper".into())
+        .spawn(move || {
+            let _ = handle.join();
+        });
 }
 
 impl Read for HttpMediaSource {
@@ -242,7 +286,7 @@ impl Read for HttpMediaSource {
                 .worker
                 .as_ref()
                 .ok_or_else(|| io::Error::new(ErrorKind::BrokenPipe, "HTTP worker is stopped"))?;
-            match worker.receiver.recv() {
+            match worker.receiver.recv_timeout(WORKER_MESSAGE_TIMEOUT) {
                 Ok(StreamMessage::Data(chunk)) => {
                     self.current_chunk = chunk;
                     self.chunk_offset = 0;
@@ -254,7 +298,14 @@ impl Read for HttpMediaSource {
                 Ok(StreamMessage::Error(message)) => {
                     return Err(io::Error::other(message));
                 }
-                Err(_) => {
+                Err(RecvTimeoutError::Timeout) => {
+                    worker.cancel.store(true, Ordering::Release);
+                    return Err(io::Error::new(
+                        ErrorKind::TimedOut,
+                        "HTTP worker produced no data before the idle deadline",
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
                     return Err(io::Error::new(
                         ErrorKind::UnexpectedEof,
                         "HTTP worker disconnected",
@@ -427,18 +478,33 @@ pub fn decode_http_window(
     })
 }
 
-fn network_worker(
+struct NetworkWorkerArgs {
     request: ResolvedMediaRequest,
     initial_offset: u64,
     sender: crossbeam_channel::Sender<StreamMessage>,
     ready_sender: crossbeam_channel::Sender<Result<ReadyInfo, String>>,
     cancel: Arc<AtomicBool>,
     metrics: Arc<StreamMetrics>,
-    mut cache_writer: Option<CacheWriter>,
-) {
+    cache_writer: Option<CacheWriter>,
+    effective_request: Arc<Mutex<EffectiveRequest>>,
+}
+
+fn network_worker(args: NetworkWorkerArgs) {
+    let NetworkWorkerArgs {
+        request,
+        initial_offset,
+        sender,
+        ready_sender,
+        cancel,
+        metrics,
+        mut cache_writer,
+        effective_request,
+    } = args;
     let mut offset = initial_offset;
     let mut active_url = request.url.clone();
+    let mut active_headers = request.headers.clone();
     let mut total_len = None;
+    let mut identity: Option<EntityIdentity> = None;
     let mut ready_sent = false;
     let mut reconnects = 0;
 
@@ -451,7 +517,13 @@ fn network_worker(
             metrics.range_requests.fetch_add(1, Ordering::Relaxed);
         }
 
-        let response = match send_request(&request, active_url.clone(), offset) {
+        let response = match send_request(
+            &mut active_headers,
+            active_url.clone(),
+            offset,
+            identity.as_ref().and_then(EntityIdentity::if_range),
+            &effective_request,
+        ) {
             Ok(response) => response,
             Err(error) => {
                 if !ready_sent {
@@ -463,39 +535,31 @@ fn network_worker(
             }
         };
         active_url = response.url().clone();
-        let status = response.status();
-        if offset > 0 && status != StatusCode::PARTIAL_CONTENT {
-            let message =
-                format!("server ignored Range request at byte {offset}, returned {status}");
-            if !ready_sent {
-                let _ = ready_sender.send(Err(message));
-            } else {
-                let _ = sender.send(StreamMessage::Error(message));
-            }
-            return;
+        if let Ok(mut effective) = effective_request.lock() {
+            effective.url = active_url.clone();
+            effective.headers = active_headers.clone();
         }
-        if !(status.is_success()) {
-            let message = format!("media request returned HTTP {status}");
-            if !ready_sent {
-                let _ = ready_sender.send(Err(message));
-            } else {
-                let _ = sender.send(StreamMessage::Error(message));
+        let response_info = match inspect_response(&response, offset, total_len, identity.as_ref())
+        {
+            Ok(info) => info,
+            Err(message) => {
+                if !ready_sent {
+                    let _ = ready_sender.send(Err(message));
+                } else {
+                    let _ = sender.send(StreamMessage::Error(message));
+                }
+                return;
             }
-            return;
+        };
+        if identity.is_none() {
+            identity = Some(response_info.identity.clone());
         }
-
-        total_len = response_total_len(&response, offset).or(total_len);
-        let supports_range = status == StatusCode::PARTIAL_CONTENT
-            || response
-                .headers()
-                .get(ACCEPT_RANGES)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.eq_ignore_ascii_case("bytes"));
+        total_len = response_info.total_len.or(total_len);
         if !ready_sent {
             let _ = ready_sender.send(Ok(ReadyInfo {
                 final_url: active_url.clone(),
                 total_len,
-                supports_range,
+                supports_range: response_info.supports_range,
             }));
             ready_sent = true;
         }
@@ -508,6 +572,15 @@ fn network_worker(
             }
             match response.read(&mut buffer) {
                 Ok(0) => {
+                    if response_info
+                        .expected_end_exclusive
+                        .is_some_and(|end| offset < end)
+                    {
+                        break Err(format!(
+                            "connection ended early at byte {offset} of response ending at {}",
+                            response_info.expected_end_exclusive.unwrap()
+                        ));
+                    }
                     if total_len.is_some_and(|len| offset < len) {
                         break Err(format!(
                             "connection ended early at byte {offset} of {}",
@@ -517,10 +590,20 @@ fn network_worker(
                     break Ok(());
                 }
                 Ok(count) => {
+                    let next_offset = offset.saturating_add(count as u64);
+                    if response_info
+                        .expected_end_exclusive
+                        .is_some_and(|end| next_offset > end)
+                        || total_len.is_some_and(|len| next_offset > len)
+                    {
+                        break Err(format!(
+                            "HTTP body exceeded its declared byte range at byte {offset}"
+                        ));
+                    }
                     if let Some(writer) = cache_writer.as_mut() {
                         writer.append(&buffer[..count]);
                     }
-                    offset += count as u64;
+                    offset = next_offset;
                     metrics
                         .bytes_received
                         .fetch_add(count as u64, Ordering::Relaxed);
@@ -547,16 +630,14 @@ fn network_worker(
 
         match outcome {
             Ok(()) => {
-                let _ = sender.send(StreamMessage::End);
                 if let Some(writer) = cache_writer.take() {
+                    // This only stages the transfer. The decoder commits it after clean EOF.
                     writer.finish(total_len);
                 }
+                let _ = sender.send(StreamMessage::End);
                 return;
             }
             Err(_message) if reconnects < MAX_RECONNECTS => {
-                if let Some(writer) = cache_writer.as_mut() {
-                    writer.invalidate();
-                }
                 reconnects += 1;
                 metrics.reconnects.fetch_add(1, Ordering::Relaxed);
                 thread::sleep(Duration::from_millis(100 * reconnects));
@@ -571,12 +652,142 @@ fn network_worker(
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EntityIdentity {
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+impl EntityIdentity {
+    fn from_response(response: &Response) -> Self {
+        Self {
+            etag: header_text(response, ETAG),
+            last_modified: header_text(response, LAST_MODIFIED),
+        }
+    }
+
+    fn if_range(&self) -> Option<&str> {
+        self.etag
+            .as_deref()
+            .filter(|etag| !etag.trim_start().starts_with("W/"))
+            .or(self.last_modified.as_deref())
+    }
+
+    fn ensure_consistent_with(&self, current: &Self) -> Result<(), String> {
+        if let (Some(expected), Some(actual)) = (&self.etag, &current.etag)
+            && expected != actual
+        {
+            return Err("media entity ETag changed during reconnect".into());
+        }
+        if let (Some(expected), Some(actual)) = (&self.last_modified, &current.last_modified)
+            && expected != actual
+        {
+            return Err("media entity Last-Modified changed during reconnect".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentRangeInfo {
+    start: u64,
+    end: u64,
+    total: Option<u64>,
+}
+
+struct ResponseInfo {
+    total_len: Option<u64>,
+    expected_end_exclusive: Option<u64>,
+    supports_range: bool,
+    identity: EntityIdentity,
+}
+
+fn inspect_response(
+    response: &Response,
+    offset: u64,
+    known_total: Option<u64>,
+    known_identity: Option<&EntityIdentity>,
+) -> Result<ResponseInfo, String> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("media request returned HTTP {status}"));
+    }
+    if offset > 0 && status != StatusCode::PARTIAL_CONTENT {
+        return Err(format!(
+            "server ignored Range/If-Range request at byte {offset}, returned {status}"
+        ));
+    }
+
+    let content_range = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range);
+    let (total_len, expected_end_exclusive) = if status == StatusCode::PARTIAL_CONTENT {
+        let range = content_range.ok_or_else(|| {
+            format!("partial response at byte {offset} has no valid Content-Range")
+        })?;
+        if range.start != offset {
+            return Err(format!(
+                "partial response starts at byte {}, expected {offset}",
+                range.start
+            ));
+        }
+        if range.end < range.start || range.total.is_some_and(|total| range.end >= total) {
+            return Err("partial response contains an impossible Content-Range".into());
+        }
+        let body_len = range.end - range.start + 1;
+        if response
+            .content_length()
+            .is_some_and(|length| length != body_len)
+        {
+            return Err("partial response Content-Length disagrees with Content-Range".into());
+        }
+        (range.total, range.end.checked_add(1))
+    } else {
+        (response.content_length(), response.content_length())
+    };
+
+    if let (Some(expected), Some(actual)) = (known_total, total_len)
+        && expected != actual
+    {
+        return Err(format!(
+            "media entity length changed during reconnect ({expected} -> {actual})"
+        ));
+    }
+    let identity = EntityIdentity::from_response(response);
+    if let Some(known) = known_identity {
+        known.ensure_consistent_with(&identity)?;
+    }
+    let supports_range = status == StatusCode::PARTIAL_CONTENT
+        || response
+            .headers()
+            .get(ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("bytes"));
+    Ok(ResponseInfo {
+        total_len,
+        expected_end_exclusive,
+        supports_range,
+        identity,
+    })
+}
+
+fn header_text(response: &Response, name: reqwest::header::HeaderName) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
 fn send_request(
-    request: &ResolvedMediaRequest,
+    headers: &mut Vec<HttpHeader>,
     mut url: reqwest::Url,
     offset: u64,
+    if_range: Option<&str>,
+    effective_request: &Mutex<EffectiveRequest>,
 ) -> Result<Response, String> {
-    let mut headers = request.headers.clone();
     for redirect_count in 0..=MAX_MEDIA_REDIRECTS {
         let resolved = resolve_media_destination(&url)
             .map_err(|error| format!("media destination denied: {error}"))?;
@@ -585,12 +796,19 @@ fn send_request(
             .ok_or_else(|| "media URL has no host".to_owned())?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
+            .no_proxy()
+            .connect_timeout(CONNECT_TIMEOUT)
+            // The blocking response applies this deadline independently to each body read. It
+            // therefore acts as an idle timeout without limiting the total duration of a song.
+            .timeout(STREAM_IDLE_TIMEOUT)
             .resolve(host, resolved)
             .build()
             .map_err(|error| format!("failed to build pinned media client: {error}"))?;
         let mut builder = client.get(url.clone());
-        for header in &headers {
+        for header in headers.iter().filter(|header| {
+            !header.name.eq_ignore_ascii_case(RANGE.as_str())
+                && !header.name.eq_ignore_ascii_case(IF_RANGE.as_str())
+        }) {
             let name = HeaderName::from_bytes(header.name.as_bytes())
                 .map_err(|error| format!("invalid media request header name: {error}"))?;
             let value = HeaderValue::from_str(&header.value)
@@ -599,11 +817,15 @@ fn send_request(
         }
         if offset > 0 {
             builder = builder.header(RANGE, format!("bytes={offset}-"));
+            if let Some(if_range) = if_range {
+                builder = builder.header(IF_RANGE, if_range);
+            }
         }
         let response = builder
             .send()
             .map_err(|error| format!("media request failed: {error}"))?;
         if !response.status().is_redirection() {
+            update_effective_request(effective_request, response.url(), headers);
             return Ok(response);
         }
         if redirect_count == MAX_MEDIA_REDIRECTS {
@@ -618,17 +840,35 @@ fn send_request(
             .join(location)
             .map_err(|_| "media redirect Location is invalid".to_owned())?;
         if !same_origin(&url, &next) {
-            headers.retain(|header| {
-                !header.name.eq_ignore_ascii_case(AUTHORIZATION.as_str())
-                    && !header
-                        .name
-                        .eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str())
-                    && !header.name.eq_ignore_ascii_case(COOKIE.as_str())
-            });
+            strip_sensitive_headers(headers);
         }
         url = next;
+        // Publish sanitization at the redirect boundary, before the next socket request. A
+        // concurrent Seek can now only inherit the already-sanitized header set.
+        update_effective_request(effective_request, &url, headers);
     }
     Err("media redirect limit exceeded".into())
+}
+
+fn update_effective_request(
+    effective_request: &Mutex<EffectiveRequest>,
+    url: &reqwest::Url,
+    headers: &[HttpHeader],
+) {
+    if let Ok(mut effective) = effective_request.lock() {
+        effective.url = url.clone();
+        effective.headers = headers.to_vec();
+    }
+}
+
+fn strip_sensitive_headers(headers: &mut Vec<HttpHeader>) {
+    headers.retain(|header| {
+        !header.name.eq_ignore_ascii_case(AUTHORIZATION.as_str())
+            && !header
+                .name
+                .eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str())
+            && !header.name.eq_ignore_ascii_case(COOKIE.as_str())
+    });
 }
 
 fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
@@ -659,20 +899,18 @@ fn resolve_media_destination(url: &reqwest::Url) -> Result<std::net::SocketAddr,
     }
 }
 
-fn response_total_len(response: &Response, offset: u64) -> Option<u64> {
-    if let Some(total) = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_content_range_total)
-    {
-        return Some(total);
+fn parse_content_range(value: &str) -> Option<ContentRangeInfo> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    if range == "*" {
+        return None;
     }
-    response.content_length().map(|length| offset + length)
-}
-
-fn parse_content_range_total(value: &str) -> Option<u64> {
-    value.rsplit_once('/')?.1.parse().ok()
+    let (start, end) = range.split_once('-')?;
+    Some(ContentRangeInfo {
+        start: start.parse().ok()?,
+        end: end.parse().ok()?,
+        total: (total != "*").then(|| total.parse().ok()).flatten(),
+    })
 }
 
 fn add_signed(base: u64, delta: i64) -> io::Result<u64> {
@@ -696,10 +934,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_content_range_total() {
-        assert_eq!(parse_content_range_total("bytes 100-199/1000"), Some(1000));
-        assert_eq!(parse_content_range_total("bytes */1000"), Some(1000));
-        assert_eq!(parse_content_range_total("invalid"), None);
+    fn parses_complete_content_ranges() {
+        assert_eq!(
+            parse_content_range("bytes 100-199/1000"),
+            Some(ContentRangeInfo {
+                start: 100,
+                end: 199,
+                total: Some(1000),
+            })
+        );
+        assert_eq!(
+            parse_content_range("bytes 100-199/*"),
+            Some(ContentRangeInfo {
+                start: 100,
+                end: 199,
+                total: None,
+            })
+        );
+        assert_eq!(parse_content_range("bytes */1000"), None);
+        assert_eq!(parse_content_range("invalid"), None);
+    }
+
+    #[test]
+    fn redirect_sanitization_is_sticky_for_future_requests() {
+        let mut headers = vec![
+            HttpHeader {
+                name: "Authorization".into(),
+                value: "secret".into(),
+            },
+            HttpHeader {
+                name: "Cookie".into(),
+                value: "session=secret".into(),
+            },
+            HttpHeader {
+                name: "User-Agent".into(),
+                value: "GXPlayer".into(),
+            },
+        ];
+        strip_sensitive_headers(&mut headers);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].name, "User-Agent");
+    }
+
+    #[test]
+    fn entity_identity_rejects_validator_changes() {
+        let original = EntityIdentity {
+            etag: Some("\"one\"".into()),
+            last_modified: None,
+        };
+        let changed = EntityIdentity {
+            etag: Some("\"two\"".into()),
+            last_modified: None,
+        };
+        assert!(original.ensure_consistent_with(&changed).is_err());
+        assert_eq!(original.if_range(), Some("\"one\""));
     }
 
     #[test]

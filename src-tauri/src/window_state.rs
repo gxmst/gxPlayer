@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -27,6 +28,28 @@ pub struct WindowState {
     pub maximized: bool,
     pub always_on_top: bool,
     pub mini_mode: bool,
+}
+
+/// Process-local source of truth for mini mode. Geometry events must not trust a React closure
+/// because the resize generated while entering mini mode can arrive before frontend state updates.
+pub struct WindowModeState {
+    mini_mode: AtomicBool,
+}
+
+impl WindowModeState {
+    pub fn new(mini_mode: bool) -> Self {
+        Self {
+            mini_mode: AtomicBool::new(mini_mode),
+        }
+    }
+
+    pub fn mini_mode(&self) -> bool {
+        self.mini_mode.load(Ordering::Acquire)
+    }
+
+    pub fn set_mini_mode(&self, enabled: bool) {
+        self.mini_mode.store(enabled, Ordering::Release);
+    }
 }
 
 fn state_path(app_data: &Path) -> PathBuf {

@@ -49,8 +49,8 @@ pub enum SafeHttpError {
     InvalidRedirect,
     #[error("redirect limit exceeded")]
     TooManyRedirects,
-    #[error("response exceeded {0} bytes")]
-    ResponseTooLarge(usize),
+    #[error("HTTP {status} response exceeded {limit} bytes")]
+    ResponseTooLarge { limit: usize, status: u16 },
 }
 
 pub fn execute(mut request: SafeHttpRequest) -> Result<SafeHttpResponse, SafeHttpError> {
@@ -59,6 +59,10 @@ pub fn execute(mut request: SafeHttpRequest) -> Result<SafeHttpResponse, SafeHtt
         let host = request.url.host_str().ok_or(SafeHttpError::MissingHost)?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // Source scripts are untrusted input. Inheriting HTTP(S)_PROXY would let a local
+            // proxy bypass the DNS pinning performed above (and would disclose request data to
+            // an ambient process the user did not select for GXPlayer).
+            .no_proxy()
             .connect_timeout(request.timeout.min(Duration::from_secs(10)))
             .timeout(request.timeout)
             .resolve(host, resolved)
@@ -168,7 +172,10 @@ fn read_response(
         .read_to_end(&mut body)
         .map_err(|error| SafeHttpError::Request(error.to_string()))?;
     if body.len() > max_bytes {
-        return Err(SafeHttpError::ResponseTooLarge(max_bytes));
+        return Err(SafeHttpError::ResponseTooLarge {
+            limit: max_bytes,
+            status,
+        });
     }
     Ok(SafeHttpResponse {
         final_url,
@@ -198,19 +205,34 @@ fn is_private(address: IpAddr) -> bool {
 }
 
 fn private_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
     address.is_private()
         || address.is_loopback()
         || address.is_link_local()
         || address.is_broadcast()
         || address.is_unspecified()
         || address.is_documentation()
+        || address.is_multicast()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+        || octets[0] >= 240
 }
 
 fn private_ipv6(address: Ipv6Addr) -> bool {
+    // `Ipv6Addr::to_ipv4` covers both IPv4-compatible (`::127.0.0.1`) and
+    // IPv4-mapped (`::ffff:127.0.0.1`) spellings. Checking the embedded IPv4 address is
+    // essential: otherwise those literals bypass the IPv4 policy below DNS resolution.
+    if let Some(address) = address.to_ipv4() {
+        return private_ipv4(address);
+    }
+    let segments = address.segments();
     address.is_loopback()
         || address.is_unspecified()
-        || (address.segments()[0] & 0xfe00) == 0xfc00
-        || (address.segments()[0] & 0xffc0) == 0xfe80
+        || address.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
 }
 
 #[cfg(test)]
@@ -228,6 +250,9 @@ mod tests {
             "http://10.0.0.1/private",
             "http://169.254.1.1/private",
             "http://[::1]/private",
+            "http://[::127.0.0.1]/private",
+            "http://[::ffff:127.0.0.1]/private",
+            "http://[::ffff:10.0.0.1]/private",
             "http://localhost/private",
         ] {
             assert!(matches!(
@@ -285,7 +310,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             read_response(response, 4),
-            Err(SafeHttpError::ResponseTooLarge(4))
+            Err(SafeHttpError::ResponseTooLarge {
+                limit: 4,
+                status: 200
+            })
         ));
         server.join().unwrap();
     }

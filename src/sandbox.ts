@@ -1,10 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Buffer } from "buffer";
-import CryptoJS from "crypto-js";
-import forge from "node-forge";
-import * as pako from "pako";
-
-type RequestHandler = (payload: unknown) => unknown | Promise<unknown>;
+import SourceRealmWorker from "./sourceRealm.worker.ts?worker&inline";
 
 type LxHttpResponse = {
   statusCode: number;
@@ -12,136 +7,158 @@ type LxHttpResponse = {
   body: unknown;
 };
 
-let requestHandler: RequestHandler | null = null;
+type RealmMessage = {
+  type: string;
+  nonce?: string;
+  callId?: number;
+  command?: "http" | "send";
+  payload?: Record<string, unknown>;
+  requestId?: string | unknown;
+  generation?: number;
+  result?: unknown;
+  error?: string | null;
+  stage?: string;
+  poc?: boolean;
+  passed?: boolean;
+  details?: unknown;
+};
+
+let realmWorker: Worker | null = null;
+let realmNonce = "";
 let currentGeneration = 0;
 let pocMode = false;
 
-const EVENT_NAMES = {
-  request: "request",
-  inited: "inited",
-  updateAlert: "updateAlert",
-} as const;
-
-function toBuffer(value: Buffer | Uint8Array | string): Buffer {
-  return Buffer.isBuffer(value) ? value : Buffer.from(value);
+function randomNonce(): string {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function toWordArray(value: Buffer | Uint8Array | string): CryptoJS.lib.WordArray {
-  const bytes = toBuffer(value);
-  const words: number[] = [];
-  for (let index = 0; index < bytes.length; index += 1) {
-    words[index >>> 2] = (words[index >>> 2] || 0) | (bytes[index] << (24 - (index % 4) * 8));
+function destroySourceRealm(): void {
+  realmNonce = "";
+  if (realmWorker) {
+    realmWorker.terminate();
+    realmWorker = null;
   }
-  return CryptoJS.lib.WordArray.create(words, bytes.length);
 }
 
-function fromWordArray(value: CryptoJS.lib.WordArray): Buffer {
-  const output = Buffer.alloc(value.sigBytes);
-  for (let index = 0; index < value.sigBytes; index += 1) {
-    output[index] = (value.words[index >>> 2] >>> (24 - (index % 4) * 8)) & 0xff;
+function isActiveRealm(worker: Worker, nonce: string): boolean {
+  return realmWorker === worker && realmNonce === nonce;
+}
+
+async function reportRealmFailure(stage: string, error: unknown, generation: number, poc: boolean) {
+  if (poc) {
+    await invoke("lx_poc_failure", { stage, error: String(error) });
+  } else {
+    await invoke("lx_runtime_failure", { generation, stage, error: String(error) });
   }
-  return output;
 }
 
-function installLxContract(scriptInfo?: Record<string, unknown>): void {
-  requestHandler = null;
-  Object.assign(globalThis, { Buffer });
-  Object.assign(globalThis, {
-    lx: {
-      EVENT_NAMES,
-      version: "2.0.0",
-      env: "desktop",
-      currentScriptInfo: scriptInfo ?? {
-        name: "Phase-1 community compatibility script",
-        version: "external",
-        author: "external",
-        homepage: "",
-        rawScript: "",
-      },
-      request(
-        url: string,
-        options: Record<string, unknown> = {},
-        callback: (error: Error | null, response?: LxHttpResponse, body?: unknown) => void,
-      ) {
-        let cancelled = false;
-        void invoke<LxHttpResponse>("lx_http_request", { url, options })
-          .then((response) => {
-            if (!cancelled) callback(null, response, response.body);
-          })
-          .catch((error) => {
-            if (!cancelled) callback(new Error(String(error)));
-          });
-        return () => {
-          cancelled = true;
-        };
-      },
-      on(eventName: string, handler: RequestHandler) {
-        if (eventName !== EVENT_NAMES.request) {
-          return Promise.reject(new Error(`Unsupported event: ${eventName}`));
+async function handleBridgeCall(worker: Worker, nonce: string, message: RealmMessage) {
+  const callId = message.callId;
+  if (typeof callId !== "number" || !message.command || !message.payload) return;
+  try {
+    let result: unknown;
+    if (message.command === "http") {
+      result = await invoke<LxHttpResponse>("lx_http_request", {
+        url: message.payload.url,
+        options: message.payload.options ?? {},
+      });
+    } else if (message.command === "send") {
+      const eventName = message.payload.eventName;
+      if (eventName !== "inited" && eventName !== "updateAlert") {
+        throw new Error(`Unsupported LX send event: ${String(eventName)}`);
+      }
+      result = await invoke("lx_send", {
+        eventName,
+        data: message.payload.data,
+        generation: message.payload.generation,
+      });
+    } else {
+      throw new Error("Unsupported source-realm bridge command");
+    }
+    if (isActiveRealm(worker, nonce)) {
+      worker.postMessage({ type: "bridgeResult", nonce, callId, result: result ?? null });
+    }
+  } catch (error) {
+    if (isActiveRealm(worker, nonce)) {
+      worker.postMessage({ type: "bridgeResult", nonce, callId, error: String(error) });
+    }
+  }
+}
+
+async function handleRealmMessage(worker: Worker, nonce: string, message: RealmMessage) {
+  if (!isActiveRealm(worker, nonce) || message.nonce !== nonce) return;
+  switch (message.type) {
+    case "bridge":
+      await handleBridgeCall(worker, nonce, message);
+      break;
+    case "runtimeResult":
+      if (message.poc) {
+        if (message.error) {
+          await invoke("lx_poc_failure", { stage: "music-url", error: message.error });
+        } else {
+          await invoke("lx_poc_result", { result: message.result });
         }
-        requestHandler = handler;
-        return Promise.resolve();
-      },
-      send(eventName: string, data: unknown) {
-        if (eventName !== EVENT_NAMES.inited && eventName !== EVENT_NAMES.updateAlert) {
-          return Promise.reject(new Error(`Unsupported event: ${eventName}`));
-        }
-        return invoke("lx_send", { eventName, data, generation: currentGeneration });
-      },
-      utils: {
-        crypto: {
-          aesEncrypt(
-            data: Buffer | Uint8Array | string,
-            algorithm: string,
-            key: Buffer | Uint8Array | string,
-            iv: Buffer | Uint8Array | string,
-          ) {
-            const mode = algorithm.toLowerCase().includes("ecb")
-              ? CryptoJS.mode.ECB
-              : CryptoJS.mode.CBC;
-            const encrypted = CryptoJS.AES.encrypt(toWordArray(data), toWordArray(key), {
-              iv: toWordArray(iv),
-              mode,
-              padding: CryptoJS.pad.Pkcs7,
-            });
-            return fromWordArray(encrypted.ciphertext);
-          },
-          rsaEncrypt(data: Buffer | Uint8Array | string, publicKeyPem: string) {
-            const input = toBuffer(data);
-            if (input.length > 128) throw new Error("RSA raw input exceeds 128 bytes");
-            const padded = Buffer.concat([Buffer.alloc(128 - input.length), input]);
-            const publicKey = forge.pki.publicKeyFromPem(publicKeyPem);
-            const encrypted = publicKey.encrypt(padded.toString("binary"), "RAW");
-            return Buffer.from(encrypted, "binary");
-          },
-          randomBytes(size: number) {
-            const output = Buffer.alloc(size);
-            crypto.getRandomValues(output);
-            return output;
-          },
-          md5(value: Buffer | Uint8Array | string) {
-            return CryptoJS.MD5(toWordArray(value)).toString(CryptoJS.enc.Hex);
-          },
-        },
-        buffer: {
-          from(value: unknown, encoding?: BufferEncoding) {
-            return Buffer.from(value as never, encoding);
-          },
-          bufToString(value: Buffer | Uint8Array | string, encoding?: BufferEncoding) {
-            return toBuffer(value).toString(encoding);
-          },
-        },
-        zlib: {
-          async inflate(value: Buffer | Uint8Array) {
-            return Buffer.from(pako.inflate(value));
-          },
-          async deflate(value: Buffer | Uint8Array | string) {
-            return Buffer.from(pako.deflate(toBuffer(value)));
-          },
-        },
-      },
-    },
+      } else {
+        await invoke("lx_runtime_result", {
+          requestId: message.requestId,
+          generation: message.generation,
+          result: message.error ? null : message.result,
+          error: message.error ?? null,
+        });
+      }
+      break;
+    case "runtimeFailure":
+      await reportRealmFailure(
+        message.stage ?? "community-script",
+        message.error ?? "unknown source realm failure",
+        message.generation ?? currentGeneration,
+        Boolean(message.poc),
+      );
+      break;
+    case "cryptoResult":
+      if (message.error) {
+        await invoke("lx_poc_failure", { stage: "sync-crypto", error: message.error });
+      } else {
+        await invoke("lx_crypto_result", {
+          passed: Boolean(message.passed),
+          details: message.details ?? {},
+        });
+      }
+      break;
+  }
+}
+
+function createSourceRealm(
+  script: string,
+  context: {
+    generation?: number;
+    poc?: boolean;
+    scriptInfo?: Record<string, unknown>;
+    config?: Record<string, unknown>;
+  },
+): void {
+  destroySourceRealm();
+  const nonce = randomNonce();
+  const worker = new SourceRealmWorker({ name: "gx-lx-source-realm" });
+  realmWorker = worker;
+  realmNonce = nonce;
+  worker.addEventListener("message", (event: MessageEvent<RealmMessage>) => {
+    void handleRealmMessage(worker, nonce, event.data).catch((error) => {
+      if (isActiveRealm(worker, nonce)) console.error("LX source bridge failed", error);
+    });
   });
+  worker.addEventListener("error", (event) => {
+    if (!isActiveRealm(worker, nonce)) return;
+    void reportRealmFailure(
+      "source-worker",
+      event.message || "LX source worker crashed",
+      currentGeneration,
+      pocMode,
+    );
+  });
+  worker.postMessage({ type: "launch", nonce, script, context });
 }
 
 Object.assign(window, {
@@ -156,84 +173,33 @@ Object.assign(window, {
   ) {
     currentGeneration = context.generation ?? 0;
     pocMode = context.poc ?? false;
-    try {
-      installLxContract(context.scriptInfo);
-      Object.assign(globalThis, {
-        ls: context.config ?? { api: { addr: "http://gx.invalid/", pass: "" } },
-      });
-      await (0, eval)(script);
-    } catch (error) {
-      if (pocMode) {
-        await invoke("lx_poc_failure", { stage: "community-script", error: String(error) });
-      } else {
-        await invoke("lx_runtime_failure", {
-          generation: currentGeneration,
-          stage: "community-script",
-          error: String(error),
-        });
-      }
-    }
+    createSourceRealm(script, context);
   },
   async __gxDispatchRequest(requestId: string | unknown, payload?: unknown, generation?: number) {
+    const worker = realmWorker;
+    const nonce = realmNonce;
+    if (!worker || !nonce) throw new Error("LX source realm is unavailable");
     const isPocRequest = payload === undefined;
-    const actualPayload = isPocRequest ? requestId : payload;
-    try {
-      if (!requestHandler) throw new Error("Request event is not defined");
-      const raw = await requestHandler(actualPayload);
-      const result = (isPocRequest || pocMode) && typeof raw === "string" ? { url: raw, type: "128k" } : raw;
-      if (isPocRequest || pocMode) {
-        await invoke("lx_poc_result", { result });
-      } else {
-        await invoke("lx_runtime_result", {
-          requestId,
-          generation: generation ?? currentGeneration,
-          result,
-          error: null,
-        });
-      }
-    } catch (error) {
-      if (isPocRequest || pocMode) {
-        await invoke("lx_poc_failure", { stage: "music-url", error: String(error) });
-      } else {
-        await invoke("lx_runtime_result", {
-          requestId,
-          generation: generation ?? currentGeneration,
-          result: null,
-          error: String(error),
-        });
-      }
-    }
+    worker.postMessage({
+      type: "dispatch",
+      nonce,
+      requestId,
+      payload: isPocRequest ? requestId : payload,
+      generation: generation ?? currentGeneration,
+      poc: isPocRequest || pocMode,
+    });
   },
   async __gxRunCryptoSelfTest() {
-    try {
-      const lx = (globalThis as typeof globalThis & { lx: any }).lx;
-      const publicKey = `-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDgtQn2JZ34ZC28NWYpAUd98iZ37BUrX/aKzmFbt7clFSs6sXqHauqKWqdtLkF2KexO40H1YTX8z2lSgBBOAxLsvaklV8k4cBFK9snQXE9/DDaFt6Rr7iVZMldczhC0JNgTz+SHXT6CBHuX3e9SdB1Ua44oncaTWz7OBGLbCiK45wIDAQAB\n-----END PUBLIC KEY-----`;
-      const aes = lx.utils.crypto.aesEncrypt(
-        Buffer.from("phase-1"),
-        "aes-128-cbc",
-        Buffer.from("0123456789abcdef"),
-        Buffer.from("abcdef0123456789"),
-      );
-      const rsa = lx.utils.crypto.rsaEncrypt(Buffer.from("phase-1"), publicKey);
-      const md5 = lx.utils.crypto.md5("phase-1");
-      const random = lx.utils.crypto.randomBytes(32);
-      const compressed = await lx.utils.zlib.deflate(Buffer.from("gxplayer-zlib"));
-      const inflated = await lx.utils.zlib.inflate(compressed);
-      const passed =
-        Buffer.isBuffer(aes) &&
-        aes.length === 16 &&
-        Buffer.isBuffer(rsa) &&
-        rsa.length === 128 &&
-        md5 === "886fb78f4674a6619afd8822efc65877" &&
-        random.length === 32 &&
-        inflated.toString() === "gxplayer-zlib";
-      await invoke("lx_crypto_result", {
-        passed,
-        details: { aesLength: aes.length, rsaLength: rsa.length, md5 },
+    const worker = realmWorker;
+    const nonce = realmNonce;
+    if (!worker || !nonce) {
+      await invoke("lx_poc_failure", {
+        stage: "sync-crypto",
+        error: "LX source realm is unavailable",
       });
-    } catch (error) {
-      await invoke("lx_poc_failure", { stage: "sync-crypto", error: String(error) });
+      return;
     }
+    worker.postMessage({ type: "cryptoSelfTest", nonce });
   },
   async __gxRunSecuritySelfTest() {
     const results = {
@@ -289,6 +255,8 @@ Object.assign(window, {
     await invoke("lx_security_result", { results });
   },
 });
+
+window.addEventListener("beforeunload", destroySourceRealm, { once: true });
 
 void invoke("sandbox_ready").catch((error) => {
   console.error("Failed to announce LX sandbox readiness", error);

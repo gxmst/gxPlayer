@@ -142,6 +142,14 @@ impl LibraryStore {
     }
 
     pub fn add_tracks(&self, tracks: &[NewTrack]) -> Result<Vec<LibraryTrack>> {
+        self.upsert_tracks(tracks)?;
+        self.list_tracks(10_000)
+    }
+
+    /// Insert or refresh track metadata without allocating and returning the
+    /// entire library. Playback/import command paths should prefer this method;
+    /// `add_tracks` remains for callers that explicitly need a refreshed list.
+    pub fn upsert_tracks(&self, tracks: &[NewTrack]) -> Result<()> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction()?;
         let now = now_ms();
@@ -168,8 +176,7 @@ impl LibraryStore {
             )?;
         }
         transaction.commit()?;
-        drop(connection);
-        self.list_tracks(10_000)
+        Ok(())
     }
 
     pub fn list_tracks(&self, limit: usize) -> Result<Vec<LibraryTrack>> {
@@ -181,6 +188,32 @@ impl LibraryStore {
              FROM tracks t ORDER BY t.added_at_ms DESC, t.id DESC LIMIT ?1",
             params![limit.min(10_000) as i64],
         )
+    }
+
+    pub fn track_by_path(&self, path: &str) -> Result<Option<LibraryTrack>> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .query_row(
+                "SELECT t.id, t.path, t.title, t.artist, t.album, t.duration_seconds,
+                        EXISTS(SELECT 1 FROM favorites f WHERE f.track_id=t.id), t.added_at_ms
+                 FROM tracks t WHERE t.path=?1",
+                [path],
+                |row| {
+                    Ok(LibraryTrack {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        title: row.get(2)?,
+                        artist: row.get(3)?,
+                        album: row.get(4)?,
+                        duration_seconds: row.get(5)?,
+                        favorite: row.get(6)?,
+                        added_at_ms: row.get(7)?,
+                        missing: false,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn list_favorites(&self) -> Result<Vec<LibraryTrack>> {
@@ -500,6 +533,32 @@ mod tests {
             ])
             .unwrap();
         let one = tracks.iter().find(|track| track.title == "One").unwrap();
+        assert_eq!(
+            store
+                .track_by_path("C:/Music/one.flac")
+                .unwrap()
+                .unwrap()
+                .album,
+            "Album"
+        );
+        store
+            .upsert_tracks(&[NewTrack {
+                path: "C:/Music/one.flac".into(),
+                title: "One (Remastered)".into(),
+                artist: "Artist".into(),
+                album: "Album".into(),
+                duration_seconds: Some(121.0),
+            }])
+            .unwrap();
+        assert_eq!(store.list_tracks(100).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .track_by_path("C:/Music/one.flac")
+                .unwrap()
+                .unwrap()
+                .title,
+            "One (Remastered)"
+        );
         store.set_favorite(one.id, true).unwrap();
         let playlist = store.create_playlist("夜间").unwrap();
         store.add_to_playlist(playlist.id, one.id).unwrap();

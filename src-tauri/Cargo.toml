@@ -1,7 +1,7 @@
 [package]
 name = "gxplayer"
 version.workspace = true
-description = "A Tauri App"
+description = "Native Windows music player with local libraries, isolated online sources and media controls"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -20,7 +20,6 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde.workspace = true
 serde_json.workspace = true
@@ -36,3 +35,6 @@ regex.workspace = true
 url.workspace = true
 base64 = "0.22"
 souvlaki = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.44", features = ["Win32_System_WinRT"] }

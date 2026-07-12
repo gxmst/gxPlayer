@@ -90,8 +90,8 @@ pub fn library_embedded_cover(
     if path.len() > 1024 {
         return Err("path too long".into());
     }
-    let cover = gx_audio::extract_embedded_cover(PathBuf::from(&path))
-        .map_err(|e| e.to_string())?;
+    let cover =
+        gx_audio::extract_embedded_cover(PathBuf::from(&path)).map_err(|e| e.to_string())?;
     Ok(cover.map(|c| CoverPayload {
         mime: c.mime.clone(),
         data_url: format!("data:{};base64,{}", c.mime, B64.encode(&c.data)),
@@ -109,15 +109,23 @@ pub fn window_get_state(window: WebviewWindow, app: AppHandle) -> Result<WindowS
 pub fn window_save_state(
     window: WebviewWindow,
     app: AppHandle,
+    mode: State<'_, window_state::WindowModeState>,
     mini_mode: Option<bool>,
 ) -> Result<WindowState, String> {
     require_window(&window, "main")?;
+    let _ = mini_mode; // retained for IPC compatibility; backend runtime state is authoritative.
     let app_data = window_state::app_data_dir(&app)?;
     let previous = window_state::load(&app_data);
+    // A mini-mode resize event must never overwrite the remembered normal geometry. The backend
+    // state is authoritative even if the frontend event closure still holds the old boolean.
+    if mode.mini_mode() {
+        let mut state = previous;
+        state.mini_mode = true;
+        window_state::save(&app_data, &state)?;
+        return Ok(state);
+    }
     // Skip save when minimized/hidden/off-screen so we never persist garbage coords.
-    if let Some(state) =
-        window_state::capture_from_window(&window, mini_mode.unwrap_or(previous.mini_mode))
-    {
+    if let Some(state) = window_state::capture_from_window(&window, false) {
         window_state::save(&app_data, &state)?;
         Ok(state)
     } else {
@@ -138,10 +146,13 @@ pub fn window_force_show(window: WebviewWindow, app: AppHandle) -> Result<(), St
 pub fn window_set_always_on_top(
     window: WebviewWindow,
     app: AppHandle,
+    mode: State<'_, window_state::WindowModeState>,
     enabled: bool,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
-    window.set_always_on_top(enabled).map_err(|e| e.to_string())?;
+    window
+        .set_always_on_top(enabled || mode.mini_mode())
+        .map_err(|e| e.to_string())?;
     let app_data = window_state::app_data_dir(&app)?;
     let mut state = window_state::load(&app_data);
     state.always_on_top = enabled;
@@ -153,6 +164,7 @@ pub fn window_set_always_on_top(
 pub fn window_set_mini_mode(
     window: WebviewWindow,
     app: AppHandle,
+    mode: State<'_, window_state::WindowModeState>,
     enabled: bool,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
@@ -174,7 +186,6 @@ pub fn window_set_mini_mode(
         window.set_always_on_top(true).map_err(|e| e.to_string())?;
         let _ = window.center();
         state.mini_mode = true;
-        state.always_on_top = true;
     } else {
         state.mini_mode = false;
         let width = state.width.unwrap_or(1100.0).max(720.0);
@@ -191,6 +202,7 @@ pub fn window_set_mini_mode(
             let _ = window.center();
         }
     }
+    mode.set_mini_mode(enabled);
     window_state::save(&app_data, &state)?;
     Ok(())
 }

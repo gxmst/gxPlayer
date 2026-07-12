@@ -43,7 +43,21 @@ pub struct ManagedSource {
 pub struct SourceBackup {
     pub version: u32,
     pub active_source_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub fallback_enabled: bool,
+    /// `None` preserves automatic import-order fallback selection for older backups.
+    #[serde(default)]
+    pub fallback_source_ids: Option<Vec<String>>,
     pub sources: Vec<BackupSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceFallbackConfig {
+    pub enabled: bool,
+    pub source_ids: Vec<String>,
+    /// False means the order is still automatic and follows the stable import order.
+    pub explicitly_configured: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,11 +71,26 @@ pub struct BackupSource {
     pub config: Value,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SourceConfig {
     active_source_id: Option<String>,
+    #[serde(default = "default_true")]
+    fallback_enabled: bool,
+    #[serde(default)]
+    fallback_source_ids: Option<Vec<String>>,
     sources: Vec<ManagedSource>,
+}
+
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self {
+            active_source_id: None,
+            fallback_enabled: true,
+            fallback_source_ids: None,
+            sources: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -82,6 +111,8 @@ pub enum SourceStoreError {
     InvalidConfig,
     #[error("source config is larger than 256 KiB")]
     ConfigTooLarge,
+    #[error("invalid source fallback order: {0}")]
+    InvalidFallbackOrder(String),
     #[error("source storage I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("source storage JSON failed: {0}")]
@@ -319,6 +350,90 @@ impl SourceStore {
         self.persist()
     }
 
+    pub fn fallback_config(&self) -> SourceFallbackConfig {
+        let explicitly_configured = self.config.fallback_source_ids.is_some();
+        let configured = self
+            .config
+            .fallback_source_ids
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| {
+                self.config
+                    .sources
+                    .iter()
+                    .map(|source| source.id.clone())
+                    .collect()
+            });
+        let valid_ids = self
+            .config
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        let source_ids = configured
+            .into_iter()
+            .filter(|id| valid_ids.contains(id.as_str()) && seen.insert(id.clone()))
+            .collect();
+        SourceFallbackConfig {
+            enabled: self.config.fallback_enabled,
+            source_ids,
+            explicitly_configured,
+        }
+    }
+
+    pub fn set_fallback_config(
+        &mut self,
+        enabled: bool,
+        source_ids: Vec<String>,
+    ) -> Result<(), SourceStoreError> {
+        let valid_ids = self
+            .config
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        for id in &source_ids {
+            if !valid_ids.contains(id.as_str()) {
+                return Err(SourceStoreError::SourceNotFound(id.clone()));
+            }
+            if !seen.insert(id.clone()) {
+                return Err(SourceStoreError::InvalidFallbackOrder(format!(
+                    "source '{id}' appears more than once"
+                )));
+            }
+        }
+        self.config.fallback_enabled = enabled;
+        self.config.fallback_source_ids = Some(source_ids);
+        self.persist()
+    }
+
+    /// Returns the requested/active source first, then enabled fallbacks in stable order.
+    pub fn resolution_source_ids(
+        &self,
+        requested_source_id: Option<&str>,
+    ) -> Result<Vec<String>, SourceStoreError> {
+        let primary = requested_source_id
+            .map(str::to_owned)
+            .or_else(|| self.valid_active_source_id());
+        if let Some(id) = primary.as_deref()
+            && !self.config.sources.iter().any(|source| source.id == id)
+        {
+            return Err(SourceStoreError::SourceNotFound(id.into()));
+        }
+        let mut source_ids = primary.into_iter().collect::<Vec<_>>();
+        if !self.config.fallback_enabled {
+            return Ok(source_ids);
+        }
+        for id in self.fallback_config().source_ids {
+            if !source_ids.iter().any(|known| known == &id) {
+                source_ids.push(id);
+            }
+        }
+        Ok(source_ids)
+    }
+
     pub fn active_updates_enabled(&self) -> bool {
         self.config
             .active_source_id
@@ -344,6 +459,9 @@ impl SourceStore {
             .position(|source| source.id == id)
             .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
         let removed = self.config.sources.remove(index);
+        if let Some(source_ids) = self.config.fallback_source_ids.as_mut() {
+            source_ids.retain(|source_id| source_id != id);
+        }
         if removed.script_path.starts_with(&self.root) {
             let _ = fs::remove_file(removed.script_path);
         }
@@ -399,6 +517,8 @@ impl SourceStore {
         Ok(SourceBackup {
             version: 1,
             active_source_id: self.config.active_source_id.clone(),
+            fallback_enabled: self.config.fallback_enabled,
+            fallback_source_ids: self.config.fallback_source_ids.clone(),
             sources,
         })
     }
@@ -454,6 +574,20 @@ impl SourceStore {
             .active_source_id
             .filter(|id| self.config.sources.iter().any(|source| &source.id == id))
             .or_else(|| self.config.sources.first().map(|source| source.id.clone()));
+        self.config.fallback_enabled = backup.fallback_enabled;
+        self.config.fallback_source_ids = backup.fallback_source_ids.map(|source_ids| {
+            let valid_ids = self
+                .config
+                .sources
+                .iter()
+                .map(|source| source.id.as_str())
+                .collect::<HashSet<_>>();
+            let mut seen = HashSet::new();
+            source_ids
+                .into_iter()
+                .filter(|id| valid_ids.contains(id.as_str()) && seen.insert(id.clone()))
+                .collect()
+        });
         self.persist()
     }
 
@@ -752,6 +886,61 @@ mod tests {
             .import_drop_in_dir(&root.join("does-not-exist"))
             .unwrap();
         assert_eq!(report, DropInImportReport::default());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fallback_chain_is_stable_configurable_and_survives_reopen() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        let first = store
+            .import_script("lx.on('request', () => 1)", "test:first", "First")
+            .unwrap();
+        let second = store
+            .import_script("lx.on('request', () => 2)", "test:second", "Second")
+            .unwrap();
+        let third = store
+            .import_script("lx.on('request', () => 3)", "test:third", "Third")
+            .unwrap();
+
+        assert_eq!(
+            store.resolution_source_ids(None).unwrap(),
+            [first.id.clone(), second.id.clone(), third.id.clone()]
+        );
+        assert!(!store.fallback_config().explicitly_configured);
+
+        store.activate(&second.id).unwrap();
+        store
+            .set_fallback_config(true, vec![third.id.clone(), first.id.clone()])
+            .unwrap();
+        assert_eq!(
+            store.resolution_source_ids(None).unwrap(),
+            [second.id.clone(), third.id.clone(), first.id.clone()]
+        );
+        assert!(store.fallback_config().explicitly_configured);
+
+        let fourth = store
+            .import_script("lx.on('request', () => 4)", "test:fourth", "Fourth")
+            .unwrap();
+        assert!(
+            !store
+                .fallback_config()
+                .source_ids
+                .iter()
+                .any(|id| id == &fourth.id)
+        );
+
+        drop(store);
+        let mut reopened = SourceStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.resolution_source_ids(None).unwrap(),
+            [second.id.clone(), third.id.clone(), first.id.clone()]
+        );
+        reopened.set_fallback_config(false, vec![]).unwrap();
+        assert_eq!(
+            reopened.resolution_source_ids(Some(&third.id)).unwrap(),
+            [third.id]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,7 +1,7 @@
 use gx_audio::engine::LocalAudioEngine;
 use gx_cache::{CacheEntryView, CacheKey, CacheStatus, CacheStore};
 use gx_metadata::CatalogTrack;
-use tauri::WebviewWindow;
+use tauri::{Manager, WebviewWindow};
 
 use crate::require_window;
 use crate::source_runtime::{MAX_RUNTIME_PAYLOAD_BYTES, ensure_json_size};
@@ -142,7 +142,9 @@ pub fn cache_remove_entries(
     if keys.len() > 5_000 {
         return Err("一次最多删除 5000 条缓存".into());
     }
-    cache.remove_entries(&keys).map_err(|error| error.to_string())
+    cache
+        .remove_entries(&keys)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -175,13 +177,53 @@ pub fn player_play_cache_entry(
         provider_track_id,
         quality,
     };
+    let listed = cache.list_entries().into_iter().find(|entry| {
+        entry.provider_id == key.provider_id
+            && entry.provider_track_id == key.provider_track_id
+            && entry.quality == key.quality
+    });
+    let favorite = cache
+        .online_favorites()
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<CatalogTrack>(value).ok())
+        .find(|track| {
+            track.provider_id == key.provider_id && track.provider_track_id == key.provider_track_id
+        });
     let hit = cache
         .lookup(&key)
         .ok_or_else(|| "该缓存条目不存在或文件已丢失".to_owned())?;
     let play_title = title
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| listed.as_ref().map(|entry| entry.title.clone()))
         .unwrap_or_else(|| hit.key.provider_track_id.clone());
+    let artist = listed
+        .as_ref()
+        .map(|entry| entry.artist.clone())
+        .or_else(|| favorite.as_ref().map(|track| track.artist.clone()))
+        .unwrap_or_default();
+    let album = listed
+        .as_ref()
+        .map(|entry| entry.album.clone())
+        .or_else(|| favorite.as_ref().map(|track| track.album.clone()))
+        .unwrap_or_default();
+    let cover_url = favorite
+        .as_ref()
+        .and_then(|track| track.artwork_url.as_ref())
+        .map(ToString::to_string);
+    let minimum_generation = crate::media_session::next_engine_generation(&engine);
+    let location = hit.audio_path.display().to_string();
+    let metadata_title = play_title.clone();
     engine
         .load_cached_online(hit.audio_path, play_title)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    crate::media_session::set_cached_metadata(
+        window.app_handle(),
+        metadata_title,
+        artist,
+        album,
+        cover_url,
+        minimum_generation,
+        location,
+    );
+    Ok(())
 }

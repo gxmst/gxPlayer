@@ -1,5 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use gx_audio::engine::LocalAudioEngine;
@@ -8,8 +11,8 @@ use gx_contracts::ResolvedMediaRequest;
 use gx_metadata::{
     CatalogTrack, find_replacements, search_all, search_kugou, search_kuwo, search_netease,
 };
-use gx_source::SourceBackup;
-use gx_source::safe_http::{SafeHttpRequest, execute};
+use gx_source::safe_http::{SafeHttpError, SafeHttpRequest, execute};
+use gx_source::{SourceBackup, SourceFallbackConfig};
 use reqwest::{Method, Url};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -37,11 +40,133 @@ pub struct ImportResult {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OnlinePlaybackResult {
+    pub outcome: ResolveOutcome,
     pub track: CatalogTrack,
     pub source_id: Option<String>,
     pub source_name: Option<String>,
     pub quality: Option<String>,
     pub cache_hit: bool,
+    pub attempts: Vec<ResolveAttemptDiagnostic>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolveOutcome {
+    Started,
+    Failed,
+    Cancelled,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveAttemptDiagnostic {
+    pub source_id: Option<String>,
+    pub source_name: Option<String>,
+    pub provider_id: String,
+    pub provider_track_id: String,
+    pub quality: Option<String>,
+    pub stage: String,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+const RESOLVE_ACTIVE: u8 = 0;
+const RESOLVE_CANCELLED: u8 = 1;
+const RESOLVE_STALE: u8 = 2;
+
+#[derive(Clone)]
+pub(crate) struct ResolveToken {
+    request_id: String,
+    state: Arc<AtomicU8>,
+}
+
+impl ResolveToken {
+    pub(crate) fn outcome(&self) -> Option<ResolveOutcome> {
+        match self.state.load(Ordering::Acquire) {
+            RESOLVE_CANCELLED => Some(ResolveOutcome::Cancelled),
+            RESOLVE_STALE => Some(ResolveOutcome::Stale),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResolveRegistryInner {
+    current_request_id: Option<String>,
+    requests: HashMap<String, Arc<AtomicU8>>,
+}
+
+#[derive(Default)]
+pub struct ResolveCancellationRegistry {
+    inner: Mutex<ResolveRegistryInner>,
+}
+
+impl ResolveCancellationRegistry {
+    pub(crate) fn begin(&self, request_id: String) -> Result<ResolveToken, String> {
+        let request_id = request_id.trim().to_owned();
+        if request_id.is_empty() || request_id.len() > 160 {
+            return Err("resolve requestId must contain 1 to 160 characters".into());
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(previous_id) = inner.current_request_id.take()
+            && previous_id != request_id
+            && let Some(previous) = inner.requests.get(&previous_id)
+        {
+            previous.store(RESOLVE_STALE, Ordering::Release);
+        }
+        if let Some(previous) = inner.requests.remove(&request_id) {
+            previous.store(RESOLVE_STALE, Ordering::Release);
+        }
+        let state = Arc::new(AtomicU8::new(RESOLVE_ACTIVE));
+        inner.requests.insert(request_id.clone(), state.clone());
+        inner.current_request_id = Some(request_id.clone());
+        Ok(ResolveToken { request_id, state })
+    }
+
+    fn cancel(&self, request_id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let Some(state) = inner.requests.get(request_id) else {
+            return false;
+        };
+        state.store(RESOLVE_CANCELLED, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn run_if_active<T>(
+        &self,
+        token: &ResolveToken,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, ResolveOutcome> {
+        let inner = self.inner.lock().unwrap();
+        let owns_current = inner.current_request_id.as_deref() == Some(token.request_id.as_str())
+            && inner
+                .requests
+                .get(&token.request_id)
+                .is_some_and(|state| Arc::ptr_eq(state, &token.state));
+        if !owns_current {
+            return Err(token.outcome().unwrap_or(ResolveOutcome::Stale));
+        }
+        if let Some(outcome) = token.outcome() {
+            return Err(outcome);
+        }
+        Ok(operation())
+    }
+
+    pub(crate) fn finish(&self, token: &ResolveToken) {
+        let mut inner = self.inner.lock().unwrap();
+        let owns_request = inner
+            .requests
+            .get(&token.request_id)
+            .is_some_and(|state| Arc::ptr_eq(state, &token.state));
+        if owns_request {
+            inner.requests.remove(&token.request_id);
+            if inner.current_request_id.as_deref() == Some(token.request_id.as_str()) {
+                inner.current_request_id = None;
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -241,6 +366,31 @@ pub fn source_set_config(
 }
 
 #[tauri::command]
+pub fn source_get_fallback_config(
+    window: WebviewWindow,
+    runtime: tauri::State<SourceRuntime>,
+) -> Result<SourceFallbackConfig, String> {
+    require_window(&window, "main")?;
+    Ok(runtime.fallback_config())
+}
+
+#[tauri::command]
+pub fn source_set_fallback_config(
+    window: WebviewWindow,
+    runtime: tauri::State<SourceRuntime>,
+    enabled: bool,
+    source_ids: Vec<String>,
+) -> Result<SourceFallbackConfig, String> {
+    require_window(&window, "main")?;
+    runtime.serialized(|| {
+        runtime
+            .set_fallback_config(enabled, source_ids)
+            .map_err(|error| error.to_string())
+    })?;
+    Ok(runtime.fallback_config())
+}
+
+#[tauri::command]
 pub fn source_export_backup(
     window: WebviewWindow,
     runtime: tauri::State<SourceRuntime>,
@@ -278,10 +428,36 @@ pub async fn source_resolve(
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        resolve_serialized(&app, payload, quality.as_deref(), source_id.as_deref())
+        resolve_with_fallback(&app, payload, quality.as_deref(), source_id.as_deref())
     })
     .await
     .map_err(|error| format!("LX resolver task failed: {error}"))?
+}
+
+fn resolve_with_fallback(
+    app: &AppHandle,
+    payload: Value,
+    quality: Option<&str>,
+    requested_source_id: Option<&str>,
+) -> Result<ResolvedMediaRequest, String> {
+    let source_ids = app
+        .state::<SourceRuntime>()
+        .resolution_source_ids(requested_source_id)
+        .map_err(|error| error.to_string())?;
+    if source_ids.is_empty() {
+        return Err("no LX source is available".into());
+    }
+    let mut errors = Vec::new();
+    for source_id in source_ids {
+        match resolve_serialized(app, payload.clone(), quality, Some(&source_id)) {
+            Ok(request) => return Ok(request),
+            Err(error) => errors.push(format!("{source_id}: {error}")),
+        }
+    }
+    Err(format!(
+        "all LX source fallbacks failed ({})",
+        errors.join("; ")
+    ))
 }
 
 #[tauri::command]
@@ -290,12 +466,40 @@ pub async fn player_play_online_track(
     track: CatalogTrack,
     quality: Option<String>,
     source_id: Option<String>,
+    request_id: Option<String>,
 ) -> Result<OnlinePlaybackResult, String> {
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
-    tauri::async_runtime::spawn_blocking(move || play_online_track(&app, track, quality, source_id))
-        .await
-        .map_err(|error| format!("online playback task failed: {error}"))?
+    let token = request_id
+        .map(|request_id| app.state::<ResolveCancellationRegistry>().begin(request_id))
+        .transpose()?;
+    let token_for_worker = token.clone();
+    let app_for_worker = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        play_online_track(
+            &app_for_worker,
+            track,
+            quality,
+            source_id,
+            token_for_worker.as_ref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("online playback task failed: {error}"))?;
+    if let Some(token) = token.as_ref() {
+        app.state::<ResolveCancellationRegistry>().finish(token);
+    }
+    result
+}
+
+#[tauri::command]
+pub fn player_cancel_resolve(
+    window: WebviewWindow,
+    registry: tauri::State<ResolveCancellationRegistry>,
+    request_id: String,
+) -> Result<bool, String> {
+    require_window(&window, "main")?;
+    Ok(registry.cancel(request_id.trim()))
 }
 
 fn play_online_track(
@@ -303,6 +507,7 @@ fn play_online_track(
     track: CatalogTrack,
     quality: Option<String>,
     source_id: Option<String>,
+    cancellation: Option<&ResolveToken>,
 ) -> Result<OnlinePlaybackResult, String> {
     // Constraint 2 audit trail: each call is one on-demand resolve (never batch at enqueue).
     println!(
@@ -312,75 +517,204 @@ fn play_online_track(
         track.title,
         quality.as_deref().unwrap_or("auto")
     );
-    if let Some((source, _)) = lx_identity(&track) {
-        let capabilities = app.state::<SourceRuntime>().status().capabilities;
-        for attempt in quality_attempts(&capabilities, source, quality.as_deref()) {
-            if let Some(result) = play_cache_hit(app, &track, &attempt, &source_id)? {
-                return Ok(result);
-            }
-        }
+    let original_track = track.clone();
+    let mut diagnostics = Vec::new();
+    if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
+        return Ok(terminal_playback_result(
+            original_track,
+            outcome,
+            diagnostics,
+            None,
+        ));
     }
-    let candidates = select_lx_candidates(track)?;
-    let mut errors = Vec::new();
-    for candidate in candidates {
-        let source = lx_identity(&candidate)
-            .map(|(source, _)| source)
-            .ok_or_else(|| "candidate lost its LX source identity".to_owned())?;
-        let capabilities = app.state::<SourceRuntime>().status().capabilities;
-        let attempts = quality_attempts(&capabilities, source, quality.as_deref());
-        for attempt in &attempts {
-            if let Some(result) = play_cache_hit(app, &candidate, attempt, &source_id)? {
-                return Ok(result);
-            }
-            let payload = lx_music_url_payload(&candidate, attempt)?;
-            match resolve_serialized(app, payload, Some(attempt), source_id.as_deref()) {
-                Ok(request) => {
-                    if let Err(error) = validate_full_track_request(&request, candidate.duration_ms)
-                    {
-                        errors.push(format!(
-                            "{}:{} {attempt}: {error}",
-                            candidate.provider_id, candidate.provider_track_id
-                        ));
-                        continue;
-                    }
-                    let resolved_quality =
-                        request.quality.clone().unwrap_or_else(|| attempt.clone());
-                    let cache_plan = app.state::<CacheStore>().prepare_with_meta(
-                        CacheKey {
-                            provider_id: candidate.provider_id.clone(),
-                            provider_track_id: candidate.provider_track_id.clone(),
-                            quality: resolved_quality.clone(),
-                        },
-                        request.media_type.clone(),
-                        candidate.title.clone(),
-                        candidate.artist.clone(),
-                    );
-                    app.state::<LocalAudioEngine>()
-                        .load_resolved_cached(request, candidate.title.clone(), Some(cache_plan))
-                        .map_err(|error| {
-                            format!("Rust streaming engine rejected LX media: {error}")
-                        })?;
 
-                    let (selected_source_id, selected_source_name) =
-                        selected_source(app, &source_id);
-                    return Ok(OnlinePlaybackResult {
-                        track: candidate,
-                        source_id: selected_source_id,
-                        source_name: selected_source_name,
-                        quality: Some(resolved_quality),
-                        cache_hit: false,
-                    });
-                }
-                Err(error) => errors.push(format!(
-                    "{}:{} {attempt}: {error}",
-                    candidate.provider_id, candidate.provider_track_id
-                )),
+    let runtime = app.state::<SourceRuntime>();
+    let source_ids = runtime
+        .resolution_source_ids(source_id.as_deref())
+        .map_err(|error| error.to_string())?;
+    if source_ids.is_empty() {
+        return Ok(terminal_playback_result(
+            original_track,
+            ResolveOutcome::Failed,
+            diagnostics,
+            Some("没有已导入且可用的 LX 音源".into()),
+        ));
+    }
+
+    // A direct catalog identity lets us reuse an already verified cache without doing metadata
+    // replacement searches or starting a JavaScript runtime.
+    if let Some((provider, _)) = lx_identity(&track) {
+        let capabilities = runtime.status().capabilities;
+        for attempt in quality_attempts(&capabilities, provider, quality.as_deref()) {
+            if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
+                return Ok(terminal_playback_result(
+                    original_track,
+                    outcome,
+                    diagnostics,
+                    None,
+                ));
+            }
+            if let Some(result) = play_cache_hit(
+                app,
+                &track,
+                &attempt,
+                source_ids.first().map(String::as_str),
+                cancellation,
+                &mut diagnostics,
+            )? {
+                return Ok(result);
             }
         }
     }
-    Err(format!(
-        "LX source could not resolve a verified full-track URL ({})",
-        errors.join("; ")
+
+    let candidates = match select_lx_candidates(track) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
+                return Ok(terminal_playback_result(
+                    original_track,
+                    outcome,
+                    diagnostics,
+                    None,
+                ));
+            }
+            return Ok(terminal_playback_result(
+                original_track,
+                ResolveOutcome::Failed,
+                diagnostics,
+                Some(error),
+            ));
+        }
+    };
+
+    // Cache entries are source-independent after verification, so check every candidate once
+    // before paying the cost of switching community runtimes.
+    for candidate in &candidates {
+        let provider = lx_identity(candidate)
+            .map(|(provider, _)| provider)
+            .ok_or_else(|| "candidate lost its LX source identity".to_owned())?;
+        for attempt in quality_attempts(&Value::Null, provider, quality.as_deref()) {
+            if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
+                return Ok(terminal_playback_result(
+                    original_track,
+                    outcome,
+                    diagnostics,
+                    None,
+                ));
+            }
+            if let Some(result) = play_cache_hit(
+                app,
+                candidate,
+                &attempt,
+                source_ids.first().map(String::as_str),
+                cancellation,
+                &mut diagnostics,
+            )? {
+                return Ok(result);
+            }
+        }
+    }
+
+    for runtime_source_id in &source_ids {
+        if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
+            return Ok(terminal_playback_result(
+                original_track,
+                outcome,
+                diagnostics,
+                None,
+            ));
+        }
+        if let Some(resolved) = resolve_candidates_with_source(
+            app,
+            runtime_source_id,
+            &candidates,
+            quality.as_deref(),
+            cancellation,
+            &mut diagnostics,
+        )? {
+            if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
+                return Ok(terminal_playback_result(
+                    original_track,
+                    outcome,
+                    diagnostics,
+                    None,
+                ));
+            }
+            let cache_plan = app.state::<CacheStore>().prepare_with_meta(
+                CacheKey {
+                    provider_id: resolved.track.provider_id.clone(),
+                    provider_track_id: resolved.track.provider_track_id.clone(),
+                    quality: resolved.quality.clone(),
+                },
+                resolved.request.media_type.clone(),
+                resolved.track.title.clone(),
+                resolved.track.artist.clone(),
+            );
+            if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
+                return Ok(terminal_playback_result(
+                    original_track,
+                    outcome,
+                    diagnostics,
+                    None,
+                ));
+            }
+            let engine = app.state::<LocalAudioEngine>();
+            let minimum_generation = crate::media_session::next_engine_generation(&engine);
+            let location = resolved.request.redacted_for_log();
+            let commit = run_playback_commit(app, cancellation, || {
+                engine
+                    .load_resolved_cached(
+                        resolved.request,
+                        resolved.track.title.clone(),
+                        Some(cache_plan),
+                    )
+                    .map_err(|error| format!("Rust streaming engine rejected LX media: {error}"))?;
+                crate::media_session::set_online_metadata(
+                    app,
+                    &resolved.track,
+                    minimum_generation,
+                    Some(location),
+                );
+                Ok::<_, String>(())
+            });
+            match commit {
+                Ok(result) => result?,
+                Err(outcome) => {
+                    return Ok(terminal_playback_result(
+                        original_track,
+                        outcome,
+                        diagnostics,
+                        None,
+                    ));
+                }
+            }
+            return Ok(OnlinePlaybackResult {
+                outcome: ResolveOutcome::Started,
+                track: resolved.track,
+                source_id: Some(resolved.source_id),
+                source_name: resolved.source_name,
+                quality: Some(resolved.quality),
+                cache_hit: false,
+                attempts: diagnostics,
+                error: None,
+            });
+        }
+    }
+
+    if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
+        return Ok(terminal_playback_result(
+            original_track,
+            outcome,
+            diagnostics,
+            None,
+        ));
+    }
+    let error = format_attempt_failure(&diagnostics);
+    Ok(terminal_playback_result(
+        original_track,
+        ResolveOutcome::Failed,
+        diagnostics,
+        Some(error),
     ))
 }
 
@@ -388,7 +722,9 @@ fn play_cache_hit(
     app: &AppHandle,
     track: &CatalogTrack,
     quality: &str,
-    source_id: &Option<String>,
+    source_id: Option<&str>,
+    cancellation: Option<&ResolveToken>,
+    diagnostics: &mut Vec<ResolveAttemptDiagnostic>,
 ) -> Result<Option<OnlinePlaybackResult>, String> {
     let key = CacheKey {
         provider_id: track.provider_id.clone(),
@@ -398,25 +734,53 @@ fn play_cache_hit(
     let Some(hit) = app.state::<CacheStore>().lookup(&key) else {
         return Ok(None);
     };
-    app.state::<LocalAudioEngine>()
-        .load_cached_online(hit.audio_path, track.title.clone())
-        .map_err(|error| format!("Rust audio engine rejected cached media: {error}"))?;
-    let (selected_source_id, selected_source_name) = selected_source(app, source_id);
+    let engine = app.state::<LocalAudioEngine>();
+    let minimum_generation = crate::media_session::next_engine_generation(&engine);
+    let location = hit.audio_path.display().to_string();
+    let commit = run_playback_commit(app, cancellation, || {
+        engine
+            .load_cached_online(hit.audio_path, track.title.clone())
+            .map_err(|error| format!("Rust audio engine rejected cached media: {error}"))?;
+        crate::media_session::set_online_metadata(app, track, minimum_generation, Some(location));
+        Ok::<_, String>(())
+    });
+    match commit {
+        Ok(result) => result?,
+        Err(outcome) => {
+            return Ok(Some(terminal_playback_result(
+                track.clone(),
+                outcome,
+                diagnostics.clone(),
+                None,
+            )));
+        }
+    }
+    let (selected_source_id, selected_source_name) = source_identity(app, source_id);
+    diagnostics.push(ResolveAttemptDiagnostic {
+        source_id: selected_source_id.clone(),
+        source_name: selected_source_name.clone(),
+        provider_id: track.provider_id.clone(),
+        provider_track_id: track.provider_track_id.clone(),
+        quality: Some(quality.to_owned()),
+        stage: "cache".into(),
+        success: true,
+        error: None,
+    });
     Ok(Some(OnlinePlaybackResult {
+        outcome: ResolveOutcome::Started,
         track: track.clone(),
         source_id: selected_source_id,
         source_name: selected_source_name,
         quality: Some(quality.to_owned()),
         cache_hit: true,
+        attempts: diagnostics.clone(),
+        error: None,
     }))
 }
 
-fn selected_source(
-    app: &AppHandle,
-    requested_source_id: &Option<String>,
-) -> (Option<String>, Option<String>) {
-    let selected_source_id = requested_source_id
-        .clone()
+fn source_identity(app: &AppHandle, source_id: Option<&str>) -> (Option<String>, Option<String>) {
+    let selected_source_id = source_id
+        .map(str::to_owned)
         .or_else(|| app.state::<SourceRuntime>().status().active_source_id);
     let selected_source_name = selected_source_id.as_deref().and_then(|id| {
         app.state::<SourceRuntime>()
@@ -426,6 +790,295 @@ fn selected_source(
             .map(|source| source.source.metadata.name)
     });
     (selected_source_id, selected_source_name)
+}
+
+fn terminal_playback_result(
+    track: CatalogTrack,
+    outcome: ResolveOutcome,
+    attempts: Vec<ResolveAttemptDiagnostic>,
+    error: Option<String>,
+) -> OnlinePlaybackResult {
+    OnlinePlaybackResult {
+        outcome,
+        track,
+        source_id: None,
+        source_name: None,
+        quality: None,
+        cache_hit: false,
+        attempts,
+        error,
+    }
+}
+
+fn run_playback_commit<T>(
+    app: &AppHandle,
+    cancellation: Option<&ResolveToken>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, ResolveOutcome> {
+    match cancellation {
+        Some(token) => app
+            .state::<ResolveCancellationRegistry>()
+            .run_if_active(token, operation),
+        None => Ok(operation()),
+    }
+}
+
+fn format_attempt_failure(attempts: &[ResolveAttemptDiagnostic]) -> String {
+    let details = attempts
+        .iter()
+        .filter(|attempt| !attempt.success)
+        .filter_map(|attempt| {
+            attempt.error.as_ref().map(|error| {
+                format!(
+                    "{} {}:{} {} {}: {error}",
+                    attempt.source_name.as_deref().unwrap_or("LX"),
+                    attempt.provider_id,
+                    attempt.provider_track_id,
+                    attempt.quality.as_deref().unwrap_or("auto"),
+                    attempt.stage
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        "LX source could not resolve a verified full-track URL".into()
+    } else {
+        format!(
+            "LX source could not resolve a verified full-track URL ({})",
+            details.join("; ")
+        )
+    }
+}
+
+fn public_attempt_error(stage: &str, error: &str) -> String {
+    let error = error.to_ascii_lowercase();
+    if error.contains("timed out") || error.contains("timeout") {
+        return "timeout".into();
+    }
+    if error.contains("private destination")
+        || error.contains("loopback")
+        || error.contains("link-local")
+    {
+        return "blocked_destination".into();
+    }
+    if error.contains("http 401") || error.contains("http 403") {
+        return "upstream_auth_rejected".into();
+    }
+    if error.contains("http 404") {
+        return "upstream_not_found".into();
+    }
+    if error.contains("http 429") {
+        return "upstream_rate_limited".into();
+    }
+    if error.contains("preview-sized") || error.contains("minimum full-track") {
+        return "preview_or_truncated_media".into();
+    }
+    if error.contains("content-range") || error.contains("range probe") {
+        return "range_verification_failed".into();
+    }
+    match stage {
+        "initialize" => "source_initialization_failed",
+        "payload" => "invalid_candidate_payload",
+        "verify" => "media_verification_failed",
+        "restore" => "active_source_restore_failed",
+        _ => "source_resolution_failed",
+    }
+    .into()
+}
+
+struct ResolvedCandidate {
+    track: CatalogTrack,
+    request: ResolvedMediaRequest,
+    quality: String,
+    source_id: String,
+    source_name: Option<String>,
+}
+
+fn resolve_candidates_with_source(
+    app: &AppHandle,
+    source_id: &str,
+    candidates: &[CatalogTrack],
+    quality_preference: Option<&str>,
+    cancellation: Option<&ResolveToken>,
+    diagnostics: &mut Vec<ResolveAttemptDiagnostic>,
+) -> Result<Option<ResolvedCandidate>, String> {
+    let runtime = app.state::<SourceRuntime>();
+    let (_, source_name) = source_identity(app, Some(source_id));
+    runtime.serialized(|| {
+        let persistent_active = runtime
+            .list()
+            .into_iter()
+            .find(|source| source.active)
+            .map(|source| source.source.id);
+        let temporary = persistent_active.as_deref() != Some(source_id);
+        let status = runtime.status();
+        let needs_launch = status.active_source_id.as_deref() != Some(source_id)
+            || status.state != crate::source_runtime::RuntimeState::Ready;
+        if needs_launch {
+            let switched = (|| {
+                let launch = runtime
+                    .prepare_reload_for(source_id)
+                    .map_err(|error| error.to_string())?;
+                let sandbox = app
+                    .get_webview_window(SANDBOX_LABEL)
+                    .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
+                evaluate_launch(&sandbox, &launch)?;
+                wait_until_ready(
+                    &runtime,
+                    launch.generation,
+                    Duration::from_secs(15),
+                    cancellation,
+                )
+            })();
+            if let Err(error) = switched {
+                if cancellation.and_then(ResolveToken::outcome).is_none() {
+                    let first = candidates.first();
+                    diagnostics.push(ResolveAttemptDiagnostic {
+                        source_id: Some(source_id.to_owned()),
+                        source_name: source_name.clone(),
+                        provider_id: first
+                            .map_or_else(String::new, |track| track.provider_id.clone()),
+                        provider_track_id: first
+                            .map_or_else(String::new, |track| track.provider_track_id.clone()),
+                        quality: quality_preference.map(str::to_owned),
+                        stage: "initialize".into(),
+                        success: false,
+                        error: Some(public_attempt_error("initialize", &error)),
+                    });
+                }
+                if temporary {
+                    let _ = restore_persistent_runtime_background(app, &runtime);
+                }
+                return Ok(None);
+            }
+        }
+
+        let capabilities = runtime.status().capabilities;
+        let mut resolved = None;
+        'candidate: for candidate in candidates {
+            if cancellation.and_then(ResolveToken::outcome).is_some() {
+                break;
+            }
+            let Some(provider) = lx_identity(candidate).map(|(provider, _)| provider) else {
+                diagnostics.push(ResolveAttemptDiagnostic {
+                    source_id: Some(source_id.to_owned()),
+                    source_name: source_name.clone(),
+                    provider_id: candidate.provider_id.clone(),
+                    provider_track_id: candidate.provider_track_id.clone(),
+                    quality: quality_preference.map(str::to_owned),
+                    stage: "payload".into(),
+                    success: false,
+                    error: Some("invalid_candidate_identity".into()),
+                });
+                continue;
+            };
+            for quality in quality_attempts(&capabilities, provider, quality_preference) {
+                if cancellation.and_then(ResolveToken::outcome).is_some() {
+                    break 'candidate;
+                }
+                let payload = match lx_music_url_payload(candidate, &quality) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        diagnostics.push(ResolveAttemptDiagnostic {
+                            source_id: Some(source_id.to_owned()),
+                            source_name: source_name.clone(),
+                            provider_id: candidate.provider_id.clone(),
+                            provider_track_id: candidate.provider_track_id.clone(),
+                            quality: Some(quality),
+                            stage: "payload".into(),
+                            success: false,
+                            error: Some(public_attempt_error("payload", &error)),
+                        });
+                        continue;
+                    }
+                };
+                let request = match dispatch_and_wait(
+                    app,
+                    &runtime,
+                    &payload,
+                    Some(&quality),
+                    cancellation,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        if cancellation.and_then(ResolveToken::outcome).is_none() {
+                            diagnostics.push(ResolveAttemptDiagnostic {
+                                source_id: Some(source_id.to_owned()),
+                                source_name: source_name.clone(),
+                                provider_id: candidate.provider_id.clone(),
+                                provider_track_id: candidate.provider_track_id.clone(),
+                                quality: Some(quality),
+                                stage: "resolve".into(),
+                                success: false,
+                                error: Some(public_attempt_error("resolve", &error)),
+                            });
+                        }
+                        continue;
+                    }
+                };
+                if cancellation.and_then(ResolveToken::outcome).is_some() {
+                    break 'candidate;
+                }
+                if let Err(error) =
+                    validate_full_track_request(&request, candidate.duration_ms, Some(&quality))
+                {
+                    if cancellation.and_then(ResolveToken::outcome).is_none() {
+                        diagnostics.push(ResolveAttemptDiagnostic {
+                            source_id: Some(source_id.to_owned()),
+                            source_name: source_name.clone(),
+                            provider_id: candidate.provider_id.clone(),
+                            provider_track_id: candidate.provider_track_id.clone(),
+                            quality: Some(quality),
+                            stage: "verify".into(),
+                            success: false,
+                            error: Some(public_attempt_error("verify", &error)),
+                        });
+                    }
+                    continue;
+                }
+                if cancellation.and_then(ResolveToken::outcome).is_some() {
+                    break 'candidate;
+                }
+                let resolved_quality = request.quality.clone().unwrap_or(quality);
+                diagnostics.push(ResolveAttemptDiagnostic {
+                    source_id: Some(source_id.to_owned()),
+                    source_name: source_name.clone(),
+                    provider_id: candidate.provider_id.clone(),
+                    provider_track_id: candidate.provider_track_id.clone(),
+                    quality: Some(resolved_quality.clone()),
+                    stage: "verify".into(),
+                    success: true,
+                    error: None,
+                });
+                resolved = Some(ResolvedCandidate {
+                    track: candidate.clone(),
+                    request,
+                    quality: resolved_quality,
+                    source_id: source_id.to_owned(),
+                    source_name: source_name.clone(),
+                });
+                break 'candidate;
+            }
+        }
+
+        if temporary && let Err(error) = restore_persistent_runtime_background(app, &runtime) {
+            let first = candidates.first();
+            diagnostics.push(ResolveAttemptDiagnostic {
+                source_id: persistent_active.clone(),
+                source_name: persistent_active
+                    .as_deref()
+                    .and_then(|id| source_identity(app, Some(id)).1),
+                provider_id: first.map_or_else(String::new, |track| track.provider_id.clone()),
+                provider_track_id: first
+                    .map_or_else(String::new, |track| track.provider_track_id.clone()),
+                quality: quality_preference.map(str::to_owned),
+                stage: "restore".into(),
+                success: false,
+                error: Some(public_attempt_error("restore", &error)),
+            });
+        }
+        Ok(resolved)
+    })
 }
 
 const QUALITY_ORDER: [&str; 4] = ["flac24bit", "flac", "320k", "128k"];
@@ -525,13 +1178,33 @@ fn select_lx_candidates(track: CatalogTrack) -> Result<Vec<CatalogTrack>, String
 fn validate_full_track_request(
     request: &ResolvedMediaRequest,
     expected_duration_ms: Option<u64>,
+    requested_quality: Option<&str>,
 ) -> Result<(), String> {
-    let mut headers = request
+    let minimum_full_track_bytes =
+        minimum_full_track_bytes(expected_duration_ms, requested_quality);
+    let mut base_headers = request
         .headers
         .iter()
         .map(|header| (header.name.clone(), header.value.clone()))
         .collect::<Vec<_>>();
-    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("range"));
+    base_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("range"));
+
+    let head_length = execute(SafeHttpRequest {
+        url: request.url.clone(),
+        method: Method::HEAD,
+        headers: base_headers.clone(),
+        body: None,
+        timeout: Duration::from_secs(10),
+        max_response_bytes: 0,
+    })
+    .ok()
+    .filter(|response| (200..300).contains(&response.status))
+    .and_then(|response| header_u64(&response.headers, "content-length"));
+    if head_length.is_some_and(|length| length >= minimum_full_track_bytes) {
+        return Ok(());
+    }
+
+    let mut headers = base_headers;
     headers.push(("range".into(), "bytes=0-0".into()));
     let response = execute(SafeHttpRequest {
         url: request.url.clone(),
@@ -539,30 +1212,52 @@ fn validate_full_track_request(
         headers,
         body: None,
         timeout: Duration::from_secs(10),
-        max_response_bytes: 4096,
-    })
-    .map_err(|error| format!("resolved media probe failed: {error}"))?;
-    if response.status != 206 {
-        return Err(format!(
-            "resolved media Range probe returned HTTP {} instead of 206",
-            response.status
-        ));
-    }
-    let total_length = response
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-range"))
-        .and_then(|(_, value)| parse_content_range_total(value))
-        .ok_or_else(|| {
-            "resolved media Range probe omitted total Content-Range length".to_owned()
-        })?;
-    let minimum_full_track_bytes = minimum_full_track_bytes(expected_duration_ms);
+        max_response_bytes: minimum_full_track_bytes as usize,
+    });
+    let total_length = match response {
+        Ok(response) if response.status == 206 => response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-range"))
+            .and_then(|(_, value)| parse_content_range_total(value))
+            .ok_or_else(|| {
+                "resolved media Range probe omitted total Content-Range length".to_owned()
+            })?,
+        Ok(response) if response.status == 200 => {
+            header_u64(&response.headers, "content-length").unwrap_or(response.body.len() as u64)
+        }
+        Ok(response) => {
+            return Err(format!(
+                "resolved media probe returned unsupported HTTP {}",
+                response.status
+            ));
+        }
+        Err(SafeHttpError::ResponseTooLarge { limit, status: 200 })
+            if limit as u64 >= minimum_full_track_bytes =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            if let Some(length) = head_length {
+                length
+            } else {
+                return Err(format!("resolved media probe failed: {error}"));
+            }
+        }
+    };
     if total_length < minimum_full_track_bytes {
         return Err(format!(
-            "resolved media is only {total_length} bytes (minimum {minimum_full_track_bytes}); refusing preview-sized audio"
+            "resolved media is only {total_length} bytes (minimum full-track {minimum_full_track_bytes}); refusing preview-sized audio"
         ));
     }
     Ok(())
+}
+
+fn header_u64(headers: &[(String, String)], name: &str) -> Option<u64> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.trim().parse().ok())
 }
 
 fn parse_content_range_total(value: &str) -> Option<u64> {
@@ -570,11 +1265,21 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
     (total != "*").then(|| total.parse().ok()).flatten()
 }
 
-fn minimum_full_track_bytes(expected_duration_ms: Option<u64>) -> u64 {
+fn minimum_full_track_bytes(
+    expected_duration_ms: Option<u64>,
+    requested_quality: Option<&str>,
+) -> u64 {
+    let bytes_per_second = match requested_quality {
+        Some("flac24bit") => 32_000,
+        Some("flac") => 24_000,
+        Some("320k") => 20_000,
+        Some("128k") => 8_000,
+        _ => 4_000,
+    };
     expected_duration_ms
-        .map(|duration| duration / 1000 * 3000)
+        .map(|duration| duration.div_ceil(1000) * bytes_per_second)
         .unwrap_or(0)
-        .max(512 * 1024)
+        .clamp(512 * 1024, 8 * 1024 * 1024)
 }
 
 fn lx_music_url_payload(track: &CatalogTrack, quality: &str) -> Result<Value, String> {
@@ -711,7 +1416,13 @@ fn start_online_e2e(app: &AppHandle) -> Result<(), String> {
                 .into_iter()
                 .find(|track| lx_identity(track).is_some())
                 .ok_or_else(|| "online E2E search returned no LX-compatible track".to_owned())?;
-            let result = play_online_track(&app_for_play, track, Some("320k".into()), None)?;
+            let result = play_online_track(&app_for_play, track, Some("320k".into()), None, None)?;
+            if result.outcome != ResolveOutcome::Started {
+                return Err(result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("online E2E ended as {:?}", result.outcome)));
+            }
             println!(
                 "GX_ONLINE_SEARCH_RESOLVE_OK provider={} id={} quality={} cache_hit={}",
                 result.track.provider_id,
@@ -823,6 +1534,7 @@ fn monitor_cache_completion(app: &AppHandle, first: OnlinePlaybackResult) -> Res
                 first.track.clone(),
                 first.quality.clone(),
                 first.source_id.clone(),
+                None,
             )?;
             if !replay.cache_hit {
                 return Err("second playback did not hit the completed cache".into());
@@ -1094,14 +1806,14 @@ fn resolve_serialized(
                     .get_webview_window(SANDBOX_LABEL)
                     .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
                 evaluate_launch(&sandbox, &launch)?;
-                wait_until_ready(&runtime, launch.generation, Duration::from_secs(15))
+                wait_until_ready(&runtime, launch.generation, Duration::from_secs(15), None)
             })();
             if let Err(error) = switched {
                 let _ = restore_persistent_runtime(app, &runtime);
                 return Err(error);
             }
         }
-        let result = dispatch_and_wait(app, &runtime, &payload, quality);
+        let result = dispatch_and_wait(app, &runtime, &payload, quality, None);
         if temporary.is_some()
             && let Err(restore_error) = restore_persistent_runtime(app, &runtime)
         {
@@ -1125,7 +1837,24 @@ fn restore_persistent_runtime(app: &AppHandle, runtime: &SourceRuntime) -> Resul
             .get_webview_window(SANDBOX_LABEL)
             .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
         evaluate_launch(&sandbox, &launch)?;
-        wait_until_ready(runtime, launch.generation, Duration::from_secs(15))?;
+        wait_until_ready(runtime, launch.generation, Duration::from_secs(15), None)?;
+    }
+    Ok(())
+}
+
+fn restore_persistent_runtime_background(
+    app: &AppHandle,
+    runtime: &SourceRuntime,
+) -> Result<(), String> {
+    let restore = runtime
+        .prepare_reload()
+        .map_err(|error| error.to_string())?;
+    if let Some(launch) = restore {
+        let sandbox = app
+            .get_webview_window(SANDBOX_LABEL)
+            .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
+        evaluate_launch(&sandbox, &launch)?;
+        schedule_runtime_timeout(app.clone(), launch.generation);
     }
     Ok(())
 }
@@ -1135,6 +1864,7 @@ fn dispatch_and_wait(
     runtime: &SourceRuntime,
     payload: &Value,
     quality: Option<&str>,
+    cancellation: Option<&ResolveToken>,
 ) -> Result<ResolvedMediaRequest, String> {
     let pending = runtime.begin_request(payload)?;
     let request_id = pending.request_id.clone();
@@ -1150,11 +1880,29 @@ fn dispatch_and_wait(
         runtime.cancel_request(&request_id, "failed to dispatch LX runtime request");
         return Err(error.to_string());
     }
-    let raw = match pending.receiver.recv_timeout(RUNTIME_REQUEST_TIMEOUT) {
-        Ok(result) => result?,
-        Err(_) => {
+    let deadline = Instant::now() + RUNTIME_REQUEST_TIMEOUT;
+    let raw = loop {
+        if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
+            let reason = match outcome {
+                ResolveOutcome::Cancelled => "LX resolver request cancelled",
+                ResolveOutcome::Stale => "LX resolver request superseded",
+                _ => "LX resolver request stopped",
+            };
+            runtime.cancel_request(&request_id, reason);
+            return Err(reason.into());
+        }
+        let now = Instant::now();
+        if now >= deadline {
             runtime.cancel_request(&request_id, "LX resolver request timed out");
             return Err("LX resolver request timed out".into());
+        }
+        let wait = (deadline - now).min(Duration::from_millis(75));
+        match pending.receiver.recv_timeout(wait) {
+            Ok(result) => break result?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("LX resolver response channel disconnected".into());
+            }
         }
     };
     normalize_media_request(raw, quality)
@@ -1164,9 +1912,17 @@ fn wait_until_ready(
     runtime: &SourceRuntime,
     generation: u64,
     timeout: Duration,
+    cancellation: Option<&ResolveToken>,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
+        if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
+            return Err(match outcome {
+                ResolveOutcome::Cancelled => "LX runtime initialization cancelled".into(),
+                ResolveOutcome::Stale => "LX runtime initialization superseded".into(),
+                _ => "LX runtime initialization stopped".into(),
+            });
+        }
         let status = runtime.status();
         if status.generation != generation {
             return Err("LX runtime generation changed while waiting for initialization".into());
@@ -1219,14 +1975,16 @@ fn reload_runtime(sandbox: &Option<WebviewWindow>, runtime: &SourceRuntime) -> R
         .as_ref()
         .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
     evaluate_launch(sandbox, &launch)?;
-    let app = sandbox.app_handle().clone();
-    let generation = launch.generation;
+    schedule_runtime_timeout(sandbox.app_handle().clone(), launch.generation);
+    Ok(())
+}
+
+fn schedule_runtime_timeout(app: AppHandle, generation: u64) {
     tauri::async_runtime::spawn_blocking(move || {
         std::thread::sleep(Duration::from_secs(15));
         app.state::<SourceRuntime>()
             .fail_if_initializing(generation, "LX runtime initialization timed out".into());
     });
-    Ok(())
 }
 
 fn evaluate_launch(window: &WebviewWindow, launch: &ScriptLaunch) -> Result<(), String> {
@@ -1429,6 +2187,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replaced_request_finish_cannot_detach_the_new_owner() {
+        let registry = ResolveCancellationRegistry::default();
+        let old = registry.begin("same".into()).unwrap();
+        let replacement = registry.begin("same".into()).unwrap();
+        assert_eq!(old.outcome(), Some(ResolveOutcome::Stale));
+
+        registry.finish(&old);
+        let next = registry.begin("next".into()).unwrap();
+
+        assert_eq!(replacement.outcome(), Some(ResolveOutcome::Stale));
+        assert_eq!(next.outcome(), None);
+    }
+
+    #[test]
+    fn cancelled_request_cannot_commit_playback() {
+        let registry = ResolveCancellationRegistry::default();
+        let token = registry.begin("cancelled".into()).unwrap();
+        assert!(registry.cancel("cancelled"));
+        let mut committed = false;
+
+        let result = registry.run_if_active(&token, || committed = true);
+
+        assert_eq!(result, Err(ResolveOutcome::Cancelled));
+        assert!(!committed);
+    }
+
+    #[test]
     fn parses_bounded_http_options() {
         let request = parse_http_request(
             "https://example.com/api",
@@ -1503,15 +2288,29 @@ mod tests {
 
     #[test]
     fn preview_guard_scales_with_catalog_duration() {
-        assert_eq!(minimum_full_track_bytes(None), 512 * 1024);
-        assert_eq!(minimum_full_track_bytes(Some(269_000)), 807_000);
-        assert!(185_336 < minimum_full_track_bytes(Some(269_000)));
-        assert!(10_792_943 > minimum_full_track_bytes(Some(269_000)));
+        assert_eq!(minimum_full_track_bytes(None, None), 512 * 1024);
+        assert_eq!(
+            minimum_full_track_bytes(Some(269_000), Some("128k")),
+            2_152_000
+        );
+        assert_eq!(
+            minimum_full_track_bytes(Some(269_000), Some("320k")),
+            5_380_000
+        );
+        assert!(1_200_000 < minimum_full_track_bytes(Some(269_000), Some("320k")));
+        assert!(10_792_943 > minimum_full_track_bytes(Some(269_000), Some("320k")));
         assert_eq!(
             parse_content_range_total("bytes 0-0/10792943"),
             Some(10_792_943)
         );
         assert_eq!(parse_content_range_total("bytes */*"), None);
+        assert_eq!(
+            header_u64(
+                &[("Content-Length".into(), "10792943".into())],
+                "content-length"
+            ),
+            Some(10_792_943)
+        );
     }
 
     #[test]

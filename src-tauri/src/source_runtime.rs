@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use gx_contracts::{HttpHeader, MediaType, ResolvedMediaRequest};
-use gx_source::{ManagedSource, ScriptMetadata, SourceBackup, SourceStore, SourceStoreError};
+use gx_source::{
+    ManagedSource, ScriptMetadata, SourceBackup, SourceFallbackConfig, SourceStore,
+    SourceStoreError,
+};
 use serde::Serialize;
 use serde_json::Value;
 use url::Url;
@@ -171,6 +174,31 @@ impl SourceRuntime {
 
     pub fn set_config(&self, id: &str, config: Value) -> Result<(), SourceStoreError> {
         self.store.lock().unwrap().set_config(id, config)
+    }
+
+    pub fn fallback_config(&self) -> SourceFallbackConfig {
+        self.store.lock().unwrap().fallback_config()
+    }
+
+    pub fn set_fallback_config(
+        &self,
+        enabled: bool,
+        source_ids: Vec<String>,
+    ) -> Result<(), SourceStoreError> {
+        self.store
+            .lock()
+            .unwrap()
+            .set_fallback_config(enabled, source_ids)
+    }
+
+    pub fn resolution_source_ids(
+        &self,
+        requested_source_id: Option<&str>,
+    ) -> Result<Vec<String>, SourceStoreError> {
+        self.store
+            .lock()
+            .unwrap()
+            .resolution_source_ids(requested_source_id)
     }
 
     pub fn export_backup(&self) -> Result<SourceBackup, SourceStoreError> {

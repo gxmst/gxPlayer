@@ -9,6 +9,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager, WebviewWindow};
 
 use crate::require_window;
+use crate::source_commands::{ResolveCancellationRegistry, ResolveToken};
 
 static PHASE3_SMOKE_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -73,25 +74,64 @@ pub async fn metadata_play_preview(
     window: WebviewWindow,
     wanted: CatalogTrack,
     candidates: Vec<CatalogTrack>,
+    request_id: Option<String>,
 ) -> Result<SelectedPlayback, String> {
     require_window(&window, "main")?;
-    let (selected, replaced_provider_id) = tauri::async_runtime::spawn_blocking(move || {
-        select_playable_with(&wanted, candidates, preview_is_available)
-    })
-    .await
-    .map_err(|error| format!("preview availability task failed: {error}"))?
-    .ok_or_else(|| {
-        "no playable preview exists on the selected or replacement platform".to_owned()
-    })?;
     let app = window.app_handle().clone();
-    let cached = cache_preview(&app, &selected).await?;
-    app.state::<LocalAudioEngine>()
-        .load(vec![cached])
-        .map_err(|error| error.to_string())?;
-    Ok(SelectedPlayback {
-        track: selected,
-        replaced_provider_id,
-    })
+    let token = request_id
+        .map(|request_id| app.state::<ResolveCancellationRegistry>().begin(request_id))
+        .transpose()?;
+    let result = async {
+        let (selected, replaced_provider_id) = tauri::async_runtime::spawn_blocking(move || {
+            select_playable_with(&wanted, candidates, preview_is_available)
+        })
+        .await
+        .map_err(|error| format!("preview availability task failed: {error}"))?
+        .ok_or_else(|| {
+            "no playable preview exists on the selected or replacement platform".to_owned()
+        })?;
+        ensure_preview_active(token.as_ref())?;
+        let cached = cache_preview(&app, &selected).await?;
+        ensure_preview_active(token.as_ref())?;
+        let engine = app.state::<LocalAudioEngine>();
+        let minimum_generation = crate::media_session::next_engine_generation(&engine);
+        let location = cached.display().to_string();
+        let load = || {
+            engine
+                .load(vec![cached])
+                .map_err(|error| error.to_string())?;
+            crate::media_session::set_online_metadata(
+                &app,
+                &selected,
+                minimum_generation,
+                Some(location),
+            );
+            Ok::<_, String>(())
+        };
+        match token.as_ref() {
+            Some(token) => app
+                .state::<ResolveCancellationRegistry>()
+                .run_if_active(token, load)
+                .map_err(|outcome| format!("preview request ended as {outcome:?}"))??,
+            None => load()?,
+        }
+        Ok(SelectedPlayback {
+            track: selected,
+            replaced_provider_id,
+        })
+    }
+    .await;
+    if let Some(token) = token.as_ref() {
+        app.state::<ResolveCancellationRegistry>().finish(token);
+    }
+    result
+}
+
+fn ensure_preview_active(token: Option<&ResolveToken>) -> Result<(), String> {
+    match token.and_then(ResolveToken::outcome) {
+        Some(outcome) => Err(format!("preview request ended as {outcome:?}")),
+        None => Ok(()),
+    }
 }
 
 pub fn maybe_start_phase3_smoke(app: &AppHandle) {
@@ -145,11 +185,20 @@ pub fn maybe_start_phase3_smoke(app: &AppHandle) {
                 return;
             }
         };
-        if let Err(error) = app.state::<LocalAudioEngine>().load(vec![cached]) {
+        let engine = app.state::<LocalAudioEngine>();
+        let minimum_generation = crate::media_session::next_engine_generation(&engine);
+        let location = cached.display().to_string();
+        if let Err(error) = engine.load(vec![cached]) {
             eprintln!("GX_PHASE3_FAILED {error}");
             app.exit(2);
             return;
         }
+        crate::media_session::set_online_metadata(
+            &app,
+            &selected,
+            minimum_generation,
+            Some(location),
+        );
         let monitor_app = app.clone();
         let monitored = tauri::async_runtime::spawn_blocking(move || {
             for _ in 0..600 {

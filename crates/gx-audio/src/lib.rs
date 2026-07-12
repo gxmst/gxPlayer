@@ -211,9 +211,10 @@ pub fn play_local_file(path: impl AsRef<Path>, options: PlaybackOptions) -> Resu
     let sample_format = supported.sample_format();
     let stream_config: StreamConfig = supported.into();
     let output_sample_rate = stream_config.sample_rate.0;
+    let output_channels = stream_config.channels as usize;
 
     let capacity = ((output_sample_rate as f64
-        * info.channels as f64
+        * output_channels as f64
         * options.ring_buffer_seconds.max(0.25)) as usize)
         .max(4096);
     let ring = HeapRb::<f32>::new(capacity);
@@ -249,6 +250,7 @@ pub fn play_local_file(path: impl AsRef<Path>, options: PlaybackOptions) -> Resu
         let to_push = samples.len().min(remaining_samples);
 
         let prepared = rate_adapter.process(&samples[..to_push])?;
+        let prepared = remap_channels(&prepared, channels, output_channels)?;
         push_samples(&mut producer, &queued_samples, &prepared);
 
         let frames = (to_push / channels) as u64;
@@ -256,6 +258,7 @@ pub fn play_local_file(path: impl AsRef<Path>, options: PlaybackOptions) -> Resu
         Ok(max_frames.is_none_or(|limit| total < limit))
     })?;
     let tail = rate_adapter.finish()?;
+    let tail = remap_channels(&tail, channels, output_channels)?;
     push_samples(&mut producer, &queued_samples, &tail);
 
     let drain_deadline = Instant::now() + Duration::from_secs(10);
@@ -557,37 +560,150 @@ fn choose_output_config(
     sample_rate: u32,
     channels: u16,
 ) -> Result<cpal::SupportedStreamConfig> {
+    let default = device.default_output_config().ok();
+    let default_channels = default.as_ref().map(|config| config.channels());
     let mut candidates = device
         .supported_output_configs()
         .context("failed to enumerate output configurations")?
-        .filter(|config| {
-            config.channels() == channels
-                && config.min_sample_rate().0 <= sample_rate
-                && sample_rate <= config.max_sample_rate().0
+        .filter_map(|config| {
+            let format_rank = sample_format_rank(config.sample_format())?;
+            let selected_rate =
+                sample_rate.clamp(config.min_sample_rate().0, config.max_sample_rate().0);
+            let score = (
+                channel_config_rank(config.channels(), channels, default_channels),
+                u8::from(selected_rate != sample_rate),
+                selected_rate.abs_diff(sample_rate),
+                format_rank,
+            );
+            Some((
+                score,
+                config.with_sample_rate(cpal::SampleRate(selected_rate)),
+            ))
         })
-        .map(|config| config.with_sample_rate(cpal::SampleRate(sample_rate)))
         .collect::<Vec<_>>();
 
-    candidates.sort_by_key(|config| match config.sample_format() {
-        SampleFormat::F32 => 0,
-        SampleFormat::I16 => 1,
-        SampleFormat::U16 => 2,
-        _ => 3,
-    });
-    if let Some(exact) = candidates.into_iter().next() {
-        return Ok(exact);
+    candidates.sort_by_key(|(score, _)| *score);
+    if let Some((_, best)) = candidates.into_iter().next() {
+        return Ok(best);
     }
 
-    let fallback = device
-        .default_output_config()
-        .context("failed to query the default output configuration")?;
-    if fallback.channels() != channels {
-        return Err(anyhow!(
-            "default device exposes {} channels but source has {channels}; channel remapping is outside the local PoC",
-            fallback.channels()
-        ));
+    if let Some(default) = default
+        && sample_format_rank(default.sample_format()).is_some()
+    {
+        return Ok(default);
     }
-    Ok(fallback)
+    Err(anyhow!(
+        "audio device exposes no output configuration with a supported sample format"
+    ))
+}
+
+fn channel_config_rank(output: u16, requested: u16, default: Option<u16>) -> u16 {
+    if output == requested {
+        0
+    } else if output == 2 {
+        1
+    } else if Some(output) == default {
+        2
+    } else if output == 1 {
+        3
+    } else {
+        4 + output.abs_diff(requested)
+    }
+}
+
+fn sample_format_rank(format: SampleFormat) -> Option<u8> {
+    Some(match format {
+        SampleFormat::F32 => 0,
+        SampleFormat::F64 => 1,
+        SampleFormat::I16 => 2,
+        SampleFormat::I32 => 3,
+        SampleFormat::U16 => 4,
+        SampleFormat::U32 => 5,
+        SampleFormat::I8 => 6,
+        SampleFormat::U8 => 7,
+        SampleFormat::I64 => 8,
+        SampleFormat::U64 => 9,
+        _ => return None,
+    })
+}
+
+fn remap_channels(
+    interleaved: &[f32],
+    input_channels: usize,
+    output_channels: usize,
+) -> Result<Vec<f32>> {
+    if input_channels == 0 || output_channels == 0 {
+        bail!("channel counts must be non-zero");
+    }
+    if !interleaved.len().is_multiple_of(input_channels) {
+        bail!(
+            "PCM sample count {} is not divisible by {input_channels} source channels",
+            interleaved.len()
+        );
+    }
+    if input_channels == output_channels {
+        return Ok(interleaved.to_vec());
+    }
+
+    let frames = interleaved.len() / input_channels;
+    let mut output = Vec::with_capacity(frames.saturating_mul(output_channels));
+    for frame in interleaved.chunks_exact(input_channels) {
+        match (input_channels, output_channels) {
+            (1, _) => output.extend(std::iter::repeat_n(frame[0], output_channels)),
+            (_, 1) => output.push(frame.iter().copied().sum::<f32>() / input_channels as f32),
+            (_, 2) => {
+                let (left, right) = downmix_stereo(frame);
+                output.extend_from_slice(&[left, right]);
+            }
+            (2, _) => {
+                output.extend_from_slice(frame);
+                output.extend(std::iter::repeat_n(0.0, output_channels - 2));
+            }
+            _ => {
+                let copied = input_channels.min(output_channels);
+                output.extend_from_slice(&frame[..copied]);
+                output.extend(std::iter::repeat_n(0.0, output_channels - copied));
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn downmix_stereo(frame: &[f32]) -> (f32, f32) {
+    debug_assert!(frame.len() >= 2);
+    let mut left = frame[0];
+    let mut right = frame[1];
+    match frame.len() {
+        2 => {}
+        3 => {
+            left += frame[2] * std::f32::consts::FRAC_1_SQRT_2;
+            right += frame[2] * std::f32::consts::FRAC_1_SQRT_2;
+        }
+        4 => {
+            left += frame[2] * std::f32::consts::FRAC_1_SQRT_2;
+            right += frame[3] * std::f32::consts::FRAC_1_SQRT_2;
+        }
+        _ => {
+            // Common 5.0/5.1+ order: FL, FR, FC, [LFE], surrounds/back channels.
+            left += frame[2] * std::f32::consts::FRAC_1_SQRT_2;
+            right += frame[2] * std::f32::consts::FRAC_1_SQRT_2;
+            let surround_start = if frame.len() >= 6 {
+                left += frame[3] * 0.5;
+                right += frame[3] * 0.5;
+                4
+            } else {
+                3
+            };
+            for (index, sample) in frame[surround_start..].iter().enumerate() {
+                if index % 2 == 0 {
+                    left += *sample * std::f32::consts::FRAC_1_SQRT_2;
+                } else {
+                    right += *sample * std::f32::consts::FRAC_1_SQRT_2;
+                }
+            }
+        }
+    }
+    (left.clamp(-1.0, 1.0), right.clamp(-1.0, 1.0))
 }
 
 fn build_output_stream<C>(
@@ -602,6 +718,13 @@ where
     C: Consumer<Item = f32> + Send + 'static,
 {
     match sample_format {
+        SampleFormat::I8 => build_typed_output_stream::<i8, C>(
+            device,
+            config,
+            consumer,
+            queued_samples,
+            underrun_callbacks,
+        ),
         SampleFormat::F32 => build_typed_output_stream::<f32, C>(
             device,
             config,
@@ -623,7 +746,49 @@ where
             queued_samples,
             underrun_callbacks,
         ),
-        other => bail!("unsupported output sample format for PoC: {other}"),
+        SampleFormat::I32 => build_typed_output_stream::<i32, C>(
+            device,
+            config,
+            consumer,
+            queued_samples,
+            underrun_callbacks,
+        ),
+        SampleFormat::I64 => build_typed_output_stream::<i64, C>(
+            device,
+            config,
+            consumer,
+            queued_samples,
+            underrun_callbacks,
+        ),
+        SampleFormat::U8 => build_typed_output_stream::<u8, C>(
+            device,
+            config,
+            consumer,
+            queued_samples,
+            underrun_callbacks,
+        ),
+        SampleFormat::U32 => build_typed_output_stream::<u32, C>(
+            device,
+            config,
+            consumer,
+            queued_samples,
+            underrun_callbacks,
+        ),
+        SampleFormat::U64 => build_typed_output_stream::<u64, C>(
+            device,
+            config,
+            consumer,
+            queued_samples,
+            underrun_callbacks,
+        ),
+        SampleFormat::F64 => build_typed_output_stream::<f64, C>(
+            device,
+            config,
+            consumer,
+            queued_samples,
+            underrun_callbacks,
+        ),
+        other => bail!("unsupported output sample format: {other}"),
     }
 }
 
@@ -713,6 +878,29 @@ mod tests {
             output_frames.abs_diff(expected) < 2048,
             "resampler produced {output_frames} frames, expected approximately {expected}"
         );
+    }
+
+    #[test]
+    fn channel_mapper_handles_mono_stereo_and_surround() {
+        assert_eq!(
+            remap_channels(&[0.25, -0.5], 1, 2).unwrap(),
+            vec![0.25, 0.25, -0.5, -0.5]
+        );
+        assert_eq!(
+            remap_channels(&[0.25, -0.5], 2, 6).unwrap(),
+            vec![0.25, -0.5, 0.0, 0.0, 0.0, 0.0]
+        );
+        let surround = remap_channels(&[0.2, -0.2, 0.1, 0.05, 0.3, -0.3], 6, 2).unwrap();
+        assert_eq!(surround.len(), 2);
+        assert!(surround[0] > 0.2);
+        assert!(surround[1] < -0.2);
+    }
+
+    #[test]
+    fn channel_config_ranking_prefers_exact_then_stereo() {
+        assert_eq!(channel_config_rank(1, 1, Some(2)), 0);
+        assert!(channel_config_rank(2, 1, Some(6)) < channel_config_rank(6, 1, Some(6)));
+        assert!(sample_format_rank(SampleFormat::F32) < sample_format_rank(SampleFormat::I16));
     }
 
     fn temporary_wav_path() -> PathBuf {

@@ -35,5 +35,5 @@
 - Community fixture: ZxwyWebSite/lx-script at revision `da7759eb54a9e293b5594933ebff61043e8c46cd`, executed unchanged from the ignored Phase-1 cache.
 - The script initialized through the factual callback-style `lx.request`, registered `lx.on('request')`, sent `inited`, and returned `https://media.example/phase-1.mp3` for a deterministic mock request.
 - Synchronous contract: AES returned 16 bytes, RSA no-padding returned 128 bytes, MD5 matched the platform reference, random bytes returned the requested length, and zlib round-tripped.
-- Isolation: the sandbox has an empty dedicated Tauri capability and a restrictive CSP. Window-label authorization rejected a main-only command, the opener plugin was denied, and the HTTP bridge rejected loopback SSRF.
+- Isolation: the sandbox has an empty dedicated Tauri capability and a restrictive CSP. Window-label authorization rejected a main-only command, the unavailable opener command was denied, and the HTTP bridge rejected loopback SSRF.
 - The companion music-resolution service was not run and no music content was fetched.

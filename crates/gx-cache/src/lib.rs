@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +13,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const DEFAULT_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const CACHE_DIRECTORY_NAME: &str = "GXPlayerCache";
+const CACHE_FILE_PREFIX: &str = "gx-cache-";
+const MANIFEST_FILE_NAME: &str = "gx-cache-manifest.json";
+static JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +114,9 @@ struct CacheState {
     root: PathBuf,
     settings: PersistentSettings,
     manifest: Manifest,
+    epoch: u64,
+    next_writer_token: u64,
+    active_writers: BTreeMap<String, u64>,
 }
 
 #[derive(Clone)]
@@ -132,7 +139,8 @@ impl CacheStore {
             .unwrap_or_else(|| fallback_root.clone());
         let root = settings
             .custom_directory
-            .clone()
+            .as_ref()
+            .map(|directory| dedicated_cache_root(directory))
             .filter(|directory| ensure_writable_directory(directory).is_ok())
             .unwrap_or_else(|| {
                 settings.custom_directory = None;
@@ -148,6 +156,9 @@ impl CacheStore {
                 root,
                 settings,
                 manifest,
+                epoch: 1,
+                next_writer_token: 0,
+                active_writers: BTreeMap::new(),
             })),
         };
         store.persist_all()?;
@@ -203,14 +214,19 @@ impl CacheStore {
         title: impl Into<String>,
         artist: impl Into<String>,
     ) -> CacheWritePlan {
-        let state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock().unwrap();
         let id = cache_id(&key);
+        state.next_writer_token = state.next_writer_token.wrapping_add(1).max(1);
+        let writer_token = state.next_writer_token;
+        state.active_writers.insert(id.clone(), writer_token);
+        let epoch = state.epoch;
         let extension = media_extension(&media_type);
-        let final_path = state.root.join(format!("{id}.{extension}"));
-        let sidecar_path = state.root.join(format!("{id}.json"));
-        let part_path = state
-            .root
-            .join(format!("{id}.{}.{}.part", std::process::id(), now_ms()));
+        let file_tag = format!("{CACHE_FILE_PREFIX}{id}-{}-{writer_token}", now_ms());
+        let final_path = state.root.join(format!("{file_tag}.{extension}"));
+        let sidecar_path = state.root.join(format!("{file_tag}.json"));
+        let part_path = state.root.join(format!("{file_tag}.part"));
+        let staged_path = state.root.join(format!("{file_tag}.ready"));
+        let root = state.root.clone();
         let pinned = state
             .settings
             .online_favorites
@@ -234,8 +250,15 @@ impl CacheStore {
                     title: title.into(),
                     artist: artist.into(),
                 }),
+                id,
+                writer_token,
+                epoch,
+                root,
                 part_path,
+                staged_path,
                 invalid: AtomicBool::new(false),
+                started: AtomicBool::new(false),
+                staged: AtomicBool::new(false),
             }),
         }
     }
@@ -260,6 +283,7 @@ impl CacheStore {
         let id = cache_id(key);
         {
             let mut state = self.inner.lock().unwrap();
+            state.active_writers.remove(&id);
             if let Some(entry) = state.manifest.entries.get(&id).cloned() {
                 if remove_entry_files(&entry) {
                     state.manifest.entries.remove(&id);
@@ -283,6 +307,7 @@ impl CacheStore {
             let mut state = self.inner.lock().unwrap();
             for key in keys {
                 let id = cache_id(key);
+                state.active_writers.remove(&id);
                 if let Some(entry) = state.manifest.entries.get(&id).cloned()
                     && remove_entry_files(&entry)
                 {
@@ -314,6 +339,7 @@ impl CacheStore {
                 .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>();
             for id in ids {
+                state.active_writers.remove(&id);
                 if let Some(entry) = state.manifest.entries.get(&id).cloned()
                     && remove_entry_files(&entry)
                 {
@@ -339,14 +365,17 @@ impl CacheStore {
     }
 
     pub fn set_directory(&self, directory: impl Into<PathBuf>) -> Result<CacheStatus> {
-        let directory = directory.into();
-        validate_custom_directory(&directory)?;
+        let selected_directory = directory.into();
+        validate_custom_directory(&selected_directory)?;
+        let directory = dedicated_cache_root(&selected_directory);
         ensure_writable_directory(&directory)?;
         cleanup_part_files(&directory);
         let manifest = load_manifest(&directory);
         {
             let mut state = self.inner.lock().unwrap();
-            state.settings.custom_directory = Some(directory.clone());
+            state.epoch = state.epoch.wrapping_add(1).max(1);
+            state.active_writers.clear();
+            state.settings.custom_directory = Some(selected_directory);
             state.root = directory;
             state.manifest = manifest;
             persist_settings(&state)?;
@@ -365,6 +394,8 @@ impl CacheStore {
         let manifest = load_manifest(&default_root);
         {
             let mut state = self.inner.lock().unwrap();
+            state.epoch = state.epoch.wrapping_add(1).max(1);
+            state.active_writers.clear();
             state.settings.custom_directory = None;
             state.root = default_root;
             state.manifest = manifest;
@@ -376,6 +407,10 @@ impl CacheStore {
 
     pub fn clear(&self, include_pinned: bool) -> Result<CacheStatus> {
         let mut state = self.inner.lock().unwrap();
+        // A clear is a cache-generation boundary. Existing downloaders may still own an open
+        // handle, but they can no longer publish into the freshly-cleared manifest.
+        state.epoch = state.epoch.wrapping_add(1).max(1);
+        state.active_writers.clear();
         let ids = state
             .manifest
             .entries
@@ -446,8 +481,44 @@ impl CacheStore {
             .contains_key(&favorite_id(provider_id, provider_track_id))
     }
 
-    fn record_completed(&self, mut entry: CacheEntry) -> Result<()> {
+    fn writer_is_current(&self, id: &str, token: u64, epoch: u64, root: &Path) -> bool {
+        let state = self.inner.lock().unwrap();
+        state.epoch == epoch && state.root == root && state.active_writers.get(id) == Some(&token)
+    }
+
+    fn release_writer(&self, id: &str, token: u64) {
         let mut state = self.inner.lock().unwrap();
+        if state.active_writers.get(id) == Some(&token) {
+            state.active_writers.remove(id);
+        }
+    }
+
+    fn commit_staged(
+        &self,
+        id: &str,
+        token: u64,
+        epoch: u64,
+        root: &Path,
+        staged_path: &Path,
+        mut entry: CacheEntry,
+    ) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        if state.epoch != epoch
+            || state.root != root
+            || state.active_writers.get(id) != Some(&token)
+        {
+            bail!("cache writer belongs to an expired cache generation");
+        }
+        if !staged_path.is_file()
+            || !entry.audio_path.starts_with(root)
+            || !entry.sidecar_path.starts_with(root)
+        {
+            bail!("staged cache entry is unavailable or outside the active cache root");
+        }
+        let staged_len = fs::metadata(staged_path)?.len();
+        if staged_len != entry.byte_len {
+            bail!("staged cache entry length changed before commit");
+        }
         let now = now_ms();
         entry.completed_at_ms = now;
         entry.last_accessed_at_ms = now;
@@ -455,10 +526,37 @@ impl CacheStore {
             &entry.key.provider_id,
             &entry.key.provider_track_id,
         ));
-        write_sidecar(&entry)?;
-        state.manifest.entries.insert(cache_id(&entry.key), entry);
-        persist_manifest(&state)?;
+        if entry.audio_path.exists() {
+            bail!("cache destination unexpectedly already exists");
+        }
+        fs::rename(staged_path, &entry.audio_path).with_context(|| {
+            format!(
+                "failed to promote staged cache file {}",
+                staged_path.display()
+            )
+        })?;
+        if let Err(error) = write_sidecar(&entry) {
+            let _ = fs::remove_file(&entry.audio_path);
+            return Err(error);
+        }
+        let previous = state.manifest.entries.insert(id.to_owned(), entry.clone());
+        if let Err(error) = persist_manifest(&state) {
+            if let Some(previous) = previous.clone() {
+                state.manifest.entries.insert(id.to_owned(), previous);
+            } else {
+                state.manifest.entries.remove(id);
+            }
+            let _ = fs::remove_file(&entry.audio_path);
+            let _ = fs::remove_file(&entry.sidecar_path);
+            return Err(error);
+        }
+        state.active_writers.remove(id);
         drop(state);
+        if let Some(previous) = previous
+            && previous.audio_path != entry.audio_path
+        {
+            let _ = remove_entry_files(&previous);
+        }
         self.evict()
     }
 
@@ -510,20 +608,36 @@ pub struct CacheWritePlan {
 struct CacheWritePlanInner {
     store: CacheStore,
     entry: Mutex<CacheEntry>,
+    id: String,
+    writer_token: u64,
+    epoch: u64,
+    root: PathBuf,
     part_path: PathBuf,
+    staged_path: PathBuf,
     invalid: AtomicBool,
+    started: AtomicBool,
+    staged: AtomicBool,
 }
 
 impl CacheWritePlan {
     pub fn begin(&self) -> Option<CacheWriter> {
-        if self.inner.invalid.load(Ordering::Acquire) {
+        if self.inner.invalid.load(Ordering::Acquire)
+            || self.inner.started.swap(true, Ordering::AcqRel)
+            || !self.is_current()
+        {
             return None;
         }
-        let file = OpenOptions::new()
+        let file = match OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&self.inner.part_path)
-            .ok()?;
+        {
+            Ok(file) => file,
+            Err(_) => {
+                self.invalidate();
+                return None;
+            }
+        };
         Some(CacheWriter {
             plan: self.clone(),
             file: Some(file),
@@ -534,9 +648,50 @@ impl CacheWritePlan {
 
     pub fn invalidate(&self) {
         self.inner.invalid.store(true, Ordering::Release);
+        self.inner
+            .store
+            .release_writer(&self.inner.id, self.inner.writer_token);
+        let _ = fs::remove_file(&self.inner.part_path);
+        let _ = fs::remove_file(&self.inner.staged_path);
+    }
+
+    /// Publish a fully-downloaded entry after the decoder has consumed the media to a clean EOF.
+    /// `CacheWriter::finish` intentionally does not make an entry visible on its own.
+    pub fn commit(&self) -> Result<()> {
+        if self.inner.invalid.load(Ordering::Acquire)
+            || !self.inner.staged.load(Ordering::Acquire)
+            || !self.is_current()
+        {
+            bail!("cache download is not staged for the active cache generation");
+        }
+        let entry = self.inner.entry.lock().unwrap().clone();
+        let result = self.inner.store.commit_staged(
+            &self.inner.id,
+            self.inner.writer_token,
+            self.inner.epoch,
+            &self.inner.root,
+            &self.inner.staged_path,
+            entry,
+        );
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
+
+    fn is_current(&self) -> bool {
+        self.inner.store.writer_is_current(
+            &self.inner.id,
+            self.inner.writer_token,
+            self.inner.epoch,
+            &self.inner.root,
+        )
     }
 
     pub fn update_source_spec(&self, sample_rate: u32, bit_depth: Option<u32>, channels: u16) {
+        if !self.is_current() {
+            return;
+        }
         let mut entry = self.inner.entry.lock().unwrap();
         entry.source_sample_rate = Some(sample_rate);
         entry.source_bit_depth = bit_depth;
@@ -544,7 +699,9 @@ impl CacheWritePlan {
     }
 
     pub fn update_media_type(&self, media_type: MediaType) {
-        self.inner.entry.lock().unwrap().media_type = media_type;
+        if self.is_current() {
+            self.inner.entry.lock().unwrap().media_type = media_type;
+        }
     }
 }
 
@@ -557,7 +714,11 @@ pub struct CacheWriter {
 
 impl CacheWriter {
     pub fn append(&mut self, bytes: &[u8]) {
-        if self.plan.inner.invalid.load(Ordering::Acquire) || self.file.is_none() {
+        if self.plan.inner.invalid.load(Ordering::Acquire)
+            || !self.plan.is_current()
+            || self.file.is_none()
+        {
+            self.abandon();
             return;
         }
         let result = self.file.as_mut().unwrap().write_all(bytes);
@@ -575,6 +736,7 @@ impl CacheWriter {
 
     pub fn finish(mut self, total_len: Option<u64>) {
         if self.plan.inner.invalid.load(Ordering::Acquire)
+            || !self.plan.is_current()
             || total_len.is_some_and(|expected| expected != self.written)
             || self.file.is_none()
         {
@@ -582,29 +744,17 @@ impl CacheWriter {
             return;
         }
         if let Some(mut file) = self.file.take()
-            && file.flush().is_err()
+            && (file.flush().is_err() || file.sync_data().is_err())
         {
             self.abandon();
             return;
         }
-        let mut entry = self.plan.inner.entry.lock().unwrap().clone();
-        entry.byte_len = self.written;
-        let _ = fs::remove_file(&entry.audio_path);
-        if fs::rename(&self.plan.inner.part_path, &entry.audio_path).is_err() {
+        self.plan.inner.entry.lock().unwrap().byte_len = self.written;
+        if fs::rename(&self.plan.inner.part_path, &self.plan.inner.staged_path).is_err() {
             self.abandon();
             return;
         }
-        if self
-            .plan
-            .inner
-            .store
-            .record_completed(entry.clone())
-            .is_err()
-        {
-            let _ = fs::remove_file(&entry.audio_path);
-            let _ = fs::remove_file(&entry.sidecar_path);
-            return;
-        }
+        self.plan.inner.staged.store(true, Ordering::Release);
         self.finalized = true;
     }
 
@@ -619,6 +769,14 @@ impl Drop for CacheWriter {
         if !self.finalized {
             self.abandon();
         }
+    }
+}
+
+impl Drop for CacheWritePlanInner {
+    fn drop(&mut self) {
+        self.store.release_writer(&self.id, self.writer_token);
+        let _ = fs::remove_file(&self.part_path);
+        let _ = fs::remove_file(&self.staged_path);
     }
 }
 
@@ -649,6 +807,10 @@ fn media_extension(media_type: &MediaType) -> &'static str {
         MediaType::Wav => "wav",
         MediaType::Hls | MediaType::Unknown => "media",
     }
+}
+
+fn dedicated_cache_root(selected_directory: &Path) -> PathBuf {
+    selected_directory.join(CACHE_DIRECTORY_NAME)
 }
 
 fn validate_custom_directory(path: &Path) -> Result<()> {
@@ -685,9 +847,13 @@ fn cleanup_part_files(root: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "part")
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let temporary_extension = path.extension().and_then(|value| value.to_str());
+        if name.starts_with(CACHE_FILE_PREFIX)
+            && matches!(temporary_extension, Some("part" | "ready" | "gxpart"))
         {
             let _ = fs::remove_file(path);
         }
@@ -695,7 +861,23 @@ fn cleanup_part_files(root: &Path) {
 }
 
 fn load_manifest(root: &Path) -> Manifest {
-    let mut manifest: Manifest = read_json(&root.join("manifest.json")).unwrap_or_default();
+    let path = root.join(MANIFEST_FILE_NAME);
+    let backup = json_backup_path(&path);
+    let legacy = root.join("manifest.json");
+    let mut manifest: Manifest = match read_json(&path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            if error.kind() != io::ErrorKind::NotFound {
+                quarantine_corrupt_json(&path);
+            }
+            read_json(&backup)
+                .or_else(|_| read_json(&legacy))
+                .unwrap_or_else(|_| recover_manifest_from_sidecars(root))
+        }
+    };
+    for (id, entry) in recover_manifest_from_sidecars(root).entries {
+        manifest.entries.entry(id).or_insert(entry);
+    }
     manifest.entries.retain(|_, entry| {
         entry.audio_path.starts_with(root)
             && entry.sidecar_path.starts_with(root)
@@ -710,7 +892,7 @@ fn persist_settings(state: &CacheState) -> Result<()> {
 }
 
 fn persist_manifest(state: &CacheState) -> Result<()> {
-    write_json_atomic(&state.root.join("manifest.json"), &state.manifest)
+    write_json_atomic(&state.root.join(MANIFEST_FILE_NAME), &state.manifest)
 }
 
 fn write_sidecar(entry: &CacheEntry) -> Result<()> {
@@ -721,10 +903,12 @@ fn remove_entry_files(entry: &CacheEntry) -> bool {
     match fs::remove_file(&entry.audio_path) {
         Ok(()) => {
             let _ = fs::remove_file(&entry.sidecar_path);
+            let _ = fs::remove_file(json_backup_path(&entry.sidecar_path));
             true
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let _ = fs::remove_file(&entry.sidecar_path);
+            let _ = fs::remove_file(json_backup_path(&entry.sidecar_path));
             true
         }
         Err(_) => false,
@@ -778,16 +962,82 @@ fn non_empty(value: &str) -> Option<String> {
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("JSON path has no parent")?;
     fs::create_dir_all(parent)?;
-    let temporary = path.with_extension(format!(
-        "{}.part",
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("gx-cache.json");
+    let temporary = parent.join(format!(
+        "{CACHE_FILE_PREFIX}{name}.{}.{}.{}.gxpart",
+        std::process::id(),
+        now_ms(),
+        JSON_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)?;
+    file.flush()?;
+    file.sync_data()?;
+    drop(file);
+
+    let backup = json_backup_path(path);
+    if path.exists() {
+        let _ = fs::remove_file(&backup);
+        fs::rename(path, &backup)?;
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn json_backup_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}.bak",
         path.extension()
             .and_then(|value| value.to_str())
             .unwrap_or("json")
-    ));
-    fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
-    let _ = fs::remove_file(path);
-    fs::rename(temporary, path)?;
-    Ok(())
+    ))
+}
+
+fn quarantine_corrupt_json(path: &Path) {
+    if path.exists() {
+        let quarantined = path.with_extension(format!("corrupt-{}.json", now_ms()));
+        let _ = fs::rename(path, quarantined);
+    }
+}
+
+fn recover_manifest_from_sidecars(root: &Path) -> Manifest {
+    let mut manifest = Manifest::default();
+    let Ok(entries) = fs::read_dir(root) else {
+        return manifest;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if !name.starts_with(CACHE_FILE_PREFIX)
+            || path.extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let Ok(entry) = read_json::<CacheEntry>(&path) else {
+            continue;
+        };
+        if entry.audio_path.starts_with(root)
+            && entry.sidecar_path == path
+            && entry.audio_path.is_file()
+        {
+            manifest.entries.insert(cache_id(&entry.key), entry);
+        }
+    }
+    manifest
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
@@ -821,6 +1071,8 @@ mod tests {
         let mut writer = plan.begin().unwrap();
         writer.append(b"complete audio");
         writer.finish(Some(14));
+        assert!(store.lookup(&first_key).is_none());
+        plan.commit().unwrap();
         let hit = store.lookup(&first_key).unwrap();
         assert_eq!(fs::read(&hit.audio_path).unwrap(), b"complete audio");
         assert_eq!(hit.source_sample_rate, Some(44_100));
@@ -898,6 +1150,7 @@ mod tests {
         let mut writer = plan.begin().unwrap();
         writer.append(b"audio-bytes-here");
         writer.finish(Some(16));
+        plan.commit().unwrap();
 
         let listed = store.list_entries();
         assert_eq!(listed.len(), 1);
@@ -924,12 +1177,74 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn custom_directory_uses_product_subdirectory_and_preserves_unrelated_parts() {
+        let app_data = temporary_root();
+        let selected = temporary_root().with_extension("selected");
+        fs::create_dir_all(&selected).unwrap();
+        let unrelated = selected.join("another-download.part");
+        fs::write(&unrelated, b"do not delete").unwrap();
+
+        let store = CacheStore::open(&app_data, None).unwrap();
+        let status = store.set_directory(&selected).unwrap();
+        assert_eq!(status.directory, selected.join(CACHE_DIRECTORY_NAME));
+        assert_eq!(status.custom_directory, Some(selected.clone()));
+        assert!(unrelated.is_file());
+        assert!(status.directory.is_dir());
+
+        fs::remove_dir_all(app_data).unwrap();
+        fs::remove_dir_all(selected).unwrap();
+    }
+
+    #[test]
+    fn directory_epoch_invalidates_in_flight_writer() {
+        let app_data = temporary_root();
+        let selected = temporary_root().with_extension("new-root");
+        fs::create_dir_all(&selected).unwrap();
+        let store = CacheStore::open(&app_data, None).unwrap();
+        let cache_key = key("moving", "320k");
+        let plan = store.prepare(cache_key.clone(), MediaType::Mp3);
+        let mut writer = plan.begin().unwrap();
+        writer.append(b"before move");
+
+        store.set_directory(&selected).unwrap();
+        writer.append(b"after move");
+        writer.finish(None);
+        assert!(plan.commit().is_err());
+        assert!(store.lookup(&cache_key).is_none());
+
+        fs::remove_dir_all(app_data).unwrap();
+        fs::remove_dir_all(selected).unwrap();
+    }
+
+    #[test]
+    fn corrupt_manifest_recovers_from_namespaced_sidecars() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        let cache_key = key("recover", "flac");
+        write_entry(&store, cache_key.clone(), 32);
+        let cache_root = store.status().directory;
+        fs::write(cache_root.join(MANIFEST_FILE_NAME), b"{not-json").unwrap();
+        drop(store);
+
+        let reopened = CacheStore::open(&root, None).unwrap();
+        assert!(reopened.lookup(&cache_key).is_some());
+        assert!(
+            fs::read_dir(&cache_root)
+                .unwrap()
+                .flatten()
+                .any(|entry| { entry.file_name().to_string_lossy().contains("corrupt-") })
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn write_entry(store: &CacheStore, key: CacheKey, size: usize) {
         let plan = store.prepare(key, MediaType::Mp3);
         let mut writer = plan.begin().unwrap();
         let bytes = vec![1; size];
         writer.append(&bytes);
         writer.finish(Some(size as u64));
+        plan.commit().unwrap();
     }
 
     fn key(track: &str, quality: &str) -> CacheKey {
@@ -941,10 +1256,15 @@ mod tests {
     }
 
     fn temporary_root() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!("gx-cache-test-{}-{nanos}", std::process::id()))
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "gx-cache-test-{}-{nanos}-{sequence}",
+            std::process::id()
+        ))
     }
 }

@@ -53,11 +53,31 @@ export type CatalogTrack = {
 };
 
 export type OnlinePlaybackResult = {
+  outcome: "started" | "failed" | "cancelled" | "stale";
+  attempts: ResolveAttemptDiagnostic[];
+  error?: string | null;
   track: CatalogTrack;
   sourceId: string | null;
   sourceName: string | null;
   quality: string | null;
   cacheHit: boolean;
+};
+
+export type ResolveAttemptDiagnostic = {
+  sourceId: string | null;
+  sourceName: string | null;
+  providerId: string;
+  providerTrackId: string;
+  quality: string | null;
+  stage: string;
+  success: boolean;
+  error: string | null;
+};
+
+export type SourceFallbackConfig = {
+  enabled: boolean;
+  sourceIds: string[];
+  explicitlyConfigured: boolean;
 };
 
 export type CacheStatus = {
@@ -103,6 +123,11 @@ export type LibraryTrack = {
   favorite: boolean;
   addedAtMs: number;
   missing?: boolean;
+};
+
+export type LibraryImportResult = {
+  imported: LibraryTrack[];
+  failures: Array<{ path: string; error: string }>;
 };
 
 export type HistoryEntry = {

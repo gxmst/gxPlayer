@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -26,21 +27,22 @@ use cache_commands::{
     cache_remove_entries, cache_remove_entry, cache_reset_directory, cache_set_directory,
     cache_set_limit, cache_set_online_favorite, cache_status, player_play_cache_entry,
 };
+use metadata_commands::{
+    maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
+    metadata_play_preview, metadata_search,
+};
 use product_commands::{
     backup_read_file, backup_write_file, library_clear_history, library_embedded_cover,
     library_history, library_record_history, library_scan_missing, player_media_action,
     window_force_show, window_get_state, window_save_state, window_set_always_on_top,
     window_set_mini_mode,
 };
-use metadata_commands::{
-    maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
-    metadata_play_preview, metadata_search,
-};
 use source_commands::{
-    lx_http_request, lx_runtime_failure, lx_runtime_result, lx_send, player_play_online_track,
-    source_activate, source_export_backup, source_get_config, source_import_file,
-    source_import_url, source_list, source_reload, source_remove, source_resolve,
-    source_restore_backup, source_set_config, source_set_updates_enabled, source_status,
+    ResolveCancellationRegistry, lx_http_request, lx_runtime_failure, lx_runtime_result, lx_send,
+    player_cancel_resolve, player_play_online_track, source_activate, source_export_backup,
+    source_get_config, source_get_fallback_config, source_import_file, source_import_url,
+    source_list, source_reload, source_remove, source_resolve, source_restore_backup,
+    source_set_config, source_set_fallback_config, source_set_updates_enabled, source_status,
 };
 use source_runtime::SourceRuntime;
 
@@ -122,7 +124,6 @@ fn ui_ready(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
 fn player_load_local(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
-    library: tauri::State<LibraryStore>,
     paths: Vec<String>,
     start_index: Option<usize>,
 ) -> Result<(), String> {
@@ -138,29 +139,6 @@ fn player_load_local(
             paths.len()
         ));
     }
-    let tracks = paths
-        .iter()
-        .map(|path| {
-            let info = gx_audio::probe_local_file(path).map_err(|error| error.to_string())?;
-            let stem = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("未命名曲目");
-            let (filename_artist, filename_title) = stem
-                .split_once(" - ")
-                .map_or(("", stem), |(artist, title)| (artist, title));
-            Ok(NewTrack {
-                path: path.display().to_string(),
-                title: info.title.unwrap_or_else(|| filename_title.to_owned()),
-                artist: info.artist.unwrap_or_else(|| filename_artist.to_owned()),
-                album: info.album.unwrap_or_default(),
-                duration_seconds: info.duration_seconds,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    library
-        .add_tracks(&tracks)
-        .map_err(|error| error.to_string())?;
     engine
         .load_at(paths, start_index)
         .map_err(|error| error.to_string())
@@ -170,7 +148,6 @@ fn player_load_local(
 fn player_enqueue_local(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
-    library: tauri::State<LibraryStore>,
     paths: Vec<String>,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
@@ -178,30 +155,111 @@ fn player_enqueue_local(
     if paths.is_empty() {
         return Err("至少需要一首本地音频".into());
     }
-    let tracks = paths
+    engine.enqueue(paths).map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryImportFailure {
+    path: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryImportResult {
+    imported: Vec<LibraryTrack>,
+    failures: Vec<LibraryImportFailure>,
+}
+
+#[tauri::command]
+async fn library_import_files(
+    window: WebviewWindow,
+    paths: Vec<String>,
+) -> Result<LibraryImportResult, String> {
+    require_window(&window, "main")?;
+    if paths.len() > 10_000 {
+        return Err("单次最多导入 10000 个本地音频文件".into());
+    }
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let library = app.state::<LibraryStore>();
+        import_local_files(&library, paths)
+    })
+    .await
+    .map_err(|error| format!("本地音乐导入任务失败: {error}"))?
+}
+
+fn import_local_files(
+    library: &LibraryStore,
+    paths: Vec<String>,
+) -> Result<LibraryImportResult, String> {
+    let mut seen = HashSet::new();
+    let mut accepted = Vec::new();
+    let mut failures = Vec::new();
+    for raw_path in paths {
+        if raw_path.trim().is_empty() {
+            failures.push(LibraryImportFailure {
+                path: raw_path,
+                error: "文件路径为空".into(),
+            });
+            continue;
+        }
+        if !seen.insert(local_path_key(&raw_path)) {
+            continue;
+        }
+        let path = PathBuf::from(&raw_path);
+        let info = match gx_audio::probe_local_file(&path) {
+            Ok(info) => info,
+            Err(error) => {
+                failures.push(LibraryImportFailure {
+                    path: raw_path,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        accepted.push(new_library_track(&path, info));
+    }
+
+    library
+        .upsert_tracks(&accepted)
+        .map_err(|error| error.to_string())?;
+    let imported = accepted
         .iter()
-        .map(|path| {
-            let info = gx_audio::probe_local_file(path).map_err(|error| error.to_string())?;
-            let stem = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("未命名曲目");
-            let (filename_artist, filename_title) = stem
-                .split_once(" - ")
-                .map_or(("", stem), |(artist, title)| (artist, title));
-            Ok(NewTrack {
-                path: path.display().to_string(),
-                title: info.title.unwrap_or_else(|| filename_title.to_owned()),
-                artist: info.artist.unwrap_or_else(|| filename_artist.to_owned()),
-                album: info.album.unwrap_or_default(),
-                duration_seconds: info.duration_seconds,
-            })
+        .map(|track| {
+            library
+                .track_by_path(&track.path)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("导入后未能读取曲目: {}", track.path))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    library
-        .add_tracks(&tracks)
-        .map_err(|error| error.to_string())?;
-    engine.enqueue(paths).map_err(|error| error.to_string())
+    Ok(LibraryImportResult { imported, failures })
+}
+
+fn new_library_track(path: &Path, info: gx_audio::LocalMediaInfo) -> NewTrack {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("未命名曲目");
+    let (filename_artist, filename_title) = stem
+        .split_once(" - ")
+        .map_or(("", stem), |(artist, title)| (artist, title));
+    NewTrack {
+        path: path.display().to_string(),
+        title: info.title.unwrap_or_else(|| filename_title.to_owned()),
+        artist: info.artist.unwrap_or_else(|| filename_artist.to_owned()),
+        album: info.album.unwrap_or_default(),
+        duration_seconds: info.duration_seconds,
+    }
+}
+
+fn local_path_key(path: &str) -> String {
+    if cfg!(windows) {
+        path.replace('/', "\\").to_lowercase()
+    } else {
+        path.to_owned()
+    }
 }
 
 #[tauri::command]
@@ -223,6 +281,19 @@ fn player_remove_queue_item(
     require_window(&window, "main")?;
     engine
         .remove_queue_item(index)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_reorder_queue(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    from: usize,
+    to: usize,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine
+        .reorder_queue(from, to)
         .map_err(|error| error.to_string())
 }
 
@@ -701,9 +772,13 @@ fn phase1_script_path() -> PathBuf {
 
 /// Size and show the main window before first paint.
 /// Restores saved geometry when present and on-screen; otherwise safe centered default.
-fn place_and_show_main_window(window: &WebviewWindow, app_data: &std::path::Path) -> tauri::Result<()> {
+fn place_and_show_main_window(
+    window: &WebviewWindow,
+    app_data: &std::path::Path,
+) -> tauri::Result<()> {
     let saved = window_state::load(app_data);
-    let has_saved = saved.width.is_some() || saved.x.is_some() || saved.mini_mode || saved.maximized;
+    let has_saved =
+        saved.width.is_some() || saved.x.is_some() || saved.mini_mode || saved.maximized;
     if has_saved {
         window_state::apply_to_window(window, &saved);
     } else {
@@ -820,9 +895,10 @@ fn create_lx_sandbox(app: &AppHandle) -> tauri::Result<WebviewWindow> {
 pub fn run() {
     let audio_engine = LocalAudioEngine::new().expect("failed to create local audio engine");
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(audio_engine)
+        .manage(ResolveCancellationRegistry::default())
+        .manage(media_session::MediaSessionState::default())
         .manage(LxPocState {
             script_path: phase1_script_path(),
             progress: Mutex::new(LxPocProgress::default()),
@@ -837,6 +913,9 @@ pub fn run() {
         })
         .setup(|app| {
             let app_data = isolated_smoke_data_root().unwrap_or(app.path().app_data_dir()?);
+            app.manage(window_state::WindowModeState::new(
+                window_state::load(&app_data).mini_mode,
+            ));
             app.manage(LibraryStore::open(app_data.join("library.sqlite3"))?);
             app.manage(gx_cache::CacheStore::open(
                 &app_data,
@@ -896,6 +975,7 @@ pub fn run() {
             player_enqueue_local,
             player_load_resolved,
             player_play_online_track,
+            player_cancel_resolve,
             player_play,
             player_pause,
             player_seek,
@@ -907,11 +987,13 @@ pub fn run() {
             player_previous,
             player_jump,
             player_remove_queue_item,
+            player_reorder_queue,
             player_clear_queue,
             player_snapshot,
             player_output_devices,
             player_set_output_device,
             player_media_action,
+            library_import_files,
             library_tracks,
             library_favorites,
             library_set_favorite,
@@ -946,6 +1028,8 @@ pub fn run() {
             source_set_updates_enabled,
             source_get_config,
             source_set_config,
+            source_get_fallback_config,
+            source_set_fallback_config,
             source_export_backup,
             source_restore_backup,
             source_resolve,

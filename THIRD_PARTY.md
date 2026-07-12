@@ -16,4 +16,8 @@ Phase -1 external compatibility fixture (not committed; cloned under ignored `.p
 - Its companion service is not run. The PoC supplies deterministic mock HTTP responses through the sandbox bridge so compatibility can be tested without fetching music content.
 # Bundled fonts
 
-GXPlayer bundles Space Grotesk, Noto Sans SC, and JetBrains Mono through Fontsource packages. The font files are distributed under the SIL Open Font License 1.1; package metadata and license texts are available in the corresponding `node_modules/@fontsource-variable/*` packages and npm lockfile.
+GXPlayer bundles Geist, Geist Mono, and Noto Sans SC through Fontsource packages. The font files are distributed under the SIL Open Font License 1.1. The notices copied from the packages are included in:
+
+- `third_party/licenses/OFL-Geist.txt`
+- `third_party/licenses/OFL-Geist-Mono.txt`
+- `third_party/licenses/OFL-Noto-Sans-SC.txt`

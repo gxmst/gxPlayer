@@ -1,31 +1,140 @@
-//! Windows System Media Transport Controls (taskbar media flyout).
+//! Windows System Media Transport Controls (SMTC) and playback snapshot events.
 //!
-//! Uses souvlaki + the main window HWND. Next/previous are emitted to the
-//! frontend so playlist ownership stays consistent.
+//! Windows exposes this session in its media flyout/quick settings and on media keys. The
+//! session remains attached to the main HWND while the WebView is hidden to the tray.
 
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-use gx_audio::engine::LocalAudioEngine;
+use gx_audio::engine::{EngineSnapshot, LocalAudioEngine, QueueItem};
 use gx_contracts::PlaybackStatus;
-use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
+use gx_library::LibraryStore;
+use gx_metadata::CatalogTrack;
+use souvlaki::{
+    MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
+    SeekDirection,
+};
 use tauri::{AppHandle, Emitter, Manager};
+
+const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
+const DEFAULT_SEEK_SECONDS: f64 = 10.0;
+
+#[derive(Debug, Clone, Default)]
+struct PlaybackMetadata {
+    revision: u64,
+    minimum_generation: u64,
+    location_hint: Option<String>,
+    online_only: bool,
+    title: String,
+    artist: String,
+    album: String,
+    duration_seconds: Option<f64>,
+    cover_url: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct MediaSessionInner {
+    next_revision: u64,
+    override_metadata: Option<PlaybackMetadata>,
+}
+
+/// Metadata supplied by online/preview/cache commands. Local-library metadata is read directly
+/// from `LibraryStore` using the engine queue path.
+#[derive(Debug, Default)]
+pub struct MediaSessionState {
+    inner: Mutex<MediaSessionInner>,
+}
+
+impl MediaSessionState {
+    fn set_override(&self, mut metadata: PlaybackMetadata) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.next_revision = inner.next_revision.wrapping_add(1).max(1);
+        metadata.revision = inner.next_revision;
+        inner.override_metadata = Some(metadata);
+    }
+
+    fn matching_override(
+        &self,
+        snapshot: &EngineSnapshot,
+        item: &QueueItem,
+    ) -> Option<PlaybackMetadata> {
+        let metadata = self.inner.lock().unwrap().override_metadata.clone()?;
+        if snapshot.generation < metadata.minimum_generation {
+            return None;
+        }
+        let matches = metadata.location_hint.as_deref().map_or_else(
+            || !metadata.online_only || item.online,
+            |location| location == item.location,
+        );
+        matches.then_some(metadata)
+    }
+}
+
+/// Capture this before submitting a load command, then pass it to `set_*_metadata`.
+pub fn next_engine_generation(engine: &LocalAudioEngine) -> u64 {
+    engine.snapshot().generation.wrapping_add(1)
+}
+
+pub fn set_online_metadata(
+    app: &AppHandle,
+    track: &CatalogTrack,
+    minimum_generation: u64,
+    location_hint: Option<String>,
+) {
+    app.state::<MediaSessionState>()
+        .set_override(PlaybackMetadata {
+            minimum_generation,
+            location_hint,
+            online_only: true,
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            duration_seconds: track.duration_ms.map(|value| value as f64 / 1000.0),
+            cover_url: track.artwork_url.as_ref().map(ToString::to_string),
+            ..PlaybackMetadata::default()
+        });
+}
+
+pub fn set_cached_metadata(
+    app: &AppHandle,
+    title: String,
+    artist: String,
+    album: String,
+    cover_url: Option<String>,
+    minimum_generation: u64,
+    location: String,
+) {
+    app.state::<MediaSessionState>()
+        .set_override(PlaybackMetadata {
+            minimum_generation,
+            location_hint: Some(location),
+            online_only: false,
+            title,
+            artist,
+            album,
+            duration_seconds: None,
+            cover_url,
+            ..PlaybackMetadata::default()
+        });
+}
 
 pub fn spawn_media_session(app: AppHandle) {
     thread::Builder::new()
         .name("gx-media-session".into())
         .spawn(move || {
-            // Wait for the main window to be shown; HWND is required on Windows.
             for attempt in 1..=12 {
-                thread::sleep(Duration::from_millis(if attempt == 1 { 900 } else { 700 }));
+                thread::sleep(Duration::from_millis(if attempt == 1 { 500 } else { 700 }));
                 match run_media_session(app.clone()) {
                     Ok(()) => return,
-                    Err(error) => {
-                        eprintln!("GX_SMTC attempt {attempt} failed: {error}");
-                    }
+                    Err(error) => eprintln!("GX_SMTC attempt {attempt} failed: {error}"),
                 }
             }
-            eprintln!("GX_SMTC unavailable after retries (taskbar media controls disabled)");
+            eprintln!("GX_SMTC unavailable after retries (Windows media controls disabled)");
         })
         .ok();
 }
@@ -34,12 +143,9 @@ fn main_hwnd(app: &AppHandle) -> Result<*mut std::ffi::c_void, String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "main window missing".to_owned())?;
-    if !window.is_visible().unwrap_or(false) {
-        return Err("main window not visible yet".into());
-    }
     #[cfg(windows)]
     {
-        let hwnd = window.hwnd().map_err(|e| e.to_string())?;
+        let hwnd = window.hwnd().map_err(|error| error.to_string())?;
         let raw = hwnd.0;
         if raw.is_null() {
             return Err("HWND is null".into());
@@ -53,128 +159,387 @@ fn main_hwnd(app: &AppHandle) -> Result<*mut std::ffi::c_void, String> {
     }
 }
 
-fn run_media_session(app: AppHandle) -> Result<(), String> {
-    let hwnd = main_hwnd(&app)?;
-    println!("GX_SMTC hwnd={hwnd:?}");
+#[cfg(windows)]
+struct WinRtApartment;
 
+#[cfg(windows)]
+impl WinRtApartment {
+    fn initialize() -> Result<Self, String> {
+        unsafe {
+            windows::Win32::System::WinRT::RoInitialize(
+                windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
+            )
+            .map_err(|error| format!("RoInitialize: {error}"))?;
+        }
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WinRtApartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::WinRT::RoUninitialize() };
+    }
+}
+
+fn run_media_session(app: AppHandle) -> Result<(), String> {
+    #[cfg(windows)]
+    let _apartment = WinRtApartment::initialize()?;
+
+    let hwnd = main_hwnd(&app)?;
     let config = PlatformConfig {
         dbus_name: "com.gxplayer.desktop",
         display_name: "GXPlayer",
         hwnd: Some(hwnd),
     };
-    let mut controls = MediaControls::new(config).map_err(|e| format!("MediaControls::new: {e:?}"))?;
+    let mut controls =
+        MediaControls::new(config).map_err(|error| format!("MediaControls::new: {error:?}"))?;
     let app_events = app.clone();
-
     controls
-        .attach(move |event| {
-            let Some(engine) = app_events.try_state::<LocalAudioEngine>() else {
-                return;
-            };
-            let result = match event {
-                MediaControlEvent::Toggle => {
-                    let status = engine.snapshot().status;
-                    if matches!(status, PlaybackStatus::Playing | PlaybackStatus::Loading) {
-                        engine.pause()
-                    } else {
-                        engine.play()
-                    }
-                }
-                MediaControlEvent::Play => engine.play(),
-                MediaControlEvent::Pause | MediaControlEvent::Stop => engine.pause(),
-                MediaControlEvent::Next => {
-                    let _ = app_events.emit("gx-media", "next");
-                    Ok(())
-                }
-                MediaControlEvent::Previous => {
-                    let _ = app_events.emit("gx-media", "previous");
-                    Ok(())
-                }
-                _ => Ok(()),
-            };
-            if let Err(error) = result {
-                eprintln!("GX_SMTC command failed: {error}");
-            }
+        .attach(move |event| handle_media_control_event(&app_events, event))
+        .map_err(|error| format!("MediaControls::attach: {error:?}"))?;
+
+    let default_cover = default_cover_url(&app);
+    controls
+        .set_metadata(MediaMetadata {
+            title: Some("GXPlayer"),
+            artist: Some("就绪"),
+            album: Some("GXPlayer"),
+            cover_url: default_cover.as_deref(),
+            duration: None,
         })
-        .map_err(|e| format!("MediaControls::attach: {e:?}"))?;
+        .map_err(|error| format!("initial SMTC metadata: {error:?}"))?;
+    controls
+        .set_playback(MediaPlayback::Stopped)
+        .map_err(|error| format!("initial SMTC playback: {error:?}"))?;
+    println!("GX_SMTC attached hwnd={hwnd:?}");
 
-    // Seed metadata immediately so Windows registers the session.
-    let _ = controls.set_metadata(MediaMetadata {
-        title: Some("GXPlayer"),
-        artist: Some("就绪"),
-        album: Some("GXPlayer"),
-        cover_url: None,
-        duration: None,
-    });
-    let _ = controls.set_playback(MediaPlayback::Stopped);
-    println!("GX_SMTC attached");
-
-    let mut last_title = String::new();
-    let mut last_generation = u64::MAX;
-    let mut last_status: Option<&'static str> = None;
-
+    let mut last_metadata_key = String::new();
+    let mut last_status = None;
+    let mut last_position = f64::NEG_INFINITY;
     loop {
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(SNAPSHOT_INTERVAL);
         let Some(engine) = app.try_state::<LocalAudioEngine>() else {
             continue;
         };
-        let snap = engine.snapshot();
-        let item = snap.queue_index.and_then(|index| snap.queue.get(index));
-        let title = item
-            .map(|item| item.title.clone())
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "GXPlayer".into());
-        let artist = item
-            .map(|item| {
-                if item.online {
-                    "在线".to_owned()
-                } else {
-                    "本地".to_owned()
-                }
-            })
-            .unwrap_or_else(|| "GXPlayer".into());
+        let snapshot = engine.snapshot();
+        let _ = app.emit("gx-player-snapshot", &snapshot);
 
-        if title != last_title || snap.generation != last_generation {
+        let item = snapshot
+            .queue_index
+            .and_then(|index| snapshot.queue.get(index));
+        let override_metadata = item.and_then(|item| {
+            app.state::<MediaSessionState>()
+                .matching_override(&snapshot, item)
+        });
+        let metadata_key = metadata_key(&snapshot, item, override_metadata.as_ref());
+        if metadata_key != last_metadata_key {
+            let metadata =
+                resolve_metadata(&app, &snapshot, item, override_metadata, &default_cover);
+            let duration = metadata
+                .duration_seconds
+                .or(snapshot.duration_seconds)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(Duration::from_secs_f64);
             if let Err(error) = controls.set_metadata(MediaMetadata {
-                title: Some(title.as_str()),
-                artist: Some(artist.as_str()),
-                album: Some("GXPlayer"),
-                cover_url: None,
-                duration: snap
-                    .duration_seconds
-                    .filter(|v| v.is_finite() && *v > 0.0)
-                    .map(Duration::from_secs_f64),
+                title: Some(&metadata.title),
+                artist: Some(&metadata.artist),
+                album: Some(&metadata.album),
+                cover_url: metadata.cover_url.as_deref().or(default_cover.as_deref()),
+                duration,
             }) {
                 eprintln!("GX_SMTC set_metadata: {error:?}");
             }
-            last_title = title;
-            last_generation = snap.generation;
+            if let Some(window) = app.get_webview_window("main") {
+                let title = window_title(&metadata.title, &metadata.artist);
+                let _ = window.set_title(&title);
+            }
+            last_metadata_key = metadata_key;
         }
 
-        let status_label: &'static str = match snap.status {
-            PlaybackStatus::Playing | PlaybackStatus::Loading => "playing",
-            PlaybackStatus::Paused | PlaybackStatus::Buffering => "paused",
-            _ => "stopped",
+        let status = playback_label(snapshot.status);
+        let position = if snapshot.position_seconds.is_finite() {
+            snapshot.position_seconds.max(0.0)
+        } else {
+            0.0
         };
-        if last_status != Some(status_label) {
-            let playback = match status_label {
-                "playing" => MediaPlayback::Playing {
-                    progress: Some(souvlaki::MediaPosition(Duration::from_secs_f64(
-                        snap.position_seconds.max(0.0),
-                    ))),
-                },
-                "paused" => MediaPlayback::Paused {
-                    progress: Some(souvlaki::MediaPosition(Duration::from_secs_f64(
-                        snap.position_seconds.max(0.0),
-                    ))),
-                },
+        if last_status != Some(status)
+            || !last_position.is_finite()
+            || (position - last_position).abs() >= 0.2
+        {
+            let progress = Some(MediaPosition(Duration::from_secs_f64(position)));
+            let playback = match status {
+                "playing" => MediaPlayback::Playing { progress },
+                "paused" => MediaPlayback::Paused { progress },
                 _ => MediaPlayback::Stopped,
             };
             if let Err(error) = controls.set_playback(playback) {
                 eprintln!("GX_SMTC set_playback: {error:?}");
-            } else {
-                println!("GX_SMTC playback={status_label}");
             }
-            last_status = Some(status_label);
+            last_status = Some(status);
+            last_position = position;
         }
+    }
+}
+
+fn handle_media_control_event(app: &AppHandle, event: MediaControlEvent) {
+    let Some(engine) = app.try_state::<LocalAudioEngine>() else {
+        return;
+    };
+    let result: Result<(), String> = match event {
+        MediaControlEvent::Toggle => if matches!(
+            engine.snapshot().status,
+            PlaybackStatus::Playing | PlaybackStatus::Loading
+        ) {
+            engine.pause()
+        } else {
+            engine.play()
+        }
+        .map_err(|error| error.to_string()),
+        MediaControlEvent::Play => engine.play().map_err(|error| error.to_string()),
+        MediaControlEvent::Pause | MediaControlEvent::Stop => {
+            engine.pause().map_err(|error| error.to_string())
+        }
+        MediaControlEvent::Next => {
+            let _ = app.emit("gx-media", "next");
+            Ok(())
+        }
+        MediaControlEvent::Previous => {
+            let _ = app.emit("gx-media", "previous");
+            Ok(())
+        }
+        MediaControlEvent::SetPosition(MediaPosition(position)) => engine
+            .seek(position.as_secs_f64())
+            .map_err(|error| error.to_string()),
+        MediaControlEvent::SeekBy(direction, amount) => {
+            seek_relative(&engine, direction, amount.as_secs_f64())
+        }
+        MediaControlEvent::Seek(direction) => {
+            seek_relative(&engine, direction, DEFAULT_SEEK_SECONDS)
+        }
+        MediaControlEvent::Raise => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    };
+    if let Err(error) = result {
+        eprintln!("GX_SMTC command failed: {error}");
+    }
+}
+
+fn seek_relative(
+    engine: &LocalAudioEngine,
+    direction: SeekDirection,
+    amount_seconds: f64,
+) -> Result<(), String> {
+    let position = engine.snapshot().position_seconds;
+    let target = match direction {
+        SeekDirection::Forward => position + amount_seconds,
+        SeekDirection::Backward => (position - amount_seconds).max(0.0),
+    };
+    engine.seek(target).map_err(|error| error.to_string())
+}
+
+fn playback_label(status: PlaybackStatus) -> &'static str {
+    match status {
+        PlaybackStatus::Playing | PlaybackStatus::Loading => "playing",
+        PlaybackStatus::Paused | PlaybackStatus::Buffering => "paused",
+        _ => "stopped",
+    }
+}
+
+fn window_title(title: &str, artist: &str) -> String {
+    let clean = |value: &str| value.replace(['\r', '\n'], " ").trim().to_owned();
+    let title = clean(title);
+    let artist = clean(artist);
+    if title.is_empty() || title == "GXPlayer" {
+        "GXPlayer".into()
+    } else if artist.is_empty() {
+        format!("{title} · GXPlayer")
+    } else {
+        format!("{title} — {artist} · GXPlayer")
+    }
+}
+
+fn metadata_key(
+    snapshot: &EngineSnapshot,
+    item: Option<&QueueItem>,
+    metadata: Option<&PlaybackMetadata>,
+) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        snapshot.queue_index.map_or(usize::MAX, |value| value),
+        item.map_or("", |item| item.location.as_str()),
+        metadata.map_or(0, |metadata| metadata.revision),
+        snapshot
+            .duration_seconds
+            .filter(|value| value.is_finite())
+            .map_or(0, |value| (value * 10.0) as u64)
+    )
+}
+
+fn resolve_metadata(
+    app: &AppHandle,
+    snapshot: &EngineSnapshot,
+    item: Option<&QueueItem>,
+    override_metadata: Option<PlaybackMetadata>,
+    default_cover: &Option<String>,
+) -> PlaybackMetadata {
+    if let Some(mut metadata) = override_metadata {
+        metadata.duration_seconds = metadata.duration_seconds.or(snapshot.duration_seconds);
+        if metadata.cover_url.is_none() {
+            metadata.cover_url = default_cover.clone();
+        }
+        return metadata;
+    }
+    let Some(item) = item else {
+        return PlaybackMetadata {
+            title: "GXPlayer".into(),
+            artist: "就绪".into(),
+            album: "GXPlayer".into(),
+            cover_url: default_cover.clone(),
+            ..PlaybackMetadata::default()
+        };
+    };
+    if !item.online {
+        let library_track = app
+            .try_state::<LibraryStore>()
+            .and_then(|library| library.track_by_path(&item.location).ok().flatten());
+        let probed = if library_track.is_none() {
+            gx_audio::probe_local_file(Path::new(&item.location)).ok()
+        } else {
+            None
+        };
+        let title = library_track
+            .as_ref()
+            .map(|track| track.title.clone())
+            .or_else(|| probed.as_ref().and_then(|info| info.title.clone()))
+            .unwrap_or_else(|| item.title.clone());
+        let artist = library_track
+            .as_ref()
+            .map(|track| track.artist.clone())
+            .or_else(|| probed.as_ref().and_then(|info| info.artist.clone()))
+            .unwrap_or_default();
+        let album = library_track
+            .as_ref()
+            .map(|track| track.album.clone())
+            .or_else(|| probed.as_ref().and_then(|info| info.album.clone()))
+            .unwrap_or_default();
+        let duration_seconds = library_track
+            .as_ref()
+            .and_then(|track| track.duration_seconds)
+            .or_else(|| probed.as_ref().and_then(|info| info.duration_seconds))
+            .or(snapshot.duration_seconds);
+        let cover_url =
+            local_cover_url(app, Path::new(&item.location)).or_else(|| default_cover.clone());
+        return PlaybackMetadata {
+            title,
+            artist,
+            album,
+            duration_seconds,
+            cover_url,
+            ..PlaybackMetadata::default()
+        };
+    }
+    PlaybackMetadata {
+        title: item.title.clone(),
+        artist: String::new(),
+        album: String::new(),
+        duration_seconds: snapshot.duration_seconds,
+        cover_url: default_cover.clone(),
+        ..PlaybackMetadata::default()
+    }
+}
+
+fn local_cover_url(app: &AppHandle, media_path: &Path) -> Option<String> {
+    let cover = gx_audio::extract_embedded_cover(media_path)
+        .ok()
+        .flatten()?;
+    let mut hasher = DefaultHasher::new();
+    media_path.hash(&mut hasher);
+    media_path
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .hash(&mut hasher);
+    let extension = if cover.mime.eq_ignore_ascii_case("image/png") {
+        "png"
+    } else {
+        "jpg"
+    };
+    let directory = app.path().app_cache_dir().ok()?.join("media-session");
+    fs::create_dir_all(&directory).ok()?;
+    let path = directory.join(format!("local-{:016x}.{extension}", hasher.finish()));
+    if !path.exists() {
+        fs::write(&path, cover.data).ok()?;
+    }
+    Some(file_url(&path))
+}
+
+fn default_cover_url(app: &AppHandle) -> Option<String> {
+    let directory = app.path().app_cache_dir().ok()?.join("media-session");
+    fs::create_dir_all(&directory).ok()?;
+    let path = directory.join("gxplayer-default.png");
+    if !path.exists() {
+        fs::write(&path, include_bytes!("../icons/128x128.png")).ok()?;
+    }
+    Some(file_url(&path))
+}
+
+fn file_url(path: &Path) -> String {
+    let absolute = path.canonicalize().unwrap_or_else(|_| PathBuf::from(path));
+    url::Url::from_file_path(&absolute)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| format!("file://{}", absolute.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_status_mapping_is_stable() {
+        assert_eq!(playback_label(PlaybackStatus::Playing), "playing");
+        assert_eq!(playback_label(PlaybackStatus::Buffering), "paused");
+        assert_eq!(playback_label(PlaybackStatus::Failed), "stopped");
+    }
+
+    #[test]
+    fn generation_guard_rejects_old_override() {
+        let state = MediaSessionState::default();
+        state.set_override(PlaybackMetadata {
+            minimum_generation: 5,
+            online_only: true,
+            title: "new".into(),
+            ..PlaybackMetadata::default()
+        });
+        let mut snapshot = EngineSnapshot {
+            generation: 4,
+            ..EngineSnapshot::default()
+        };
+        let item = QueueItem {
+            location: "online".into(),
+            title: "old".into(),
+            duration_seconds: None,
+            online: true,
+        };
+        assert!(state.matching_override(&snapshot, &item).is_none());
+        snapshot.generation = 5;
+        assert_eq!(
+            state.matching_override(&snapshot, &item).unwrap().title,
+            "new"
+        );
+    }
+
+    #[test]
+    fn taskbar_window_title_contains_real_track_metadata() {
+        assert_eq!(window_title("Song", "Artist"), "Song — Artist · GXPlayer");
+        assert_eq!(window_title("Song", ""), "Song · GXPlayer");
+        assert_eq!(window_title("GXPlayer", "就绪"), "GXPlayer");
     }
 }

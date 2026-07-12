@@ -1,5 +1,11 @@
 # GXPlayer project review — 2026-07-12
 
+> Historical snapshot. Later commits on 2026-07-12 implemented parts of the
+> online LX playback path, queue ownership, embedded artwork, and window-state
+> persistence described below as missing. Treat this document as review
+> provenance rather than the current roadmap; current behavior is documented
+> in `README.md` and `docs/architecture`.
+
 ## Executive assessment
 
 The native audio, sandbox boundary, metadata services, and local persistence are useful foundations, but the project was declared daily-use ready too early. This review found one release-blocking audio scheduling bug, two visible window/layout defects, and an important gap between the LX source runtime and the normal search/play user flow.

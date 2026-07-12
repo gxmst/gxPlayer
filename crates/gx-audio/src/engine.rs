@@ -20,10 +20,11 @@ use symphonia::core::codecs::{
     CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_VORBIS, CodecType,
 };
 use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::meta::StandardTagKey;
 
 use super::{
-    OpenedMedia, RateAdapter, choose_output_config, open_media, open_media_source, seek_media,
-    seek_media_coarse,
+    OpenedMedia, RateAdapter, choose_output_config, open_media, open_media_source, remap_channels,
+    seek_media, seek_media_coarse,
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -159,6 +160,10 @@ enum EngineCommand {
     Enqueue(Vec<EngineQueueItem>),
     Jump(usize),
     Remove(usize),
+    Reorder {
+        from: usize,
+        to: usize,
+    },
     ClearQueue,
     Play,
     Pause,
@@ -204,7 +209,10 @@ impl LocalAudioEngine {
             bail!("at least one local audio path is required");
         }
         if start_index >= paths.len() {
-            bail!("start_index {start_index} is out of range for {} paths", paths.len());
+            bail!(
+                "start_index {start_index} is out of range for {} paths",
+                paths.len()
+            );
         }
         self.send(EngineCommand::Load {
             items: paths.into_iter().map(local_queue_item).collect(),
@@ -273,6 +281,10 @@ impl LocalAudioEngine {
 
     pub fn remove_queue_item(&self, index: usize) -> Result<()> {
         self.send(EngineCommand::Remove(index))
+    }
+
+    pub fn reorder_queue(&self, from: usize, to: usize) -> Result<()> {
+        self.send(EngineCommand::Reorder { from, to })
     }
 
     pub fn clear_queue(&self) -> Result<()> {
@@ -421,9 +433,7 @@ fn default_shuffle_seed() -> u64 {
 
 /// Numerical Recipes LCG — worker-thread only, never on the audio callback path.
 fn lcg_next(state: &mut u64) -> u64 {
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1);
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
     *state
 }
 
@@ -492,11 +502,7 @@ fn next_index_on_ended(model: &mut WorkerModel) -> Option<usize> {
     match model.play_mode {
         PlayMode::Sequential => {
             let next = current + 1;
-            if next < n {
-                Some(next)
-            } else {
-                None
-            }
+            if next < n { Some(next) } else { None }
         }
         PlayMode::RepeatAll => {
             if n == 1 {
@@ -524,11 +530,7 @@ fn next_index_on_next(model: &mut WorkerModel) -> Option<usize> {
     match model.play_mode {
         PlayMode::Sequential | PlayMode::RepeatOne => {
             let next = current + 1;
-            if next < n {
-                Some(next)
-            } else {
-                None
-            }
+            if next < n { Some(next) } else { None }
         }
         PlayMode::RepeatAll => {
             if n == 1 {
@@ -577,7 +579,11 @@ fn next_index_on_previous(model: &mut WorkerModel) -> Option<usize> {
     }
 }
 
-fn request_track_change(model: &mut WorkerModel, index: usize, session: &mut Option<PlaybackSession>) {
+fn request_track_change(
+    model: &mut WorkerModel,
+    index: usize,
+    session: &mut Option<PlaybackSession>,
+) {
     model.index = Some(index);
     model.start_seconds = 0.0;
     model.reload_requested = true;
@@ -627,6 +633,14 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                     model.output_device.as_deref(),
                 ) {
                     Ok(mut next_session) => {
+                        if let Some(index) = model.index
+                            && let Some(item) = model.queue.get_mut(index)
+                        {
+                            item.public.duration_seconds = next_session.duration_seconds();
+                            if let Some(title) = next_session.discovered_title() {
+                                item.public.title = title.to_owned();
+                            }
+                        }
                         if !model.intent_playing {
                             next_session.pause();
                             model.status = PlaybackStatus::Paused;
@@ -635,6 +649,13 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                         model.error = None;
                     }
                     Err(error) => {
+                        if let PlaybackSource::Online {
+                            cache_plan: Some(plan),
+                            ..
+                        } = &item.source
+                        {
+                            plan.invalidate();
+                        }
                         model.status = PlaybackStatus::Failed;
                         model.error = Some(error.to_string());
                     }
@@ -670,6 +691,7 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                     session = None;
                 }
                 Err(error) => {
+                    active.invalidate_cache();
                     model.status = PlaybackStatus::Failed;
                     model.error = Some(error.to_string());
                     session = None;
@@ -711,10 +733,7 @@ fn handle_command(
     session: &mut Option<PlaybackSession>,
 ) -> bool {
     match command {
-        EngineCommand::Load {
-            items,
-            start_index,
-        } => {
+        EngineCommand::Load { items, start_index } => {
             let start = if items.is_empty() {
                 None
             } else {
@@ -803,6 +822,20 @@ fn handle_command(
                 }
                 Some(_) => {}
             }
+        }
+        EngineCommand::Reorder { from, to } => {
+            if from >= model.queue.len() || to >= model.queue.len() || from == to {
+                return false;
+            }
+            let item = model.queue.remove(from);
+            model.queue.insert(to, item);
+            if model.shuffle_played.len() == model.queue.len() {
+                let played = model.shuffle_played.remove(from);
+                model.shuffle_played.insert(to, played);
+            } else {
+                reset_shuffle_cycle(model);
+            }
+            model.index = model.index.map(|index| remap_moved_index(index, from, to));
         }
         EngineCommand::ClearQueue => {
             model.queue.clear();
@@ -911,6 +944,18 @@ fn handle_command(
     false
 }
 
+fn remap_moved_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to && (from + 1..=to).contains(&index) {
+        index - 1
+    } else if to < from && (to..from).contains(&index) {
+        index + 1
+    } else {
+        index
+    }
+}
+
 fn apply_volume_change(model: &mut WorkerModel, volume_bits: Option<&AtomicU32>, volume: f32) {
     model.volume = volume;
     if let Some(volume_bits) = volume_bits {
@@ -935,22 +980,16 @@ fn apply_dsp_change(
 }
 
 fn local_queue_item(path: PathBuf) -> EngineQueueItem {
-    let fallback_title = path
+    let title = path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("Untitled")
         .to_owned();
-    let info = super::probe_local_file(&path).ok();
-    let title = info
-        .as_ref()
-        .and_then(|info| info.title.clone())
-        .unwrap_or(fallback_title);
-    let duration_seconds = info.and_then(|info| info.duration_seconds);
     EngineQueueItem {
         public: QueueItem {
             location: path.display().to_string(),
             title,
-            duration_seconds,
+            duration_seconds: None,
             online: false,
         },
         source: PlaybackSource::Local(path),
@@ -1014,11 +1053,15 @@ struct PlaybackSession {
     callback_enabled: Arc<AtomicBool>,
     volume_bits: Arc<AtomicU32>,
     source_channels: usize,
+    output_channels: usize,
     source_sample_rate: u32,
     source_bit_depth: Option<u32>,
     output_sample_rate: u32,
     start_seconds: f64,
     duration_seconds: Option<f64>,
+    discovered_title: Option<String>,
+    cache_plan: Option<CacheWritePlan>,
+    cache_committed: bool,
     prebuffer_samples: usize,
     pending: Vec<f32>,
     pending_offset: usize,
@@ -1079,6 +1122,18 @@ impl PlaybackSession {
             .codec_params
             .n_frames
             .map(|frames| frames as f64 / sample_rate as f64);
+        let discovered_title = matches!(source, PlaybackSource::Local(_))
+            .then(|| {
+                media.format.metadata().current().and_then(|revision| {
+                    revision
+                        .tags()
+                        .iter()
+                        .find(|tag| tag.std_key == Some(StandardTagKey::TrackTitle))
+                        .map(|tag| tag.value.to_string())
+                        .filter(|title| !title.trim().is_empty())
+                })
+            })
+            .flatten();
 
         let host = cpal::default_host();
         let device = match output_device_name {
@@ -1091,12 +1146,19 @@ impl PlaybackSession {
                 .default_output_device()
                 .context("no default audio output device is available")?,
         };
-        let supported = choose_output_config(&device, sample_rate, channels as u16)?;
+        let preferred_channels = if dsp_settings.crossfeed.enabled || dsp_settings.hrtf.enabled {
+            2
+        } else {
+            channels as u16
+        };
+        let supported = choose_output_config(&device, sample_rate, preferred_channels)?;
         let sample_format = supported.sample_format();
         let config: StreamConfig = supported.into();
         let output_sample_rate = config.sample_rate.0;
-        let ring_capacity =
-            ((output_sample_rate as f64 * channels as f64 * RING_SECONDS) as usize).max(4096);
+        let output_channels = config.channels as usize;
+        let ring_capacity = ((output_sample_rate as f64 * output_channels as f64 * RING_SECONDS)
+            as usize)
+            .max(4096);
         let ring = HeapRb::<f32>::new(ring_capacity);
         let (producer, consumer) = ring.split();
         let played_samples = Arc::new(AtomicU64::new(0));
@@ -1116,13 +1178,14 @@ impl PlaybackSession {
             },
         )?;
         let mut rate_adapter = RateAdapter::new(sample_rate, output_sample_rate, channels)?;
-        let mut dsp_chain = DspChain::new(output_sample_rate, channels, dsp_settings)?;
+        let mut dsp_chain = DspChain::new(output_sample_rate, output_channels, dsp_settings)?;
         let prefetched = std::mem::take(&mut media.prefetched_samples);
         let mut pending = if prefetched.is_empty() {
             Vec::new()
         } else {
             rate_adapter.process(&prefetched)?
         };
+        pending = remap_channels(&pending, channels, output_channels)?;
         dsp_chain.process_interleaved_in_place(&mut pending)?;
 
         Ok(Self {
@@ -1137,13 +1200,18 @@ impl PlaybackSession {
             callback_enabled,
             volume_bits,
             source_channels: channels,
+            output_channels,
             source_sample_rate: sample_rate,
             source_bit_depth,
             output_sample_rate,
             start_seconds,
             duration_seconds,
-            prebuffer_samples: (output_sample_rate as f64 * channels as f64 * PREBUFFER_SECONDS)
-                as usize,
+            discovered_title,
+            cache_plan,
+            cache_committed: false,
+            prebuffer_samples: (output_sample_rate as f64
+                * output_channels as f64
+                * PREBUFFER_SECONDS) as usize,
             pending,
             pending_offset: 0,
             eof: false,
@@ -1175,6 +1243,8 @@ impl PlaybackSession {
         if self.eof {
             if !self.flushed {
                 self.pending = self.rate_adapter.finish()?;
+                self.pending =
+                    remap_channels(&self.pending, self.source_channels, self.output_channels)?;
                 self.dsp_chain
                     .process_interleaved_in_place(&mut self.pending)?;
                 self.flushed = true;
@@ -1192,6 +1262,7 @@ impl PlaybackSession {
         let packet = match self.media.format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => {
+                self.commit_cache_after_decode();
                 self.eof = true;
                 return Ok(PumpResult::Progress);
             }
@@ -1227,6 +1298,7 @@ impl PlaybackSession {
             }
         }
         self.pending = self.rate_adapter.process(samples)?;
+        self.pending = remap_channels(&self.pending, self.source_channels, self.output_channels)?;
         self.dsp_chain
             .process_interleaved_in_place(&mut self.pending)?;
         Ok(PumpResult::Progress)
@@ -1267,7 +1339,7 @@ impl PlaybackSession {
 
     fn position_seconds(&self) -> f64 {
         let played_frames =
-            self.played_samples.load(Ordering::Relaxed) as f64 / self.source_channels as f64;
+            self.played_samples.load(Ordering::Relaxed) as f64 / self.output_channels as f64;
         self.start_seconds + played_frames / self.output_sample_rate as f64
     }
 
@@ -1275,8 +1347,37 @@ impl PlaybackSession {
         self.duration_seconds
     }
 
+    fn discovered_title(&self) -> Option<&str> {
+        self.discovered_title.as_deref()
+    }
+
+    fn commit_cache_after_decode(&mut self) {
+        if self.cache_committed {
+            return;
+        }
+        if let Some(plan) = &self.cache_plan {
+            let _ = plan.commit();
+        }
+        self.cache_committed = true;
+    }
+
+    fn invalidate_cache(&mut self) {
+        if !self.cache_committed {
+            if let Some(plan) = &self.cache_plan {
+                plan.invalidate();
+            }
+            self.cache_committed = true;
+        }
+    }
+
     fn underruns(&self) -> u64 {
         self.underrun_callbacks.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for PlaybackSession {
+    fn drop(&mut self) {
+        self.invalidate_cache();
     }
 }
 
@@ -1317,9 +1418,16 @@ fn build_engine_output_stream(
     counters: OutputCallbackCounters,
 ) -> Result<Stream> {
     match sample_format {
+        SampleFormat::I8 => build_typed_engine_stream::<i8>(device, config, consumer, counters),
         SampleFormat::F32 => build_typed_engine_stream::<f32>(device, config, consumer, counters),
         SampleFormat::I16 => build_typed_engine_stream::<i16>(device, config, consumer, counters),
         SampleFormat::U16 => build_typed_engine_stream::<u16>(device, config, consumer, counters),
+        SampleFormat::I32 => build_typed_engine_stream::<i32>(device, config, consumer, counters),
+        SampleFormat::I64 => build_typed_engine_stream::<i64>(device, config, consumer, counters),
+        SampleFormat::U8 => build_typed_engine_stream::<u8>(device, config, consumer, counters),
+        SampleFormat::U32 => build_typed_engine_stream::<u32>(device, config, consumer, counters),
+        SampleFormat::U64 => build_typed_engine_stream::<u64>(device, config, consumer, counters),
+        SampleFormat::F64 => build_typed_engine_stream::<f64>(device, config, consumer, counters),
         other => bail!("unsupported output sample format: {other}"),
     }
 }
@@ -1464,6 +1572,54 @@ mod tests {
     }
 
     #[test]
+    fn local_queue_item_is_built_without_media_probe() {
+        let item = local_queue_item(PathBuf::from("definitely-missing/queued-song.flac"));
+        assert_eq!(item.public.title, "queued-song");
+        assert_eq!(item.public.duration_seconds, None);
+        assert!(!item.public.online);
+    }
+
+    #[test]
+    fn reorder_remaps_current_and_shuffle_without_reloading() {
+        let mut model = model_with_queue(4, 1, PlayMode::Shuffle);
+        model.status = PlaybackStatus::Playing;
+        model.start_seconds = 37.5;
+        model.generation = 9;
+        model.reload_requested = false;
+        model.shuffle_played = vec![true, false, true, false];
+        let mut session = None;
+
+        assert!(!handle_command(
+            EngineCommand::Reorder { from: 1, to: 3 },
+            &mut model,
+            &mut session,
+        ));
+
+        assert_eq!(
+            model
+                .queue
+                .iter()
+                .map(|item| item.public.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t0", "t2", "t3", "t1"]
+        );
+        assert_eq!(model.index, Some(3));
+        assert_eq!(model.shuffle_played, vec![true, true, false, false]);
+        assert_eq!(model.status, PlaybackStatus::Playing);
+        assert_eq!(model.start_seconds, 37.5);
+        assert_eq!(model.generation, 9);
+        assert!(!model.reload_requested);
+        assert!(session.is_none());
+    }
+
+    #[test]
+    fn reorder_remaps_indices_shifted_by_another_item() {
+        assert_eq!(remap_moved_index(2, 0, 3), 1);
+        assert_eq!(remap_moved_index(1, 3, 0), 2);
+        assert_eq!(remap_moved_index(0, 2, 3), 0);
+    }
+
+    #[test]
     fn stopped_play_restarts_from_zero() {
         let mut model = WorkerModel {
             queue: vec![dummy_item("Dummy")],
@@ -1539,7 +1695,10 @@ mod tests {
         seen[0] = true; // starting track counted as played
         for _ in 0..3 {
             let next = next_index_on_ended(&mut model).expect("should pick next");
-            assert!(!seen[next], "shuffle should not repeat within a cycle: {next}");
+            assert!(
+                !seen[next],
+                "shuffle should not repeat within a cycle: {next}"
+            );
             seen[next] = true;
             model.index = Some(next);
         }

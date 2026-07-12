@@ -11,6 +11,9 @@ import "./App.css";
 import { QueuePanel } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
 import { SourceGuide } from "./components/SourceGuide";
+import { useCatalogSearch } from "./hooks/useCatalogSearch";
+import { useEngineSnapshot } from "./hooks/useEngineSnapshot";
+import { useWindowPreferences } from "./hooks/useWindowPreferences";
 import {
   frontendNextIndex,
   moveIndex,
@@ -18,23 +21,31 @@ import {
 } from "./lib/playlistLogic";
 import { formatFailureMessage } from "./lib/resolveErrors";
 import {
-  EMPTY_ENGINE,
+  STARTED,
+  nextOptionIndex,
+  putLruValue,
+  shouldSkipAfterStart,
+  type PlaybackStartResult,
+} from "./lib/uiState";
+import {
   type CacheEntryView,
   type CacheStatus,
   type CatalogTrack,
   type EngineSnapshot,
   type HistoryEntry,
+  type LibraryImportResult,
   type LibraryTrack,
   type ListedSource,
   type LyricDocument,
   type OnlinePlaybackResult,
   type PlayMode,
   type PlaylistSummary,
+  type ResolveAttemptDiagnostic,
   type RuntimeStatus,
+  type SourceFallbackConfig,
   type ViewId,
 } from "./types";
 
-type SearchState = "idle" | "loading" | "ready" | "empty" | "error";
 type AudioMode = EngineSnapshot["audioMode"];
 type QualityPreference = "auto" | "128k" | "320k" | "flac" | "flac24bit";
 type SourceConfigDraft = {
@@ -44,6 +55,10 @@ type SourceConfigDraft = {
   apiAddr: string;
   apiPass: string;
 };
+type SearchOption =
+  | { id: string; kind: "track"; track: CatalogTrack }
+  | { id: string; kind: "artist" | "album"; query: string }
+  | { id: string; kind: "all" };
 
 /** Frontend playlist entry. Online items store metadata only — never pre-resolved URLs. */
 type PlaylistEntry =
@@ -79,6 +94,7 @@ const PLAY_MODE_META: Record<PlayMode, { label: string; glyph: string }> = {
 const RESOLVE_TIMEOUT_MS = 25_000;
 const TOAST_OK_MS = 3_000;
 const TOAST_ERROR_MS = 10_000;
+const COVER_CACHE_LIMIT = 96;
 
 function catalogKey(track: CatalogTrack): string {
   return `${track.providerId}:${track.providerTrackId}`;
@@ -215,6 +231,14 @@ function formatSourceSpec(snapshot: EngineSnapshot): string | null {
   if (snapshot.sourceBitDepth) parts.push(`${snapshot.sourceBitDepth}bit`);
   if (snapshot.sourceChannels) parts.push(`${snapshot.sourceChannels}ch`);
   return parts.join("/");
+}
+
+function formatResolveAttempts(attempts: ResolveAttemptDiagnostic[]): string {
+  if (!attempts.length) return "";
+  const failed = attempts.filter((attempt) => !attempt.success);
+  const last = failed[failed.length - 1] ?? attempts[attempts.length - 1];
+  const location = [last?.sourceName || last?.sourceId, last?.quality].filter(Boolean).join(" · ");
+  return `（共 ${attempts.length} 次尝试${location ? `，最后：${location}` : ""}）`;
 }
 
 function isSuspiciousQuality(quality: string | null, snapshot: EngineSnapshot): boolean {
@@ -382,8 +406,17 @@ async function accentFromArtwork(url: string | null, key: string): Promise<strin
 }
 
 function Cover({ artwork, title, className = "" }: { artwork?: string | null; title: string; className?: string }) {
-  return artwork ? (
-    <img className={`cover ${className}`} src={artwork} alt={`${title} 封面`} crossOrigin="anonymous" />
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  return artwork && failedUrl !== artwork ? (
+    <img
+      className={`cover ${className}`}
+      src={artwork}
+      alt={`${title} 封面`}
+      crossOrigin="anonymous"
+      loading="lazy"
+      decoding="async"
+      onError={() => setFailedUrl(artwork)}
+    />
   ) : (
     <div className={`cover cover-placeholder ${className}`} aria-label={`${title} 暂无封面`}>
       {initials(title)}
@@ -392,12 +425,25 @@ function Cover({ artwork, title, className = "" }: { artwork?: string | null; ti
 }
 
 function App() {
-  const [snapshot, setSnapshot] = useState<EngineSnapshot>(EMPTY_ENGINE);
   const [view, setView] = useState<ViewId>(initialView);
   const [viewHistory, setViewHistory] = useState<ViewId[]>([]);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [message, setMessageState] = useState("");
   const [messageIsError, setMessageIsError] = useState(false);
+  const [snapshot, setSnapshot] = useEngineSnapshot((error) => {
+    setMessageState(String(error));
+    setMessageIsError(true);
+  });
+  const {
+    alwaysOnTop,
+    miniMode,
+    sidebarCollapsed,
+    setSidebarCollapsed,
+    toggleAlwaysOnTop,
+    toggleMiniMode,
+  } = useWindowPreferences((error) => {
+    setMessageState(String(error));
+    setMessageIsError(true);
+  });
   /** User dismissed the engine error toast; reset when generation/error changes. */
   const [engineErrorDismissed, setEngineErrorDismissed] = useState(false);
   const [accent, setAccent] = useState(FALLBACK_ACCENT);
@@ -421,40 +467,59 @@ function App() {
 
   const [sources, setSources] = useState<ListedSource[]>([]);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [sourceFallback, setSourceFallback] = useState<SourceFallbackConfig>({
+    enabled: true,
+    sourceIds: [],
+    explicitlyConfigured: false,
+  });
   const [sourceUrl, setSourceUrl] = useState("");
   const [configSource, setConfigSource] = useState<ListedSource | null>(null);
   const [sourceConfigDraft, setSourceConfigDraft] = useState<SourceConfigDraft | null>(null);
   const [sourceConfigRevealed, setSourceConfigRevealed] = useState(false);
   const [sourceConfigBusy, setSourceConfigBusy] = useState(false);
+  const [sourceFallbackBusy, setSourceFallbackBusy] = useState(false);
   const [backupText, setBackupText] = useState("");
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
   const [cacheLimitGiB, setCacheLimitGiB] = useState("5");
+  const cacheLimitDirtyRef = useRef(false);
   const [onlineFavorites, setOnlineFavorites] = useState<CatalogTrack[]>([]);
   const [cacheEntries, setCacheEntries] = useState<CacheEntryView[]>([]);
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
-  const [alwaysOnTop, setAlwaysOnTop] = useState(false);
-  const [miniMode, setMiniMode] = useState(false);
   const [selectedCacheKeys, setSelectedCacheKeys] = useState<string[]>([]);
   const [coverCache, setCoverCache] = useState<Record<string, string>>({});
   const [resolveBanner, setResolveBanner] = useState<{ title: string; detail: string } | null>(null);
   const resolveGenerationRef = useRef(0);
   const resolveAbortRef = useRef(false);
-  const windowSaveTimer = useRef<number | null>(null);
+  const activeResolveRequestRef = useRef<string | null>(null);
+  const cancelledResolveRequestsRef = useRef<Set<string>>(new Set());
+  const suppressNextTerminalAdvanceRef = useRef(false);
+  const terminalAdvanceGuardTimerRef = useRef<number | null>(null);
   const searchShellRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const toastTimerRef = useRef<number | null>(null);
 
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchState, setSearchState] = useState<SearchState>("idle");
-  const [suggestions, setSuggestions] = useState<CatalogTrack[]>([]);
-  const [searchResults, setSearchResults] = useState<CatalogTrack[]>([]);
+  const {
+    suggestions,
+    suggestionState,
+    suggestionError,
+    retrySuggestions,
+    results: searchResults,
+    resultsQuery,
+    resultsState,
+    resultsError,
+    search: searchCatalog,
+    retryResults,
+    seedResults,
+  } = useCatalogSearch(searchQuery);
   const [chartTracks, setChartTracks] = useState<CatalogTrack[]>([]);
   const [suggestionOpen, setSuggestionOpen] = useState(false);
   const [suggestionIndex, setSuggestionIndex] = useState(-1);
   const [playingCatalogKey, setPlayingCatalogKey] = useState<string | null>(null);
-  const searchRequest = useRef<AbortController | null>(null);
 
   const [selectedCatalogTrack, setSelectedCatalogTrack] = useState<CatalogTrack | null>(null);
   const [lyrics, setLyrics] = useState<LyricDocument | null>(null);
+  const lyricsGenerationRef = useRef(0);
   const lyricRefs = useRef<Array<HTMLParagraphElement | null>>([]);
 
   /** Logical playlist (local paths + online CatalogTrack metadata). Online never pre-resolved. */
@@ -508,12 +573,18 @@ function App() {
   };
 
   const refreshSources = async () => {
-    const [nextSources, nextRuntime] = await Promise.all([
+    const [nextSources, nextRuntime, nextFallback] = await Promise.all([
       invoke<ListedSource[]>("source_list"),
       invoke<RuntimeStatus>("source_status"),
+      invoke<SourceFallbackConfig>("source_get_fallback_config").catch(() => ({
+        enabled: true,
+        sourceIds: [],
+        explicitlyConfigured: false,
+      })),
     ]);
     setSources(nextSources);
     setRuntime(nextRuntime);
+    setSourceFallback(nextFallback);
   };
 
   const refreshCache = async () => {
@@ -523,7 +594,9 @@ function App() {
       invoke<CacheEntryView[]>("cache_list_entries"),
     ]);
     setCacheStatus(status);
-    setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
+    if (!cacheLimitDirtyRef.current) {
+      setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
+    }
     setOnlineFavorites(favoriteTracks);
     setCacheEntries(entries);
   };
@@ -561,18 +634,23 @@ function App() {
   };
 
   const cancelResolve = () => {
+    const requestId = activeResolveRequestRef.current;
+    if (requestId) {
+      cancelledResolveRequestsRef.current.add(requestId);
+      void invoke("player_cancel_resolve", { requestId }).catch(() => undefined);
+    }
     resolveAbortRef.current = true;
     resolveGenerationRef.current += 1;
+    activeResolveRequestRef.current = null;
+    suppressNextTerminalAdvanceRef.current = true;
+    if (terminalAdvanceGuardTimerRef.current) window.clearTimeout(terminalAdvanceGuardTimerRef.current);
+    terminalAdvanceGuardTimerRef.current = window.setTimeout(() => {
+      suppressNextTerminalAdvanceRef.current = false;
+      terminalAdvanceGuardTimerRef.current = null;
+    }, 3_000);
     setPlayingCatalogKey(null);
     setResolveBanner(null);
     pushMessage("已取消解析");
-  };
-
-  const scheduleWindowSave = () => {
-    if (windowSaveTimer.current) window.clearTimeout(windowSaveTimer.current);
-    windowSaveTimer.current = window.setTimeout(() => {
-      void invoke("window_save_state", { miniMode }).catch(() => undefined);
-    }, 400);
   };
 
   useEffect(() => {
@@ -583,12 +661,6 @@ function App() {
     void refreshSources().catch((error) => setMessage(String(error), true));
     void refreshCache().catch((error) => setMessage(String(error), true));
     void refreshHistory().catch(() => undefined);
-    void invoke<{ alwaysOnTop?: boolean; miniMode?: boolean }>("window_get_state")
-      .then((state) => {
-        setAlwaysOnTop(Boolean(state.alwaysOnTop));
-        setMiniMode(Boolean(state.miniMode));
-      })
-      .catch(() => undefined);
     void invoke<string[]>("player_output_devices")
       .then(setOutputDevices)
       .catch((error) => setMessage(String(error), true));
@@ -609,13 +681,7 @@ function App() {
       }
     })();
 
-    const unlistenPromise = getCurrentWindow().onResized(() => scheduleWindowSave());
-    const unlistenMoved = getCurrentWindow().onMoved(() => scheduleWindowSave());
-    return () => {
-      void unlistenPromise.then((unlisten) => unlisten());
-      void unlistenMoved.then((unlisten) => unlisten());
-      if (windowSaveTimer.current) window.clearTimeout(windowSaveTimer.current);
-    };
+    return undefined;
   }, []);
 
   useEffect(() => {
@@ -687,24 +753,6 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let disposed = false;
-    const update = async () => {
-      try {
-        const next = await invoke<EngineSnapshot>("player_snapshot");
-        if (!disposed) setSnapshot(next);
-      } catch (error) {
-        if (!disposed) setMessage(String(error), true);
-      }
-    };
-    void update();
-    const timer = window.setInterval(update, 150);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
-  }, []);
-
-  useEffect(() => {
     setEngineErrorDismissed(false);
   }, [snapshot.error, snapshot.generation]);
 
@@ -729,7 +777,7 @@ function App() {
     void invoke<{ dataUrl: string } | null>("library_embedded_cover", { path })
       .then((cover) => {
         if (!cancelled && cover?.dataUrl) {
-          setCoverCache((prev) => ({ ...prev, [path]: cover.dataUrl }));
+          setCoverCache((prev) => putLruValue(prev, path, cover.dataUrl, COVER_CACHE_LIMIT));
         }
       })
       .catch(() => undefined);
@@ -737,6 +785,11 @@ function App() {
       cancelled = true;
     };
   }, [currentLibraryTrack?.path, coverCache, selectedCatalogTrack?.artworkUrl]);
+  useEffect(() => {
+    const path = currentLibraryTrack?.path;
+    if (!path) return;
+    setCoverCache((prev) => prev[path] ? putLruValue(prev, path, prev[path], COVER_CACHE_LIMIT) : prev);
+  }, [currentLibraryTrack?.path]);
   // Loading only while a session is opening — failed must not look like "still playing".
   const isPlaying = snapshot.status === "playing" || snapshot.status === "loading";
   const shownPosition = dragPosition ?? pendingSeek?.target ?? snapshot.positionSeconds;
@@ -747,6 +800,13 @@ function App() {
     ? onlineFavorites.some((track) => track.providerId === selectedCatalogTrack.providerId && track.providerTrackId === selectedCatalogTrack.providerTrackId)
     : false;
   const activeSource = sources.find((source) => source.id === runtime?.activeSourceId || source.active) ?? null;
+  const fallbackSources = sourceFallback.sourceIds
+    .filter((id) => id !== activeSource?.id)
+    .map((id) => sources.find((source) => source.id === id))
+    .filter((source): source is ListedSource => Boolean(source));
+  const availableFallbackSources = sources.filter(
+    (source) => source.id !== activeSource?.id && !fallbackSources.some((fallback) => fallback.id === source.id),
+  );
   const sourceStatus = (() => {
     switch (runtime?.state) {
       case "ready":
@@ -810,37 +870,16 @@ function App() {
   }, [currentArtwork, currentArtist, currentTitle]);
 
   useEffect(() => {
-    const query = searchQuery.trim();
-    searchRequest.current?.abort();
-    if (!query) {
-      setSuggestions([]);
-      setSearchState("idle");
+    if (!searchQuery.trim()) {
       setSuggestionOpen(false);
+      setSuggestionIndex(-1);
       return;
     }
-    const controller = new AbortController();
-    searchRequest.current = controller;
-    setSearchState("loading");
-    const timer = window.setTimeout(async () => {
-      try {
-        const tracks = await invoke<CatalogTrack[]>("metadata_search", { query, limit: 9 });
-        if (controller.signal.aborted) return;
-        setSuggestions(tracks);
-        setSearchState(tracks.length ? "ready" : "empty");
-        setSuggestionOpen(true);
-        setSuggestionIndex(-1);
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          setSearchState("error");
-          setMessage(String(error), true);
-        }
-      }
-    }, 200);
-    return () => {
-      controller.abort();
-      window.clearTimeout(timer);
-    };
-  }, [searchQuery]);
+    if (suggestionState !== "idle" && searchShellRef.current?.contains(document.activeElement)) {
+      setSuggestionOpen(true);
+    }
+    setSuggestionIndex(-1);
+  }, [searchQuery, suggestionState]);
 
   const activeLyricIndex = useMemo(() => {
     if (!lyrics) return -1;
@@ -864,17 +903,45 @@ function App() {
     () => [...new Set(suggestions.map((track) => track.album).filter(Boolean))].slice(0, 2),
     [suggestions],
   );
+  const visibleSuggestions = useMemo(() => suggestions.slice(0, 4), [suggestions]);
+  const searchOptions = useMemo<SearchOption[]>(() => [
+    ...visibleSuggestions.map((track) => ({
+      id: `search-track-${encodeURIComponent(catalogKey(track))}`,
+      kind: "track" as const,
+      track,
+    })),
+    ...artists.map((artist) => ({
+      id: `search-artist-${encodeURIComponent(artist)}`,
+      kind: "artist" as const,
+      query: artist,
+    })),
+    ...albums.map((album) => ({
+      id: `search-album-${encodeURIComponent(album)}`,
+      kind: "album" as const,
+      query: album,
+    })),
+    { id: "search-view-all", kind: "all" as const },
+  ], [albums, artists, visibleSuggestions]);
+
+  const clearLyrics = () => {
+    lyricsGenerationRef.current += 1;
+    setLyrics(null);
+  };
 
   const loadLyricsFor = async (title: string, artist: string, durationMs: number | null, baseMessage: string) => {
+    const generation = ++lyricsGenerationRef.current;
+    setLyrics(null);
     try {
       const lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
         title,
         artist,
         durationMs,
       });
-      setLyrics(lyricDocument);
+      if (generation === lyricsGenerationRef.current) setLyrics(lyricDocument);
     } catch (lyricError) {
-      setMessage(`${baseMessage} 歌曲已播放，但歌词加载失败：${String(lyricError)}`);
+      if (generation === lyricsGenerationRef.current) {
+        setMessage(`${baseMessage} 歌曲已播放，但歌词加载失败：${String(lyricError)}`);
+      }
     }
   };
 
@@ -887,16 +954,26 @@ function App() {
     wanted: CatalogTrack,
     quality: QualityPreference,
     opts?: { allowPreviewFallback?: boolean; candidates?: CatalogTrack[] },
-  ): Promise<OnlinePlaybackResult | null> => {
+  ): Promise<PlaybackStartResult> => {
     const key = catalogKey(wanted);
     const generation = ++resolveGenerationRef.current;
+    const requestId = typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${generation}-${Math.random().toString(16).slice(2)}`;
     resolveAbortRef.current = false;
+    activeResolveRequestRef.current = requestId;
+    suppressNextTerminalAdvanceRef.current = false;
     setResolveBanner({ title: `正在解析《${wanted.title}》`, detail: "可取消 · 超时自动停止 · 仅解析当前这一首" });
-    console.info("[GXPlayer] online resolve request", { key, title: wanted.title, quality });
+    console.info("[GXPlayer] online resolve request", { key, requestId, title: wanted.title, quality });
 
-    const timed = <T,>(promise: Promise<T>): Promise<T> =>
+    const timed = <T,>(promise: Promise<T>, cancelOnTimeout = false): Promise<T> =>
       new Promise<T>((resolve, reject) => {
-        const timer = window.setTimeout(() => reject(new Error("timeout: 解析超时")), RESOLVE_TIMEOUT_MS);
+        const timer = window.setTimeout(() => {
+          if (cancelOnTimeout) {
+            void invoke("player_cancel_resolve", { requestId }).catch(() => undefined);
+          }
+          reject(new Error("timeout: 解析超时"));
+        }, RESOLVE_TIMEOUT_MS);
         promise.then(
           (value) => {
             window.clearTimeout(timer);
@@ -909,7 +986,15 @@ function App() {
         );
       });
 
-    const stillCurrent = () => generation === resolveGenerationRef.current && !resolveAbortRef.current;
+    const interruptedOutcome = (): PlaybackStartResult | null => {
+      if (cancelledResolveRequestsRef.current.has(requestId) || resolveAbortRef.current) {
+        return { outcome: "cancelled" };
+      }
+      if (generation !== resolveGenerationRef.current || activeResolveRequestRef.current !== requestId) {
+        return { outcome: "stale" };
+      }
+      return null;
+    };
 
     try {
       const online = await timed(
@@ -917,9 +1002,19 @@ function App() {
           track: wanted,
           quality: quality === "auto" ? null : quality,
           sourceId: null,
+          requestId,
         }),
+        true,
       );
-      if (!stillCurrent()) return null;
+      const interrupted = interruptedOutcome();
+      if (interrupted) return interrupted;
+      if (online.outcome === "cancelled" || online.outcome === "stale") {
+        return { outcome: online.outcome };
+      }
+      if (online.outcome === "failed") {
+        const diagnostics = formatResolveAttempts(online.attempts);
+        throw new Error(`${online.error || "音源未能返回可播放地址"}${diagnostics}`);
+      }
       console.info("[GXPlayer] online resolve ok", {
         key,
         cacheHit: online.cacheHit,
@@ -927,7 +1022,7 @@ function App() {
       });
       setSelectedCatalogTrack(online.track);
       setCurrentQuality(online.quality);
-      setLyrics(null);
+      clearLyrics();
       const sourceLabel = online.sourceName || activeSource?.metadata.name || "当前 LX 音源";
       const playbackMessage = online.cacheHit
         ? `已命中本地缓存 · ${online.quality ?? "自动"}，无需再次请求音频直链。`
@@ -942,25 +1037,28 @@ function App() {
         providerTrackId: online.track.providerTrackId,
         quality: online.quality,
       });
-      return online;
+      return STARTED;
     } catch (onlineError) {
-      if (!stillCurrent()) return null;
+      const interrupted = interruptedOutcome();
+      if (interrupted) return interrupted;
       console.warn("[GXPlayer] online resolve failed", { key, error: String(onlineError) });
       if (!opts?.allowPreviewFallback) {
         setMessage(formatFailureMessage(onlineError, wanted.title), true);
-        return null;
+        return { outcome: "failed", error: onlineError };
       }
       try {
         const preview = await timed(
           invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
             wanted,
             candidates: opts.candidates ?? [wanted],
+            requestId,
           }),
         );
-        if (!stillCurrent()) return null;
+        const previewInterrupted = interruptedOutcome();
+        if (previewInterrupted) return previewInterrupted;
         setSelectedCatalogTrack(preview.track);
         setCurrentQuality("preview");
-        setLyrics(null);
+        clearLyrics();
         const playbackMessage = `LX 整首解析失败，已回退为 ${preview.track.providerId} 官方 30 秒预览。原因：${formatFailureMessage(onlineError)}`;
         setMessage(playbackMessage);
         void loadLyricsFor(preview.track.title, preview.track.artist, preview.track.durationMs, playbackMessage);
@@ -972,19 +1070,16 @@ function App() {
           providerTrackId: preview.track.providerTrackId,
           quality: "preview",
         });
-        return {
-          track: preview.track,
-          sourceId: null,
-          sourceName: null,
-          quality: "preview",
-          cacheHit: false,
-        };
+        return STARTED;
       } catch (previewError) {
-        if (!stillCurrent()) return null;
+        const previewInterrupted = interruptedOutcome();
+        if (previewInterrupted) return previewInterrupted;
         setMessage(formatFailureMessage(`${String(onlineError)}; ${String(previewError)}`, wanted.title), true);
-        return null;
+        return { outcome: "failed", error: previewError };
       }
     } finally {
+      cancelledResolveRequestsRef.current.delete(requestId);
+      if (activeResolveRequestRef.current === requestId) activeResolveRequestRef.current = null;
       if (generation === resolveGenerationRef.current) {
         setResolveBanner(null);
       }
@@ -1016,7 +1111,7 @@ function App() {
       fileName: "",
     }));
     setCurrentQuality(entry.quality);
-    setLyrics(null);
+    clearLyrics();
     setMessage(`已从本地缓存秒开 · ${entry.quality}`);
   };
 
@@ -1025,9 +1120,14 @@ function App() {
     entries: PlaylistEntry[],
     index: number,
     opts?: { allowPreviewFallback?: boolean },
-  ): Promise<boolean> => {
+  ): Promise<PlaybackStartResult> => {
     const entry = entries[index];
-    if (!entry) return false;
+    if (!entry) return { outcome: "failed", error: new Error("队列索引无效") };
+    suppressNextTerminalAdvanceRef.current = false;
+    if (terminalAdvanceGuardTimerRef.current) {
+      window.clearTimeout(terminalAdvanceGuardTimerRef.current);
+      terminalAdvanceGuardTimerRef.current = null;
+    }
     if (entry.kind === "local") {
       try {
         if (playlistIsLocalOnly(entries)) {
@@ -1038,12 +1138,12 @@ function App() {
         }
         setSelectedCatalogTrack(null);
         setCurrentQuality(null);
-        setLyrics(null);
+        clearLyrics();
         void recordHistory({ kind: "local", title: entry.title, artist: entry.artist, path: entry.path });
-        return true;
+        return STARTED;
       } catch (error) {
         setMessage(formatFailureMessage(error, entry.title), true);
-        return false;
+        return { outcome: "failed", error };
       }
     }
     if (entry.kind === "cached") {
@@ -1057,22 +1157,21 @@ function App() {
           providerTrackId: entry.providerTrackId,
           quality: entry.quality,
         });
-        return true;
+        return STARTED;
       } catch (error) {
         setMessage(formatFailureMessage(error, entry.title), true);
-        return false;
+        return { outcome: "failed", error };
       }
     }
     const key = catalogKey(entry.track);
     setPlayingCatalogKey(key);
     try {
-      const result = await resolveAndPlayOnline(entry.track, entry.quality, {
+      return await resolveAndPlayOnline(entry.track, entry.quality, {
         allowPreviewFallback: opts?.allowPreviewFallback,
         candidates: entries
           .filter((item): item is Extract<PlaylistEntry, { kind: "online" }> => item.kind === "online")
           .map((item) => item.track),
       });
-      return result !== null;
     } finally {
       setPlayingCatalogKey(null);
     }
@@ -1088,8 +1187,8 @@ function App() {
     current: number,
     intent: "ended" | "next" | "previous",
     opts?: { fromFailure?: boolean },
-  ): Promise<boolean> => {
-    if (advancingRef.current) return false;
+  ): Promise<PlaybackStartResult> => {
+    if (advancingRef.current) return { outcome: "stale" };
     advancingRef.current = true;
     const tried = new Set<number>();
     if (opts?.fromFailure) tried.add(current);
@@ -1119,26 +1218,27 @@ function App() {
           if (opts?.fromFailure || attempt > 0) {
             setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。", true);
           }
-          return false;
+          return { outcome: "failed" };
         }
         if (tried.has(next)) {
           setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。", true);
-          return false;
+          return { outcome: "failed" };
         }
         tried.add(next);
         setPlaylistIndex(next);
         cursor = next;
         // Failure-skip never uses preview fallback (avoids cascading slow preview attempts).
-        const started = await tryStartEntry(entries, next, {
+        const result = await tryStartEntry(entries, next, {
           // Preview fallback only for the user's explicit first click (handled in playPlaylistEntry).
           allowPreviewFallback: false,
         });
-        if (started) return true;
+        if (result.outcome === "started") return result;
+        if (!shouldSkipAfterStart(result)) return result;
         // Subsequent picks in this chain are failure-skips (one pass, no infinite loop).
         opts = { fromFailure: true };
       }
       setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。", true);
-      return false;
+      return { outcome: "failed" };
     } finally {
       advancingRef.current = false;
       setPlayingCatalogKey(null);
@@ -1149,9 +1249,9 @@ function App() {
     entries: PlaylistEntry[],
     index: number,
     opts?: { allowPreviewFallback?: boolean },
-  ): Promise<boolean> => {
-    const started = await tryStartEntry(entries, index, opts);
-    if (started) return true;
+  ): Promise<PlaybackStartResult> => {
+    const result = await tryStartEntry(entries, index, opts);
+    if (result.outcome === "started" || !shouldSkipAfterStart(result)) return result;
     // First track failed — walk the rest once, then stop (no infinite loop).
     return advanceFromIndex(entries, index, "ended", { fromFailure: true });
   };
@@ -1160,8 +1260,8 @@ function App() {
     entries: PlaylistEntry[],
     startIndex: number,
     opts?: { allowPreviewFallback?: boolean },
-  ): Promise<boolean> => {
-    if (!entries.length) return false;
+  ): Promise<PlaybackStartResult> => {
+    if (!entries.length) return { outcome: "failed" };
     const index = Math.max(0, Math.min(startIndex, entries.length - 1));
     shufflePlayedRef.current = new Set([index]);
     setPlaylist(entries);
@@ -1184,18 +1284,26 @@ function App() {
     if (!selected) return;
     const paths = Array.isArray(selected) ? selected : [selected];
     try {
-      await invoke("player_load_local", { paths, startIndex: 0 });
-      const entries: PlaylistEntry[] = paths.map((path) => {
-        const name = path.split(/[/\\]/).pop()?.replace(/\.[^.]+$/, "") || "未命名";
-        return { kind: "local", path, title: name, artist: "", durationSeconds: null };
-      });
+      const result = await invoke<LibraryImportResult>("library_import_files", { paths });
+      await refreshLibrary();
+      if (!result.imported.length) {
+        const firstFailure = result.failures[0];
+        const detail = firstFailure ? `：${firstFailure.error}` : "";
+        setMessage(`没有可导入的音频文件${detail}`, true);
+        return;
+      }
+
+      const acceptedPaths = result.imported.map((track) => track.path);
+      await invoke("player_load_local", { paths: acceptedPaths, startIndex: 0 });
+      const entries = result.imported.map(localEntryFromLibrary);
       shufflePlayedRef.current = new Set([0]);
       setPlaylist(entries);
       setPlaylistIndex(0);
       setSelectedCatalogTrack(null);
       setCurrentQuality(null);
-      setLyrics(null);
-      await refreshLibrary();
+      clearLyrics();
+      const failureNote = result.failures.length ? `，另有 ${result.failures.length} 个文件导入失败` : "";
+      setMessage(`已导入并播放 ${result.imported.length} 首${failureNote}`);
     } catch (error) {
       setMessage(String(error), true);
     }
@@ -1215,9 +1323,12 @@ function App() {
   const enqueueLocalTracks = async (tracks: LibraryTrack[]) => {
     if (!tracks.length) return;
     const paths = tracks.map((track) => track.path);
+    const additions = tracks.map(localEntryFromLibrary);
+    const wasEmpty = playlistRef.current.length === 0;
     try {
       await invoke("player_enqueue_local", { paths });
-      setPlaylist((prev) => [...prev, ...tracks.map(localEntryFromLibrary)]);
+      setPlaylist((prev) => [...prev, ...additions]);
+      if (wasEmpty) setPlaylistIndex(0);
       setMessage(`已添加 ${tracks.length} 首到队列`);
     } catch (error) {
       setMessage(String(error), true);
@@ -1238,9 +1349,9 @@ function App() {
       note: "only the starting track will resolve now; others stay as CatalogTrack metadata",
     });
     try {
-      const started = await replacePlaylist(entries, startIndex, { allowPreviewFallback: true });
+      const result = await replacePlaylist(entries, startIndex, { allowPreviewFallback: true });
       // Only leave the current page when something actually began playing.
-      if (started) {
+      if (result.outcome === "started") {
         navigateTo("now-playing");
       }
     } catch (error) {
@@ -1268,10 +1379,12 @@ function App() {
   const enqueueCatalogTracks = (tracks: CatalogTrack[]) => {
     if (!tracks.length) return;
     console.info("[GXPlayer] online enqueue metadata only", { count: tracks.length });
+    const wasEmpty = playlistRef.current.length === 0;
     setPlaylist((prev) => [
       ...prev,
       ...tracks.map((track) => onlineEntryFromCatalog(track, qualityPreference)),
     ]);
+    if (wasEmpty) setPlaylistIndex(0);
     setMessage(`已添加 ${tracks.length} 首在线歌曲到队列（播放到时再解析）`);
   };
 
@@ -1279,14 +1392,17 @@ function App() {
     const current = snapshot.playMode ?? "sequential";
     const index = PLAY_MODE_ORDER.indexOf(current);
     const next = PLAY_MODE_ORDER[(index + 1) % PLAY_MODE_ORDER.length] ?? "sequential";
-    // Fresh shuffle cycle when entering shuffle; mark the current track as already heard.
-    if (next === "shuffle") {
-      shufflePlayedRef.current = new Set(playlistIndex !== null ? [playlistIndex] : []);
-      shuffleRngRef.current.state = (Date.now() ^ (playlistIndex ?? 0) ^ 0x9e3779b9) >>> 0 || 1;
+    try {
+      await invoke("player_set_play_mode", { mode: next });
+      // Fresh shuffle cycle when entering shuffle; mark the current track as already heard.
+      if (next === "shuffle") {
+        shufflePlayedRef.current = new Set(playlistIndex !== null ? [playlistIndex] : []);
+        shuffleRngRef.current.state = (Date.now() ^ (playlistIndex ?? 0) ^ 0x9e3779b9) >>> 0 || 1;
+      }
+      setSnapshot((state) => ({ ...state, playMode: next }));
+    } catch (error) {
+      setMessage(String(error), true);
     }
-    setSnapshot((state) => ({ ...state, playMode: next }));
-    // Keep engine snapshot.playMode in sync for UI; engine never auto-advances on Ended.
-    await run("player_set_play_mode", { mode: next });
   };
 
   const handleTransportNext = async () => {
@@ -1337,8 +1453,8 @@ function App() {
     ));
     const playlistEntries = entries.map(cacheEntryToPlaylist);
     try {
-      const started = await replacePlaylist(playlistEntries, startIndex === -1 ? 0 : startIndex);
-      if (started) navigateTo("now-playing");
+      const result = await replacePlaylist(playlistEntries, startIndex === -1 ? 0 : startIndex);
+      if (result.outcome === "started") navigateTo("now-playing");
     } catch (error) {
       setPlayingCatalogKey(null);
       advancingRef.current = false;
@@ -1348,11 +1464,14 @@ function App() {
 
   const enqueueCacheEntries = (entries: CacheEntryView[]) => {
     if (!entries.length) return;
+    const wasEmpty = playlistRef.current.length === 0;
     setPlaylist((prev) => [...prev, ...entries.map(cacheEntryToPlaylist)]);
+    if (wasEmpty) setPlaylistIndex(0);
     setMessage(`已添加 ${entries.length} 首缓存歌曲到队列`);
   };
 
   const removeCacheEntry = async (entry: CacheEntryView) => {
+    if (!window.confirm(`确定删除《${entry.title}》的 ${entry.quality} 缓存吗？`)) return;
     try {
       const status = await invoke<CacheStatus>("cache_remove_entry", {
         providerId: entry.providerId,
@@ -1389,6 +1508,8 @@ function App() {
     const current = playlistIndexRef.current;
     const removedCurrent = current === index;
     const wasLocalOnly = playlistIsLocalOnly(previous);
+    const previousShufflePlayed = new Set(shufflePlayedRef.current);
+    if (removedCurrent && activeResolveRequestRef.current) cancelResolve();
     entries.splice(index, 1);
     // Remap shuffle played indices after mid-cycle edits.
     const nextPlayed = new Set<number>();
@@ -1399,13 +1520,29 @@ function App() {
     shufflePlayedRef.current = nextPlayed;
 
     if (wasLocalOnly) {
-      await run("player_remove_queue_item", { index });
+      try {
+        await invoke("player_remove_queue_item", { index });
+      } catch (error) {
+        shufflePlayedRef.current = previousShufflePlayed;
+        setMessage(String(error), true);
+        return;
+      }
+    } else if (!entries.length) {
+      try {
+        await invoke("player_clear_queue");
+      } catch (error) {
+        shufflePlayedRef.current = previousShufflePlayed;
+        setMessage(String(error), true);
+        return;
+      }
     }
 
     setPlaylist(entries);
     if (!entries.length) {
       setPlaylistIndex(null);
-      if (!wasLocalOnly) await run("player_clear_queue");
+      setSelectedCatalogTrack(null);
+      setCurrentQuality(null);
+      clearLyrics();
       return;
     }
     let nextIndex: number | null = current;
@@ -1421,18 +1558,30 @@ function App() {
   };
 
   const clearPlaylist = async () => {
+    if (playlistRef.current.length && !window.confirm("确定清空整个播放队列吗？")) return;
+    if (activeResolveRequestRef.current) cancelResolve();
+    try {
+      await invoke("player_clear_queue");
+    } catch (error) {
+      setMessage(String(error), true);
+      return;
+    }
     setPlaylist([]);
     setPlaylistIndex(null);
     shufflePlayedRef.current.clear();
-    await run("player_clear_queue");
+    setSelectedCatalogTrack(null);
+    setCurrentQuality(null);
+    clearLyrics();
     setMessage("队列已清空");
   };
 
   const reorderPlaylist = async (from: number, to: number) => {
     if (from === to) return;
     const previous = playlistRef.current;
+    const previousIndex = playlistIndexRef.current;
+    const previousShufflePlayed = new Set(shufflePlayedRef.current);
     const next = moveIndex(previous, from, to);
-    let nextIndex = playlistIndexRef.current;
+    let nextIndex = previousIndex;
     if (nextIndex !== null) {
       if (nextIndex === from) nextIndex = to;
       else if (from < nextIndex && to >= nextIndex) nextIndex -= 1;
@@ -1441,29 +1590,17 @@ function App() {
     setPlaylist(next);
     setPlaylistIndex(nextIndex);
     shufflePlayedRef.current = new Set();
-    // Local multi-item engine queue: rebuild order without interrupting if possible.
-    if (playlistIsLocalOnly(next) && nextIndex !== null) {
-      const paths = next.map((item) => (item as Extract<PlaylistEntry, { kind: "local" }>).path);
+    // The engine reorders in place; playback position/state must not be reset.
+    if (playlistIsLocalOnly(next)) {
       try {
-        await invoke("player_load_local", { paths, startIndex: nextIndex });
-        await run("player_pause");
-      } catch {
-        // keep frontend order even if engine reload fails mid-pause
+        await invoke("player_reorder_queue", { from, to });
+      } catch (error) {
+        setPlaylist(previous);
+        setPlaylistIndex(previousIndex);
+        shufflePlayedRef.current = previousShufflePlayed;
+        setMessage(`队列排序失败，已恢复原顺序：${String(error)}`, true);
       }
     }
-  };
-
-  const toggleAlwaysOnTop = async () => {
-    const next = !alwaysOnTop;
-    await run("window_set_always_on_top", { enabled: next });
-    setAlwaysOnTop(next);
-  };
-
-  const toggleMiniMode = async () => {
-    const next = !miniMode;
-    await run("window_set_mini_mode", { enabled: next });
-    setMiniMode(next);
-    if (next) setAlwaysOnTop(true);
   };
 
   const exportBackupFile = async () => {
@@ -1495,6 +1632,7 @@ function App() {
 
   const removeSelectedCache = async () => {
     if (!selectedCacheKeys.length) return;
+    if (!window.confirm(`确定删除选中的 ${selectedCacheKeys.length} 条缓存吗？`)) return;
     const keys = selectedCacheKeys.map((key) => {
       const [providerId, providerTrackId, quality] = key.split("\u0000");
       return { providerId, providerTrackId, quality };
@@ -1507,6 +1645,7 @@ function App() {
   };
 
   const removeCacheByQuality = async (quality: string) => {
+    if (!window.confirm(`确定清理所有未钉住的 ${quality} 缓存吗？`)) return;
     const status = await invoke<CacheStatus>("cache_remove_by_quality", {
       quality,
       includePinned: false,
@@ -1523,35 +1662,64 @@ function App() {
   useEffect(() => {
     const prev = prevStatusRef.current;
     prevStatusRef.current = snapshot.status;
+    if (snapshot.status === "playing") suppressNextTerminalAdvanceRef.current = false;
     const entries = playlistRef.current;
     if (!entries.length) return;
     const current = playlistIndexRef.current ?? 0;
 
     if (snapshot.status === "stopped") {
       if (prev === "stopped" || prev === "idle" || prev === "failed") return;
+      if (suppressNextTerminalAdvanceRef.current) {
+        suppressNextTerminalAdvanceRef.current = false;
+        return;
+      }
       void advanceFromIndex(entries, current, "ended");
       return;
     }
     if (snapshot.status === "failed" && prev !== "failed") {
+      if (suppressNextTerminalAdvanceRef.current) {
+        suppressNextTerminalAdvanceRef.current = false;
+        return;
+      }
       void advanceFromIndex(entries, current, "ended", { fromFailure: true });
     }
   }, [snapshot.status]);
 
   const switchOnlineQuality = async (preference: QualityPreference) => {
-    if (!selectedCatalogTrack || !currentQueueItem?.online || qualitySwitching) return;
+    if (!selectedCatalogTrack || !currentQueueItem?.online || qualitySwitching || resolveBanner) return;
     setQualitySwitching(true);
+    const requestId = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-quality`;
+    const generation = ++resolveGenerationRef.current;
+    resolveAbortRef.current = false;
+    activeResolveRequestRef.current = requestId;
+    setResolveBanner({ title: `正在切换《${selectedCatalogTrack.title}》的音质`, detail: "可取消 · 当前播放会保留到新音质就绪" });
+    const interrupted = () => cancelledResolveRequestsRef.current.has(requestId)
+      || resolveAbortRef.current
+      || generation !== resolveGenerationRef.current
+      || activeResolveRequestRef.current !== requestId;
     try {
       const online = await invoke<OnlinePlaybackResult>("player_play_online_track", {
         track: selectedCatalogTrack,
         quality: preference === "auto" ? null : preference,
         sourceId: null,
+        requestId,
       });
+      if (interrupted()) return;
+      if (online.outcome !== "started") {
+        if (online.outcome === "failed") {
+          setMessage(`切换音质失败，已保留当前播放：${online.error ?? "没有可播放结果"}`, true);
+        }
+        return;
+      }
       setSelectedCatalogTrack(online.track);
       setCurrentQuality(online.quality);
       setMessage(online.cacheHit ? `已切换到本地缓存 ${online.quality ?? "自动"}。` : `已切换到 ${online.quality ?? "自动"}，并重新开始流式播放。`);
     } catch (error) {
-      setMessage(`切换音质失败，已保留当前播放：${String(error)}`, true);
+      if (!interrupted()) setMessage(`切换音质失败，已保留当前播放：${String(error)}`, true);
     } finally {
+      cancelledResolveRequestsRef.current.delete(requestId);
+      if (activeResolveRequestRef.current === requestId) activeResolveRequestRef.current = null;
+      if (generation === resolveGenerationRef.current) setResolveBanner(null);
       setQualitySwitching(false);
     }
   };
@@ -1559,6 +1727,38 @@ function App() {
   const updateQualityPreference = (preference: QualityPreference) => {
     setQualityPreference(preference);
     window.localStorage.setItem("gxplayer.defaultQuality", preference);
+  };
+
+  const saveSourceFallback = async (enabled: boolean, sourceIds: string[]) => {
+    setSourceFallbackBusy(true);
+    try {
+      const saved = await invoke<SourceFallbackConfig>("source_set_fallback_config", { enabled, sourceIds });
+      setSourceFallback(saved);
+      setMessage(enabled ? "自动音源降级顺序已保存。" : "已关闭备用音源自动降级。");
+    } catch (error) {
+      setMessage(String(error), true);
+    } finally {
+      setSourceFallbackBusy(false);
+    }
+  };
+
+  const moveFallbackSource = (index: number, direction: -1 | 1) => {
+    const target = index + direction;
+    if (target < 0 || target >= fallbackSources.length) return;
+    const next = fallbackSources.map((source) => source.id);
+    [next[index], next[target]] = [next[target]!, next[index]!];
+    void saveSourceFallback(sourceFallback.enabled, next);
+  };
+
+  const addFallbackSource = (sourceId: string) => {
+    if (!sourceId) return;
+    const next = [...fallbackSources.map((source) => source.id), sourceId];
+    void saveSourceFallback(sourceFallback.enabled, next);
+  };
+
+  const removeFallbackSource = (sourceId: string) => {
+    const next = fallbackSources.map((source) => source.id).filter((id) => id !== sourceId);
+    void saveSourceFallback(sourceFallback.enabled, next);
   };
 
   const openSourceConfig = async (source: ListedSource) => {
@@ -1628,14 +1828,26 @@ function App() {
   const submitSearch = async (queryOverride?: string) => {
     const query = (queryOverride ?? searchQuery).trim();
     if (!query) return;
+    if (queryOverride) setSearchQuery(query);
     setSuggestionOpen(false);
+    setSuggestionIndex(-1);
+    searchInputRef.current?.blur();
     navigateTo("search");
-    setSearchState("loading");
-    const results = await run<CatalogTrack[]>("metadata_search", { query, limit: 40 });
-    if (results !== undefined) {
-      setSearchResults(results);
-      setSearchState(results.length ? "ready" : "empty");
+    await searchCatalog(query);
+  };
+
+  const activateSearchOption = (option: SearchOption) => {
+    setSuggestionOpen(false);
+    setSuggestionIndex(-1);
+    if (option.kind === "track") {
+      void playCatalog(option.track);
+      return;
     }
+    if (option.kind === "all") {
+      void submitSearch();
+      return;
+    }
+    void submitSearch(option.query);
   };
 
   const onSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -1645,22 +1857,26 @@ function App() {
     }
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
-      const direction = event.key === "ArrowDown" ? 1 : -1;
+      const direction: 1 | -1 = event.key === "ArrowDown" ? 1 : -1;
       setSuggestionOpen(true);
-      setSuggestionIndex((index) => Math.max(-1, Math.min(suggestions.length - 1, index + direction)));
+      setSuggestionIndex((index) => nextOptionIndex(index, searchOptions.length, direction));
       return;
     }
     if (event.key === "Enter") {
       event.preventDefault();
-      const selected = suggestions[suggestionIndex];
-      if (selected) void playCatalog(selected);
+      const selected = searchOptions[suggestionIndex];
+      if (selected) activateSearchOption(selected);
       else void submitSearch();
     }
   };
 
   const setAudioMode = async (mode: AudioMode) => {
-    setSnapshot((state) => ({ ...state, audioMode: mode }));
-    await run("player_set_audio_mode", { mode });
+    try {
+      await invoke("player_set_audio_mode", { mode });
+      setSnapshot((state) => ({ ...state, audioMode: mode }));
+    } catch (error) {
+      setMessage(String(error), true);
+    }
   };
 
   const toggleFavorite = async (track: LibraryTrack) => {
@@ -1691,6 +1907,8 @@ function App() {
     }
     const status = await invoke<CacheStatus>("cache_set_limit", { limitBytes: Math.round(gib * 1024 * 1024 * 1024) });
     setCacheStatus(status);
+    cacheLimitDirtyRef.current = false;
+    setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
     setMessage("缓存上限已保存，超限未收藏条目已按 LRU 清理。");
   };
 
@@ -1751,6 +1969,31 @@ function App() {
       setPendingSeek(null);
       setMessage(String(error), true);
     }
+  };
+
+  const commitVolume = async (volume: number) => {
+    setVolumeDraft(volume);
+    try {
+      await invoke("player_set_volume", { volume });
+    } catch (error) {
+      setVolumeDraft(null);
+      setMessage(String(error), true);
+    }
+  };
+
+  const handlePlayPause = async () => {
+    if (isPlaying) {
+      await run("player_pause");
+      return;
+    }
+    const entries = playlistRef.current;
+    if (!currentQueueItem && entries.length) {
+      const index = playlistIndexRef.current ?? 0;
+      setPlaylistIndex(index);
+      await playPlaylistEntry(entries, index, { allowPreviewFallback: true });
+      return;
+    }
+    await run("player_play");
   };
 
   const renderTrackRow = (track: LibraryTrack, index: number, list: LibraryTrack[], playlistId?: number) => (
@@ -1943,14 +2186,24 @@ function App() {
             <label className="playlist-card create-card"><span>＋</span><input aria-label="新歌单名称" placeholder="新歌单" value={newPlaylistName} onChange={(event) => setNewPlaylistName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createPlaylist(); }} /><button onClick={() => void createPlaylist()} disabled={!newPlaylistName.trim()}>创建</button></label>
           </div>
         </section>
-        {chartTracks.length > 0 && <section className="section-block panel-enter delay-2"><div className="section-heading"><div><p className="eyebrow">DISCOVER</p><h2>正在流行</h2></div><button onClick={() => { setSearchResults(chartTracks); setSearchQuery("中国区热门"); navigateTo("search"); }}>查看全部 →</button></div>{renderCatalogRows(chartTracks.slice(0, 6))}</section>}
+        {chartTracks.length > 0 && <section className="section-block panel-enter delay-2"><div className="section-heading"><div><p className="eyebrow">DISCOVER</p><h2>正在流行</h2></div><button onClick={() => { seedResults(chartTracks, "中国区热门"); setSearchQuery("中国区热门"); navigateTo("search"); }}>查看全部 →</button></div>{renderCatalogRows(chartTracks.slice(0, 6))}</section>}
       </div>
     );
 
     if (view === "search") return (
       <div className="page">
-        <PageHeading eyebrow="SEARCH" title={searchQuery ? `“${searchQuery}” 的结果` : "搜索音乐"} copy={runtime?.state === "ready" ? `${sourceStatus.copy} 点击歌曲将优先解析整首播放，失败时会明确提示并回退官方 30 秒预览。` : `${sourceStatus.title}：${sourceStatus.copy} 当前仍可尝试官方 30 秒预览。`} />
-        {searchState === "loading" ? <LoadingState /> : searchResults.length ? renderCatalogRows(searchResults) : <EmptyState title="从顶栏开始搜索" copy="输入歌名、歌手或专辑，联想结果会按类型分组。" />}
+        <PageHeading eyebrow="SEARCH" title={resultsQuery ? `“${resultsQuery}” 的结果` : "搜索音乐"} copy={runtime?.state === "ready" ? `${sourceStatus.copy} 点击歌曲将优先解析整首播放，失败时会明确提示并回退官方 30 秒预览。` : `${sourceStatus.title}：${sourceStatus.copy} 当前仍可尝试官方 30 秒预览。`} />
+        {resultsState === "loading" ? (
+          <LoadingState />
+        ) : resultsState === "error" ? (
+          <ErrorState title="搜索没有完成" copy={resultsError ?? "请检查网络或音源后重试。"} onRetry={retryResults} />
+        ) : searchResults.length ? (
+          renderCatalogRows(searchResults)
+        ) : resultsState === "empty" ? (
+          <EmptyState title="没有找到相关音乐" copy="换一个歌名、歌手或专辑关键词试试。" />
+        ) : (
+          <EmptyState title="从顶栏开始搜索" copy="输入歌名、歌手或专辑，联想结果会按类型分组。" />
+        )}
       </div>
     );
 
@@ -2053,7 +2306,7 @@ function App() {
             eyebrow="HISTORY"
             title="播放历史"
             copy={`${historyEntries.length} 条最近播放（最多保留 500）。`}
-            action={<button type="button" className="danger" onClick={async () => { await run("library_clear_history"); await refreshHistory(); }}>清空历史</button>}
+            action={<button type="button" className="danger" onClick={async () => { if (!window.confirm("确定清空全部播放历史吗？")) return; try { await invoke("library_clear_history"); await refreshHistory(); } catch (error) { setMessage(String(error), true); } }}>清空历史</button>}
           />
           {historyEntries.length === 0 ? (
             <EmptyState title="还没有播放记录" copy="听歌后会出现在这里，方便找回昨晚那首。" />
@@ -2100,15 +2353,28 @@ function App() {
     }
 
     if (view === "playlist") return (
-      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistTracks.length} 首音乐`} action={activePlaylist ? <button className="danger" onClick={async () => { await run("library_delete_playlist", { playlistId: activePlaylist.id }); navigateTo("discovery"); setActivePlaylist(null); await refreshLibrary(); }}>删除歌单</button> : undefined} />{playlistTracks.length && activePlaylist ? renderTrackRows(playlistTracks, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把想听的歌加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
+      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistTracks.length} 首音乐`} action={activePlaylist ? <button className="danger" onClick={async () => { if (!window.confirm(`确定删除歌单“${activePlaylist.name}”吗？`)) return; try { await invoke("library_delete_playlist", { playlistId: activePlaylist.id }); navigateTo("discovery"); setActivePlaylist(null); await refreshLibrary(); } catch (error) { setMessage(String(error), true); } }}>删除歌单</button> : undefined} />{playlistTracks.length && activePlaylist ? renderTrackRows(playlistTracks, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把想听的歌加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
     );
 
     if (view === "sources") return (
-      <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="音源脚本运行在独立沙箱中；程序启动时也会自动扫描 %APPDATA%\\com.gxplayer.desktop\\sources\\drop-in 里的 .js。" action={<button onClick={async () => { const selected = await open({ multiple: false, filters: [{ name: "LX 音源脚本", extensions: ["js"] }] }); if (selected && !Array.isArray(selected)) { await run("source_import_file", { path: selected }); await refreshSources(); } }}>导入脚本</button>} />
+      <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="音源脚本运行在独立沙箱中；程序启动时也会自动扫描 %APPDATA%\\com.gxplayer.desktop\\sources\\drop-in 里的 .js。" action={<button onClick={async () => { const selected = await open({ multiple: false, filters: [{ name: "LX 音源脚本", extensions: ["js"] }] }); if (selected && !Array.isArray(selected)) { try { await invoke("source_import_file", { path: selected }); await refreshSources(); } catch (error) { setMessage(String(error), true); } } }}>导入脚本</button>} />
         <SourceGuide />
         <section className="source-status-card"><span className={`runtime-dot ${runtime?.state ?? "no_source"}`} /><div><strong>{sourceStatus.title}</strong><p>{sourceStatus.copy}</p></div><code>GEN {runtime?.generation ?? 0}</code></section>
-        <div className="inline-form"><input aria-label="音源脚本 URL" placeholder="https://…/source.js" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} /><button className="primary" disabled={!sourceUrl.trim()} onClick={async () => { await run("source_import_url", { url: sourceUrl.trim() }); setSourceUrl(""); await refreshSources(); }}>从 URL 导入</button></div>
-        <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div><span className="source-badge">{source.active ? "正在使用" : source.hasConfig ? "已配置" : "可用"}</span><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { await run("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); }} /> 更新提醒</label><button disabled={sourceConfigBusy} onClick={() => void openSourceConfig(source)}>配置</button><button disabled={source.active} onClick={async () => { await run("source_activate", { id: source.id }); await refreshSources(); }}>启用</button><button className="danger" onClick={async () => { await run("source_remove", { id: source.id }); await refreshSources(); }}>删除</button></div></article>)}</div>
+        <section className="source-fallback-card" aria-labelledby="source-fallback-title">
+          <div className="source-fallback-heading">
+            <div><p className="eyebrow">FALLBACK</p><h3 id="source-fallback-title">自动降级</h3><p>主音源失败时按顺序尝试备用音源；每个音源内部仍会继续做音质降级。</p></div>
+            <label className="source-fallback-toggle"><input type="checkbox" checked={sourceFallback.enabled} disabled={sourceFallbackBusy} onChange={(event) => void saveSourceFallback(event.target.checked, fallbackSources.map((source) => source.id))} /> 启用</label>
+          </div>
+          <div className="fallback-main"><span>主音源</span><strong>{activeSource?.metadata.name || "尚未启用音源"}</strong></div>
+          {fallbackSources.length ? (
+            <ol className="fallback-list">
+              {fallbackSources.map((source, index) => <li key={source.id}><span>{index + 1}</span><div><strong>{source.metadata.name || "未命名音源"}</strong><small>{source.metadata.author || source.id}</small></div><div className="fallback-actions"><button type="button" disabled={sourceFallbackBusy || index === 0} onClick={() => moveFallbackSource(index, -1)} aria-label={`上移 ${source.metadata.name}`}>↑</button><button type="button" disabled={sourceFallbackBusy || index === fallbackSources.length - 1} onClick={() => moveFallbackSource(index, 1)} aria-label={`下移 ${source.metadata.name}`}>↓</button><button type="button" disabled={sourceFallbackBusy} onClick={() => removeFallbackSource(source.id)}>移除</button></div></li>)}
+            </ol>
+          ) : <div className="fallback-empty">还没有备用音源。主源会继续逐档降低音质，最终可回退到官方 30 秒预览。</div>}
+          {availableFallbackSources.length > 0 && <select aria-label="添加备用音源" defaultValue="" disabled={sourceFallbackBusy} onChange={(event) => { addFallbackSource(event.target.value); event.target.value = ""; }}><option value="">＋ 添加备用音源…</option>{availableFallbackSources.map((source) => <option key={source.id} value={source.id}>{source.metadata.name || source.id}</option>)}</select>}
+        </section>
+        <div className="inline-form"><input aria-label="音源脚本 URL" placeholder="https://…/source.js" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} /><button className="primary" disabled={!sourceUrl.trim()} onClick={async () => { try { await invoke("source_import_url", { url: sourceUrl.trim() }); setSourceUrl(""); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>从 URL 导入</button></div>
+        <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div><span className="source-badge">{source.active ? "正在使用" : source.hasConfig ? "已配置" : "可用"}</span><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { try { await invoke("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }} /> 更新提醒</label><button disabled={sourceConfigBusy} onClick={() => void openSourceConfig(source)}>配置</button><button disabled={source.active} onClick={async () => { try { await invoke("source_activate", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>启用</button><button className="danger" onClick={async () => { if (!window.confirm(`确定删除音源“${source.metadata.name || source.id}”吗？`)) return; try { await invoke("source_remove", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>删除</button></div></article>)}</div>
       </div>
     );
 
@@ -2126,7 +2392,7 @@ function App() {
               <button type="button" className={miniMode ? "primary" : ""} onClick={() => void toggleMiniMode()}>{miniMode ? "退出迷你" : "迷你模式"}</button>
             </div>
           </section>
-          <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。批量管理请到「曲库」页的在线缓存分区。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => setCacheLimitGiB(event.target.value)} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_clear", { includePinned: false }); setCacheStatus(status); }}>清未收藏</button><button className="danger" onClick={async () => { const status = await invoke<CacheStatus>("cache_clear", { includePinned: true }); setCacheStatus(status); }}>清空全部</button></div></section>
+          <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。批量管理请到「曲库」页的在线缓存分区。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => { cacheLimitDirtyRef.current = true; setCacheLimitGiB(event.target.value); }} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={async () => { if (!window.confirm("确定清理所有未收藏缓存吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: false }); setCacheStatus(status); }}>清未收藏</button><button className="danger" onClick={async () => { if (!window.confirm("确定清空全部缓存（包括收藏钉住项）吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: true }); setCacheStatus(status); }}>清空全部</button></div></section>
         </div>
         <section className="backup-card">
           <div className="section-heading">
@@ -2224,48 +2490,63 @@ function App() {
   };
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`} style={{ "--accent": accent } as CSSProperties}>
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${miniMode ? "mini-mode" : ""}`} style={{ "--accent": accent } as CSSProperties}>
       <div className="ambient-light" aria-hidden="true" />
       <div className="ambient-light ambient-light-secondary" aria-hidden="true" />
       <div className="shell-noise" aria-hidden="true" />
       <header className="top-bar" data-tauri-drag-region>
         <div className="brand-cluster">
-          <button className="menu-button" onClick={() => setSidebarCollapsed((value) => !value)} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>☰</button>
+          <button className="menu-button" onClick={() => setSidebarCollapsed((value) => !value)} aria-pressed={!sidebarCollapsed} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>☰</button>
           <button className="logo" onClick={() => navigateTo("discovery")} aria-label="返回探索页"><img src={gxplayerIcon} alt="" /></button>
           <button className="history-back" onClick={navigateBack} disabled={!viewHistory.length} aria-label="返回上一页" title="返回上一页">‹</button>
+          <button className="mini-mode-exit" type="button" onClick={() => void toggleMiniMode()}>退出迷你</button>
         </div>
         <div className="global-search" ref={searchShellRef}>
           <span aria-hidden="true">⌕</span>
           <input
+            ref={searchInputRef}
+            role="combobox"
             aria-label="搜索歌曲、歌手、专辑"
+            aria-autocomplete="list"
+            aria-expanded={suggestionOpen}
+            aria-controls="search-suggestions"
+            aria-activedescendant={suggestionIndex >= 0 ? searchOptions[suggestionIndex]?.id : undefined}
             placeholder="搜索歌曲、歌手、专辑…"
             value={searchQuery}
             onChange={(event) => setSearchQuery(event.target.value)}
             onFocus={() => searchQuery.trim() && setSuggestionOpen(true)}
             onKeyDown={onSearchKeyDown}
           />
-          {searchState === "loading" && <i className="search-spinner" aria-label="正在搜索" />}
+          {suggestionState === "loading" && <i className="search-spinner" aria-label="正在搜索联想" />}
           {suggestionOpen && (
-            <div className="suggestions" role="listbox">
-              {searchState === "empty" && <div className="suggestion-state">没有找到相关音乐</div>}
-              {suggestions.slice(0, 4).length > 0 && (
+            <div className="suggestions" id="search-suggestions" role="listbox" aria-label="搜索联想">
+              {suggestionState === "loading" && <div className="suggestion-state">正在查找联想…</div>}
+              {suggestionState === "empty" && <div className="suggestion-state">没有找到相关音乐</div>}
+              {suggestionState === "error" && (
+                <div className="suggestion-state suggestion-error">
+                  <span>{suggestionError ?? "联想加载失败"}</span>
+                  <button type="button" onClick={retrySuggestions}>重试</button>
+                </div>
+              )}
+              {visibleSuggestions.length > 0 && (
                 <SuggestionGroup label="歌曲">
-                  {suggestions.slice(0, 4).map((track, index) => {
+                  {visibleSuggestions.map((track) => {
                     const trackKey = `${track.providerId}:${track.providerTrackId}`;
                     const resolving = playingCatalogKey === trackKey;
+                    const optionIndex = searchOptions.findIndex((option) => option.kind === "track" && catalogKey(option.track) === trackKey);
+                    const option = searchOptions[optionIndex];
                     return (
                       <button
                         role="option"
-                        aria-selected={index === suggestionIndex}
+                        id={option?.id}
+                        aria-selected={optionIndex === suggestionIndex}
                         aria-busy={resolving}
                         disabled={resolving}
-                        className={index === suggestionIndex ? "selected" : ""}
+                        className={optionIndex === suggestionIndex ? "selected" : ""}
                         key={trackKey}
                         onMouseDown={(event) => event.preventDefault()}
-                        onClick={() => {
-                          setSuggestionOpen(false);
-                          void playCatalog(track);
-                        }}
+                        onMouseEnter={() => setSuggestionIndex(optionIndex)}
+                        onClick={() => option && activateSearchOption(option)}
                       >
                         <span>{resolving ? "…" : "♪"}</span>
                         <strong>{track.title}</strong>
@@ -2277,49 +2558,56 @@ function App() {
               )}
               {artists.length > 0 && (
                 <SuggestionGroup label="歌手">
-                  {artists.map((artist) => (
-                    <button
+                  {artists.map((artist) => {
+                    const optionIndex = searchOptions.findIndex((option) => option.kind === "artist" && option.query === artist);
+                    const option = searchOptions[optionIndex];
+                    return <button
+                      role="option"
+                      id={option?.id}
+                      aria-selected={optionIndex === suggestionIndex}
+                      className={optionIndex === suggestionIndex ? "selected" : ""}
                       key={artist}
                       onMouseDown={(event) => event.preventDefault()}
-                      onClick={() => {
-                        setSearchQuery(artist);
-                        setSuggestionOpen(false);
-                        void submitSearch(artist);
-                      }}
+                      onMouseEnter={() => setSuggestionIndex(optionIndex)}
+                      onClick={() => option && activateSearchOption(option)}
                     >
                       <span>●</span>
                       <strong>{artist}</strong>
                       <small>歌手</small>
-                    </button>
-                  ))}
+                    </button>;
+                  })}
                 </SuggestionGroup>
               )}
               {albums.length > 0 && (
                 <SuggestionGroup label="专辑">
-                  {albums.map((album) => (
-                    <button
+                  {albums.map((album) => {
+                    const optionIndex = searchOptions.findIndex((option) => option.kind === "album" && option.query === album);
+                    const option = searchOptions[optionIndex];
+                    return <button
+                      role="option"
+                      id={option?.id}
+                      aria-selected={optionIndex === suggestionIndex}
+                      className={optionIndex === suggestionIndex ? "selected" : ""}
                       key={album}
                       onMouseDown={(event) => event.preventDefault()}
-                      onClick={() => {
-                        setSearchQuery(album);
-                        setSuggestionOpen(false);
-                        void submitSearch(album);
-                      }}
+                      onMouseEnter={() => setSuggestionIndex(optionIndex)}
+                      onClick={() => option && activateSearchOption(option)}
                     >
                       <span>◉</span>
                       <strong>{album}</strong>
                       <small>专辑</small>
-                    </button>
-                  ))}
+                    </button>;
+                  })}
                 </SuggestionGroup>
               )}
               <button
-                className="view-all"
+                id="search-view-all"
+                role="option"
+                aria-selected={searchOptions[suggestionIndex]?.kind === "all"}
+                className={`view-all ${searchOptions[suggestionIndex]?.kind === "all" ? "selected" : ""}`}
                 onMouseDown={(event) => event.preventDefault()}
-                onClick={() => {
-                  setSuggestionOpen(false);
-                  void submitSearch();
-                }}
+                onMouseEnter={() => setSuggestionIndex(searchOptions.length - 1)}
+                onClick={() => activateSearchOption({ id: "search-view-all", kind: "all" })}
               >
                 查看“{searchQuery}”的全部结果 <span>→</span>
               </button>
@@ -2329,7 +2617,7 @@ function App() {
         <div className="top-bar-trail">
           <button className={`mode-pill ${snapshot.audioMode === "cinema_game" ? "active" : ""}`} onClick={() => navigateTo("now-playing")}><span>⊙</span>{snapshot.audioMode === "music" ? "原声" : "空间"}</button>
         </div>
-        <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label="关闭">×</button></div>
+        <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button className="maximize-control" onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label="关闭">×</button></div>
       </header>
 
       <aside className="sidebar">
@@ -2345,7 +2633,7 @@ function App() {
       {(message || (snapshot.error && !engineErrorDismissed)) && (
         <div
           className={`toast ${snapshot.error && !engineErrorDismissed || messageIsError ? "toast-error" : "toast-ok"}`}
-          role="status"
+          role={snapshot.error && !engineErrorDismissed || messageIsError ? "alert" : "status"}
         >
           <span>{snapshot.error && !engineErrorDismissed || messageIsError ? "!" : "✓"}</span>
           <p>{(!engineErrorDismissed && snapshot.error) ? snapshot.error : message}</p>
@@ -2378,7 +2666,7 @@ function App() {
             <button type="button" className="transport-btn" onClick={() => void handleTransportPrevious()} aria-label="上一首">
               <span className="glyph-prev" aria-hidden="true" />
             </button>
-            <button type="button" className="play-button" onClick={() => void run(isPlaying ? "player_pause" : "player_play")} disabled={!currentQueueItem && !displayPlaylist.length} aria-label={isPlaying ? "暂停" : "播放"}>
+            <button type="button" className="play-button" onClick={() => void handlePlayPause()} disabled={!currentQueueItem && !displayPlaylist.length} aria-label={isPlaying ? "暂停" : "播放"}>
               <span className={isPlaying ? "glyph-pause" : "glyph-play"} aria-hidden="true" />
             </button>
             <button type="button" className="transport-btn" onClick={() => void handleTransportNext()} aria-label="下一首">
@@ -2413,7 +2701,7 @@ function App() {
         <div className="player-tools">
           {selectedCatalogTrack && currentQueueItem?.online && <button className={`online-favorite ${selectedOnlineFavorite ? "active" : ""}`} onClick={() => void toggleOnlineFavorite(selectedCatalogTrack)} aria-label={selectedOnlineFavorite ? "取消在线收藏" : "收藏在线歌曲"} title={selectedOnlineFavorite ? "取消收藏" : "收藏并钉住缓存"}>{selectedOnlineFavorite ? "♥" : "♡"}</button>}
           {measuredSourceSpec && <span className={`measured-quality ${suspiciousQuality ? "suspicious" : ""}`} title={`${currentQuality ? `${currentQuality}（音源自报） · ` : ""}实测 ${measuredSourceSpec}${suspiciousQuality ? " · 疑似虚标" : ""}`}>{suspiciousQuality ? "⚠ " : ""}{measuredSourceSpec}</span>}
-          {selectedCatalogTrack && currentQueueItem?.online && <select className="quality-select" aria-label="音源自报音质" title={`音源自报档位：${currentQuality ?? "自动"}`} value={QUALITY_OPTIONS.some((option) => option.value === currentQuality) ? currentQuality ?? "auto" : "auto"} disabled={qualitySwitching} onChange={(event) => void switchOnlineQuality(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.value === "auto" ? `自动${currentQuality ? ` · ${currentQuality}` : ""}` : option.label}</option>)}</select>}
+          {selectedCatalogTrack && currentQueueItem?.online && <select className="quality-select" aria-label="音源自报音质" title={`音源自报档位：${currentQuality ?? "自动"}`} value={QUALITY_OPTIONS.some((option) => option.value === currentQuality) ? currentQuality ?? "auto" : "auto"} disabled={qualitySwitching || Boolean(resolveBanner)} onChange={(event) => void switchOnlineQuality(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.value === "auto" ? `自动${currentQuality ? ` · ${currentQuality}` : ""}` : option.label}</option>)}</select>}
           <div className="volume-cluster">
             <span className="volume-icon" aria-hidden="true" />
             <input
@@ -2428,7 +2716,15 @@ function App() {
               onChange={(event) => setVolumeDraft(Number(event.target.value))}
               onPointerUp={(event) => {
                 const volume = Number(event.currentTarget.value);
-                void run("player_set_volume", { volume });
+                void commitVolume(volume);
+              }}
+              onKeyUp={(event) => {
+                if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
+                  void commitVolume(Number(event.currentTarget.value));
+                }
+              }}
+              onBlur={(event) => {
+                if (volumeDraft !== null) void commitVolume(Number(event.currentTarget.value));
               }}
             />
           </div>
@@ -2492,6 +2788,10 @@ function PageHeading({ eyebrow, title, copy, action }: { eyebrow: string; title:
 
 function EmptyState({ title, copy, action, onAction }: { title: string; copy: string; action?: string; onAction?: () => void }) {
   return <div className="empty-state"><span>♫</span><h3>{title}</h3><p>{copy}</p>{action && <button className="primary" onClick={onAction}>{action}</button>}</div>;
+}
+
+function ErrorState({ title, copy, onRetry }: { title: string; copy: string; onRetry: () => void }) {
+  return <div className="empty-state error-state" role="alert"><span>!</span><h3>{title}</h3><p>{copy}</p><button className="primary" type="button" onClick={onRetry}>重试</button></div>;
 }
 
 function LoadingState() {

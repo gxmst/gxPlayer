@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine, PlayMode};
 use gx_contracts::ResolvedMediaRequest;
@@ -29,7 +29,8 @@ use cache_commands::{
 use product_commands::{
     backup_read_file, backup_write_file, library_clear_history, library_embedded_cover,
     library_history, library_record_history, library_scan_missing, player_media_action,
-    window_get_state, window_save_state, window_set_always_on_top, window_set_mini_mode,
+    window_force_show, window_get_state, window_save_state, window_set_always_on_top,
+    window_set_mini_mode,
 };
 use metadata_commands::{
     maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
@@ -699,35 +700,17 @@ fn phase1_script_path() -> PathBuf {
 }
 
 /// Size and show the main window before first paint.
-/// Restores saved geometry when present; otherwise adaptive 16:10 from the monitor.
+/// Restores saved geometry when present and on-screen; otherwise safe centered default.
 fn place_and_show_main_window(window: &WebviewWindow, app_data: &std::path::Path) -> tauri::Result<()> {
     let saved = window_state::load(app_data);
-    if saved.width.is_some() || saved.mini_mode {
+    let has_saved = saved.width.is_some() || saved.x.is_some() || saved.mini_mode || saved.maximized;
+    if has_saved {
         window_state::apply_to_window(window, &saved);
     } else {
-        let monitor = window.current_monitor()?.or(window.primary_monitor()?);
-        if let Some(monitor) = monitor {
-            let scale = monitor.scale_factor();
-            let physical = monitor.size();
-            let logical_width = physical.width as f64 / scale;
-            let logical_height = physical.height as f64 / scale;
-
-            let mut width = (logical_width * 0.88).min(1280.0);
-            let mut height = width / 1.6;
-            let maximum_height = logical_height * 0.86;
-            if height > maximum_height {
-                height = maximum_height;
-                width = height * 1.6;
-            }
-
-            width = width.max(720.0);
-            height = height.max(560.0);
-
-            window.set_size(LogicalSize::new(width.floor(), height.floor()))?;
-        }
-        let _ = window.center();
+        window_state::apply_default_placement(window);
     }
 
+    let _ = window.unminimize();
     window.show()?;
     let _ = window.set_focus();
     Ok(())
@@ -735,8 +718,14 @@ fn place_and_show_main_window(window: &WebviewWindow, app_data: &std::path::Path
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
+        // If a bad geometry made the window invisible, recover to center.
+        if let Ok(app_data) = app.path().app_data_dir() {
+            let state = window_state::load(&app_data);
+            // Re-apply validation (no-op when already good).
+            window_state::apply_to_window(&window, &state);
+        }
         let _ = window.unminimize();
+        let _ = window.show();
         let _ = window.set_focus();
     }
 }
@@ -888,15 +877,16 @@ pub fn run() {
             app.manage(SourceRuntime::new(source_store));
             create_lx_sandbox(app.handle())?;
             create_system_tray(app.handle())?;
-            media_session::spawn_media_session(app.handle().clone());
 
             if let Some(main) = app.get_webview_window("main") {
                 // Fail soft: still show with tauri.conf fallback size if monitor probe fails.
                 if let Err(error) = place_and_show_main_window(&main, &app_data) {
                     eprintln!("main window placement failed: {error}");
-                    let _ = main.show();
+                    window_state::force_show_main(&main, &app_data);
                 }
             }
+            // SMTC after show so HWND is valid and visible.
+            media_session::spawn_media_session(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -940,6 +930,7 @@ pub fn run() {
             library_embedded_cover,
             window_get_state,
             window_save_state,
+            window_force_show,
             window_set_always_on_top,
             window_set_mini_mode,
             backup_write_file,

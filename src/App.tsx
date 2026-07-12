@@ -596,6 +596,19 @@ function App() {
       .then(setChartTracks)
       .catch(() => setChartTracks([]));
 
+    // If the window somehow ended off-screen, recover after first paint.
+    void (async () => {
+      try {
+        const win = getCurrentWindow();
+        const pos = await win.outerPosition();
+        if (pos.x < -5000 || pos.y < -5000) {
+          await invoke("window_force_show");
+        }
+      } catch {
+        // ignore
+      }
+    })();
+
     const unlistenPromise = getCurrentWindow().onResized(() => scheduleWindowSave());
     const unlistenMoved = getCurrentWindow().onMoved(() => scheduleWindowSave());
     return () => {

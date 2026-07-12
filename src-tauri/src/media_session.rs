@@ -1,8 +1,7 @@
-//! Windows SMTC / media-key bridge via souvlaki.
+//! Windows System Media Transport Controls (taskbar media flyout).
 //!
-//! Shows the OS taskbar media flyout (title + play/pause/prev/next) while GXPlayer is playing.
-//! Play/pause hit the engine; next/previous are emitted to the frontend so playlist authority
-//! (including online lazy resolve) stays consistent.
+//! Uses souvlaki + the main window HWND. Next/previous are emitted to the
+//! frontend so playlist ownership stays consistent.
 
 use std::thread;
 use std::time::Duration;
@@ -16,42 +15,54 @@ pub fn spawn_media_session(app: AppHandle) {
     thread::Builder::new()
         .name("gx-media-session".into())
         .spawn(move || {
-            // Retry a few times — HWND may not be ready at first paint.
-            for attempt in 0..8 {
-                thread::sleep(Duration::from_millis(if attempt == 0 { 600 } else { 500 }));
+            // Wait for the main window to be shown; HWND is required on Windows.
+            for attempt in 1..=12 {
+                thread::sleep(Duration::from_millis(if attempt == 1 { 900 } else { 700 }));
                 match run_media_session(app.clone()) {
                     Ok(()) => return,
                     Err(error) => {
-                        eprintln!(
-                            "media session attempt {} failed: {error}",
-                            attempt + 1
-                        );
+                        eprintln!("GX_SMTC attempt {attempt} failed: {error}");
                     }
                 }
             }
-            eprintln!("media session unavailable after retries");
+            eprintln!("GX_SMTC unavailable after retries (taskbar media controls disabled)");
         })
         .ok();
 }
 
-fn run_media_session(app: AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    let hwnd = {
-        let window = app
-            .get_webview_window("main")
-            .ok_or_else(|| "main window missing for SMTC".to_owned())?;
+fn main_hwnd(app: &AppHandle) -> Result<*mut std::ffi::c_void, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window missing".to_owned())?;
+    if !window.is_visible().unwrap_or(false) {
+        return Err("main window not visible yet".into());
+    }
+    #[cfg(windows)]
+    {
         let hwnd = window.hwnd().map_err(|e| e.to_string())?;
-        Some(hwnd.0)
-    };
-    #[cfg(not(target_os = "windows"))]
-    let hwnd = None;
+        let raw = hwnd.0;
+        if raw.is_null() {
+            return Err("HWND is null".into());
+        }
+        Ok(raw)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        Err("SMTC is Windows-only".into())
+    }
+}
+
+fn run_media_session(app: AppHandle) -> Result<(), String> {
+    let hwnd = main_hwnd(&app)?;
+    println!("GX_SMTC hwnd={hwnd:?}");
 
     let config = PlatformConfig {
         dbus_name: "com.gxplayer.desktop",
         display_name: "GXPlayer",
-        hwnd,
+        hwnd: Some(hwnd),
     };
-    let mut controls = MediaControls::new(config).map_err(|e| format!("{e:?}"))?;
+    let mut controls = MediaControls::new(config).map_err(|e| format!("MediaControls::new: {e:?}"))?;
     let app_events = app.clone();
 
     controls
@@ -70,7 +81,6 @@ fn run_media_session(app: AppHandle) -> Result<(), String> {
                 }
                 MediaControlEvent::Play => engine.play(),
                 MediaControlEvent::Pause | MediaControlEvent::Stop => engine.pause(),
-                // Frontend owns playlist order (online lazy resolve + local jump).
                 MediaControlEvent::Next => {
                     let _ = app_events.emit("gx-media", "next");
                     Ok(())
@@ -82,16 +92,28 @@ fn run_media_session(app: AppHandle) -> Result<(), String> {
                 _ => Ok(()),
             };
             if let Err(error) = result {
-                eprintln!("media session command failed: {error}");
+                eprintln!("GX_SMTC command failed: {error}");
             }
         })
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("MediaControls::attach: {e:?}"))?;
+
+    // Seed metadata immediately so Windows registers the session.
+    let _ = controls.set_metadata(MediaMetadata {
+        title: Some("GXPlayer"),
+        artist: Some("就绪"),
+        album: Some("GXPlayer"),
+        cover_url: None,
+        duration: None,
+    });
+    let _ = controls.set_playback(MediaPlayback::Stopped);
+    println!("GX_SMTC attached");
 
     let mut last_title = String::new();
     let mut last_generation = u64::MAX;
-    let mut last_playing: Option<bool> = None;
+    let mut last_status: Option<&'static str> = None;
+
     loop {
-        thread::sleep(Duration::from_millis(350));
+        thread::sleep(Duration::from_millis(300));
         let Some(engine) = app.try_state::<LocalAudioEngine>() else {
             continue;
         };
@@ -101,49 +123,58 @@ fn run_media_session(app: AppHandle) -> Result<(), String> {
             .map(|item| item.title.clone())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "GXPlayer".into());
-        // QueueItem has no artist field — surface online/local location hint lightly.
         let artist = item
             .map(|item| {
                 if item.online {
-                    "在线播放".to_owned()
+                    "在线".to_owned()
                 } else {
-                    "本地播放".to_owned()
+                    "本地".to_owned()
                 }
             })
             .unwrap_or_else(|| "GXPlayer".into());
-        let playing = matches!(
-            snap.status,
-            PlaybackStatus::Playing | PlaybackStatus::Loading
-        );
-        let active = item.is_some()
-            && !matches!(
-                snap.status,
-                PlaybackStatus::Idle | PlaybackStatus::Stopped
-            );
 
         if title != last_title || snap.generation != last_generation {
-            let _ = controls.set_metadata(MediaMetadata {
+            if let Err(error) = controls.set_metadata(MediaMetadata {
                 title: Some(title.as_str()),
                 artist: Some(artist.as_str()),
                 album: Some("GXPlayer"),
                 cover_url: None,
-                duration: None,
-            });
+                duration: snap
+                    .duration_seconds
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .map(Duration::from_secs_f64),
+            }) {
+                eprintln!("GX_SMTC set_metadata: {error:?}");
+            }
             last_title = title;
             last_generation = snap.generation;
         }
 
-        let playback = if !active {
-            MediaPlayback::Stopped
-        } else if playing {
-            MediaPlayback::Playing { progress: None }
-        } else {
-            MediaPlayback::Paused { progress: None }
+        let status_label: &'static str = match snap.status {
+            PlaybackStatus::Playing | PlaybackStatus::Loading => "playing",
+            PlaybackStatus::Paused | PlaybackStatus::Buffering => "paused",
+            _ => "stopped",
         };
-        let playing_flag = matches!(playback, MediaPlayback::Playing { .. });
-        if last_playing != Some(playing_flag) || (!active && last_playing.is_some()) {
-            let _ = controls.set_playback(playback);
-            last_playing = if active { Some(playing_flag) } else { Some(false) };
+        if last_status != Some(status_label) {
+            let playback = match status_label {
+                "playing" => MediaPlayback::Playing {
+                    progress: Some(souvlaki::MediaPosition(Duration::from_secs_f64(
+                        snap.position_seconds.max(0.0),
+                    ))),
+                },
+                "paused" => MediaPlayback::Paused {
+                    progress: Some(souvlaki::MediaPosition(Duration::from_secs_f64(
+                        snap.position_seconds.max(0.0),
+                    ))),
+                },
+                _ => MediaPlayback::Stopped,
+            };
+            if let Err(error) = controls.set_playback(playback) {
+                eprintln!("GX_SMTC set_playback: {error:?}");
+            } else {
+                println!("GX_SMTC playback={status_label}");
+            }
+            last_status = Some(status_label);
         }
     }
 }

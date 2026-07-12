@@ -114,9 +114,24 @@ pub fn window_save_state(
     require_window(&window, "main")?;
     let app_data = window_state::app_data_dir(&app)?;
     let previous = window_state::load(&app_data);
-    let state = window_state::capture_from_window(&window, mini_mode.unwrap_or(previous.mini_mode));
-    window_state::save(&app_data, &state)?;
-    Ok(state)
+    // Skip save when minimized/hidden/off-screen so we never persist garbage coords.
+    if let Some(state) =
+        window_state::capture_from_window(&window, mini_mode.unwrap_or(previous.mini_mode))
+    {
+        window_state::save(&app_data, &state)?;
+        Ok(state)
+    } else {
+        Ok(previous)
+    }
+}
+
+/// Recover a missing window: center on primary display and clear bad geometry.
+#[tauri::command]
+pub fn window_force_show(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
+    require_window(&window, "main")?;
+    let app_data = window_state::app_data_dir(&app)?;
+    window_state::force_show_main(&window, &app_data);
+    Ok(())
 }
 
 #[tauri::command]
@@ -146,28 +161,35 @@ pub fn window_set_mini_mode(
     if enabled {
         if !state.mini_mode {
             // Remember normal size before shrinking.
-            let captured = window_state::capture_from_window(&window, false);
-            state.x = captured.x.or(state.x);
-            state.y = captured.y.or(state.y);
-            state.width = captured.width.or(state.width);
-            state.height = captured.height.or(state.height);
+            if let Some(captured) = window_state::capture_from_window(&window, false) {
+                state.x = captured.x.or(state.x);
+                state.y = captured.y.or(state.y);
+                state.width = captured.width.or(state.width);
+                state.height = captured.height.or(state.height);
+            }
         }
         window
-            .set_size(tauri::LogicalSize::new(380.0, 128.0))
+            .set_size(tauri::LogicalSize::new(380.0, 140.0))
             .map_err(|e| e.to_string())?;
         window.set_always_on_top(true).map_err(|e| e.to_string())?;
+        let _ = window.center();
         state.mini_mode = true;
         state.always_on_top = true;
     } else {
         state.mini_mode = false;
         let width = state.width.unwrap_or(1100.0).max(720.0);
-        let height = state.height.unwrap_or(688.0).max(480.0);
+        let height = state.height.unwrap_or(688.0).max(560.0);
         window
             .set_size(tauri::LogicalSize::new(width, height))
             .map_err(|e| e.to_string())?;
         window
             .set_always_on_top(state.always_on_top)
             .map_err(|e| e.to_string())?;
+        if let (Some(x), Some(y)) = (state.x, state.y) {
+            let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+        } else {
+            let _ = window.center();
+        }
     }
     window_state::save(&app_data, &state)?;
     Ok(())

@@ -204,6 +204,46 @@ function pickShuffleIndex(
   return choice;
 }
 
+/**
+ * After a hard play/resolve failure: leave the failed track and pick another
+ * untried index. Never re-pick the same index (avoids infinite loops under
+ * repeat_one / repeat_all / single-item shuffle).
+ * Returns null when every index has already been tried once.
+ */
+function pickFailureSkipIndex(
+  mode: PlayMode,
+  current: number,
+  length: number,
+  tried: Set<number>,
+  shufflePlayed: Set<number>,
+  rng: { state: number },
+): number | null {
+  if (length <= 0) return null;
+  const untried = Array.from({ length }, (_, i) => i).filter((i) => !tried.has(i));
+  if (untried.length === 0) return null;
+
+  if (mode === "shuffle") {
+    const unplayedUntried = untried.filter((i) => !shufflePlayed.has(i));
+    const pool = unplayedUntried.length > 0 ? unplayedUntried : untried;
+    const choice = pool[lcgNext(rng) % pool.length]!;
+    shufflePlayed.add(choice);
+    return choice;
+  }
+
+  if (mode === "sequential") {
+    // Sequential: only walk forward; do not wrap on failure.
+    const after = untried.filter((i) => i > current).sort((a, b) => a - b);
+    return after[0] ?? null;
+  }
+
+  // repeat_all / repeat_one on failure: step forward (wrapping) among untried.
+  for (let step = 1; step <= length; step += 1) {
+    const candidate = (current + step) % length;
+    if (!tried.has(candidate)) return candidate;
+  }
+  return null;
+}
+
 const QUALITY_OPTIONS: Array<{ value: QualityPreference; label: string }> = [
   { value: "auto", label: "自动" },
   { value: "128k", label: "128k" },
@@ -448,6 +488,8 @@ function App() {
   const [viewHistory, setViewHistory] = useState<ViewId[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [message, setMessage] = useState("");
+  /** User dismissed the engine error toast; reset when generation/error changes. */
+  const [engineErrorDismissed, setEngineErrorDismissed] = useState(false);
   const [accent, setAccent] = useState(FALLBACK_ACCENT);
   const [dragPosition, setDragPosition] = useState<number | null>(null);
   const [volumeDraft, setVolumeDraft] = useState<number | null>(null);
@@ -591,6 +633,10 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    setEngineErrorDismissed(false);
+  }, [snapshot.error, snapshot.generation]);
+
   const currentQueueItem = useMemo(
     () => (snapshot.queueIndex === null ? null : snapshot.queue[snapshot.queueIndex] ?? null),
     [snapshot.queue, snapshot.queueIndex],
@@ -603,6 +649,7 @@ function App() {
   const currentTitle = selectedCatalogTrack?.title ?? currentLibraryTrack?.title ?? currentQueueItem?.title ?? "尚未播放";
   const currentArtist = selectedCatalogTrack?.artist ?? currentLibraryTrack?.artist ?? "选择一首歌，让房间亮起来";
   const currentArtwork = selectedCatalogTrack?.artworkUrl ?? null;
+  // Loading only while a session is opening — failed must not look like "still playing".
   const isPlaying = snapshot.status === "playing" || snapshot.status === "loading";
   const shownPosition = dragPosition ?? pendingSeek?.target ?? snapshot.positionSeconds;
   const shownVolume = volumeDraft ?? snapshot.volume;
@@ -835,104 +882,139 @@ function App() {
     setMessage(`已从本地缓存秒开 · ${entry.quality}`);
   };
 
-  const playPlaylistEntry = async (entries: PlaylistEntry[], index: number, opts?: { allowPreviewFallback?: boolean }) => {
+  /** Try to start one playlist entry. Does not chain-skip on failure (caller decides). */
+  const tryStartEntry = async (
+    entries: PlaylistEntry[],
+    index: number,
+    opts?: { allowPreviewFallback?: boolean },
+  ): Promise<boolean> => {
     const entry = entries[index];
-    if (!entry) return;
+    if (!entry) return false;
     if (entry.kind === "local") {
-      if (playlistIsLocalOnly(entries)) {
-        const paths = entries.map((item) => (item as Extract<PlaylistEntry, { kind: "local" }>).path);
-        await invoke("player_load_local", { paths, startIndex: index });
-      } else {
-        await invoke("player_load_local", { paths: [entry.path], startIndex: 0 });
+      try {
+        if (playlistIsLocalOnly(entries)) {
+          const paths = entries.map((item) => (item as Extract<PlaylistEntry, { kind: "local" }>).path);
+          await invoke("player_load_local", { paths, startIndex: index });
+        } else {
+          await invoke("player_load_local", { paths: [entry.path], startIndex: 0 });
+        }
+        setSelectedCatalogTrack(null);
+        setCurrentQuality(null);
+        setLyrics(null);
+        return true;
+      } catch (error) {
+        setMessage(`《${entry.title}》本地播放失败：${String(error)}`);
+        return false;
       }
-      setSelectedCatalogTrack(null);
-      setCurrentQuality(null);
-      setLyrics(null);
-      return;
     }
     if (entry.kind === "cached") {
       try {
         await playCachedEntry(entry);
+        return true;
       } catch (error) {
-        setMessage(`《${entry.title}》缓存播放失败，已跳过：${String(error)}`);
-        await advanceFromIndex(entries, index, "ended");
+        setMessage(`《${entry.title}》缓存播放失败：${String(error)}`);
+        return false;
       }
-      return;
     }
-    const result = await resolveAndPlayOnline(entry.track, entry.quality, {
-      allowPreviewFallback: opts?.allowPreviewFallback,
-      candidates: entries.filter((item): item is Extract<PlaylistEntry, { kind: "online" }> => item.kind === "online").map((item) => item.track),
-    });
-    if (!result) {
-      // Skip failed online track and continue.
-      await advanceFromIndex(entries, index, "ended");
+    const key = catalogKey(entry.track);
+    setPlayingCatalogKey(key);
+    try {
+      const result = await resolveAndPlayOnline(entry.track, entry.quality, {
+        allowPreviewFallback: opts?.allowPreviewFallback,
+        candidates: entries
+          .filter((item): item is Extract<PlaylistEntry, { kind: "online" }> => item.kind === "online")
+          .map((item) => item.track),
+      });
+      return result !== null;
+    } finally {
+      setPlayingCatalogKey(null);
     }
   };
 
+  /**
+   * Advance the playhead. On hard failure, skip untried tracks at most once —
+   * never infinite-retry under repeat_one / wrap modes.
+   * @returns true if a track started successfully.
+   */
   const advanceFromIndex = async (
     entries: PlaylistEntry[],
     current: number,
     intent: "ended" | "next" | "previous",
-  ) => {
-    if (advancingRef.current) return;
+    opts?: { fromFailure?: boolean },
+  ): Promise<boolean> => {
+    if (advancingRef.current) return false;
     advancingRef.current = true;
+    const tried = new Set<number>();
+    if (opts?.fromFailure) tried.add(current);
     try {
       const mode = snapshotRef.current.playMode ?? "sequential";
-      // Skip chain for failed resolves — walk until success or exhaustion (cap to list length).
       let cursor = current;
       for (let attempt = 0; attempt < Math.max(entries.length, 1); attempt += 1) {
-        const next = frontendNextIndex(
-          mode,
-          cursor,
-          entries.length,
-          attempt === 0 ? intent : "ended",
-          shufflePlayedRef.current,
-          shuffleRngRef.current,
-        );
+        const next = opts?.fromFailure || attempt > 0
+          ? pickFailureSkipIndex(
+            mode,
+            cursor,
+            entries.length,
+            tried,
+            shufflePlayedRef.current,
+            shuffleRngRef.current,
+          )
+          : frontendNextIndex(
+            mode,
+            cursor,
+            entries.length,
+            intent,
+            shufflePlayedRef.current,
+            shuffleRngRef.current,
+          );
         if (next === null) {
           setPlaylistIndex(cursor);
-          return;
+          if (opts?.fromFailure || attempt > 0) {
+            setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。");
+          }
+          return false;
         }
+        if (tried.has(next)) {
+          setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。");
+          return false;
+        }
+        tried.add(next);
         setPlaylistIndex(next);
-        const entry = entries[next];
-        if (!entry) return;
-        if (entry.kind === "local") {
-          // Local multi-item queues stay loaded in the engine for jump; mixed playlists load one path.
-          if (playlistIsLocalOnly(entries)) {
-            await invoke("player_jump", { index: next });
-          } else {
-            await invoke("player_load_local", { paths: [entry.path], startIndex: 0 });
-          }
-          setSelectedCatalogTrack(null);
-          setCurrentQuality(null);
-          setLyrics(null);
-          return;
-        }
-        if (entry.kind === "cached") {
-          try {
-            await playCachedEntry(entry);
-            return;
-          } catch (error) {
-            setMessage(`《${entry.title}》缓存播放失败，已跳过：${String(error)}`);
-            cursor = next;
-            continue;
-          }
-        }
-        const key = catalogKey(entry.track);
-        setPlayingCatalogKey(key);
-        const result = await resolveAndPlayOnline(entry.track, entry.quality, { allowPreviewFallback: false });
-        setPlayingCatalogKey(null);
-        if (result) return;
-        // Resolve failed — treat as ended and try the following track.
         cursor = next;
+        // Failure-skip never uses preview fallback (avoids cascading slow preview attempts).
+        const started = await tryStartEntry(entries, next, {
+          // Preview fallback only for the user's explicit first click (handled in playPlaylistEntry).
+          allowPreviewFallback: false,
+        });
+        if (started) return true;
+        // Subsequent picks in this chain are failure-skips (one pass, no infinite loop).
+        opts = { fromFailure: true };
       }
+      setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。");
+      return false;
     } finally {
       advancingRef.current = false;
+      setPlayingCatalogKey(null);
     }
   };
 
-  const replacePlaylist = async (entries: PlaylistEntry[], startIndex: number, opts?: { allowPreviewFallback?: boolean }) => {
-    if (!entries.length) return;
+  const playPlaylistEntry = async (
+    entries: PlaylistEntry[],
+    index: number,
+    opts?: { allowPreviewFallback?: boolean },
+  ): Promise<boolean> => {
+    const started = await tryStartEntry(entries, index, opts);
+    if (started) return true;
+    // First track failed — walk the rest once, then stop (no infinite loop).
+    return advanceFromIndex(entries, index, "ended", { fromFailure: true });
+  };
+
+  const replacePlaylist = async (
+    entries: PlaylistEntry[],
+    startIndex: number,
+    opts?: { allowPreviewFallback?: boolean },
+  ): Promise<boolean> => {
+    if (!entries.length) return false;
     const index = Math.max(0, Math.min(startIndex, entries.length - 1));
     shufflePlayedRef.current = new Set([index]);
     setPlaylist(entries);
@@ -940,9 +1022,9 @@ function App() {
     const startKey = entries[index]?.kind === "online" ? catalogKey(entries[index]!.track) : null;
     if (startKey) setPlayingCatalogKey(startKey);
     try {
-      await playPlaylistEntry(entries, index, opts);
+      return await playPlaylistEntry(entries, index, opts);
     } finally {
-      if (startKey) setPlayingCatalogKey(null);
+      setPlayingCatalogKey(null);
     }
   };
 
@@ -997,6 +1079,7 @@ function App() {
 
   /** Click a catalog track: queue the whole list as online placeholders; resolve only the clicked one. */
   const playCatalogInList = async (tracks: CatalogTrack[], wanted: CatalogTrack) => {
+    if (playingCatalogKey || advancingRef.current) return;
     const list = tracks.length ? tracks : [wanted];
     const startIndex = Math.max(0, list.findIndex((item) => catalogKey(item) === catalogKey(wanted)));
     const entries = list.map((track) => onlineEntryFromCatalog(track, qualityPreference));
@@ -1007,8 +1090,17 @@ function App() {
       startIndex,
       note: "only the starting track will resolve now; others stay as CatalogTrack metadata",
     });
-    await replacePlaylist(entries, startIndex, { allowPreviewFallback: true });
-    navigateTo("now-playing");
+    try {
+      const started = await replacePlaylist(entries, startIndex, { allowPreviewFallback: true });
+      // Only leave the current page when something actually began playing.
+      if (started) {
+        navigateTo("now-playing");
+      }
+    } catch (error) {
+      setPlayingCatalogKey(null);
+      advancingRef.current = false;
+      setMessage(`播放失败：${String(error)}`);
+    }
   };
 
   const playCatalog = async (wanted: CatalogTrack) => {
@@ -1022,7 +1114,7 @@ function App() {
             : onlineFavorites.some((track) => catalogKey(track) === catalogKey(wanted))
               ? onlineFavorites
               : [wanted];
-    if (playingCatalogKey) return;
+    if (playingCatalogKey || advancingRef.current) return;
     await playCatalogInList(context, wanted);
   };
 
@@ -1090,6 +1182,7 @@ function App() {
   };
 
   const playCacheInList = async (entries: CacheEntryView[], wanted: CacheEntryView) => {
+    if (playingCatalogKey || advancingRef.current) return;
     const startIndex = Math.max(0, entries.findIndex(
       (item) => item.providerId === wanted.providerId
         && item.providerTrackId === wanted.providerTrackId
@@ -1097,9 +1190,11 @@ function App() {
     ));
     const playlistEntries = entries.map(cacheEntryToPlaylist);
     try {
-      await replacePlaylist(playlistEntries, startIndex === -1 ? 0 : startIndex);
-      navigateTo("now-playing");
+      const started = await replacePlaylist(playlistEntries, startIndex === -1 ? 0 : startIndex);
+      if (started) navigateTo("now-playing");
     } catch (error) {
+      setPlayingCatalogKey(null);
+      advancingRef.current = false;
       setMessage(String(error));
     }
   };
@@ -1188,16 +1283,23 @@ function App() {
 
   // Engine always stops on natural end (no auto-advance). Frontend picks the next index
   // for every non-empty playlist (local, online, mixed) and drives jump / resolve / load.
+  // Also recover from engine Failed (decode/stream error) by skipping once — never hang on loading UI.
   const prevStatusRef = useRef(snapshot.status);
   useEffect(() => {
     const prev = prevStatusRef.current;
     prevStatusRef.current = snapshot.status;
-    if (snapshot.status !== "stopped") return;
-    if (prev === "stopped" || prev === "idle") return;
     const entries = playlistRef.current;
     if (!entries.length) return;
     const current = playlistIndexRef.current ?? 0;
-    void advanceFromIndex(entries, current, "ended");
+
+    if (snapshot.status === "stopped") {
+      if (prev === "stopped" || prev === "idle" || prev === "failed") return;
+      void advanceFromIndex(entries, current, "ended");
+      return;
+    }
+    if (snapshot.status === "failed" && prev !== "failed") {
+      void advanceFromIndex(entries, current, "ended", { fromFailure: true });
+    }
   }, [snapshot.status]);
 
   const switchOnlineQuality = async (preference: QualityPreference) => {
@@ -1469,7 +1571,7 @@ function App() {
         const resolving = playingCatalogKey === trackKey;
         return (
         <div className="catalog-card-wrap" key={trackKey}>
-          <button className="catalog-card" disabled={playingCatalogKey !== null} aria-busy={resolving} onClick={() => void playCatalogInList(tracks, track)}>
+          <button className="catalog-card" disabled={resolving} aria-busy={resolving} onClick={() => void playCatalogInList(tracks, track)}>
             <Cover artwork={track.artworkUrl} title={track.title} />
             <strong>{track.title}</strong>
             <span>{track.artist}</span>
@@ -1479,7 +1581,6 @@ function App() {
           <button
             type="button"
             className="catalog-enqueue"
-            disabled={playingCatalogKey !== null}
             onClick={() => enqueueCatalogTracks([track])}
             aria-label={`将 ${track.title} 添加到队列`}
             title="添加到队列（播放到时再解析）"
@@ -1779,7 +1880,7 @@ function App() {
           {searchState === "loading" && <i className="search-spinner" aria-label="正在搜索" />}
           {suggestionOpen && <div className="suggestions" role="listbox">
             {searchState === "empty" && <div className="suggestion-state">没有找到相关音乐</div>}
-            {suggestions.slice(0, 4).length > 0 && <SuggestionGroup label="歌曲">{suggestions.slice(0, 4).map((track, index) => { const trackKey = `${track.providerId}:${track.providerTrackId}`; const resolving = playingCatalogKey === trackKey; return <button role="option" aria-selected={index === suggestionIndex} aria-busy={resolving} disabled={playingCatalogKey !== null} className={index === suggestionIndex ? "selected" : ""} key={trackKey} onMouseDown={(event) => event.preventDefault()} onClick={() => void playCatalog(track)}><span>{resolving ? "…" : "♪"}</span><strong>{track.title}</strong><small>{resolving ? "正在解析整首播放…" : track.artist}</small></button>; })}</SuggestionGroup>}
+            {suggestions.slice(0, 4).length > 0 && <SuggestionGroup label="歌曲">{suggestions.slice(0, 4).map((track, index) => { const trackKey = `${track.providerId}:${track.providerTrackId}`; const resolving = playingCatalogKey === trackKey; return <button role="option" aria-selected={index === suggestionIndex} aria-busy={resolving} disabled={resolving} className={index === suggestionIndex ? "selected" : ""} key={trackKey} onMouseDown={(event) => event.preventDefault()} onClick={() => void playCatalog(track)}><span>{resolving ? "…" : "♪"}</span><strong>{track.title}</strong><small>{resolving ? "正在解析整首播放…" : track.artist}</small></button>; })}</SuggestionGroup>}
             {artists.length > 0 && <SuggestionGroup label="歌手">{artists.map((artist) => <button key={artist} onClick={() => { setSearchQuery(artist); void submitSearch(artist); }}><span>●</span><strong>{artist}</strong><small>歌手</small></button>)}</SuggestionGroup>}
             {albums.length > 0 && <SuggestionGroup label="专辑">{albums.map((album) => <button key={album} onClick={() => { setSearchQuery(album); void submitSearch(album); }}><span>◉</span><strong>{album}</strong><small>专辑</small></button>)}</SuggestionGroup>}
             <button className="view-all" onMouseDown={(event) => event.preventDefault()} onClick={() => void submitSearch()}>查看“{searchQuery}”的全部结果 <span>→</span></button>
@@ -1801,7 +1902,22 @@ function App() {
 
       {configSource && sourceConfigDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSourceConfig(); }}><section className="config-modal" role="dialog" aria-modal="true" aria-label={`${configSource.metadata.name} 音源配置`}><div className="section-heading"><div><p className="eyebrow">SOURCE CONFIG</p><h3>{configSource.metadata.name || "音源配置"}</h3><p>同时支持源码常量 key 与 LX 全局 ls；关闭或保存后敏感值会从界面状态清空。</p></div><button onClick={closeSourceConfig} aria-label="关闭配置">×</button></div><div className="config-fields"><label><span>源码常量名</span><input value={sourceConfigDraft.constName} placeholder="YuNingXi" autoComplete="off" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, constName: event.target.value })} /></label><label><span>解析 Key</span><input type={sourceConfigRevealed ? "text" : "password"} value={sourceConfigDraft.keyValue} placeholder="留空则使用音源公益额度" autoComplete="new-password" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, keyValue: event.target.value })} /></label><label><span>ls.api.addr（可选）</span><input value={sourceConfigDraft.apiAddr} placeholder="https://…" autoComplete="off" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, apiAddr: event.target.value })} /></label><label><span>ls.api.pass（可选）</span><input type={sourceConfigRevealed ? "text" : "password"} value={sourceConfigDraft.apiPass} autoComplete="new-password" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, apiPass: event.target.value })} /></label></div><label className="config-reveal"><input type="checkbox" checked={sourceConfigRevealed} onChange={(event) => setSourceConfigRevealed(event.target.checked)} /> 临时显示敏感字段</label><div className="modal-actions"><button onClick={closeSourceConfig}>取消</button><button className="primary" disabled={sourceConfigBusy} onClick={() => void saveSourceConfig()}>保存并应用</button></div></section></div>}
 
-      {(message || snapshot.error) && <div className="toast" role="status"><span>!</span><p>{snapshot.error ?? message}</p><button onClick={() => setMessage("")} aria-label="关闭提示">×</button></div>}
+      {(message || (snapshot.error && !engineErrorDismissed)) && (
+        <div className="toast" role="status">
+          <span>!</span>
+          <p>{(!engineErrorDismissed && snapshot.error) ? snapshot.error : message}</p>
+          <button
+            type="button"
+            onClick={() => {
+              setMessage("");
+              setEngineErrorDismissed(true);
+            }}
+            aria-label="关闭提示"
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       <footer className="player-bar">
         <button className="player-track" onClick={() => navigateTo("now-playing")}>

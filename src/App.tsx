@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import "@fontsource-variable/space-grotesk";
 import "@fontsource-variable/noto-sans-sc";
 import "@fontsource-variable/jetbrains-mono";
+import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
 import {
   EMPTY_ENGINE,
@@ -915,7 +916,7 @@ function App() {
       <header className="top-bar" data-tauri-drag-region>
         <div className="brand-cluster">
           <button className="menu-button" onClick={() => setSidebarCollapsed((value) => !value)} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>☰</button>
-          <button className="logo" onClick={() => navigateTo("discovery")} aria-label="返回探索页"><span>GX</span></button>
+          <button className="logo" onClick={() => navigateTo("discovery")} aria-label="返回探索页"><img src={gxplayerIcon} alt="" /></button>
           <button className="history-back" onClick={navigateBack} disabled={!viewHistory.length} aria-label="返回上一页" title="返回上一页">‹</button>
         </div>
         <div className="global-search">

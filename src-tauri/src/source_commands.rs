@@ -746,6 +746,23 @@ fn monitor_full_track_controls(app: &AppHandle) -> Result<(), String> {
                 ));
             }
             let engine = app.state::<LocalAudioEngine>();
+            let generation_before_volume = snapshot.generation;
+            engine.set_volume(0.35).map_err(|error| error.to_string())?;
+            std::thread::sleep(Duration::from_millis(300));
+            let after_volume = engine.snapshot();
+            if after_volume.generation != generation_before_volume
+                || after_volume.status != gx_contracts::PlaybackStatus::Playing
+                || after_volume.underrun_callbacks != 0
+            {
+                return Err(format!(
+                    "volume hot-update disrupted playback: generation {}->{}, status={:?}, underruns={}",
+                    generation_before_volume,
+                    after_volume.generation,
+                    after_volume.status,
+                    after_volume.underrun_callbacks
+                ));
+            }
+            println!("GX_VOLUME_HOT_UPDATE_OK generation={generation_before_volume} underruns=0");
             engine.pause().map_err(|error| error.to_string())?;
             std::thread::sleep(Duration::from_millis(300));
             let paused = engine.snapshot();

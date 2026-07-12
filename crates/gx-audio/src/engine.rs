@@ -1,6 +1,6 @@
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -377,7 +377,7 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                         } else {
                             model.status = PlaybackStatus::Stopped;
                             model.intent_playing = false;
-                            model.start_seconds = active.duration_seconds().unwrap_or(0.0);
+                            model.start_seconds = active.position_seconds();
                             session = None;
                         }
                     }
@@ -437,6 +437,11 @@ fn handle_command(
         }
         EngineCommand::Play => {
             if model.index.is_some() {
+                if model.status == PlaybackStatus::Stopped {
+                    model.start_seconds = 0.0;
+                    model.status = PlaybackStatus::Loading;
+                    model.generation += 1;
+                }
                 model.intent_playing = true;
                 if session.is_none() {
                     model.reload_requested = true;
@@ -464,38 +469,20 @@ fn handle_command(
             }
         }
         EngineCommand::SetVolume(volume) => {
-            model.volume = volume;
-            if let Some(active) = session.as_ref() {
-                // Prepared PCM already in the ring carries the previous gain. Recreate from the
-                // current position so the callback remains a pure copy path with no gain multiply.
-                model.start_seconds = active.position_seconds();
-                model.reload_requested = true;
-                model.status = PlaybackStatus::Loading;
-                model.generation += 1;
-                *session = None;
-            }
+            apply_volume_change(
+                model,
+                session.as_ref().map(|active| active.volume_bits.as_ref()),
+                volume,
+            );
         }
         EngineCommand::SetAudioMode(mode) => {
-            model.audio_mode = mode;
-            model.dsp_settings = mode.dsp_settings();
-            if let Some(active) = session.as_ref() {
-                model.start_seconds = active.position_seconds();
-                model.reload_requested = true;
-                model.status = PlaybackStatus::Loading;
-                model.error = None;
-                model.generation += 1;
-                *session = None;
+            let settings = mode.dsp_settings();
+            if apply_dsp_change(model, session.as_mut(), settings) {
+                model.audio_mode = mode;
             }
         }
         EngineCommand::SetDspSettings(settings) => {
-            model.dsp_settings = settings;
-            if let Some(active) = session.as_ref() {
-                model.start_seconds = active.position_seconds();
-                model.reload_requested = true;
-                model.status = PlaybackStatus::Loading;
-                model.generation += 1;
-                *session = None;
-            }
+            apply_dsp_change(model, session.as_mut(), settings);
         }
         EngineCommand::SetOutputDevice(name) => {
             model.output_device = name;
@@ -541,6 +528,29 @@ fn handle_command(
         EngineCommand::Shutdown => return true,
     }
     false
+}
+
+fn apply_volume_change(model: &mut WorkerModel, volume_bits: Option<&AtomicU32>, volume: f32) {
+    model.volume = volume;
+    if let Some(volume_bits) = volume_bits {
+        volume_bits.store(volume.to_bits(), Ordering::Relaxed);
+    }
+}
+
+fn apply_dsp_change(
+    model: &mut WorkerModel,
+    session: Option<&mut PlaybackSession>,
+    settings: DspSettings,
+) -> bool {
+    if let Some(active) = session
+        && let Err(error) = active.set_dsp_settings(settings.clone())
+    {
+        model.error = Some(format!("failed to update DSP settings: {error}"));
+        return false;
+    }
+    model.dsp_settings = settings;
+    model.error = None;
+    true
 }
 
 fn local_queue_item(path: PathBuf) -> EngineQueueItem {
@@ -614,6 +624,7 @@ struct PlaybackSession {
     played_samples: Arc<AtomicU64>,
     underrun_callbacks: Arc<AtomicU64>,
     callback_enabled: Arc<AtomicBool>,
+    volume_bits: Arc<AtomicU32>,
     source_channels: usize,
     output_sample_rate: u32,
     start_seconds: f64,
@@ -621,7 +632,6 @@ struct PlaybackSession {
     prebuffer_samples: usize,
     pending: Vec<f32>,
     pending_offset: usize,
-    volume: f32,
     eof: bool,
     flushed: bool,
     intent_playing: bool,
@@ -688,6 +698,7 @@ impl PlaybackSession {
         let played_samples = Arc::new(AtomicU64::new(0));
         let underrun_callbacks = Arc::new(AtomicU64::new(0));
         let callback_enabled = Arc::new(AtomicBool::new(false));
+        let volume_bits = Arc::new(AtomicU32::new(volume.to_bits()));
         let stream = build_engine_output_stream(
             &device,
             &config,
@@ -697,6 +708,7 @@ impl PlaybackSession {
                 played_samples: Arc::clone(&played_samples),
                 underruns: Arc::clone(&underrun_callbacks),
                 enabled: Arc::clone(&callback_enabled),
+                volume_bits: Arc::clone(&volume_bits),
             },
         )?;
         let mut rate_adapter = RateAdapter::new(sample_rate, output_sample_rate, channels)?;
@@ -708,7 +720,6 @@ impl PlaybackSession {
             rate_adapter.process(&prefetched)?
         };
         dsp_chain.process_interleaved_in_place(&mut pending)?;
-        apply_volume(&mut pending, volume);
 
         Ok(Self {
             media,
@@ -720,6 +731,7 @@ impl PlaybackSession {
             played_samples,
             underrun_callbacks,
             callback_enabled,
+            volume_bits,
             source_channels: channels,
             output_sample_rate,
             start_seconds,
@@ -728,7 +740,6 @@ impl PlaybackSession {
                 as usize,
             pending,
             pending_offset: 0,
-            volume,
             eof: false,
             flushed: false,
             intent_playing: true,
@@ -760,7 +771,6 @@ impl PlaybackSession {
                 self.pending = self.rate_adapter.finish()?;
                 self.dsp_chain
                     .process_interleaved_in_place(&mut self.pending)?;
-                apply_volume(&mut self.pending, self.volume);
                 self.flushed = true;
                 if !self.pending.is_empty() {
                     return Ok(PumpResult::Progress);
@@ -813,7 +823,6 @@ impl PlaybackSession {
         self.pending = self.rate_adapter.process(samples)?;
         self.dsp_chain
             .process_interleaved_in_place(&mut self.pending)?;
-        apply_volume(&mut self.pending, self.volume);
         Ok(PumpResult::Progress)
     }
 
@@ -845,6 +854,11 @@ impl PlaybackSession {
         self.stream_playing
     }
 
+    fn set_dsp_settings(&mut self, settings: DspSettings) -> Result<()> {
+        self.dsp_chain.set_settings(settings)?;
+        Ok(())
+    }
+
     fn position_seconds(&self) -> f64 {
         let played_frames =
             self.played_samples.load(Ordering::Relaxed) as f64 / self.source_channels as f64;
@@ -871,20 +885,12 @@ fn media_extension(media_type: &MediaType) -> Option<&'static str> {
     }
 }
 
-fn apply_volume(samples: &mut [f32], volume: f32) {
-    if volume == 1.0 {
-        return;
-    }
-    for sample in samples {
-        *sample *= volume;
-    }
-}
-
 #[derive(Clone)]
 struct OutputCallbackCounters {
     played_samples: Arc<AtomicU64>,
     underruns: Arc<AtomicU64>,
     enabled: Arc<AtomicBool>,
+    volume_bits: Arc<AtomicU32>,
 }
 
 fn build_engine_output_stream(
@@ -929,13 +935,14 @@ fn render_output_callback<T>(
     T: Sample + SizedSample + FromSample<f32>,
 {
     let enabled = counters.enabled.load(Ordering::Acquire);
+    let volume = f32::from_bits(counters.volume_bits.load(Ordering::Relaxed));
     let mut starved = false;
     let mut consumed = 0u64;
     for target in output {
         let sample = match consumer.try_pop() {
             Some(value) => {
                 consumed += 1;
-                value
+                value * volume
             }
             None => {
                 starved = enabled;
@@ -994,35 +1001,88 @@ mod tests {
     static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
 
     #[test]
-    fn volume_is_identity_at_one_and_scales_elsewhere() {
-        let mut identity = vec![-0.5, 0.25];
-        apply_volume(&mut identity, 1.0);
-        assert_eq!(identity, vec![-0.5, 0.25]);
+    fn volume_hot_update_changes_atomic_without_reloading() {
+        let mut model = WorkerModel {
+            status: PlaybackStatus::Playing,
+            generation: 7,
+            ..WorkerModel::default()
+        };
+        let volume_bits = AtomicU32::new(1.0f32.to_bits());
 
-        let mut scaled = vec![-0.5, 0.25];
-        apply_volume(&mut scaled, 0.5);
-        assert_eq!(scaled, vec![-0.25, 0.125]);
+        apply_volume_change(&mut model, Some(&volume_bits), 0.35);
+
+        assert_eq!(model.volume, 0.35);
+        assert_eq!(f32::from_bits(volume_bits.load(Ordering::Relaxed)), 0.35);
+        assert!(!model.reload_requested);
+        assert_eq!(model.status, PlaybackStatus::Playing);
+        assert_eq!(model.generation, 7);
+    }
+
+    #[test]
+    fn stopped_play_restarts_from_zero() {
+        let mut model = WorkerModel {
+            queue: vec![EngineQueueItem {
+                public: QueueItem {
+                    location: "dummy.wav".into(),
+                    title: "Dummy".into(),
+                    duration_seconds: Some(120.0),
+                    online: false,
+                },
+                source: PlaybackSource::Local(PathBuf::from("dummy.wav")),
+            }],
+            index: Some(0),
+            status: PlaybackStatus::Stopped,
+            start_seconds: 120.0,
+            generation: 4,
+            ..WorkerModel::default()
+        };
+        let mut session = None;
+
+        assert!(!handle_command(
+            EngineCommand::Play,
+            &mut model,
+            &mut session
+        ));
+
+        assert_eq!(model.start_seconds, 0.0);
+        assert_eq!(model.status, PlaybackStatus::Loading);
+        assert!(model.intent_playing);
+        assert!(model.reload_requested);
+        assert_eq!(model.generation, 5);
     }
 
     #[test]
     fn audio_callback_path_allocates_nothing_and_uses_only_atomics() {
         let ring = HeapRb::<f32>::new(256);
         let (mut producer, mut consumer) = ring.split();
-        for value in 0..128 {
-            producer.try_push(value as f32 / 128.0).unwrap();
+        for _ in 0..128 {
+            producer.try_push(1.0).unwrap();
         }
+        let volume_bits = Arc::new(AtomicU32::new(0.5f32.to_bits()));
         let counters = OutputCallbackCounters {
             played_samples: Arc::new(AtomicU64::new(0)),
             underruns: Arc::new(AtomicU64::new(0)),
             enabled: Arc::new(AtomicBool::new(true)),
+            volume_bits: Arc::clone(&volume_bits),
         };
         let mut output = [0.0f32; 128];
         ALLOCATION_COUNT.with(|count| count.set(0));
         TRACK_ALLOCATIONS.with(|enabled| enabled.set(true));
         render_output_callback(&mut output, &mut consumer, &counters);
+        for sample in &output {
+            assert_eq!(*sample, 0.5);
+        }
+        for _ in 0..128 {
+            producer.try_push(1.0).unwrap();
+        }
+        volume_bits.store(0.25f32.to_bits(), Ordering::Relaxed);
+        render_output_callback(&mut output, &mut consumer, &counters);
         TRACK_ALLOCATIONS.with(|enabled| enabled.set(false));
         assert_eq!(ALLOCATION_COUNT.with(Cell::get), 0);
-        assert_eq!(counters.played_samples.load(Ordering::Relaxed), 128);
+        for sample in &output {
+            assert_eq!(*sample, 0.25);
+        }
+        assert_eq!(counters.played_samples.load(Ordering::Relaxed), 256);
         assert_eq!(counters.underruns.load(Ordering::Relaxed), 0);
     }
 }

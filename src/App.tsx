@@ -220,6 +220,7 @@ function App() {
   const [message, setMessage] = useState("");
   const [accent, setAccent] = useState(FALLBACK_ACCENT);
   const [dragPosition, setDragPosition] = useState<number | null>(null);
+  const [pendingSeek, setPendingSeek] = useState<{ target: number; generation: number; queueKey: string } | null>(null);
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
 
   const [library, setLibrary] = useState<LibraryTrack[]>([]);
@@ -315,6 +316,7 @@ function App() {
     () => (snapshot.queueIndex === null ? null : snapshot.queue[snapshot.queueIndex] ?? null),
     [snapshot.queue, snapshot.queueIndex],
   );
+  const currentQueueKey = currentQueueItem ? `${snapshot.queueIndex}:${currentQueueItem.location}` : "";
   const currentLibraryTrack = useMemo(
     () => library.find((track) => track.path === currentQueueItem?.location) ?? null,
     [currentQueueItem?.location, library],
@@ -323,7 +325,7 @@ function App() {
   const currentArtist = selectedCatalogTrack?.artist ?? currentLibraryTrack?.artist ?? "选择一首歌，让房间亮起来";
   const currentArtwork = selectedCatalogTrack?.artworkUrl ?? null;
   const isPlaying = snapshot.status === "playing" || snapshot.status === "loading";
-  const shownPosition = dragPosition ?? snapshot.positionSeconds;
+  const shownPosition = dragPosition ?? pendingSeek?.target ?? snapshot.positionSeconds;
   const activeSource = sources.find((source) => source.id === runtime?.activeSourceId || source.active) ?? null;
   const sourceStatus = (() => {
     switch (runtime?.state) {
@@ -340,6 +342,20 @@ function App() {
         return { title: "还没有可用音源", copy: "导入 LX 音源脚本后，在线歌曲才能解析为整首播放。" };
     }
   })();
+
+  useEffect(() => {
+    if (!pendingSeek) return;
+    if (snapshot.status === "failed" || currentQueueKey !== pendingSeek.queueKey) {
+      setPendingSeek(null);
+      return;
+    }
+    if (
+      snapshot.generation > pendingSeek.generation
+      && Math.abs(snapshot.positionSeconds - pendingSeek.target) < 1.5
+    ) {
+      setPendingSeek(null);
+    }
+  }, [currentQueueKey, pendingSeek, snapshot.generation, snapshot.positionSeconds, snapshot.status]);
 
   useEffect(() => {
     let disposed = false;
@@ -575,8 +591,15 @@ function App() {
   };
 
   const commitSeek = async (seconds: number) => {
+    if (!currentQueueItem) return;
+    setPendingSeek({ target: seconds, generation: snapshot.generation, queueKey: currentQueueKey });
     setDragPosition(null);
-    await run("player_seek", { seconds });
+    try {
+      await invoke("player_seek", { seconds });
+    } catch (error) {
+      setPendingSeek(null);
+      setMessage(String(error));
+    }
   };
 
   const renderTrackRow = (track: LibraryTrack, index: number, playlistId?: number) => (

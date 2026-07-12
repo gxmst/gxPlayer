@@ -2,9 +2,9 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties, type Keyboard
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
-import "@fontsource-variable/space-grotesk";
+import "@fontsource-variable/geist";
+import "@fontsource-variable/geist-mono";
 import "@fontsource-variable/noto-sans-sc";
-import "@fontsource-variable/jetbrains-mono";
 import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
 import {
@@ -16,6 +16,7 @@ import {
   type ListedSource,
   type LyricDocument,
   type OnlinePlaybackResult,
+  type PlayMode,
   type PlaylistSummary,
   type RuntimeStatus,
   type ViewId,
@@ -31,6 +32,104 @@ type SourceConfigDraft = {
   apiAddr: string;
   apiPass: string;
 };
+
+/** Frontend playlist entry. Online items store metadata only — never pre-resolved URLs. */
+type PlaylistEntry =
+  | {
+      kind: "local";
+      path: string;
+      title: string;
+      artist: string;
+      durationSeconds: number | null;
+    }
+  | {
+      kind: "online";
+      track: CatalogTrack;
+      quality: QualityPreference;
+    };
+
+const PLAY_MODE_ORDER: PlayMode[] = ["sequential", "repeat_all", "repeat_one", "shuffle"];
+const PLAY_MODE_META: Record<PlayMode, { label: string; glyph: string }> = {
+  sequential: { label: "顺序播放", glyph: "seq" },
+  repeat_all: { label: "列表循环", glyph: "all" },
+  repeat_one: { label: "单曲循环", glyph: "one" },
+  shuffle: { label: "随机播放", glyph: "shuf" },
+};
+
+function catalogKey(track: CatalogTrack): string {
+  return `${track.providerId}:${track.providerTrackId}`;
+}
+
+function entryKey(entry: PlaylistEntry, index: number): string {
+  if (entry.kind === "local") return `local:${entry.path}:${index}`;
+  return `online:${catalogKey(entry.track)}:${index}`;
+}
+
+function entryTitle(entry: PlaylistEntry): string {
+  return entry.kind === "local" ? entry.title : entry.track.title;
+}
+
+function entryArtist(entry: PlaylistEntry): string {
+  return entry.kind === "local" ? entry.artist || "未知歌手" : entry.track.artist || "未知歌手";
+}
+
+function localEntryFromLibrary(track: LibraryTrack): PlaylistEntry {
+  return {
+    kind: "local",
+    path: track.path,
+    title: track.title,
+    artist: track.artist,
+    durationSeconds: track.durationSeconds,
+  };
+}
+
+function onlineEntryFromCatalog(track: CatalogTrack, quality: QualityPreference): PlaylistEntry {
+  return { kind: "online", track, quality };
+}
+
+function playlistIsLocalOnly(entries: PlaylistEntry[]): boolean {
+  return entries.length > 0 && entries.every((entry) => entry.kind === "local");
+}
+
+/** Frontend-side next index for online/mixed playlists (engine only holds the resolved current track). */
+function pickPlaylistIndex(
+  mode: PlayMode,
+  current: number,
+  length: number,
+  intent: "ended" | "next" | "previous",
+  shufflePlayed: Set<number>,
+): number | null {
+  if (length <= 0) return null;
+  if (intent === "previous") {
+    if (mode === "shuffle") {
+      shufflePlayed.add(current);
+      return pickShuffle(length, shufflePlayed, current);
+    }
+    if (mode === "repeat_all") return current === 0 ? length - 1 : current - 1;
+    return current > 0 ? current - 1 : 0;
+  }
+  if (mode === "repeat_one" && intent === "ended") return current;
+  if (mode === "shuffle") {
+    shufflePlayed.add(current);
+    return pickShuffle(length, shufflePlayed, current);
+  }
+  if (mode === "repeat_all") return (current + 1) % length;
+  const next = current + 1;
+  return next < length ? next : null;
+}
+
+function pickShuffle(length: number, played: Set<number>, preferNot: number): number {
+  let available = Array.from({ length }, (_, i) => i).filter((i) => !played.has(i));
+  if (available.length === 0) {
+    played.clear();
+    available = Array.from({ length }, (_, i) => i);
+    if (length > 1) available = available.filter((i) => i !== preferNot);
+  }
+  if (available.length === 0) return 0;
+  const choice = available[Math.floor(Math.random() * available.length)]!;
+  played.add(choice);
+  return choice;
+}
 
 const QUALITY_OPTIONS: Array<{ value: QualityPreference; label: string }> = [
   { value: "auto", label: "自动" },
@@ -277,6 +376,7 @@ function App() {
   const [message, setMessage] = useState("");
   const [accent, setAccent] = useState(FALLBACK_ACCENT);
   const [dragPosition, setDragPosition] = useState<number | null>(null);
+  const [volumeDraft, setVolumeDraft] = useState<number | null>(null);
   const [pendingSeek, setPendingSeek] = useState<{ target: number; generation: number; queueKey: string } | null>(null);
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
   const [qualityPreference, setQualityPreference] = useState<QualityPreference>(() => {
@@ -318,6 +418,19 @@ function App() {
   const [selectedCatalogTrack, setSelectedCatalogTrack] = useState<CatalogTrack | null>(null);
   const [lyrics, setLyrics] = useState<LyricDocument | null>(null);
   const lyricRefs = useRef<Array<HTMLParagraphElement | null>>([]);
+
+  /** Logical playlist (local paths + online CatalogTrack metadata). Online never pre-resolved. */
+  const [playlist, setPlaylist] = useState<PlaylistEntry[]>([]);
+  const [playlistIndex, setPlaylistIndex] = useState<number | null>(null);
+  const [queuePanelOpen, setQueuePanelOpen] = useState(false);
+  const shufflePlayedRef = useRef<Set<number>>(new Set());
+  const advancingRef = useRef(false);
+  const playlistRef = useRef(playlist);
+  const playlistIndexRef = useRef(playlistIndex);
+  const snapshotRef = useRef(snapshot);
+  playlistRef.current = playlist;
+  playlistIndexRef.current = playlistIndex;
+  snapshotRef.current = snapshot;
 
   const run = async <T,>(command: string, args?: Record<string, unknown>): Promise<T | undefined> => {
     try {
@@ -414,6 +527,7 @@ function App() {
   const currentArtwork = selectedCatalogTrack?.artworkUrl ?? null;
   const isPlaying = snapshot.status === "playing" || snapshot.status === "loading";
   const shownPosition = dragPosition ?? pendingSeek?.target ?? snapshot.positionSeconds;
+  const shownVolume = volumeDraft ?? snapshot.volume;
   const measuredSourceSpec = formatSourceSpec(snapshot);
   const suspiciousQuality = isSuspiciousQuality(currentQuality, snapshot);
   const selectedOnlineFavorite = selectedCatalogTrack
@@ -450,6 +564,11 @@ function App() {
       return history.slice(0, -1);
     });
   };
+
+  useEffect(() => {
+    if (volumeDraft === null) return;
+    if (Math.abs(snapshot.volume - volumeDraft) < 0.005) setVolumeDraft(null);
+  }, [snapshot.volume, volumeDraft]);
 
   useEffect(() => {
     if (!pendingSeek) return;
@@ -524,6 +643,14 @@ function App() {
     if (activeLyricIndex >= 0) lyricRefs.current[activeLyricIndex]?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [activeLyricIndex]);
 
+  // Local-only playlists: engine owns advancement — mirror queueIndex into playlistIndex.
+  useEffect(() => {
+    if (!playlistIsLocalOnly(playlist)) return;
+    if (snapshot.queueIndex !== null && snapshot.queueIndex !== playlistIndex) {
+      setPlaylistIndex(snapshot.queueIndex);
+    }
+  }, [snapshot.queueIndex, playlist, playlistIndex]);
+
   const artists = useMemo(
     () => [...new Set(suggestions.map((track) => track.artist).filter(Boolean))].slice(0, 2),
     [suggestions],
@@ -532,6 +659,162 @@ function App() {
     () => [...new Set(suggestions.map((track) => track.album).filter(Boolean))].slice(0, 2),
     [suggestions],
   );
+
+  const loadLyricsFor = async (title: string, artist: string, durationMs: number | null, baseMessage: string) => {
+    try {
+      const lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
+        title,
+        artist,
+        durationMs,
+      });
+      setLyrics(lyricDocument);
+    } catch (lyricError) {
+      setMessage(`${baseMessage} 歌曲已播放，但歌词加载失败：${String(lyricError)}`);
+    }
+  };
+
+  /**
+   * Resolve and play a single online CatalogTrack into the engine.
+   * Constraint 2: only called when the playhead actually reaches this track — never batch.
+   */
+  const resolveAndPlayOnline = async (
+    wanted: CatalogTrack,
+    quality: QualityPreference,
+    opts?: { allowPreviewFallback?: boolean; candidates?: CatalogTrack[] },
+  ): Promise<OnlinePlaybackResult | null> => {
+    const key = catalogKey(wanted);
+    console.info("[GXPlayer] online resolve request", { key, title: wanted.title, quality });
+    try {
+      const online = await invoke<OnlinePlaybackResult>("player_play_online_track", {
+        track: wanted,
+        quality: quality === "auto" ? null : quality,
+        sourceId: null,
+      });
+      console.info("[GXPlayer] online resolve ok", {
+        key,
+        cacheHit: online.cacheHit,
+        quality: online.quality,
+      });
+      setSelectedCatalogTrack(online.track);
+      setCurrentQuality(online.quality);
+      setLyrics(null);
+      const sourceLabel = online.sourceName || activeSource?.metadata.name || "当前 LX 音源";
+      const playbackMessage = online.cacheHit
+        ? `已命中本地缓存 · ${online.quality ?? "自动"}，无需再次请求音频直链。`
+        : `${sourceLabel} 已解析整首播放${online.quality ? ` · ${online.quality}` : ""}，本次播放会顺手写入缓存。`;
+      setMessage(playbackMessage);
+      void loadLyricsFor(online.track.title, online.track.artist, online.track.durationMs, playbackMessage);
+      return online;
+    } catch (onlineError) {
+      console.warn("[GXPlayer] online resolve failed", { key, error: String(onlineError) });
+      if (!opts?.allowPreviewFallback) {
+        setMessage(`《${wanted.title}》解析失败，已跳过：${String(onlineError)}`);
+        return null;
+      }
+      try {
+        const preview = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
+          wanted,
+          candidates: opts.candidates ?? [wanted],
+        });
+        setSelectedCatalogTrack(preview.track);
+        setCurrentQuality("preview");
+        setLyrics(null);
+        const playbackMessage = `LX 整首解析失败，已回退为 ${preview.track.providerId} 官方 30 秒预览。原因：${String(onlineError)}`;
+        setMessage(playbackMessage);
+        void loadLyricsFor(preview.track.title, preview.track.artist, preview.track.durationMs, playbackMessage);
+        return {
+          track: preview.track,
+          sourceId: null,
+          sourceName: null,
+          quality: "preview",
+          cacheHit: false,
+        };
+      } catch (previewError) {
+        setMessage(`《${wanted.title}》播放失败：${String(onlineError)}；预览也失败：${String(previewError)}`);
+        return null;
+      }
+    }
+  };
+
+  const playPlaylistEntry = async (entries: PlaylistEntry[], index: number, opts?: { allowPreviewFallback?: boolean }) => {
+    const entry = entries[index];
+    if (!entry) return;
+    if (entry.kind === "local") {
+      if (playlistIsLocalOnly(entries)) {
+        const paths = entries.map((item) => (item as Extract<PlaylistEntry, { kind: "local" }>).path);
+        await invoke("player_load_local", { paths, startIndex: index });
+      } else {
+        await invoke("player_load_local", { paths: [entry.path], startIndex: 0 });
+      }
+      setSelectedCatalogTrack(null);
+      setCurrentQuality(null);
+      setLyrics(null);
+      return;
+    }
+    const result = await resolveAndPlayOnline(entry.track, entry.quality, {
+      allowPreviewFallback: opts?.allowPreviewFallback,
+      candidates: entries.filter((item): item is Extract<PlaylistEntry, { kind: "online" }> => item.kind === "online").map((item) => item.track),
+    });
+    if (!result) {
+      // Skip failed online track and continue.
+      await advanceFromIndex(entries, index, "ended");
+    }
+  };
+
+  const advanceFromIndex = async (
+    entries: PlaylistEntry[],
+    current: number,
+    intent: "ended" | "next" | "previous",
+  ) => {
+    if (advancingRef.current) return;
+    advancingRef.current = true;
+    try {
+      const mode = snapshotRef.current.playMode ?? "sequential";
+      // Skip chain for failed resolves — walk until success or exhaustion (cap to list length).
+      let cursor = current;
+      for (let attempt = 0; attempt < entries.length; attempt += 1) {
+        const next = pickPlaylistIndex(mode, cursor, entries.length, attempt === 0 ? intent : "ended", shufflePlayedRef.current);
+        if (next === null) {
+          setPlaylistIndex(cursor);
+          return;
+        }
+        setPlaylistIndex(next);
+        const entry = entries[next];
+        if (!entry) return;
+        if (entry.kind === "local") {
+          await invoke("player_load_local", { paths: [entry.path], startIndex: 0 });
+          setSelectedCatalogTrack(null);
+          setCurrentQuality(null);
+          setLyrics(null);
+          return;
+        }
+        const key = catalogKey(entry.track);
+        setPlayingCatalogKey(key);
+        const result = await resolveAndPlayOnline(entry.track, entry.quality, { allowPreviewFallback: false });
+        setPlayingCatalogKey(null);
+        if (result) return;
+        // Resolve failed — treat as ended and try the following track.
+        cursor = next;
+      }
+    } finally {
+      advancingRef.current = false;
+    }
+  };
+
+  const replacePlaylist = async (entries: PlaylistEntry[], startIndex: number, opts?: { allowPreviewFallback?: boolean }) => {
+    if (!entries.length) return;
+    const index = Math.max(0, Math.min(startIndex, entries.length - 1));
+    shufflePlayedRef.current = new Set([index]);
+    setPlaylist(entries);
+    setPlaylistIndex(index);
+    const startKey = entries[index]?.kind === "online" ? catalogKey(entries[index]!.track) : null;
+    if (startKey) setPlayingCatalogKey(startKey);
+    try {
+      await playPlaylistEntry(entries, index, opts);
+    } finally {
+      if (startKey) setPlayingCatalogKey(null);
+    }
+  };
 
   const chooseFiles = async () => {
     const selected = await open({
@@ -542,7 +825,14 @@ function App() {
     if (!selected) return;
     const paths = Array.isArray(selected) ? selected : [selected];
     try {
-      await invoke("player_load_local", { paths });
+      await invoke("player_load_local", { paths, startIndex: 0 });
+      const entries: PlaylistEntry[] = paths.map((path) => {
+        const name = path.split(/[/\\]/).pop()?.replace(/\.[^.]+$/, "") || "未命名";
+        return { kind: "local", path, title: name, artist: "", durationSeconds: null };
+      });
+      shufflePlayedRef.current = new Set([0]);
+      setPlaylist(entries);
+      setPlaylistIndex(0);
       setSelectedCatalogTrack(null);
       setCurrentQuality(null);
       setLyrics(null);
@@ -552,71 +842,177 @@ function App() {
     }
   };
 
-  const playLocal = async (track: LibraryTrack) => {
+  /** Click a local track: load the entire current view as the queue, start at the clicked item. */
+  const playLocalInList = async (tracks: LibraryTrack[], track: LibraryTrack) => {
+    const startIndex = Math.max(0, tracks.findIndex((item) => item.id === track.id));
+    const entries = tracks.map(localEntryFromLibrary);
     try {
-      await invoke("player_load_local", { paths: [track.path] });
-      setSelectedCatalogTrack(null);
-      setCurrentQuality(null);
-      setLyrics(null);
+      await replacePlaylist(entries, startIndex === -1 ? 0 : startIndex);
     } catch (error) {
       setMessage(String(error));
     }
+  };
+
+  const enqueueLocalTracks = async (tracks: LibraryTrack[]) => {
+    if (!tracks.length) return;
+    const paths = tracks.map((track) => track.path);
+    try {
+      await invoke("player_enqueue_local", { paths });
+      setPlaylist((prev) => [...prev, ...tracks.map(localEntryFromLibrary)]);
+      setMessage(`已添加 ${tracks.length} 首到队列`);
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+
+  /** Click a catalog track: queue the whole list as online placeholders; resolve only the clicked one. */
+  const playCatalogInList = async (tracks: CatalogTrack[], wanted: CatalogTrack) => {
+    const list = tracks.length ? tracks : [wanted];
+    const startIndex = Math.max(0, list.findIndex((item) => catalogKey(item) === catalogKey(wanted)));
+    const entries = list.map((track) => onlineEntryFromCatalog(track, qualityPreference));
+    setSuggestionOpen(false);
+    // Constraint 2: only the start index is resolved inside replacePlaylist → resolveAndPlayOnline.
+    console.info("[GXPlayer] online queue replace", {
+      total: entries.length,
+      startIndex,
+      note: "only the starting track will resolve now; others stay as CatalogTrack metadata",
+    });
+    await replacePlaylist(entries, startIndex, { allowPreviewFallback: true });
+    navigateTo("now-playing");
   };
 
   const playCatalog = async (wanted: CatalogTrack) => {
-    const catalogKey = `${wanted.providerId}:${wanted.providerTrackId}`;
+    const context =
+      searchResults.some((track) => catalogKey(track) === catalogKey(wanted))
+        ? searchResults
+        : suggestions.some((track) => catalogKey(track) === catalogKey(wanted))
+          ? suggestions
+          : chartTracks.some((track) => catalogKey(track) === catalogKey(wanted))
+            ? chartTracks
+            : onlineFavorites.some((track) => catalogKey(track) === catalogKey(wanted))
+              ? onlineFavorites
+              : [wanted];
     if (playingCatalogKey) return;
-    setPlayingCatalogKey(catalogKey);
-    setSuggestionOpen(false);
-    try {
-      let selectedTrack: CatalogTrack;
-      let playbackMessage = "";
-      try {
-        const online = await invoke<OnlinePlaybackResult>("player_play_online_track", {
-          track: wanted,
-          quality: qualityPreference === "auto" ? null : qualityPreference,
-          sourceId: null,
-        });
-        selectedTrack = online.track;
-        setCurrentQuality(online.quality);
-        const sourceLabel = online.sourceName || activeSource?.metadata.name || "当前 LX 音源";
-        playbackMessage = online.cacheHit
-          ? `已命中本地缓存 · ${online.quality ?? "自动"}，无需再次请求音频直链。`
-          : `${sourceLabel} 已解析整首播放${online.quality ? ` · ${online.quality}` : ""}，本次播放会顺手写入缓存。`;
-      } catch (onlineError) {
-        try {
-          const preview = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
-            wanted,
-            candidates: searchResults.length ? searchResults : suggestions,
-          });
-          selectedTrack = preview.track;
-          setCurrentQuality("preview");
-          playbackMessage = `LX 整首解析失败，已回退为 ${preview.track.providerId} 官方 30 秒预览。原因：${String(onlineError)}`;
-        } catch (previewError) {
-          throw new Error(`LX 整首播放失败：${String(onlineError)}；官方 30 秒预览也失败：${String(previewError)}`);
-        }
-      }
+    await playCatalogInList(context, wanted);
+  };
 
-      setSelectedCatalogTrack(selectedTrack);
-      setLyrics(null);
-      navigateTo("now-playing");
-      setMessage(playbackMessage);
-      try {
-        const lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
-          title: selectedTrack.title,
-          artist: selectedTrack.artist,
-          durationMs: selectedTrack.durationMs,
-        });
-        setLyrics(lyricDocument);
-      } catch (lyricError) {
-        setMessage(`${playbackMessage} 歌曲已播放，但歌词加载失败：${String(lyricError)}`);
-      }
-    } catch (error) {
-      setMessage(String(error));
+  const enqueueCatalogTracks = (tracks: CatalogTrack[]) => {
+    if (!tracks.length) return;
+    console.info("[GXPlayer] online enqueue metadata only", { count: tracks.length });
+    setPlaylist((prev) => [
+      ...prev,
+      ...tracks.map((track) => onlineEntryFromCatalog(track, qualityPreference)),
+    ]);
+    setMessage(`已添加 ${tracks.length} 首在线歌曲到队列（播放到时再解析）`);
+  };
+
+  const cyclePlayMode = async () => {
+    const current = snapshot.playMode ?? "sequential";
+    const index = PLAY_MODE_ORDER.indexOf(current);
+    const next = PLAY_MODE_ORDER[(index + 1) % PLAY_MODE_ORDER.length] ?? "sequential";
+    if (next === "shuffle") shufflePlayedRef.current = new Set(playlistIndex !== null ? [playlistIndex] : []);
+    setSnapshot((state) => ({ ...state, playMode: next }));
+    await run("player_set_play_mode", { mode: next });
+  };
+
+  const handleTransportNext = async () => {
+    const entries = playlistRef.current;
+    if (entries.length && !playlistIsLocalOnly(entries)) {
+      const current = playlistIndexRef.current ?? 0;
+      await advanceFromIndex(entries, current, "next");
+      return;
+    }
+    await run("player_next");
+  };
+
+  const handleTransportPrevious = async () => {
+    const entries = playlistRef.current;
+    if (entries.length && !playlistIsLocalOnly(entries)) {
+      const current = playlistIndexRef.current ?? 0;
+      await advanceFromIndex(entries, current, "previous");
+      return;
+    }
+    await run("player_previous");
+  };
+
+  const jumpToPlaylistIndex = async (index: number) => {
+    const entries = playlistRef.current;
+    const target = entries[index];
+    if (!target) return;
+    if (playlistIsLocalOnly(entries)) {
+      await run("player_jump", { index });
+      setPlaylistIndex(index);
+      setSelectedCatalogTrack(null);
+      return;
+    }
+    shufflePlayedRef.current.add(index);
+    setPlaylistIndex(index);
+    const key = target.kind === "online" ? catalogKey(target.track) : null;
+    if (key) setPlayingCatalogKey(key);
+    try {
+      await playPlaylistEntry(entries, index);
     } finally {
-      setPlayingCatalogKey(null);
+      if (key) setPlayingCatalogKey(null);
     }
   };
+
+  const removePlaylistIndex = async (index: number) => {
+    const previous = playlistRef.current;
+    const entries = [...previous];
+    if (index < 0 || index >= entries.length) return;
+    const current = playlistIndexRef.current;
+    const removedCurrent = current === index;
+    const wasLocalOnly = playlistIsLocalOnly(previous);
+    entries.splice(index, 1);
+    // Remap shuffle played indices after mid-cycle edits.
+    const nextPlayed = new Set<number>();
+    shufflePlayedRef.current.forEach((value) => {
+      if (value < index) nextPlayed.add(value);
+      else if (value > index) nextPlayed.add(value - 1);
+    });
+    shufflePlayedRef.current = nextPlayed;
+
+    if (wasLocalOnly) {
+      await run("player_remove_queue_item", { index });
+    }
+
+    setPlaylist(entries);
+    if (!entries.length) {
+      setPlaylistIndex(null);
+      if (!wasLocalOnly) await run("player_clear_queue");
+      return;
+    }
+    let nextIndex: number | null = current;
+    if (current === null) nextIndex = null;
+    else if (current > index) nextIndex = current - 1;
+    else if (current === index) nextIndex = Math.min(index, entries.length - 1);
+    setPlaylistIndex(nextIndex);
+    if (removedCurrent && nextIndex !== null && !playlistIsLocalOnly(entries)) {
+      await playPlaylistEntry(entries, nextIndex);
+    }
+  };
+
+  const clearPlaylist = async () => {
+    setPlaylist([]);
+    setPlaylistIndex(null);
+    shufflePlayedRef.current.clear();
+    await run("player_clear_queue");
+    setMessage("队列已清空");
+  };
+
+  // Online/mixed playlists: engine holds only the current resolved track.
+  // When it naturally ends (stopped), advance and resolve the next online item on demand.
+  const prevStatusRef = useRef(snapshot.status);
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = snapshot.status;
+    if (snapshot.status !== "stopped") return;
+    if (prev === "stopped" || prev === "idle") return;
+    const entries = playlistRef.current;
+    if (!entries.length || playlistIsLocalOnly(entries)) return;
+    const current = playlistIndexRef.current ?? 0;
+    void advanceFromIndex(entries, current, "ended");
+  }, [snapshot.status]);
 
   const switchOnlineQuality = async (preference: QualityPreference) => {
     if (!selectedCatalogTrack || !currentQueueItem?.online || qualitySwitching) return;
@@ -834,9 +1230,9 @@ function App() {
     }
   };
 
-  const renderTrackRow = (track: LibraryTrack, index: number, playlistId?: number) => (
+  const renderTrackRow = (track: LibraryTrack, index: number, list: LibraryTrack[], playlistId?: number) => (
         <div className="track-row" role="listitem" key={track.id}>
-          <button className="track-main" onClick={() => void playLocal(track)}>
+          <button className="track-main" onClick={() => void playLocalInList(list, track)}>
             <span className="track-index">{String(index + 1).padStart(2, "0")}</span>
             <span>
               <strong>{track.title}</strong>
@@ -844,6 +1240,7 @@ function App() {
             </span>
           </button>
           <time>{formatTime(track.durationSeconds)}</time>
+          <button className="icon-button" onClick={() => void enqueueLocalTracks([track])} aria-label="添加到队列" title="添加到队列">＋</button>
           <button className={`icon-button ${track.favorite ? "active" : ""}`} onClick={() => void toggleFavorite(track)} aria-label={track.favorite ? "取消收藏" : "收藏"}>
             {track.favorite ? "♥" : "♡"}
           </button>
@@ -866,7 +1263,7 @@ function App() {
               event.target.value = "";
             }}>
               <option value="">＋ 歌单</option>
-              {playlists.map((playlist) => <option value={playlist.id} key={playlist.id}>{playlist.name}</option>)}
+              {playlists.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
             </select>
           )}
         </div>
@@ -874,27 +1271,45 @@ function App() {
 
   const renderTrackRows = (tracks: LibraryTrack[], playlistId?: number) =>
     tracks.length > 120 ? (
-      <VirtualTrackList tracks={tracks} renderRow={(track, index) => renderTrackRow(track, index, playlistId)} />
+      <VirtualTrackList tracks={tracks} renderRow={(track, index) => renderTrackRow(track, index, tracks, playlistId)} />
     ) : (
-      <div className="track-list" role="list">{tracks.map((track, index) => renderTrackRow(track, index, playlistId))}</div>
+      <div className="track-list" role="list">{tracks.map((track, index) => renderTrackRow(track, index, tracks, playlistId))}</div>
     );
 
   const renderCatalogRows = (tracks: CatalogTrack[]) => (
     <div className="catalog-grid">
       {tracks.map((track) => {
-        const trackKey = `${track.providerId}:${track.providerTrackId}`;
+        const trackKey = catalogKey(track);
         const resolving = playingCatalogKey === trackKey;
         return (
-        <button className="catalog-card" disabled={playingCatalogKey !== null} aria-busy={resolving} onClick={() => void playCatalog(track)} key={trackKey}>
-          <Cover artwork={track.artworkUrl} title={track.title} />
-          <strong>{track.title}</strong>
-          <span>{track.artist}</span>
-          <small>{resolving ? "正在解析整首播放…" : track.album || track.providerId}</small>
-          <i aria-hidden="true">{resolving ? "…" : "▶"}</i>
-        </button>
+        <div className="catalog-card-wrap" key={trackKey}>
+          <button className="catalog-card" disabled={playingCatalogKey !== null} aria-busy={resolving} onClick={() => void playCatalogInList(tracks, track)}>
+            <Cover artwork={track.artworkUrl} title={track.title} />
+            <strong>{track.title}</strong>
+            <span>{track.artist}</span>
+            <small>{resolving ? "正在解析整首播放…" : track.album || track.providerId}</small>
+            <i aria-hidden="true">{resolving ? "…" : "▶"}</i>
+          </button>
+          <button
+            type="button"
+            className="catalog-enqueue"
+            disabled={playingCatalogKey !== null}
+            onClick={() => enqueueCatalogTracks([track])}
+            aria-label={`将 ${track.title} 添加到队列`}
+            title="添加到队列（播放到时再解析）"
+          >
+            ＋ 队列
+          </button>
+        </div>
       )})}
     </div>
   );
+
+  const displayPlaylist = playlist;
+  const displayIndex = playlistIndex;
+  const upNext = displayPlaylist.length && displayIndex !== null
+    ? displayPlaylist.slice(displayIndex + 1, displayIndex + 6)
+    : [];
 
   const renderView = () => {
     if (view === "discovery") return (
@@ -998,6 +1413,31 @@ function App() {
           </section>
         </div>
         <section className="lyrics-panel"><div className="lyrics-scroll">{lyrics?.instrumental ? <p className="lyric active">纯音乐</p> : lyrics?.lines.length ? lyrics.lines.map((line, index) => <p className={`lyric ${index === activeLyricIndex ? "active" : ""}`} key={`${line.timestampMs}-${index}`} ref={(element) => { lyricRefs.current[index] = element; }}>{line.text}</p>) : <div className="lyrics-empty"><strong>歌词会出现在这里</strong><span>在线预览会自动匹配同步歌词。</span></div>}</div></section>
+        {upNext.length > 0 && (
+          <section className="up-next-panel panel-enter">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">UP NEXT</p>
+                <h3>接下来播放</h3>
+              </div>
+              <button type="button" onClick={() => setQueuePanelOpen(true)}>打开队列</button>
+            </div>
+            <ul className="up-next-list">
+              {upNext.map((entry, offset) => {
+                const absolute = (displayIndex ?? 0) + 1 + offset;
+                return (
+                  <li key={entryKey(entry, absolute)}>
+                    <button type="button" onClick={() => void jumpToPlaylistIndex(absolute)}>
+                      <span>{String(absolute + 1).padStart(2, "0")}</span>
+                      <strong>{entryTitle(entry)}</strong>
+                      <small>{entryArtist(entry)}{entry.kind === "online" ? " · 待解析" : ""}</small>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
+        )}
       </div>
     );
   };
@@ -1053,13 +1493,22 @@ function App() {
         </button>
         <div className="player-center">
           <div className="transport">
-            <button type="button" className="transport-btn" onClick={() => void run("player_previous")} aria-label="上一首">
+            <button
+              type="button"
+              className="transport-btn"
+              onClick={() => void cyclePlayMode()}
+              aria-label={PLAY_MODE_META[snapshot.playMode ?? "sequential"].label}
+              title={PLAY_MODE_META[snapshot.playMode ?? "sequential"].label}
+            >
+              <span className={`glyph-mode glyph-mode-${PLAY_MODE_META[snapshot.playMode ?? "sequential"].glyph}`} aria-hidden="true" />
+            </button>
+            <button type="button" className="transport-btn" onClick={() => void handleTransportPrevious()} aria-label="上一首">
               <span className="glyph-prev" aria-hidden="true" />
             </button>
-            <button type="button" className="play-button" onClick={() => void run(isPlaying ? "player_pause" : "player_play")} disabled={!currentQueueItem} aria-label={isPlaying ? "暂停" : "播放"}>
+            <button type="button" className="play-button" onClick={() => void run(isPlaying ? "player_pause" : "player_play")} disabled={!currentQueueItem && !displayPlaylist.length} aria-label={isPlaying ? "暂停" : "播放"}>
               <span className={isPlaying ? "glyph-pause" : "glyph-play"} aria-hidden="true" />
             </button>
-            <button type="button" className="transport-btn" onClick={() => void run("player_next")} aria-label="下一首">
+            <button type="button" className="transport-btn" onClick={() => void handleTransportNext()} aria-label="下一首">
               <span className="glyph-next" aria-hidden="true" />
             </button>
           </div>
@@ -1101,10 +1550,13 @@ function App() {
               min={0}
               max={1}
               step={0.01}
-              value={snapshot.volume}
-              style={{ "--fill": `${snapshot.volume * 100}%` } as CSSProperties}
-              onChange={(event) => setSnapshot((state) => ({ ...state, volume: Number(event.target.value) }))}
-              onPointerUp={(event) => void run("player_set_volume", { volume: Number(event.currentTarget.value) })}
+              value={shownVolume}
+              style={{ "--fill": `${shownVolume * 100}%` } as CSSProperties}
+              onChange={(event) => setVolumeDraft(Number(event.target.value))}
+              onPointerUp={(event) => {
+                const volume = Number(event.currentTarget.value);
+                void run("player_set_volume", { volume });
+              }}
             />
           </div>
           <button
@@ -1116,6 +1568,15 @@ function App() {
           >
             <span className="glyph-spatial" aria-hidden="true" />
           </button>
+          <button
+            type="button"
+            className={`tool-btn ${queuePanelOpen ? "active" : ""}`}
+            onClick={() => setQueuePanelOpen((open) => !open)}
+            aria-label="播放队列"
+            title={`播放队列${displayPlaylist.length ? ` · ${displayPlaylist.length}` : ""}`}
+          >
+            <span className="glyph-queue" aria-hidden="true" />
+          </button>
           <button type="button" className="tool-btn more-btn" onClick={() => navigateTo("settings")} aria-label="更多设置" title="设置与备份">
             <span className="more-dots" aria-hidden="true">
               <i />
@@ -1125,6 +1586,50 @@ function App() {
           </button>
         </div>
       </footer>
+
+      {queuePanelOpen && (
+        <aside className="queue-panel" aria-label="播放队列">
+          <header className="queue-panel-header">
+            <div>
+              <p className="eyebrow">QUEUE</p>
+              <h3>播放队列</h3>
+              <small>{displayPlaylist.length ? `${displayPlaylist.length} 首 · ${PLAY_MODE_META[snapshot.playMode ?? "sequential"].label}` : "队列为空"}</small>
+            </div>
+            <div className="queue-panel-actions">
+              <button type="button" disabled={!displayPlaylist.length} onClick={() => void clearPlaylist()}>清空</button>
+              <button type="button" onClick={() => setQueuePanelOpen(false)} aria-label="关闭队列">×</button>
+            </div>
+          </header>
+          {displayPlaylist.length === 0 ? (
+            <div className="queue-empty">
+              <p>还没有歌曲</p>
+              <span>在曲库或搜索结果里点一首，会把当前列表整队入列。</span>
+            </div>
+          ) : (
+            <ul className="queue-list">
+              {displayPlaylist.map((entry, index) => {
+                const active = index === displayIndex;
+                return (
+                  <li key={entryKey(entry, index)} className={active ? "active" : ""}>
+                    <button type="button" className="queue-main" onClick={() => void jumpToPlaylistIndex(index)}>
+                      <span className="queue-index">{active ? "♪" : String(index + 1).padStart(2, "0")}</span>
+                      <span>
+                        <strong>{entryTitle(entry)}</strong>
+                        <small>
+                          {entryArtist(entry)}
+                          {entry.kind === "online" ? " · 在线" : " · 本地"}
+                          {entry.kind === "online" && !active ? " · 待解析" : ""}
+                        </small>
+                      </span>
+                    </button>
+                    <button type="button" className="icon-button" aria-label="从队列移除" onClick={() => void removePlaylistIndex(index)}>×</button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </aside>
+      )}
     </div>
   );
 }

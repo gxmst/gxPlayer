@@ -1,32 +1,42 @@
 :root {
-  font-family: "Noto Sans SC Variable", "Microsoft YaHei UI", sans-serif;
+  font-family: "Geist Variable", "Noto Sans SC Variable", "Microsoft YaHei UI", sans-serif;
   color: var(--text-hi);
   background: var(--base);
   font-synthesis: none;
-  --base: #07070c;
-  --base-elevated: #0d0d14;
-  --surface: rgba(20, 20, 28, 0.55);
-  --surface-2: rgba(30, 30, 40, 0.62);
-  --surface-solid: #13131b;
-  --glass: rgba(255, 255, 255, 0.038);
-  --glass-hover: rgba(255, 255, 255, 0.07);
-  --glass-elevated: rgba(255, 255, 255, 0.075);
-  --glass-border: rgba(255, 255, 255, 0.075);
-  --glass-highlight: rgba(255, 255, 255, 0.14);
-  --glass-inset: inset 0 1px 0 rgba(255, 255, 255, 0.065);
-  --text-hi: #f4f4f8;
-  --text-mute: #9a9aaa;
-  --text-dim: #5e5e6e;
+  /* Deep blue-grey base — Linear / Apple Music dark, not pure black */
+  --base: #0f1016;
+  --base-elevated: #16171f;
+  --surface: rgba(28, 30, 40, 0.55);
+  --surface-2: rgba(36, 38, 50, 0.62);
+  --surface-solid: #191b24;
+  /* Quieter glass — subtle fills, hairline borders */
+  --glass: rgba(255, 255, 255, 0.032);
+  --glass-hover: rgba(255, 255, 255, 0.06);
+  --glass-elevated: rgba(255, 255, 255, 0.055);
+  --glass-border: rgba(255, 255, 255, 0.06);
+  --glass-highlight: rgba(255, 255, 255, 0.1);
+  --glass-inset: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --text-hi: #f2f3f7;
+  --text-mute: #a4a6b4;
+  --text-dim: #61636f;
   --accent: #e85a71;
   --accent-fallback: #e85a71;
-  --radius-sm: 10px;
-  --radius-md: 14px;
-  --radius-lg: 18px;
-  --radius-xl: 26px;
-  --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.22);
-  --shadow-md: 0 10px 36px rgba(0, 0, 0, 0.32);
-  --shadow-lg: 0 24px 72px rgba(0, 0, 0, 0.42);
-  --shadow-glow: 0 0 40px color-mix(in srgb, var(--accent) 14%, transparent);
+  /* Unified radii — controls 8, cards 12, panels 16/20 */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  /* Spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 8px 30px rgba(0, 0, 0, 0.34);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.44);
+  --shadow-glow: 0 0 40px color-mix(in srgb, var(--accent) 12%, transparent);
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-soft: cubic-bezier(0.4, 0, 0.2, 1);
   --fill: 0%;
@@ -64,9 +74,9 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   overflow: hidden;
   /* Quieter base: soft wash, not neon flood */
   background:
-    radial-gradient(90% 70% at 70% -5%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 52%),
-    radial-gradient(70% 50% at 0% 100%, rgba(90, 100, 170, 0.05), transparent 48%),
-    linear-gradient(165deg, #0c0c13 0%, var(--base) 42%, #050508 100%);
+    radial-gradient(90% 70% at 70% -5%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 52%),
+    radial-gradient(70% 50% at 0% 100%, rgba(90, 100, 170, 0.045), transparent 48%),
+    linear-gradient(165deg, #15161f 0%, var(--base) 44%, #0b0c12 100%);
   isolation: isolate;
   transition: --accent 800ms var(--ease-soft);
 }
@@ -531,7 +541,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 
 .engine-health small {
   color: var(--text-dim);
-  font: 10px "JetBrains Mono Variable", monospace;
+  font: 10px "Geist Mono Variable", monospace;
 }
 
 .sidebar-collapsed {
@@ -571,13 +581,13 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .eyebrow {
   margin: 0 0 9px;
   color: var(--accent);
-  font: 650 11px "JetBrains Mono Variable", monospace;
+  font: 650 11px "Geist Mono Variable", monospace;
   letter-spacing: 0.15em;
   text-shadow: 0 0 20px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 h1, h2, h3 {
-  font-family: "Space Grotesk Variable", "Noto Sans SC Variable", sans-serif;
+  font-family: "Geist Variable", "Noto Sans SC Variable", sans-serif;
 }
 
 h1 {
@@ -842,7 +852,7 @@ select {
   border-radius: 999px;
   background: rgba(12, 12, 18, 0.72);
   backdrop-filter: blur(12px);
-  font: 650 11px "JetBrains Mono Variable", monospace;
+  font: 650 11px "Geist Mono Variable", monospace;
   color: var(--text-mute);
   letter-spacing: 0.14em;
   box-shadow: var(--glass-inset);
@@ -1004,7 +1014,7 @@ select {
 .track-index,
 .track-row time {
   color: var(--text-dim);
-  font: 12px "JetBrains Mono Variable", monospace;
+  font: 12px "Geist Mono Variable", monospace;
 }
 
 .track-row > time {
@@ -1039,6 +1049,28 @@ select {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
   gap: 18px;
+}
+
+.catalog-card-wrap {
+  display: grid;
+  gap: 8px;
+}
+
+.catalog-enqueue {
+  justify-self: start;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-mute);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.catalog-enqueue:hover {
+  color: var(--text-hi);
+  border-color: color-mix(in srgb, var(--accent) 35%, rgba(255, 255, 255, 0.1));
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .catalog-card {
@@ -1123,7 +1155,7 @@ select {
       color-mix(in srgb, var(--accent) 32%, var(--surface-solid)),
       var(--surface-solid)
     );
-  font: 750 20px "Space Grotesk Variable", sans-serif;
+  font: 750 20px "Geist Variable", sans-serif;
 }
 
 .empty-state {
@@ -1190,7 +1222,7 @@ select {
 
 .source-status-card code {
   color: var(--text-dim);
-  font: 12px "JetBrains Mono Variable", monospace;
+  font: 12px "Geist Mono Variable", monospace;
 }
 
 .runtime-dot {
@@ -1239,7 +1271,7 @@ select {
 
 .source-badge {
   color: var(--accent);
-  font: 10px "JetBrains Mono Variable", monospace;
+  font: 10px "Geist Mono Variable", monospace;
   letter-spacing: 0.1em;
 }
 
@@ -1322,7 +1354,7 @@ select {
   min-height: 260px;
   padding: 14px;
   resize: vertical;
-  font: 12px/1.6 "JetBrains Mono Variable", monospace;
+  font: 12px/1.6 "Geist Mono Variable", monospace;
 }
 
 /* ── Now playing + sound stage (signature) ─────────────── */
@@ -1415,7 +1447,7 @@ select {
   gap: 7px;
   margin: 10px 0 0;
   color: var(--text-dim);
-  font: 600 12px/1.4 "JetBrains Mono Variable", monospace;
+  font: 600 12px/1.4 "Geist Mono Variable", monospace;
 }
 
 .source-spec b {
@@ -1525,7 +1557,7 @@ select {
 }
 
 .stage-speaker b {
-  font: 700 9px "JetBrains Mono Variable", monospace;
+  font: 700 9px "Geist Mono Variable", monospace;
 }
 
 .front-left { left: 13%; top: 19%; }
@@ -1565,7 +1597,7 @@ select {
   border-radius: 999px;
   background: rgba(10, 10, 16, 0.78);
   backdrop-filter: blur(14px);
-  font: 650 11px "JetBrains Mono Variable", monospace;
+  font: 650 11px "Geist Mono Variable", monospace;
   letter-spacing: 0.14em;
   color: var(--text-mute);
   box-shadow: var(--glass-inset), var(--shadow-sm);
@@ -1671,17 +1703,17 @@ select {
   grid-row: 3;
   z-index: 10;
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(360px, 1.45fr) minmax(200px, 1fr);
+  grid-template-columns: minmax(170px, 0.9fr) minmax(300px, 1.2fr) minmax(340px, 1.1fr);
   align-items: center;
-  gap: 18px;
-  padding: 8px 18px 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.055);
-  background: rgba(9, 9, 14, 0.72);
-  backdrop-filter: blur(40px) saturate(1.5);
-  -webkit-backdrop-filter: blur(40px) saturate(1.5);
+  gap: 16px;
+  padding: 10px 20px 12px;
+  border-top: 1px solid var(--glass-border);
+  background: rgba(15, 16, 22, 0.78);
+  backdrop-filter: blur(22px) saturate(1.4);
+  -webkit-backdrop-filter: blur(22px) saturate(1.4);
   box-shadow:
     0 -8px 32px rgba(0, 0, 0, 0.28),
-    inset 0 1px 0 rgba(255, 255, 255, 0.045);
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .player-track {
@@ -1932,7 +1964,7 @@ select {
 
 .timeline time {
   color: var(--text-dim);
-  font: 10px/1 "JetBrains Mono Variable", monospace;
+  font: 10px/1 "Geist Mono Variable", monospace;
   text-align: center;
   font-variant-numeric: tabular-nums;
   opacity: 0.9;
@@ -2012,43 +2044,70 @@ input[type="range"]::-moz-range-thumb {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 4px;
+  gap: var(--space-2);
   min-width: 0;
 }
 
+/* Every tool keeps its size — no squeezing buttons into each other */
+.player-tools > * {
+  flex-shrink: 0;
+}
+
 .quality-select {
+  flex: 0 0 auto;
   min-height: 30px;
   height: 30px;
-  max-width: 118px;
-  padding: 0 24px 0 9px;
+  max-width: 132px;
+  min-width: 78px;
+  padding: 0 26px 0 11px;
   border-radius: 999px;
   color: var(--text-mute);
-  background: rgba(255, 255, 255, 0.055);
-  border-color: rgba(255, 255, 255, 0.08);
+  background: var(--glass-hover);
+  border: 1px solid var(--glass-border);
   font-size: 11px;
-  font-weight: 650;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-overflow: ellipsis;
+}
+
+/* WebView2 renders the native option list with a system light background;
+   force dark so it never flashes a white box on the dark shell. */
+.quality-select option {
+  background: var(--surface-solid);
+  color: var(--text-hi);
 }
 
 .measured-quality {
-  padding: 4px 7px;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border-radius: 999px;
   white-space: nowrap;
   color: var(--text-dim);
-  font: 600 10px/1 "JetBrains Mono Variable", monospace;
+  background: rgba(255, 255, 255, 0.03);
+  font: 600 10px/1 "Geist Mono Variable", monospace;
 }
 
 .measured-quality.suspicious {
   color: #e5b86d;
+  background: color-mix(in srgb, #e5b86d 12%, transparent);
 }
 
 .online-favorite {
-  width: 30px;
-  height: 30px;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
   padding: 0;
   border: 0;
   border-radius: 50%;
-  color: var(--text-dim);
-  background: rgba(255, 255, 255, 0.04);
-  font-size: 17px;
+  color: var(--text-mute);
+  background: transparent;
+  font-size: 16px;
+  transition: color 0.16s var(--ease-soft), background 0.16s var(--ease-soft);
+}
+
+.online-favorite:hover {
+  background: var(--glass-hover);
+  color: var(--text-hi);
 }
 
 .online-favorite.active {
@@ -2059,6 +2118,13 @@ input[type="range"]::-moz-range-thumb {
 .quality-select:focus-visible {
   color: var(--text-hi);
   border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+/* Native option popup is system-rendered (defaults to white on WebView2) — force dark */
+.quality-select option,
+select option {
+  background: var(--surface-solid);
+  color: var(--text-hi);
 }
 
 .volume-cluster {
@@ -2105,8 +2171,7 @@ input[type="range"]::-moz-range-thumb {
 
 .volume-slider {
   width: 88px;
-  max-width: 28vw;
-  flex: 0 1 88px;
+  flex: 0 0 88px;
 }
 
 /* More (…) — optical size small; hit target exactly 32×32 */
@@ -2133,6 +2198,90 @@ input[type="range"]::-moz-range-thumb {
   border-radius: 50%;
   background: currentColor;
   opacity: 0.9;
+}
+
+/* Play mode glyphs — sequential / list-loop / one-loop / shuffle */
+.glyph-mode {
+  display: block;
+  width: 14px;
+  height: 12px;
+  position: relative;
+  opacity: 0.92;
+}
+
+.glyph-mode-seq::before,
+.glyph-mode-seq::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 2px;
+  height: 1.5px;
+  background: currentColor;
+  border-radius: 1px;
+}
+.glyph-mode-seq::before { top: 3px; }
+.glyph-mode-seq::after { top: 7px; width: 70%; }
+
+.glyph-mode-all {
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  border-top-color: transparent;
+  width: 12px;
+  height: 12px;
+}
+.glyph-mode-all::after {
+  content: "";
+  position: absolute;
+  top: -1px;
+  right: -1px;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 0 0 5px 5px;
+  border-color: transparent transparent currentColor transparent;
+}
+
+.glyph-mode-one {
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  border-top-color: transparent;
+  width: 12px;
+  height: 12px;
+}
+.glyph-mode-one::before {
+  content: "1";
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font: 700 7px/1 "Geist Mono Variable", monospace;
+  color: currentColor;
+}
+
+.glyph-mode-shuf::before,
+.glyph-mode-shuf::after {
+  content: "";
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  height: 1.5px;
+  background: currentColor;
+  border-radius: 1px;
+  transform-origin: center;
+}
+.glyph-mode-shuf::before { top: 3px; transform: rotate(18deg); }
+.glyph-mode-shuf::after { top: 7px; transform: rotate(-18deg); }
+
+.glyph-queue {
+  display: block;
+  width: 13px;
+  height: 11px;
+  position: relative;
+  opacity: 0.9;
+  background:
+    linear-gradient(currentColor, currentColor) 0 1px / 100% 1.5px no-repeat,
+    linear-gradient(currentColor, currentColor) 0 5px / 100% 1.5px no-repeat,
+    linear-gradient(currentColor, currentColor) 0 9px / 70% 1.5px no-repeat;
 }
 
 .tool-btn.active {
@@ -2224,7 +2373,7 @@ input[type="range"]::-moz-range-thumb {
   width: 100%;
   min-height: 280px;
   resize: vertical;
-  font-family: "JetBrains Mono Variable", monospace;
+  font-family: "Geist Mono Variable", monospace;
   font-size: 12px;
   line-height: 1.65;
 }
@@ -2399,6 +2548,11 @@ input[type="range"]::-moz-range-thumb {
   .volume-slider {
     width: 64px;
   }
+
+  /* Reclaim width before controls collide — the full spec still shows on now-playing */
+  .measured-quality {
+    display: none;
+  }
 }
 
 @media (max-width: 900px) {
@@ -2489,6 +2643,198 @@ input[type="range"]::-moz-range-thumb {
   .record {
     width: min(260px, 70%);
   }
+}
+
+/* Queue panel — slides up from the player bar */
+.queue-panel {
+  position: fixed;
+  z-index: 40;
+  right: 18px;
+  bottom: 92px;
+  width: min(380px, calc(100vw - 36px));
+  max-height: min(52vh, 480px);
+  display: flex;
+  flex-direction: column;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(14, 14, 20, 0.92);
+  backdrop-filter: blur(28px) saturate(1.2);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.queue-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 16px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.queue-panel-header h3 {
+  margin: 2px 0 4px;
+  font-size: 16px;
+}
+
+.queue-panel-header small {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.queue-panel-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.queue-panel-actions button {
+  min-width: 32px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-mute);
+  font-size: 12px;
+}
+
+.queue-panel-actions button:hover:not(:disabled) {
+  color: var(--text-hi);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.queue-panel-actions button:disabled {
+  opacity: 0.35;
+}
+
+.queue-empty {
+  padding: 28px 18px;
+  text-align: center;
+  color: var(--text-mute);
+}
+
+.queue-empty span {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.queue-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  flex: 1;
+}
+
+.queue-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 4px;
+  border-radius: 12px;
+  padding: 2px;
+}
+
+.queue-list li.active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.queue-main {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  border-radius: 10px;
+  min-width: 0;
+}
+
+.queue-main:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.queue-index {
+  color: var(--text-dim);
+  font: 11px/1 "Geist Mono Variable", monospace;
+  text-align: center;
+}
+
+.queue-list li.active .queue-index {
+  color: var(--accent);
+}
+
+.queue-main strong,
+.queue-main small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-main strong {
+  font-size: 13px;
+}
+
+.queue-main small {
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.up-next-panel {
+  margin-top: 28px;
+  padding: 18px 20px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(18, 18, 26, 0.4);
+}
+
+.up-next-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.up-next-list button {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  column-gap: 10px;
+  padding: 10px 12px;
+  text-align: left;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+}
+
+.up-next-list button span {
+  grid-row: 1 / span 2;
+  align-self: center;
+  color: var(--text-dim);
+  font: 11px/1 "Geist Mono Variable", monospace;
+}
+
+.up-next-list button strong {
+  font-size: 13px;
+}
+
+.up-next-list button small {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.up-next-list button:hover {
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -94,6 +94,9 @@ pub struct EngineSnapshot {
     pub generation: u64,
     pub underrun_callbacks: u64,
     pub output_sample_rate: Option<u32>,
+    pub source_sample_rate: Option<u32>,
+    pub source_bit_depth: Option<u32>,
+    pub source_channels: Option<u16>,
     pub error: Option<String>,
     pub output_device: Option<String>,
 }
@@ -112,6 +115,9 @@ impl Default for EngineSnapshot {
             generation: 0,
             underrun_callbacks: 0,
             output_sample_rate: None,
+            source_sample_rate: None,
+            source_bit_depth: None,
+            source_channels: None,
             error: None,
             output_device: None,
         }
@@ -591,6 +597,9 @@ fn publish_snapshot(
         .unwrap_or(model.start_seconds);
     let underruns = session.map_or(0, PlaybackSession::underruns);
     let output_sample_rate = session.map(|session| session.output_sample_rate);
+    let source_sample_rate = session.map(|session| session.source_sample_rate);
+    let source_bit_depth = session.and_then(|session| session.source_bit_depth);
+    let source_channels = session.map(|session| session.source_channels as u16);
     *destination.lock().unwrap() = EngineSnapshot {
         status: model.status,
         queue: model.queue.iter().map(|item| item.public.clone()).collect(),
@@ -603,6 +612,9 @@ fn publish_snapshot(
         generation: model.generation,
         underrun_callbacks: underruns,
         output_sample_rate,
+        source_sample_rate,
+        source_bit_depth,
+        source_channels,
         error: model.error.clone(),
         output_device: model.output_device.clone(),
     };
@@ -626,6 +638,8 @@ struct PlaybackSession {
     callback_enabled: Arc<AtomicBool>,
     volume_bits: Arc<AtomicU32>,
     source_channels: usize,
+    source_sample_rate: u32,
+    source_bit_depth: Option<u32>,
     output_sample_rate: u32,
     start_seconds: f64,
     duration_seconds: Option<f64>,
@@ -671,6 +685,7 @@ impl PlaybackSession {
             .channels
             .context("audio track does not declare a channel layout")?
             .count();
+        let source_bit_depth = media.codec_params.bits_per_sample;
         let duration_seconds = media
             .codec_params
             .n_frames
@@ -733,6 +748,8 @@ impl PlaybackSession {
             callback_enabled,
             volume_bits,
             source_channels: channels,
+            source_sample_rate: sample_rate,
+            source_bit_depth,
             output_sample_rate,
             start_seconds,
             duration_seconds,

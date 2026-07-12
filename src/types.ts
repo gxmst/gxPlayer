@@ -111,6 +111,9 @@ export type EngineSnapshot = {
   generation: number;
   underrunCallbacks: number;
   outputSampleRate?: number | null;
+  sourceSampleRate?: number | null;
+  sourceBitDepth?: number | null;
+  sourceChannels?: number | null;
   error: string | null;
   outputDevice?: string | null;
 };
@@ -143,6 +146,9 @@ export const EMPTY_ENGINE: EngineSnapshot = {
   },
   generation: 0,
   underrunCallbacks: 0,
+  sourceSampleRate: null,
+  sourceBitDepth: null,
+  sourceChannels: null,
   outputSampleRate: null,
   error: null,
   outputDevice: null,

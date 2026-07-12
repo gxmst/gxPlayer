@@ -76,6 +76,38 @@ function formatTime(seconds: number | null): string {
   return `${Math.floor(value / 60)}:${(value % 60).toString().padStart(2, "0")}`;
 }
 
+function formatSourceSpec(snapshot: EngineSnapshot): string | null {
+  if (!snapshot.sourceSampleRate && !snapshot.sourceBitDepth && !snapshot.sourceChannels) return null;
+  const parts: string[] = [];
+  if (snapshot.sourceSampleRate) {
+    const khz = snapshot.sourceSampleRate / 1000;
+    parts.push(`${Number.isInteger(khz) ? khz.toFixed(0) : khz.toFixed(1)}kHz`);
+  }
+  if (snapshot.sourceBitDepth) parts.push(`${snapshot.sourceBitDepth}bit`);
+  if (snapshot.sourceChannels) parts.push(`${snapshot.sourceChannels}ch`);
+  return parts.join("/");
+}
+
+function isSuspiciousQuality(quality: string | null, snapshot: EngineSnapshot): boolean {
+  if (!quality) return false;
+  const normalized = quality.toLowerCase();
+  if (normalized === "flac24bit" || normalized.includes("24bit")) {
+    return snapshot.sourceBitDepth !== null
+      && snapshot.sourceBitDepth !== undefined
+      && snapshot.sourceBitDepth <= 16;
+  }
+  if (normalized.includes("hires") || normalized.includes("hi-res")) {
+    const lowDepth = snapshot.sourceBitDepth !== null
+      && snapshot.sourceBitDepth !== undefined
+      && snapshot.sourceBitDepth <= 16;
+    const lowRate = snapshot.sourceSampleRate !== null
+      && snapshot.sourceSampleRate !== undefined
+      && snapshot.sourceSampleRate <= 48_000;
+    return lowDepth && lowRate;
+  }
+  return false;
+}
+
 function initials(title: string): string {
   return [...(title.trim() || "GX")].slice(0, 2).join("").toUpperCase();
 }
@@ -354,6 +386,8 @@ function App() {
   const currentArtwork = selectedCatalogTrack?.artworkUrl ?? null;
   const isPlaying = snapshot.status === "playing" || snapshot.status === "loading";
   const shownPosition = dragPosition ?? pendingSeek?.target ?? snapshot.positionSeconds;
+  const measuredSourceSpec = formatSourceSpec(snapshot);
+  const suspiciousQuality = isSuspiciousQuality(currentQuality, snapshot);
   const activeSource = sources.find((source) => source.id === runtime?.activeSourceId || source.active) ?? null;
   const sourceStatus = (() => {
     switch (runtime?.state) {
@@ -880,7 +914,7 @@ function App() {
     return (
       <div className="page now-playing-page">
         <div className="now-grid">
-          <section className="record-column"><div className={`record ${isPlaying ? "spinning" : ""}`}><Cover artwork={currentArtwork} title={currentTitle} className="record-cover" /><span className="record-hole" /></div><p className="eyebrow">NOW PLAYING</p><h1>{currentTitle}</h1><p className="artist-line">{currentArtist}</p></section>
+          <section className="record-column"><div className={`record ${isPlaying ? "spinning" : ""}`}><Cover artwork={currentArtwork} title={currentTitle} className="record-cover" /><span className="record-hole" /></div><p className="eyebrow">NOW PLAYING</p><h1>{currentTitle}</h1><p className="artist-line">{currentArtist}</p>{measuredSourceSpec && <p className={`source-spec ${suspiciousQuality ? "suspicious" : ""}`}>{currentQuality && currentQueueItem?.online ? <><span>{currentQuality}（自报）</span><b>·</b></> : null}<span>实测 {measuredSourceSpec}</span>{suspiciousQuality && <em title="自报高解析音质与解码规格不一致">⚠ 疑似虚标</em>}</p>}</section>
           <section className="stage-panel">
             <div className={`sound-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"}`} aria-label="声场模式盘">
               <div className="stage-field" aria-hidden="true" />
@@ -995,7 +1029,8 @@ function App() {
           </div>
         </div>
         <div className="player-tools">
-          {selectedCatalogTrack && currentQueueItem?.online && <select className="quality-select" aria-label="在线音质" title={`当前音质：${currentQuality ?? "自动"}`} value={QUALITY_OPTIONS.some((option) => option.value === currentQuality) ? currentQuality ?? "auto" : "auto"} disabled={qualitySwitching} onChange={(event) => void switchOnlineQuality(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.value === "auto" ? `自动${currentQuality ? ` · ${currentQuality}` : ""}` : option.label}</option>)}</select>}
+          {measuredSourceSpec && <span className={`measured-quality ${suspiciousQuality ? "suspicious" : ""}`} title={`${currentQuality ? `${currentQuality}（音源自报） · ` : ""}实测 ${measuredSourceSpec}${suspiciousQuality ? " · 疑似虚标" : ""}`}>{suspiciousQuality ? "⚠ " : ""}{measuredSourceSpec}</span>}
+          {selectedCatalogTrack && currentQueueItem?.online && <select className="quality-select" aria-label="音源自报音质" title={`音源自报档位：${currentQuality ?? "自动"}`} value={QUALITY_OPTIONS.some((option) => option.value === currentQuality) ? currentQuality ?? "auto" : "auto"} disabled={qualitySwitching} onChange={(event) => void switchOnlineQuality(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.value === "auto" ? `自动${currentQuality ? ` · ${currentQuality}` : ""}` : option.label}</option>)}</select>}
           <div className="volume-cluster">
             <span className="volume-icon" aria-hidden="true" />
             <input

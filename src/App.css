@@ -1365,6 +1365,26 @@ select {
   font-size: 17px;
 }
 
+.source-spec {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 7px;
+  margin: 10px 0 0;
+  color: var(--text-dim);
+  font: 600 12px/1.4 "JetBrains Mono Variable", monospace;
+}
+
+.source-spec b {
+  color: rgba(255, 255, 255, 0.2);
+  font-weight: 400;
+}
+
+.source-spec em {
+  color: #e5b86d;
+  font-style: normal;
+}
+
 .stage-panel {
   display: grid;
   grid-template-columns: minmax(280px, 1fr) minmax(220px, 0.8fr);
@@ -1964,6 +1984,17 @@ input[type="range"]::-moz-range-thumb {
   border-color: rgba(255, 255, 255, 0.08);
   font-size: 11px;
   font-weight: 650;
+}
+
+.measured-quality {
+  padding: 4px 7px;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font: 600 10px/1 "JetBrains Mono Variable", monospace;
+}
+
+.measured-quality.suspicious {
+  color: #e5b86d;
 }
 
 .quality-select:hover,

@@ -3,6 +3,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine};
@@ -621,6 +623,49 @@ fn place_and_show_main_window(window: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn create_system_tray(app: &AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "tray-show", "显示主界面", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "tray-quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(|| tauri::Error::AssetNotFound("default window icon".into()))?;
+
+    TrayIconBuilder::new()
+        .icon(icon)
+        .tooltip("GXPlayer")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "tray-show" => show_main_window(app),
+            "tray-quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 fn create_lx_sandbox(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let sandbox =
         WebviewWindowBuilder::new(app, SANDBOX_LABEL, WebviewUrl::App("sandbox.html".into()))
@@ -683,6 +728,14 @@ pub fn run() {
             script_path: phase1_script_path(),
             progress: Mutex::new(LxPocProgress::default()),
         })
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             let app_data = isolated_smoke_data_root().unwrap_or(app.path().app_data_dir()?);
             app.manage(LibraryStore::open(app_data.join("library.sqlite3"))?);
@@ -720,6 +773,7 @@ pub fn run() {
             }
             app.manage(SourceRuntime::new(source_store));
             create_lx_sandbox(app.handle())?;
+            create_system_tray(app.handle())?;
 
             if let Some(main) = app.get_webview_window("main") {
                 // Fail soft: still show with tauri.conf fallback size if monitor probe fails.

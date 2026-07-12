@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "@fontsource-variable/geist";
@@ -655,6 +656,22 @@ function App() {
     document.addEventListener("mousedown", onPointerDown);
     return () => document.removeEventListener("mousedown", onPointerDown);
   }, [suggestionOpen]);
+
+  // Windows SMTC / media keys: next & previous are owned by the frontend playlist.
+  useEffect(() => {
+    let disposed = false;
+    const unlisten = listen<string>("gx-media", (event) => {
+      if (disposed) return;
+      if (event.payload === "next") void handleTransportNext();
+      else if (event.payload === "previous") void handleTransportPrevious();
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((fn) => fn());
+    };
+    // Handlers use refs for playlist state — safe to bind once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -2119,7 +2136,28 @@ function App() {
     return (
       <div className="page now-playing-page">
         <div className="now-grid">
-          <section className="record-column"><div className={`record ${isPlaying ? "spinning" : ""}`}><Cover artwork={currentArtwork} title={currentTitle} className="record-cover" /><span className="record-hole" /></div><p className="eyebrow">NOW PLAYING</p><h1>{currentTitle}</h1><p className="artist-line">{currentArtist}</p>{measuredSourceSpec && <p className={`source-spec ${suspiciousQuality ? "suspicious" : ""}`}>{currentQuality && currentQueueItem?.online ? <><span>{currentQuality}（自报）</span><b>·</b></> : null}<span>实测 {measuredSourceSpec}</span>{suspiciousQuality && <em title="自报高解析音质与解码规格不一致">⚠ 疑似虚标</em>}</p>}</section>
+          <section className={`record-column ${isPlaying ? "is-playing" : ""}`}>
+            <div className={`record-stage ${isPlaying ? "live" : ""}`}>
+              <div className="record-glow" aria-hidden="true" />
+              <div className={`record ${isPlaying ? "spinning" : ""}`}>
+                <Cover artwork={currentArtwork} title={currentTitle} className="record-cover" />
+                <span className="record-hole" />
+              </div>
+              <div className={`eq-bars ${isPlaying ? "active" : ""}`} aria-hidden="true">
+                <i /><i /><i /><i /><i />
+              </div>
+            </div>
+            <p className="eyebrow">NOW PLAYING</p>
+            <h1 className={isPlaying ? "title-live" : ""}>{currentTitle}</h1>
+            <p className="artist-line">{currentArtist}</p>
+            {measuredSourceSpec && (
+              <p className={`source-spec ${suspiciousQuality ? "suspicious" : ""}`}>
+                {currentQuality && currentQueueItem?.online ? <><span>{currentQuality}（自报）</span><b>·</b></> : null}
+                <span>实测 {measuredSourceSpec}</span>
+                {suspiciousQuality && <em title="自报高解析音质与解码规格不一致">⚠ 疑似虚标</em>}
+              </p>
+            )}
+          </section>
           <section className="stage-panel">
             <div className={`sound-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"}`} aria-label="声场模式盘">
               <div className="stage-field" aria-hidden="true" />
@@ -2303,8 +2341,11 @@ function App() {
       )}
 
       <footer className="player-bar">
-        <button className="player-track" onClick={() => navigateTo("now-playing")}>
-          <Cover artwork={currentArtwork} title={currentTitle} />
+        <button className={`player-track ${isPlaying ? "is-playing" : ""}`} onClick={() => navigateTo("now-playing")}>
+          <span className={`player-cover-wrap ${isPlaying ? "live" : ""}`}>
+            <Cover artwork={currentArtwork} title={currentTitle} />
+            {isPlaying && <span className="player-eq" aria-hidden="true"><i /><i /><i /></span>}
+          </span>
           <span>
             <strong>{currentTitle}</strong>
             <small>{currentArtist}</small>

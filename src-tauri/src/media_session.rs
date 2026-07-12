@@ -1,7 +1,8 @@
 //! Windows SMTC / media-key bridge via souvlaki.
 //!
-//! Polls the engine snapshot and pushes metadata + play state to the OS media session.
-//! Media key events call into LocalAudioEngine (play/pause/next/previous).
+//! Shows the OS taskbar media flyout (title + play/pause/prev/next) while GXPlayer is playing.
+//! Play/pause hit the engine; next/previous are emitted to the frontend so playlist authority
+//! (including online lazy resolve) stays consistent.
 
 use std::thread;
 use std::time::Duration;
@@ -9,23 +10,31 @@ use std::time::Duration;
 use gx_audio::engine::LocalAudioEngine;
 use gx_contracts::PlaybackStatus;
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 pub fn spawn_media_session(app: AppHandle) {
     thread::Builder::new()
         .name("gx-media-session".into())
         .spawn(move || {
-            if let Err(error) = run_media_session(app) {
-                eprintln!("media session unavailable: {error}");
+            // Retry a few times — HWND may not be ready at first paint.
+            for attempt in 0..8 {
+                thread::sleep(Duration::from_millis(if attempt == 0 { 600 } else { 500 }));
+                match run_media_session(app.clone()) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        eprintln!(
+                            "media session attempt {} failed: {error}",
+                            attempt + 1
+                        );
+                    }
+                }
             }
+            eprintln!("media session unavailable after retries");
         })
         .ok();
 }
 
 fn run_media_session(app: AppHandle) -> Result<(), String> {
-    // Give the main window a moment to appear so HWND is valid.
-    thread::sleep(Duration::from_millis(800));
-
     #[cfg(target_os = "windows")]
     let hwnd = {
         let window = app
@@ -60,10 +69,16 @@ fn run_media_session(app: AppHandle) -> Result<(), String> {
                     }
                 }
                 MediaControlEvent::Play => engine.play(),
-                MediaControlEvent::Pause => engine.pause(),
-                MediaControlEvent::Next => engine.next(),
-                MediaControlEvent::Previous => engine.previous(),
-                MediaControlEvent::Stop => engine.pause(),
+                MediaControlEvent::Pause | MediaControlEvent::Stop => engine.pause(),
+                // Frontend owns playlist order (online lazy resolve + local jump).
+                MediaControlEvent::Next => {
+                    let _ = app_events.emit("gx-media", "next");
+                    Ok(())
+                }
+                MediaControlEvent::Previous => {
+                    let _ = app_events.emit("gx-media", "previous");
+                    Ok(())
+                }
                 _ => Ok(()),
             };
             if let Err(error) = result {
@@ -73,39 +88,62 @@ fn run_media_session(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("{e:?}"))?;
 
     let mut last_title = String::new();
+    let mut last_generation = u64::MAX;
     let mut last_playing: Option<bool> = None;
     loop {
-        thread::sleep(Duration::from_millis(400));
+        thread::sleep(Duration::from_millis(350));
         let Some(engine) = app.try_state::<LocalAudioEngine>() else {
             continue;
         };
         let snap = engine.snapshot();
-        let title = snap
-            .queue_index
-            .and_then(|index| snap.queue.get(index))
+        let item = snap.queue_index.and_then(|index| snap.queue.get(index));
+        let title = item
             .map(|item| item.title.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "GXPlayer".into());
+        // QueueItem has no artist field — surface online/local location hint lightly.
+        let artist = item
+            .map(|item| {
+                if item.online {
+                    "在线播放".to_owned()
+                } else {
+                    "本地播放".to_owned()
+                }
+            })
             .unwrap_or_else(|| "GXPlayer".into());
         let playing = matches!(
             snap.status,
             PlaybackStatus::Playing | PlaybackStatus::Loading
         );
-        if title != last_title {
+        let active = item.is_some()
+            && !matches!(
+                snap.status,
+                PlaybackStatus::Idle | PlaybackStatus::Stopped
+            );
+
+        if title != last_title || snap.generation != last_generation {
             let _ = controls.set_metadata(MediaMetadata {
                 title: Some(title.as_str()),
-                artist: Some("GXPlayer"),
-                album: None,
+                artist: Some(artist.as_str()),
+                album: Some("GXPlayer"),
                 cover_url: None,
                 duration: None,
             });
             last_title = title;
+            last_generation = snap.generation;
         }
-        if last_playing != Some(playing) {
-            let _ = controls.set_playback(if playing {
-                MediaPlayback::Playing { progress: None }
-            } else {
-                MediaPlayback::Paused { progress: None }
-            });
-            last_playing = Some(playing);
+
+        let playback = if !active {
+            MediaPlayback::Stopped
+        } else if playing {
+            MediaPlayback::Playing { progress: None }
+        } else {
+            MediaPlayback::Paused { progress: None }
+        };
+        let playing_flag = matches!(playback, MediaPlayback::Playing { .. });
+        if last_playing != Some(playing_flag) || (!active && last_playing.is_some()) {
+            let _ = controls.set_playback(playback);
+            last_playing = if active { Some(playing_flag) } else { Some(false) };
         }
     }
 }

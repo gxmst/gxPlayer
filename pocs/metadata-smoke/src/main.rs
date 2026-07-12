@@ -15,6 +15,18 @@ fn main() -> Result<()> {
             .map(|track| track.provider_id.as_str())
             .collect::<std::collections::BTreeSet<_>>()
     );
+    let lx_track = results
+        .iter()
+        .find(|track| {
+            matches!(track.provider_id.as_str(), "kg" | "kw" | "wy")
+                && track.resolver_payload.get("source").is_some()
+                && track.resolver_payload.get("musicInfo").is_some()
+        })
+        .context("metadata search returned no LX-compatible full-track payload")?;
+    println!(
+        "GX_ONLINE_LX_METADATA_OK provider={} id={} title={}",
+        lx_track.provider_id, lx_track.provider_track_id, lx_track.title
+    );
     let playable = results
         .iter()
         .find(|track| track.preview.is_some())

@@ -11,6 +11,7 @@ Phase -1 through Phase 5 are implemented:
 - Local Symphonia decode, accurate local seek, rubato rate adaptation, and cpal output verified.
 - Progressive HTTP decode, redirect handling, bounded backpressure, reconnect with Range, and online seek verified.
 - Hidden Tauri LX sandbox verified with an unchanged community script, synchronous crypto/RSA no-padding, minimal capability, and SSRF/privilege rejection.
+- Online search can now carry native Kugou/Kuwo/NetEase LX metadata through `musicUrl` resolution into a structured media request and Rust-native progressive playback. Preview-sized resolver results are rejected instead of being reported as full tracks.
 - Thread, state-machine, data, and LX contracts are recorded in `docs/architecture`.
 - The default music mode is transparent DSP bypass. The retained Crossfeed + stereo HRTF + linked-limiter chain is an optional cinema/game mode after the user's blind test preferred bypass for music.
 - SQLite persists the local library, favorites, playlists, and backup data. Local tags and durations are read during import.
@@ -30,3 +31,13 @@ npm run tauri dev
 ```
 
 The legacy WPF projects and large third-party datasets remain outside this repository and are read-only references.
+
+## User-provided LX sources
+
+GXPlayer never bundles community source scripts. On startup it scans this repository-external directory and imports every valid `.js` file through the same validation and sandbox path as manual imports:
+
+```text
+%APPDATA%\com.gxplayer.desktop\sources\drop-in
+```
+
+Missing directories and individual invalid scripts do not prevent startup. The existing active source is preserved; otherwise the first valid drop-in source becomes active.

@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 .phase1-cache/
+/js/
 target/
 dist
 dist-ssr

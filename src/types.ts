@@ -51,6 +51,13 @@ export type CatalogTrack = {
   preview: unknown | null;
 };
 
+export type OnlinePlaybackResult = {
+  track: CatalogTrack;
+  sourceId: string | null;
+  sourceName: string | null;
+  quality: string | null;
+};
+
 export type LyricDocument = {
   instrumental: boolean;
   lines: Array<{ timestampMs: number | null; text: string }>;

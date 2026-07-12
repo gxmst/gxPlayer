@@ -5,7 +5,7 @@ use gx_contracts::{MediaType, ResolvedMediaRequest};
 use gx_source::safe_http::{SafeHttpRequest, execute};
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 const RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
@@ -66,14 +66,23 @@ pub fn search_all(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Metada
         return Err(MetadataError::EmptyQuery);
     }
     let limit = limit.clamp(1, 50);
-    let (itunes, deezer) = std::thread::scope(|scope| {
+    let (kugou, kuwo, netease, itunes, deezer) = std::thread::scope(|scope| {
+        let kugou = scope.spawn(|| search_kugou(query, limit));
+        let kuwo = scope.spawn(|| search_kuwo(query, limit));
+        let netease = scope.spawn(|| search_netease(query, limit));
         let itunes = scope.spawn(|| search_itunes(query, limit));
         let deezer = scope.spawn(|| search_deezer(query, limit));
-        (itunes.join().unwrap(), deezer.join().unwrap())
+        (
+            kugou.join().unwrap(),
+            kuwo.join().unwrap(),
+            netease.join().unwrap(),
+            itunes.join().unwrap(),
+            deezer.join().unwrap(),
+        )
     });
     let mut tracks = Vec::new();
     let mut errors = Vec::new();
-    for result in [itunes, deezer] {
+    for result in [kugou, kuwo, netease, itunes, deezer] {
         match result {
             Ok(mut found) => tracks.append(&mut found),
             Err(error) => errors.push(error.to_string()),
@@ -83,6 +92,117 @@ pub fn search_all(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Metada
         return Err(MetadataError::Http(errors.join("; ")));
     }
     Ok(tracks)
+}
+
+pub fn search_kugou(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(MetadataError::EmptyQuery);
+    }
+    let mut url = Url::parse("https://songsearch.kugou.com/song_search_v2")?;
+    url.query_pairs_mut()
+        .append_pair("keyword", query)
+        .append_pair("page", "1")
+        .append_pair("pagesize", &limit.clamp(1, 50).to_string())
+        .append_pair("userid", "0")
+        .append_pair("clientver", "")
+        .append_pair("platform", "WebFilter")
+        .append_pair("filter", "2")
+        .append_pair("iscorrection", "1")
+        .append_pair("privilege_filter", "0")
+        .append_pair("area_code", "1");
+    let response: KugouResponse = request_json(url)?;
+    if response.error_code != 0 {
+        return Err(MetadataError::HttpStatus(response.error_code.max(0) as u16));
+    }
+    Ok(response
+        .data
+        .map(|data| data.tracks)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(KugouTrack::into_catalog)
+        .collect())
+}
+
+pub fn search_kuwo(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(MetadataError::EmptyQuery);
+    }
+    let mut url = Url::parse("https://search.kuwo.cn/r.s")?;
+    url.query_pairs_mut()
+        .append_pair("client", "kt")
+        .append_pair("all", query)
+        .append_pair("pn", "0")
+        .append_pair("rn", &limit.clamp(1, 50).to_string())
+        .append_pair("uid", "794762570")
+        .append_pair("ver", "kwplayer_ar_9.2.2.1")
+        .append_pair("vipver", "1")
+        .append_pair("show_copyright_off", "1")
+        .append_pair("newver", "1")
+        .append_pair("ft", "music")
+        .append_pair("cluster", "0")
+        .append_pair("strategy", "2012")
+        .append_pair("encoding", "utf8")
+        .append_pair("rformat", "json")
+        .append_pair("vermerge", "1")
+        .append_pair("mobi", "1")
+        .append_pair("issubtitle", "1");
+    let response: KuwoResponse = request_json(url)?;
+    Ok(response
+        .tracks
+        .into_iter()
+        .filter_map(KuwoTrack::into_catalog)
+        .collect())
+}
+
+pub fn search_netease(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(MetadataError::EmptyQuery);
+    }
+    let url = Url::parse("https://music.163.com/api/search/get/web?csrf_token=")?;
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("s", query)
+        .append_pair("type", "1")
+        .append_pair("offset", "0")
+        .append_pair("total", "true")
+        .append_pair("limit", &limit.clamp(1, 50).to_string())
+        .finish()
+        .into_bytes();
+    let response = execute(SafeHttpRequest {
+        url,
+        method: Method::POST,
+        headers: vec![
+            (
+                "user-agent".into(),
+                "Mozilla/5.0 GXPlayer/0.1 metadata".into(),
+            ),
+            ("referer".into(), "https://music.163.com/".into()),
+            (
+                "content-type".into(),
+                "application/x-www-form-urlencoded; charset=UTF-8".into(),
+            ),
+        ],
+        body: Some(body),
+        timeout: Duration::from_secs(15),
+        max_response_bytes: RESPONSE_LIMIT,
+    })
+    .map_err(|error| MetadataError::Http(error.to_string()))?;
+    if !(200..300).contains(&response.status) {
+        return Err(MetadataError::HttpStatus(response.status));
+    }
+    let response: NeteaseResponse = serde_json::from_slice(&response.body)?;
+    if response.code != 200 {
+        return Err(MetadataError::HttpStatus(response.code.max(0) as u16));
+    }
+    Ok(response
+        .result
+        .map(|result| result.songs)
+        .unwrap_or_default()
+        .into_iter()
+        .map(NeteaseTrack::into_catalog)
+        .collect())
 }
 
 pub fn search_itunes(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
@@ -380,6 +500,355 @@ struct ItunesResponse {
 }
 
 #[derive(Deserialize)]
+struct KugouResponse {
+    error_code: i32,
+    data: Option<KugouData>,
+}
+
+#[derive(Deserialize)]
+struct KugouData {
+    #[serde(rename = "lists", default)]
+    tracks: Vec<KugouTrack>,
+}
+
+#[derive(Deserialize)]
+struct KugouTrack {
+    #[serde(rename = "Audioid")]
+    audio_id: u64,
+    #[serde(rename = "SongName")]
+    song_name: String,
+    #[serde(rename = "SingerName", default)]
+    singer_name: String,
+    #[serde(rename = "AlbumName", default)]
+    album_name: String,
+    #[serde(rename = "AlbumID", default)]
+    album_id: String,
+    #[serde(rename = "Duration", default)]
+    duration: u64,
+    #[serde(rename = "FileHash", default)]
+    file_hash: String,
+    #[serde(rename = "FileSize", default)]
+    file_size: u64,
+    #[serde(rename = "HQFileHash", default)]
+    hq_file_hash: String,
+    #[serde(rename = "HQFileSize", default)]
+    hq_file_size: u64,
+    #[serde(rename = "SQFileHash", default)]
+    sq_file_hash: String,
+    #[serde(rename = "SQFileSize", default)]
+    sq_file_size: u64,
+    #[serde(rename = "ResFileHash", default)]
+    res_file_hash: String,
+    #[serde(rename = "ResFileSize", default)]
+    res_file_size: u64,
+    #[serde(rename = "Image")]
+    image: Option<String>,
+}
+
+impl KugouTrack {
+    fn into_catalog(self) -> Option<CatalogTrack> {
+        if self.audio_id == 0 || self.file_hash.trim().is_empty() {
+            return None;
+        }
+        let mut types = Vec::new();
+        let mut raw_types = Map::new();
+        push_kugou_type(
+            &mut types,
+            &mut raw_types,
+            "128k",
+            self.file_size,
+            &self.file_hash,
+        );
+        push_kugou_type(
+            &mut types,
+            &mut raw_types,
+            "320k",
+            self.hq_file_size,
+            &self.hq_file_hash,
+        );
+        push_kugou_type(
+            &mut types,
+            &mut raw_types,
+            "flac",
+            self.sq_file_size,
+            &self.sq_file_hash,
+        );
+        push_kugou_type(
+            &mut types,
+            &mut raw_types,
+            "flac24bit",
+            self.res_file_size,
+            &self.res_file_hash,
+        );
+        let interval = format!("{}:{:02}", self.duration / 60, self.duration % 60);
+        let artwork_text = self.image.map(|value| {
+            value
+                .replace("{size}", "400")
+                .replacen("http://", "https://", 1)
+        });
+        let artwork_url = artwork_text
+            .as_deref()
+            .and_then(|value| Url::parse(value).ok());
+        let songmid = self.audio_id.to_string();
+        let music_info = json!({
+            "name": self.song_name,
+            "singer": self.singer_name,
+            "source": "kg",
+            "songmid": songmid,
+            "hash": self.file_hash,
+            "interval": interval,
+            "albumName": self.album_name,
+            "albumId": self.album_id,
+            "img": artwork_text,
+            "types": types,
+            "_types": raw_types,
+            "typeUrl": {}
+        });
+        Some(CatalogTrack {
+            provider_id: "kg".into(),
+            provider_track_id: songmid,
+            title: self.song_name,
+            artist: self.singer_name,
+            album: self.album_name,
+            duration_ms: Some(self.duration * 1000),
+            artwork_url,
+            resolver_payload: json!({
+                "source": "kg",
+                "musicInfo": music_info,
+            }),
+            preview: None,
+        })
+    }
+}
+
+fn push_kugou_type(
+    types: &mut Vec<Value>,
+    raw_types: &mut Map<String, Value>,
+    kind: &str,
+    size: u64,
+    hash: &str,
+) {
+    if size == 0 || hash.trim().is_empty() {
+        return;
+    }
+    let size_text = format!("{:.2} MB", size as f64 / 1024.0 / 1024.0);
+    types.push(json!({ "type": kind, "size": size_text, "hash": hash }));
+    raw_types.insert(kind.into(), json!({ "size": size_text, "hash": hash }));
+}
+
+#[derive(Deserialize)]
+struct KuwoResponse {
+    #[serde(rename = "abslist", default)]
+    tracks: Vec<KuwoTrack>,
+}
+
+#[derive(Deserialize)]
+struct KuwoTrack {
+    #[serde(rename = "MUSICRID")]
+    music_rid: String,
+    #[serde(rename = "SONGNAME")]
+    song_name: String,
+    #[serde(rename = "ARTIST")]
+    artist: String,
+    #[serde(rename = "ALBUM", default)]
+    album: String,
+    #[serde(rename = "ALBUMID", default)]
+    album_id: String,
+    #[serde(rename = "DURATION", default)]
+    duration: String,
+    #[serde(rename = "N_MINFO", default)]
+    media_info: String,
+    #[serde(rename = "web_albumpic_short")]
+    album_picture: Option<String>,
+    #[serde(rename = "web_artistpic_short")]
+    artist_picture: Option<String>,
+}
+
+impl KuwoTrack {
+    fn into_catalog(self) -> Option<CatalogTrack> {
+        let songmid = self
+            .music_rid
+            .strip_prefix("MUSIC_")
+            .unwrap_or(&self.music_rid)
+            .trim()
+            .to_owned();
+        if songmid.is_empty() {
+            return None;
+        }
+        let duration_seconds = self.duration.parse::<u64>().ok();
+        let interval = duration_seconds
+            .map(|seconds| format!("{}:{:02}", seconds / 60, seconds % 60))
+            .unwrap_or_default();
+        let (types, raw_types) = parse_kuwo_media_types(&self.media_info);
+        let artwork_text = normalize_kuwo_artwork(
+            self.album_picture.as_deref(),
+            self.artist_picture.as_deref(),
+        );
+        let artwork_url = artwork_text
+            .as_deref()
+            .and_then(|value| Url::parse(value).ok());
+        let music_info = json!({
+            "name": self.song_name,
+            "singer": self.artist,
+            "source": "kw",
+            "songmid": songmid,
+            "interval": interval,
+            "albumName": self.album,
+            "albumId": self.album_id,
+            "img": artwork_text,
+            "types": types,
+            "_types": raw_types,
+            "typeUrl": {}
+        });
+        Some(CatalogTrack {
+            provider_id: "kw".into(),
+            provider_track_id: songmid,
+            title: self.song_name,
+            artist: self.artist,
+            album: self.album,
+            duration_ms: duration_seconds.map(|seconds| seconds * 1000),
+            artwork_url,
+            resolver_payload: json!({
+                "source": "kw",
+                "musicInfo": music_info,
+            }),
+            preview: None,
+        })
+    }
+}
+
+fn parse_kuwo_media_types(media_info: &str) -> (Vec<Value>, Map<String, Value>) {
+    let mut types = Vec::new();
+    let mut raw_types = Map::new();
+    for entry in media_info.split(';') {
+        let mut bitrate = None;
+        let mut size = None;
+        for field in entry.split(',') {
+            if let Some(value) = field.strip_prefix("bitrate:") {
+                bitrate = Some(value);
+            } else if let Some(value) = field.strip_prefix("size:") {
+                size = Some(value);
+            }
+        }
+        let Some(kind) = bitrate.and_then(|value| match value {
+            "4000" => Some("flac24bit"),
+            "2000" => Some("flac"),
+            "320" => Some("320k"),
+            "128" => Some("128k"),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if raw_types.contains_key(kind) {
+            continue;
+        }
+        let size = size.unwrap_or_default();
+        types.push(json!({ "type": kind, "size": size }));
+        raw_types.insert(kind.into(), json!({ "size": size.to_ascii_uppercase() }));
+    }
+    types.reverse();
+    (types, raw_types)
+}
+
+fn normalize_kuwo_artwork(album: Option<&str>, artist: Option<&str>) -> Option<String> {
+    let (value, root) = album
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| (value, "albumcover"))
+        .or_else(|| {
+            artist
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (value, "starheads"))
+        })?;
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return Some(value.to_owned());
+    }
+    Some(format!(
+        "https://img1.kuwo.cn/star/{root}/{}",
+        value.trim_start_matches('/')
+    ))
+}
+
+#[derive(Deserialize)]
+struct NeteaseResponse {
+    code: i32,
+    result: Option<NeteaseResult>,
+}
+
+#[derive(Deserialize)]
+struct NeteaseResult {
+    #[serde(default)]
+    songs: Vec<NeteaseTrack>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NeteaseTrack {
+    id: u64,
+    name: String,
+    duration: u64,
+    #[serde(default)]
+    artists: Vec<NeteaseArtist>,
+    album: NeteaseAlbum,
+}
+
+#[derive(Deserialize)]
+struct NeteaseArtist {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NeteaseAlbum {
+    id: u64,
+    name: String,
+    pic_url: Option<String>,
+}
+
+impl NeteaseTrack {
+    fn into_catalog(self) -> CatalogTrack {
+        let artist = self
+            .artists
+            .iter()
+            .map(|artist| artist.name.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        let interval_seconds = self.duration / 1000;
+        let interval = format!("{}:{:02}", interval_seconds / 60, interval_seconds % 60);
+        let music_info = json!({
+            "name": self.name,
+            "singer": artist,
+            "source": "wy",
+            "songmid": self.id.to_string(),
+            "interval": interval,
+            "albumName": self.album.name,
+            "albumId": self.album.id.to_string(),
+            "img": self.album.pic_url,
+            "types": [
+                { "type": "128k", "size": null },
+                { "type": "320k", "size": null },
+                { "type": "flac", "size": null }
+            ],
+            "_types": {},
+            "typeUrl": {}
+        });
+        CatalogTrack {
+            provider_id: "wy".into(),
+            provider_track_id: self.id.to_string(),
+            title: self.name,
+            artist,
+            album: self.album.name,
+            duration_ms: Some(self.duration),
+            artwork_url: self.album.pic_url.and_then(|url| Url::parse(&url).ok()),
+            resolver_payload: json!({
+                "source": "wy",
+                "musicInfo": music_info,
+            }),
+            preview: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ItunesTrack {
     track_id: Option<u64>,
@@ -564,6 +1033,116 @@ mod tests {
             .into_catalog()
             .unwrap();
         assert_eq!(track.preview.unwrap().media_type, MediaType::Aac);
+    }
+
+    #[test]
+    fn kuwo_fixture_preserves_lx_songmid_and_quality_metadata() {
+        let response: KuwoResponse = serde_json::from_value(json!({
+            "abslist": [{
+                "MUSICRID": "MUSIC_228908",
+                "SONGNAME": "晴天",
+                "ARTIST": "周杰伦",
+                "ALBUM": "叶惠美",
+                "ALBUMID": "1293",
+                "DURATION": "269",
+                "N_MINFO": "level:ff,bitrate:2000,format:flac,size:52.83Mb;level:p,bitrate:320,format:mp3,size:10.29Mb;level:h,bitrate:128,format:mp3,size:4.12Mb",
+                "web_albumpic_short": "120/s3s94/93/211513640.jpg"
+            }]
+        }))
+        .unwrap();
+        let track = response
+            .tracks
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_catalog()
+            .unwrap();
+        assert_eq!(track.provider_id, "kw");
+        assert_eq!(track.provider_track_id, "228908");
+        assert_eq!(track.duration_ms, Some(269_000));
+        assert_eq!(track.resolver_payload["source"], "kw");
+        assert_eq!(track.resolver_payload["musicInfo"]["songmid"], "228908");
+        assert_eq!(
+            track.resolver_payload["musicInfo"]["_types"]["320k"]["size"],
+            "10.29MB"
+        );
+    }
+
+    #[test]
+    fn kugou_fixture_preserves_base_hash_for_music_url() {
+        let response: KugouResponse = serde_json::from_value(json!({
+            "error_code": 0,
+            "data": {
+                "lists": [{
+                    "Audioid": 20505418,
+                    "SongName": "晴天",
+                    "SingerName": "周杰伦",
+                    "AlbumName": "叶惠美",
+                    "AlbumID": "966846",
+                    "Duration": 269,
+                    "FileHash": "B3A52A7A958BF0AED0EBFBA2E9A818B7",
+                    "FileSize": 4317292,
+                    "HQFileHash": "1B56126A8A03924F1DD066259C095CBC",
+                    "HQFileSize": 10792943,
+                    "SQFileHash": "78E125D093837C463270EAC03BB9D8A9",
+                    "SQFileSize": 31729524,
+                    "ResFileHash": "",
+                    "ResFileSize": 0,
+                    "Image": "http://imge.kugou.com/stdmusic/{size}/cover.jpg"
+                }]
+            }
+        }))
+        .unwrap();
+        let track = response
+            .data
+            .unwrap()
+            .tracks
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_catalog()
+            .unwrap();
+        assert_eq!(track.provider_id, "kg");
+        assert_eq!(track.provider_track_id, "20505418");
+        assert_eq!(
+            track.resolver_payload["musicInfo"]["hash"],
+            "B3A52A7A958BF0AED0EBFBA2E9A818B7"
+        );
+        assert_eq!(
+            track.resolver_payload["musicInfo"]["_types"]["320k"]["hash"],
+            "1B56126A8A03924F1DD066259C095CBC"
+        );
+        assert_eq!(
+            track.artwork_url.unwrap().as_str(),
+            "https://imge.kugou.com/stdmusic/400/cover.jpg"
+        );
+    }
+
+    #[test]
+    fn netease_fixture_preserves_lx_songmid() {
+        let response: NeteaseResponse = serde_json::from_value(json!({
+            "code": 200,
+            "result": {
+                "songs": [{
+                    "id": 123,
+                    "name": "Song",
+                    "duration": 245000,
+                    "artists": [{ "name": "Artist" }],
+                    "album": { "id": 9, "name": "Album", "picUrl": "https://example.com/a.jpg" }
+                }]
+            }
+        }))
+        .unwrap();
+        let track = response
+            .result
+            .unwrap()
+            .songs
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_catalog();
+        assert_eq!(track.provider_id, "wy");
+        assert_eq!(track.resolver_payload["musicInfo"]["songmid"], "123");
     }
 
     #[test]

@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 
 use gx_audio::engine::LocalAudioEngine;
 use gx_contracts::ResolvedMediaRequest;
+use gx_metadata::{
+    CatalogTrack, find_replacements, search_all, search_kugou, search_kuwo, search_netease,
+};
 use gx_source::SourceBackup;
 use gx_source::safe_http::{SafeHttpRequest, execute};
 use reqwest::{Method, Url};
@@ -27,6 +30,15 @@ const RUNTIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct ImportResult {
     pub source: gx_source::ManagedSource,
     pub runtime: RuntimeStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnlinePlaybackResult {
+    pub track: CatalogTrack,
+    pub source_id: Option<String>,
+    pub source_name: Option<String>,
+    pub quality: Option<String>,
 }
 
 #[tauri::command]
@@ -225,6 +237,212 @@ pub async fn source_resolve(
 }
 
 #[tauri::command]
+pub async fn player_play_online_track(
+    window: WebviewWindow,
+    track: CatalogTrack,
+    quality: Option<String>,
+    source_id: Option<String>,
+) -> Result<OnlinePlaybackResult, String> {
+    require_window(&window, "main")?;
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || play_online_track(&app, track, quality, source_id))
+        .await
+        .map_err(|error| format!("online playback task failed: {error}"))?
+}
+
+fn play_online_track(
+    app: &AppHandle,
+    track: CatalogTrack,
+    quality: Option<String>,
+    source_id: Option<String>,
+) -> Result<OnlinePlaybackResult, String> {
+    let candidates = select_lx_candidates(track)?;
+    let preferred_quality = quality
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("320k");
+    let mut attempts = vec![preferred_quality.to_owned()];
+    if preferred_quality != "128k" {
+        attempts.push("128k".into());
+    }
+
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        for attempt in &attempts {
+            let payload = lx_music_url_payload(&candidate, attempt)?;
+            match resolve_serialized(app, payload, Some(attempt), source_id.as_deref()) {
+                Ok(request) => {
+                    if let Err(error) = validate_full_track_request(&request, candidate.duration_ms)
+                    {
+                        errors.push(format!(
+                            "{}:{} {attempt}: {error}",
+                            candidate.provider_id, candidate.provider_track_id
+                        ));
+                        continue;
+                    }
+                    let resolved_quality = request.quality.clone();
+                    app.state::<LocalAudioEngine>()
+                        .load_resolved(request, candidate.title.clone())
+                        .map_err(|error| {
+                            format!("Rust streaming engine rejected LX media: {error}")
+                        })?;
+
+                    let selected_source_id = source_id
+                        .clone()
+                        .or_else(|| app.state::<SourceRuntime>().status().active_source_id);
+                    let selected_source_name = selected_source_id.as_deref().and_then(|id| {
+                        app.state::<SourceRuntime>()
+                            .list()
+                            .into_iter()
+                            .find(|source| source.source.id == id)
+                            .map(|source| source.source.metadata.name)
+                    });
+                    return Ok(OnlinePlaybackResult {
+                        track: candidate,
+                        source_id: selected_source_id,
+                        source_name: selected_source_name,
+                        quality: resolved_quality,
+                    });
+                }
+                Err(error) => errors.push(format!(
+                    "{}:{} {attempt}: {error}",
+                    candidate.provider_id, candidate.provider_track_id
+                )),
+            }
+        }
+    }
+    Err(format!(
+        "LX source could not resolve a verified full-track URL ({})",
+        errors.join("; ")
+    ))
+}
+
+fn select_lx_candidates(track: CatalogTrack) -> Result<Vec<CatalogTrack>, String> {
+    let direct = lx_identity(&track).is_some().then(|| track.clone());
+    let query = format!("{} {}", track.title, track.artist);
+    let (kugou, kuwo, netease) = std::thread::scope(|scope| {
+        let kugou = scope.spawn(|| search_kugou(&query, 12));
+        let kuwo = scope.spawn(|| search_kuwo(&query, 12));
+        let netease = scope.spawn(|| search_netease(&query, 12));
+        (
+            kugou.join().unwrap(),
+            kuwo.join().unwrap(),
+            netease.join().unwrap(),
+        )
+    });
+    let mut candidates = Vec::new();
+    let mut errors = Vec::new();
+    match kugou {
+        Ok(mut found) => candidates.append(&mut found),
+        Err(error) => errors.push(format!("Kugou metadata: {error}")),
+    }
+    match kuwo {
+        Ok(mut found) => candidates.append(&mut found),
+        Err(error) => errors.push(format!("Kuwo metadata: {error}")),
+    }
+    match netease {
+        Ok(mut found) => candidates.append(&mut found),
+        Err(error) => errors.push(format!("NetEase metadata: {error}")),
+    }
+    let matches = find_replacements(&track, candidates);
+    let selected = direct
+        .into_iter()
+        .chain(matches.into_iter().map(|candidate| candidate.track))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        Err({
+            if errors.is_empty() {
+                "no matching LX-platform song was found for this catalog result".into()
+            } else {
+                format!(
+                    "LX-platform metadata lookup failed or found no safe match ({})",
+                    errors.join("; ")
+                )
+            }
+        })
+    } else {
+        Ok(selected)
+    }
+}
+
+fn validate_full_track_request(
+    request: &ResolvedMediaRequest,
+    expected_duration_ms: Option<u64>,
+) -> Result<(), String> {
+    let mut headers = request
+        .headers
+        .iter()
+        .map(|header| (header.name.clone(), header.value.clone()))
+        .collect::<Vec<_>>();
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("range"));
+    headers.push(("range".into(), "bytes=0-0".into()));
+    let response = execute(SafeHttpRequest {
+        url: request.url.clone(),
+        method: Method::GET,
+        headers,
+        body: None,
+        timeout: Duration::from_secs(10),
+        max_response_bytes: 4096,
+    })
+    .map_err(|error| format!("resolved media probe failed: {error}"))?;
+    if response.status != 206 {
+        return Err(format!(
+            "resolved media Range probe returned HTTP {} instead of 206",
+            response.status
+        ));
+    }
+    let total_length = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-range"))
+        .and_then(|(_, value)| parse_content_range_total(value))
+        .ok_or_else(|| {
+            "resolved media Range probe omitted total Content-Range length".to_owned()
+        })?;
+    let minimum_full_track_bytes = minimum_full_track_bytes(expected_duration_ms);
+    if total_length < minimum_full_track_bytes {
+        return Err(format!(
+            "resolved media is only {total_length} bytes (minimum {minimum_full_track_bytes}); refusing preview-sized audio"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    let (_, total) = value.rsplit_once('/')?;
+    (total != "*").then(|| total.parse().ok()).flatten()
+}
+
+fn minimum_full_track_bytes(expected_duration_ms: Option<u64>) -> u64 {
+    expected_duration_ms
+        .map(|duration| duration / 1000 * 3000)
+        .unwrap_or(0)
+        .max(512 * 1024)
+}
+
+fn lx_music_url_payload(track: &CatalogTrack, quality: &str) -> Result<Value, String> {
+    let (source, music_info) = lx_identity(track)
+        .ok_or_else(|| "catalog result does not contain an LX musicInfo payload".to_owned())?;
+    Ok(json!({
+        "source": source,
+        "action": "musicUrl",
+        "info": {
+            "type": quality,
+            "musicInfo": music_info,
+        }
+    }))
+}
+
+fn lx_identity(track: &CatalogTrack) -> Option<(&str, &Value)> {
+    let source = track.resolver_payload.get("source")?.as_str()?;
+    if !matches!(source, "kw" | "wy" | "tx" | "kg" | "mg") {
+        return None;
+    }
+    let music_info = track.resolver_payload.get("musicInfo")?;
+    music_info.is_object().then_some((source, music_info))
+}
+
+#[tauri::command]
 pub fn lx_runtime_result(
     window: WebviewWindow,
     runtime: tauri::State<SourceRuntime>,
@@ -316,10 +534,52 @@ pub fn lx_send(
             if std::env::var_os("GX_PHASE2_AUTO_RESOLVE").is_some() {
                 start_phase2_auto_resolve(&app)?;
             }
+            if std::env::var_os("GX_ONLINE_E2E_QUERY").is_some() {
+                start_online_e2e(&app)?;
+            }
             Ok(())
         }
         _ => Err(format!("unsupported lx.send event: {event_name}")),
     }
+}
+
+fn start_online_e2e(app: &AppHandle) -> Result<(), String> {
+    let query = std::env::var("GX_ONLINE_E2E_QUERY").map_err(|error| error.to_string())?;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let app_for_play = app.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let track = search_all(&query, 8)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|track| lx_identity(track).is_some())
+                .ok_or_else(|| "online E2E search returned no LX-compatible track".to_owned())?;
+            let result = play_online_track(&app_for_play, track, Some("320k".into()), None)?;
+            println!(
+                "GX_ONLINE_SEARCH_RESOLVE_OK provider={} id={} quality={}",
+                result.track.provider_id,
+                result.track.provider_track_id,
+                result.quality.as_deref().unwrap_or("unknown")
+            );
+            monitor_full_track_controls(&app_for_play)
+        })
+        .await
+        .map_err(|error| format!("online E2E task failed: {error}"))
+        .and_then(|result| result);
+        match result {
+            Ok(()) => {
+                println!("GX_ONLINE_SEARCH_TO_NATIVE_STREAM_OK");
+                if std::env::var_os("GX_PHASE2_AUTO_EXIT").is_some() {
+                    app.exit(0);
+                }
+            }
+            Err(error) => {
+                eprintln!("GX_ONLINE_E2E_FAILED {error}");
+                app.exit(2);
+            }
+        }
+    });
+    Ok(())
 }
 
 fn start_phase2_auto_resolve(app: &AppHandle) -> Result<(), String> {
@@ -363,16 +623,72 @@ fn start_phase2_auto_resolve(app: &AppHandle) -> Result<(), String> {
         }
         let app_for_monitor = app.clone();
         let monitor = tauri::async_runtime::spawn_blocking(move || {
+            let full_e2e = std::env::var_os("GX_PHASE2_FULL_E2E").is_some();
             for _ in 0..600 {
                 let snapshot = app_for_monitor.state::<LocalAudioEngine>().snapshot();
                 if snapshot.status == gx_contracts::PlaybackStatus::Playing
                     && snapshot.position_seconds > 0.2
+                    && !full_e2e
                 {
                     println!(
                         "GX_PHASE2_NATIVE_STREAM_PLAYBACK_OK position={:.3} underruns={}",
                         snapshot.position_seconds, snapshot.underrun_callbacks
                     );
                     return Ok(());
+                }
+                if snapshot.status == gx_contracts::PlaybackStatus::Playing
+                    && snapshot.position_seconds > 1.0
+                    && full_e2e
+                {
+                    let duration = snapshot.duration_seconds.ok_or_else(|| {
+                        "full-track smoke did not expose a media duration".to_owned()
+                    })?;
+                    if duration <= 60.0 {
+                        return Err(format!(
+                            "full-track smoke resolved only {duration:.1}s; refusing to accept a preview"
+                        ));
+                    }
+                    if snapshot.underrun_callbacks != 0 {
+                        return Err(format!(
+                            "full-track smoke underrun before controls: {}",
+                            snapshot.underrun_callbacks
+                        ));
+                    }
+                    let engine = app_for_monitor.state::<LocalAudioEngine>();
+                    engine.pause().map_err(|error| error.to_string())?;
+                    std::thread::sleep(Duration::from_millis(300));
+                    let paused = engine.snapshot();
+                    if paused.status != gx_contracts::PlaybackStatus::Paused {
+                        return Err(format!(
+                            "pause smoke expected Paused, got {:?}",
+                            paused.status
+                        ));
+                    }
+                    engine.seek(30.0).map_err(|error| error.to_string())?;
+                    engine.play().map_err(|error| error.to_string())?;
+                    for _ in 0..300 {
+                        let after_seek = app_for_monitor.state::<LocalAudioEngine>().snapshot();
+                        if after_seek.status == gx_contracts::PlaybackStatus::Failed {
+                            return Err(after_seek
+                                .error
+                                .unwrap_or_else(|| "playback failed after Range seek".into()));
+                        }
+                        if after_seek.position_seconds > 35.0 {
+                            if after_seek.underrun_callbacks != 0 {
+                                return Err(format!(
+                                    "full-track smoke underruns after seek: {}",
+                                    after_seek.underrun_callbacks
+                                ));
+                            }
+                            println!(
+                                "GX_PHASE2_FULL_TRACK_CONTROLS_OK duration={duration:.3} position={:.3} underruns=0",
+                                after_seek.position_seconds
+                            );
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    return Err("Range seek did not resume within 30 seconds".into());
                 }
                 if snapshot.status == gx_contracts::PlaybackStatus::Failed {
                     return Err(snapshot
@@ -402,6 +718,72 @@ fn start_phase2_auto_resolve(app: &AppHandle) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+fn monitor_full_track_controls(app: &AppHandle) -> Result<(), String> {
+    for _ in 0..600 {
+        let snapshot = app.state::<LocalAudioEngine>().snapshot();
+        if snapshot.status == gx_contracts::PlaybackStatus::Failed {
+            return Err(snapshot
+                .error
+                .unwrap_or_else(|| "online playback failed".into()));
+        }
+        if snapshot.status == gx_contracts::PlaybackStatus::Playing
+            && snapshot.position_seconds > 1.0
+        {
+            let duration = snapshot
+                .duration_seconds
+                .ok_or_else(|| "full-track smoke did not expose a media duration".to_owned())?;
+            if duration <= 60.0 {
+                return Err(format!(
+                    "full-track smoke resolved only {duration:.1}s; refusing to accept a preview"
+                ));
+            }
+            if snapshot.underrun_callbacks != 0 {
+                return Err(format!(
+                    "full-track smoke underrun before controls: {}",
+                    snapshot.underrun_callbacks
+                ));
+            }
+            let engine = app.state::<LocalAudioEngine>();
+            engine.pause().map_err(|error| error.to_string())?;
+            std::thread::sleep(Duration::from_millis(300));
+            let paused = engine.snapshot();
+            if paused.status != gx_contracts::PlaybackStatus::Paused {
+                return Err(format!(
+                    "pause smoke expected Paused, got {:?}",
+                    paused.status
+                ));
+            }
+            engine.seek(30.0).map_err(|error| error.to_string())?;
+            engine.play().map_err(|error| error.to_string())?;
+            for _ in 0..300 {
+                let after_seek = app.state::<LocalAudioEngine>().snapshot();
+                if after_seek.status == gx_contracts::PlaybackStatus::Failed {
+                    return Err(after_seek
+                        .error
+                        .unwrap_or_else(|| "playback failed after Range seek".into()));
+                }
+                if after_seek.position_seconds > 35.0 {
+                    if after_seek.underrun_callbacks != 0 {
+                        return Err(format!(
+                            "full-track smoke underruns after seek: {}",
+                            after_seek.underrun_callbacks
+                        ));
+                    }
+                    println!(
+                        "GX_FULL_TRACK_CONTROLS_OK duration={duration:.3} position={:.3} underruns=0",
+                        after_seek.position_seconds
+                    );
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return Err("Range seek did not resume within 30 seconds".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("online playback did not start within 60 seconds".into())
 }
 
 fn resolve_serialized(
@@ -730,5 +1112,62 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn builds_only_music_url_requests_from_lx_catalog_payloads() {
+        let track = CatalogTrack {
+            provider_id: "kw".into(),
+            provider_track_id: "228908".into(),
+            title: "晴天".into(),
+            artist: "周杰伦".into(),
+            album: "叶惠美".into(),
+            duration_ms: Some(269_000),
+            artwork_url: None,
+            resolver_payload: json!({
+                "source": "kw",
+                "musicInfo": {
+                    "name": "晴天",
+                    "singer": "周杰伦",
+                    "source": "kw",
+                    "songmid": "228908"
+                }
+            }),
+            preview: None,
+        };
+        let payload = lx_music_url_payload(&track, "320k").unwrap();
+        assert_eq!(payload["action"], "musicUrl");
+        assert_eq!(payload["source"], "kw");
+        assert_eq!(payload["info"]["type"], "320k");
+        assert_eq!(payload["info"]["musicInfo"]["songmid"], "228908");
+    }
+
+    #[test]
+    fn rejects_non_lx_catalog_payloads() {
+        let track = CatalogTrack {
+            provider_id: "itunes".into(),
+            provider_track_id: "1".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: String::new(),
+            duration_ms: None,
+            artwork_url: None,
+            resolver_payload: json!({ "provider": "itunes", "trackId": 1 }),
+            preview: None,
+        };
+        assert!(lx_music_url_payload(&track, "128k").is_err());
+    }
+
+    #[test]
+    fn preview_guard_scales_with_catalog_duration() {
+        assert_eq!(minimum_full_track_bytes(None), 512 * 1024);
+        assert_eq!(minimum_full_track_bytes(Some(269_000)), 807_000);
+        assert!(185_336 < minimum_full_track_bytes(Some(269_000)));
+        assert!(10_792_943 > minimum_full_track_bytes(Some(269_000)));
+        assert_eq!(
+            parse_content_range_total("bytes 0-0/10792943"),
+            Some(10_792_943)
+        );
+        assert_eq!(parse_content_range_total("bytes */*"), None);
     }
 }

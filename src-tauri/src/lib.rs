@@ -20,10 +20,10 @@ use metadata_commands::{
     metadata_play_preview, metadata_search,
 };
 use source_commands::{
-    lx_http_request, lx_runtime_failure, lx_runtime_result, lx_send, source_activate,
-    source_export_backup, source_import_file, source_import_url, source_list, source_reload,
-    source_remove, source_resolve, source_restore_backup, source_set_updates_enabled,
-    source_status,
+    lx_http_request, lx_runtime_failure, lx_runtime_result, lx_send, player_play_online_track,
+    source_activate, source_export_backup, source_import_file, source_import_url, source_list,
+    source_reload, source_remove, source_resolve, source_restore_backup,
+    source_set_updates_enabled, source_status,
 };
 use source_runtime::SourceRuntime;
 
@@ -592,9 +592,7 @@ fn phase1_script_path() -> PathBuf {
 /// Adaptive 16:10 from the active monitor (cap 1280×86% height), matching the former
 /// frontend placeWindow — but done here so the UI does not open small then jump larger.
 fn place_and_show_main_window(window: &WebviewWindow) -> tauri::Result<()> {
-    let monitor = window
-        .current_monitor()?
-        .or(window.primary_monitor()?);
+    let monitor = window.current_monitor()?.or(window.primary_monitor()?);
 
     if let Some(monitor) = monitor {
         let scale = monitor.scale_factor();
@@ -689,7 +687,34 @@ pub fn run() {
             let app_data = isolated_smoke_data_root().unwrap_or(app.path().app_data_dir()?);
             app.manage(LibraryStore::open(app_data.join("library.sqlite3"))?);
             let source_root = app_data.join("sources");
-            let mut source_store = SourceStore::open(source_root)?;
+            let drop_in_root = source_root.join("drop-in");
+            let mut source_store = SourceStore::open(&source_root)?;
+            match source_store.import_drop_in_dir(&drop_in_root) {
+                Ok(report) => {
+                    if report.discovered > 0 {
+                        println!(
+                            "LX drop-in scan completed: directory={} discovered={} imported={} already_present={} failed={} active_source_id={}",
+                            drop_in_root.display(),
+                            report.discovered,
+                            report.imported.len(),
+                            report.already_present.len(),
+                            report.failures.len(),
+                            report.active_source_id.as_deref().unwrap_or("none")
+                        );
+                    }
+                    for failure in report.failures {
+                        eprintln!(
+                            "LX drop-in source skipped: path={} error={}",
+                            failure.path.display(),
+                            failure.error
+                        );
+                    }
+                }
+                Err(error) => eprintln!(
+                    "LX drop-in directory scan failed: directory={} error={error}",
+                    drop_in_root.display()
+                ),
+            }
             if let Some(path) = std::env::var_os("GX_PHASE2_LX_SCRIPT") {
                 source_store.import_file(&PathBuf::from(path))?;
             }
@@ -710,6 +735,7 @@ pub fn run() {
             ui_ready,
             player_load_local,
             player_load_resolved,
+            player_play_online_track,
             player_play,
             player_pause,
             player_seek,

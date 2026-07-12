@@ -13,6 +13,7 @@ import {
   type LibraryTrack,
   type ListedSource,
   type LyricDocument,
+  type OnlinePlaybackResult,
   type PlaylistSummary,
   type RuntimeStatus,
   type ViewId,
@@ -240,6 +241,7 @@ function App() {
   const [chartTracks, setChartTracks] = useState<CatalogTrack[]>([]);
   const [suggestionOpen, setSuggestionOpen] = useState(false);
   const [suggestionIndex, setSuggestionIndex] = useState(-1);
+  const [playingCatalogKey, setPlayingCatalogKey] = useState<string | null>(null);
   const searchRequest = useRef<AbortController | null>(null);
 
   const [selectedCatalogTrack, setSelectedCatalogTrack] = useState<CatalogTrack | null>(null);
@@ -322,6 +324,22 @@ function App() {
   const currentArtwork = selectedCatalogTrack?.artworkUrl ?? null;
   const isPlaying = snapshot.status === "playing" || snapshot.status === "loading";
   const shownPosition = dragPosition ?? snapshot.positionSeconds;
+  const activeSource = sources.find((source) => source.id === runtime?.activeSourceId || source.active) ?? null;
+  const sourceStatus = (() => {
+    switch (runtime?.state) {
+      case "ready":
+        return {
+          title: "音源已就绪",
+          copy: activeSource?.metadata.name ? `当前音源：${activeSource.metadata.name}` : "在线歌曲可解析为整首播放。",
+        };
+      case "initializing":
+        return { title: "音源正在初始化", copy: activeSource?.metadata.name ? `正在启动：${activeSource.metadata.name}` : "请稍候，音源沙箱正在启动。" };
+      case "failed":
+        return { title: "音源启动失败", copy: runtime.error ?? "请检查音源脚本后重试。" };
+      default:
+        return { title: "还没有可用音源", copy: "导入 LX 音源脚本后，在线歌曲才能解析为整首播放。" };
+    }
+  })();
 
   useEffect(() => {
     let disposed = false;
@@ -416,23 +434,53 @@ function App() {
   };
 
   const playCatalog = async (wanted: CatalogTrack) => {
+    const catalogKey = `${wanted.providerId}:${wanted.providerTrackId}`;
+    if (playingCatalogKey) return;
+    setPlayingCatalogKey(catalogKey);
+    setSuggestionOpen(false);
     try {
-      const selected = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
-        wanted,
-        candidates: searchResults.length ? searchResults : suggestions,
-      });
-      setSelectedCatalogTrack(selected.track);
-      const lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
-        title: wanted.title,
-        artist: wanted.artist,
-        durationMs: wanted.durationMs,
-      });
-      setLyrics(lyricDocument);
+      let selectedTrack: CatalogTrack;
+      let playbackMessage = "";
+      try {
+        const online = await invoke<OnlinePlaybackResult>("player_play_online_track", {
+          track: wanted,
+          quality: "320k",
+          sourceId: null,
+        });
+        selectedTrack = online.track;
+        const sourceLabel = online.sourceName || activeSource?.metadata.name || "当前 LX 音源";
+        playbackMessage = `${sourceLabel} 已解析整首播放${online.quality ? ` · ${online.quality}` : ""}。`;
+      } catch (onlineError) {
+        try {
+          const preview = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
+            wanted,
+            candidates: searchResults.length ? searchResults : suggestions,
+          });
+          selectedTrack = preview.track;
+          playbackMessage = `LX 整首解析失败，已回退为 ${preview.track.providerId} 官方 30 秒预览。原因：${String(onlineError)}`;
+        } catch (previewError) {
+          throw new Error(`LX 整首播放失败：${String(onlineError)}；官方 30 秒预览也失败：${String(previewError)}`);
+        }
+      }
+
+      setSelectedCatalogTrack(selectedTrack);
+      setLyrics(null);
       setView("now-playing");
-      setSuggestionOpen(false);
-      setMessage(selected.replacedProviderId ? `原平台不可播，已切换到 ${selected.track.providerId}。` : "");
+      setMessage(playbackMessage);
+      try {
+        const lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
+          title: selectedTrack.title,
+          artist: selectedTrack.artist,
+          durationMs: selectedTrack.durationMs,
+        });
+        setLyrics(lyricDocument);
+      } catch (lyricError) {
+        setMessage(`${playbackMessage} 歌曲已播放，但歌词加载失败：${String(lyricError)}`);
+      }
     } catch (error) {
       setMessage(String(error));
+    } finally {
+      setPlayingCatalogKey(null);
     }
   };
 
@@ -578,15 +626,18 @@ function App() {
 
   const renderCatalogRows = (tracks: CatalogTrack[]) => (
     <div className="catalog-grid">
-      {tracks.map((track) => (
-        <button className="catalog-card" onClick={() => void playCatalog(track)} key={`${track.providerId}:${track.providerTrackId}`}>
+      {tracks.map((track) => {
+        const trackKey = `${track.providerId}:${track.providerTrackId}`;
+        const resolving = playingCatalogKey === trackKey;
+        return (
+        <button className="catalog-card" disabled={playingCatalogKey !== null} aria-busy={resolving} onClick={() => void playCatalog(track)} key={trackKey}>
           <Cover artwork={track.artworkUrl} title={track.title} />
           <strong>{track.title}</strong>
           <span>{track.artist}</span>
-          <small>{track.album || track.providerId}</small>
-          <i aria-hidden="true">▶</i>
+          <small>{resolving ? "正在解析整首播放…" : track.album || track.providerId}</small>
+          <i aria-hidden="true">{resolving ? "…" : "▶"}</i>
         </button>
-      ))}
+      )})}
     </div>
   );
 
@@ -633,7 +684,7 @@ function App() {
 
     if (view === "search") return (
       <div className="page">
-        <PageHeading eyebrow="SEARCH" title={searchQuery ? `“${searchQuery}” 的结果` : "搜索音乐"} copy="搜索歌曲、歌手或专辑。试听会使用官方预览，并在不可播时寻找跨平台替代。" />
+        <PageHeading eyebrow="SEARCH" title={searchQuery ? `“${searchQuery}” 的结果` : "搜索音乐"} copy={runtime?.state === "ready" ? `${sourceStatus.copy} 点击歌曲将优先解析整首播放，失败时会明确提示并回退官方 30 秒预览。` : `${sourceStatus.title}：${sourceStatus.copy} 当前仍可尝试官方 30 秒预览。`} />
         {searchState === "loading" ? <LoadingState /> : searchResults.length ? renderCatalogRows(searchResults) : <EmptyState title="从顶栏开始搜索" copy="输入歌名、歌手或专辑，联想结果会按类型分组。" />}
       </div>
     );
@@ -648,8 +699,8 @@ function App() {
     );
 
     if (view === "sources") return (
-      <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="音源脚本只负责解析播放地址，运行在独立沙箱中。" action={<button onClick={async () => { const selected = await open({ multiple: false, filters: [{ name: "LX 音源脚本", extensions: ["js"] }] }); if (selected && !Array.isArray(selected)) { await run("source_import_file", { path: selected }); await refreshSources(); } }}>导入脚本</button>} />
-        <section className="source-status-card"><span className={`runtime-dot ${runtime?.state ?? "no_source"}`} /><div><strong>{runtime?.state === "ready" ? "音源已就绪" : "还没有可用音源"}</strong><p>{runtime?.error ?? "导入后可以解析在线歌曲的播放地址。"}</p></div><code>GEN {runtime?.generation ?? 0}</code></section>
+      <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="音源脚本运行在独立沙箱中；程序启动时也会自动扫描 %APPDATA%\\com.gxplayer.desktop\\sources\\drop-in 里的 .js。" action={<button onClick={async () => { const selected = await open({ multiple: false, filters: [{ name: "LX 音源脚本", extensions: ["js"] }] }); if (selected && !Array.isArray(selected)) { await run("source_import_file", { path: selected }); await refreshSources(); } }}>导入脚本</button>} />
+        <section className="source-status-card"><span className={`runtime-dot ${runtime?.state ?? "no_source"}`} /><div><strong>{sourceStatus.title}</strong><p>{sourceStatus.copy}</p></div><code>GEN {runtime?.generation ?? 0}</code></section>
         <div className="inline-form"><input aria-label="音源脚本 URL" placeholder="https://…/source.js" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} /><button className="primary" disabled={!sourceUrl.trim()} onClick={async () => { await run("source_import_url", { url: sourceUrl.trim() }); setSourceUrl(""); await refreshSources(); }}>从 URL 导入</button></div>
         <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div><span className="source-badge">{source.active ? "正在使用" : "可用"}</span><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { await run("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); }} /> 更新提醒</label><button disabled={source.active} onClick={async () => { await run("source_activate", { id: source.id }); await refreshSources(); }}>启用</button><button className="danger" onClick={async () => { await run("source_remove", { id: source.id }); await refreshSources(); }}>删除</button></div></article>)}</div>
       </div>
@@ -710,7 +761,7 @@ function App() {
           {searchState === "loading" && <i className="search-spinner" aria-label="正在搜索" />}
           {suggestionOpen && <div className="suggestions" role="listbox">
             {searchState === "empty" && <div className="suggestion-state">没有找到相关音乐</div>}
-            {suggestions.slice(0, 4).length > 0 && <SuggestionGroup label="歌曲">{suggestions.slice(0, 4).map((track, index) => <button role="option" aria-selected={index === suggestionIndex} className={index === suggestionIndex ? "selected" : ""} key={`${track.providerId}:${track.providerTrackId}`} onMouseDown={(event) => event.preventDefault()} onClick={() => void playCatalog(track)}><span>♪</span><strong>{track.title}</strong><small>{track.artist}</small></button>)}</SuggestionGroup>}
+            {suggestions.slice(0, 4).length > 0 && <SuggestionGroup label="歌曲">{suggestions.slice(0, 4).map((track, index) => { const trackKey = `${track.providerId}:${track.providerTrackId}`; const resolving = playingCatalogKey === trackKey; return <button role="option" aria-selected={index === suggestionIndex} aria-busy={resolving} disabled={playingCatalogKey !== null} className={index === suggestionIndex ? "selected" : ""} key={trackKey} onMouseDown={(event) => event.preventDefault()} onClick={() => void playCatalog(track)}><span>{resolving ? "…" : "♪"}</span><strong>{track.title}</strong><small>{resolving ? "正在解析整首播放…" : track.artist}</small></button>; })}</SuggestionGroup>}
             {artists.length > 0 && <SuggestionGroup label="歌手">{artists.map((artist) => <button key={artist} onClick={() => { setSearchQuery(artist); void submitSearch(artist); }}><span>●</span><strong>{artist}</strong><small>歌手</small></button>)}</SuggestionGroup>}
             {albums.length > 0 && <SuggestionGroup label="专辑">{albums.map((album) => <button key={album} onClick={() => { setSearchQuery(album); void submitSearch(album); }}><span>◉</span><strong>{album}</strong><small>专辑</small></button>)}</SuggestionGroup>}
             <button className="view-all" onMouseDown={(event) => event.preventDefault()} onClick={() => void submitSearch()}>查看“{searchQuery}”的全部结果 <span>→</span></button>

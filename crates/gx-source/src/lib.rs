@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,6 +78,21 @@ pub enum SourceStoreError {
     Json(#[from] serde_json::Error),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropInImportIssue {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DropInImportReport {
+    pub discovered: usize,
+    pub imported: Vec<ManagedSource>,
+    pub already_present: Vec<ManagedSource>,
+    pub failures: Vec<DropInImportIssue>,
+    pub active_source_id: Option<String>,
+}
+
 pub struct SourceStore {
     root: PathBuf,
     config: SourceConfig,
@@ -143,6 +160,112 @@ impl SourceStore {
             .and_then(|value| value.to_str())
             .unwrap_or("LX Source");
         self.import_script(&script, path.display().to_string(), fallback)
+    }
+
+    /// Imports every regular `.js` file from an external user-managed directory.
+    ///
+    /// Individual bad files are reported and skipped so one broken community source cannot
+    /// prevent the application from starting. Files are processed in a stable path order. An
+    /// already-valid active source is preserved; otherwise the first loadable drop-in becomes
+    /// active (falling back to the lexicographically smallest managed source when necessary).
+    pub fn import_drop_in_dir(
+        &mut self,
+        directory: &Path,
+    ) -> Result<DropInImportReport, SourceStoreError> {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(DropInImportReport {
+                    active_source_id: self.valid_active_source_id(),
+                    ..DropInImportReport::default()
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut report = DropInImportReport::default();
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    report.failures.push(DropInImportIssue {
+                        path: directory.to_path_buf(),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let is_regular_file = match entry.file_type() {
+                Ok(file_type) => file_type.is_file(),
+                Err(error) => {
+                    report.failures.push(DropInImportIssue {
+                        path,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if is_regular_file
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("js"))
+            {
+                paths.push(path);
+            }
+        }
+        paths.sort_by(|left, right| {
+            left.to_string_lossy()
+                .to_lowercase()
+                .cmp(&right.to_string_lossy().to_lowercase())
+                .then_with(|| left.cmp(right))
+        });
+        report.discovered = paths.len();
+
+        let valid_active_before_import = self.valid_active_source_id();
+        let mut known_ids: HashSet<String> = self
+            .config
+            .sources
+            .iter()
+            .map(|source| source.id.clone())
+            .collect();
+        let mut first_loadable_id = None;
+
+        for path in paths {
+            match self.import_file(&path) {
+                Ok(source) => {
+                    first_loadable_id.get_or_insert_with(|| source.id.clone());
+                    if known_ids.insert(source.id.clone()) {
+                        report.imported.push(source);
+                    } else {
+                        report.already_present.push(source);
+                    }
+                }
+                Err(error) => report.failures.push(DropInImportIssue {
+                    path,
+                    error: error.to_string(),
+                }),
+            }
+        }
+
+        if valid_active_before_import.is_none() {
+            let fallback = first_loadable_id.or_else(|| {
+                self.config
+                    .sources
+                    .iter()
+                    .map(|source| source.id.clone())
+                    .min()
+            });
+            if let Some(id) = fallback
+                && self.config.active_source_id.as_deref() != Some(id.as_str())
+            {
+                self.activate(&id)?;
+            }
+        }
+        report.active_source_id = self.valid_active_source_id();
+        Ok(report)
     }
 
     pub fn activate(&mut self, id: &str) -> Result<(), SourceStoreError> {
@@ -308,6 +431,13 @@ impl SourceStore {
         fs::rename(temporary, self.root.join("sources.json"))?;
         Ok(())
     }
+
+    fn valid_active_source_id(&self) -> Option<String> {
+        self.config
+            .active_source_id
+            .clone()
+            .filter(|id| self.config.sources.iter().any(|source| source.id == *id))
+    }
 }
 
 fn default_true() -> bool {
@@ -353,7 +483,11 @@ fn validate_script(script: &str) -> Result<(), SourceStoreError> {
     }
     if !(script.contains("lx.on")
         || script.contains("globalThis.lx")
-        || script.contains("window.lx"))
+        || script.contains("globalThis['lx']")
+        || script.contains("globalThis[\"lx\"]")
+        || script.contains("window.lx")
+        || script.contains("window['lx']")
+        || script.contains("window[\"lx\"]"))
     {
         return Err(SourceStoreError::InvalidScript);
     }
@@ -415,6 +549,15 @@ mod tests {
             store.import_script("console.log('no')", "test", "bad.js"),
             Err(SourceStoreError::InvalidScript)
         ));
+        assert!(
+            store
+                .import_script(
+                    "const { on, send } = globalThis['lx']; on('request', () => 1)",
+                    "test:bracket-runtime",
+                    "bracket.js"
+                )
+                .is_ok()
+        );
         let oversized = format!(
             "globalThis.lx.on('request',()=>0);{}",
             " ".repeat(MAX_SCRIPT_BYTES)
@@ -423,6 +566,86 @@ mod tests {
             store.import_script(&oversized, "test", "large.js"),
             Err(SourceStoreError::ScriptTooLarge)
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn imports_external_drop_ins_in_stable_order_and_skips_bad_files() {
+        let root = temporary_root();
+        let drop_in = root.join("external-drop-in");
+        fs::create_dir_all(drop_in.join("nested.js")).unwrap();
+        fs::write(
+            drop_in.join("b.js"),
+            "/*!\n * @name Source B\n */\nglobalThis.lx.on('request', () => 2)",
+        )
+        .unwrap();
+        fs::write(
+            drop_in.join("A.JS"),
+            "/*!\n * @name Source A\n */\nlx.on('request', () => 1)",
+        )
+        .unwrap();
+        fs::write(drop_in.join("bad.js"), "console.log('not lx')").unwrap();
+        fs::write(drop_in.join("ignored.txt"), "lx.on('request', () => 3)").unwrap();
+
+        let mut store = SourceStore::open(root.join("managed")).unwrap();
+        store.config.active_source_id = Some("stale-source-id".into());
+        store.persist().unwrap();
+        let report = store.import_drop_in_dir(&drop_in).unwrap();
+
+        assert_eq!(report.discovered, 3);
+        assert_eq!(report.imported.len(), 2);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].path, drop_in.join("bad.js"));
+        assert_eq!(store.list().len(), 2);
+        let active = store.active_script().unwrap().unwrap().0;
+        assert_eq!(active.metadata.name, "Source A");
+        assert_eq!(report.active_source_id.as_deref(), Some(active.id.as_str()));
+
+        let second = store.import_drop_in_dir(&drop_in).unwrap();
+        assert!(second.imported.is_empty());
+        assert_eq!(second.already_present.len(), 2);
+        assert_eq!(second.failures.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drop_in_import_preserves_a_valid_active_source() {
+        let root = temporary_root();
+        let drop_in = root.join("drop-in");
+        fs::create_dir_all(&drop_in).unwrap();
+        fs::write(
+            drop_in.join("a.js"),
+            "/*! @name Drop In */\nlx.on('request', () => 1)",
+        )
+        .unwrap();
+        let mut store = SourceStore::open(root.join("managed")).unwrap();
+        let existing = store
+            .import_script(
+                "/*! @name Existing */\nwindow.lx.on('request', () => 0)",
+                "test:existing",
+                "existing.js",
+            )
+            .unwrap();
+
+        let report = store.import_drop_in_dir(&drop_in).unwrap();
+
+        assert_eq!(report.imported.len(), 1);
+        assert_eq!(
+            report.active_source_id.as_deref(),
+            Some(existing.id.as_str())
+        );
+        assert_eq!(store.active_script().unwrap().unwrap().0.id, existing.id);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_drop_in_directory_is_a_noop() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(root.join("managed")).unwrap();
+        let report = store
+            .import_drop_in_dir(&root.join("does-not-exist"))
+            .unwrap();
+        assert_eq!(report, DropInImportReport::default());
         fs::remove_dir_all(root).unwrap();
     }
 

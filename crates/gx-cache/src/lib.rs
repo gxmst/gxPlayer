@@ -36,6 +36,34 @@ pub struct CacheEntry {
     pub completed_at_ms: u64,
     pub last_accessed_at_ms: u64,
     pub pinned: bool,
+    /// Display title captured at complete time (optional for older manifests).
+    #[serde(default)]
+    pub title: String,
+    /// Display artist captured at complete time (optional for older manifests).
+    #[serde(default)]
+    pub artist: String,
+}
+
+/// Frontend-safe cache row — never exposes absolute disk paths.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEntryView {
+    pub provider_id: String,
+    pub provider_track_id: String,
+    pub quality: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub byte_len: u64,
+    pub source_sample_rate: Option<u32>,
+    pub source_bit_depth: Option<u32>,
+    pub source_channels: Option<u16>,
+    pub media_type: MediaType,
+    pub pinned: bool,
+    pub last_accessed_at_ms: u64,
+    pub completed_at_ms: u64,
+    /// Basename only (e.g. `abc123.flac`), never a full path.
+    pub file_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,6 +193,16 @@ impl CacheStore {
     }
 
     pub fn prepare(&self, key: CacheKey, media_type: MediaType) -> CacheWritePlan {
+        self.prepare_with_meta(key, media_type, String::new(), String::new())
+    }
+
+    pub fn prepare_with_meta(
+        &self,
+        key: CacheKey,
+        media_type: MediaType,
+        title: impl Into<String>,
+        artist: impl Into<String>,
+    ) -> CacheWritePlan {
         let state = self.inner.lock().unwrap();
         let id = cache_id(&key);
         let extension = media_extension(&media_type);
@@ -193,11 +231,50 @@ impl CacheStore {
                     completed_at_ms: 0,
                     last_accessed_at_ms: 0,
                     pinned,
+                    title: title.into(),
+                    artist: artist.into(),
                 }),
                 part_path,
                 invalid: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// List all completed cache entries for the offline/cache UI.
+    /// Absolute paths are never included — only `file_name` basenames.
+    pub fn list_entries(&self) -> Vec<CacheEntryView> {
+        let state = self.inner.lock().unwrap();
+        let mut views = state
+            .manifest
+            .entries
+            .values()
+            .filter(|entry| entry.audio_path.is_file())
+            .map(|entry| entry_to_view(entry, &state.settings.online_favorites))
+            .collect::<Vec<_>>();
+        views.sort_by_key(|entry| std::cmp::Reverse(entry.last_accessed_at_ms));
+        views
+    }
+
+    /// Remove one cache entry: audio file + sidecar + manifest row.
+    pub fn remove_entry(&self, key: &CacheKey) -> Result<CacheStatus> {
+        let id = cache_id(key);
+        {
+            let mut state = self.inner.lock().unwrap();
+            if let Some(entry) = state.manifest.entries.get(&id).cloned() {
+                if remove_entry_files(&entry) {
+                    state.manifest.entries.remove(&id);
+                    persist_manifest(&state)?;
+                } else {
+                    bail!(
+                        "failed to delete cache files for {}/{} {}",
+                        key.provider_id,
+                        key.provider_track_id,
+                        key.quality
+                    );
+                }
+            }
+        }
+        Ok(self.status())
     }
 
     pub fn set_limit_bytes(&self, limit_bytes: u64) -> Result<CacheStatus> {
@@ -606,6 +683,50 @@ fn remove_entry_files(entry: &CacheEntry) -> bool {
     }
 }
 
+fn entry_to_view(entry: &CacheEntry, favorites: &BTreeMap<String, Value>) -> CacheEntryView {
+    let fav = favorites.get(&favorite_id(
+        &entry.key.provider_id,
+        &entry.key.provider_track_id,
+    ));
+    let title = non_empty(&entry.title)
+        .or_else(|| fav.and_then(|v| v.get("title").and_then(Value::as_str).map(str::to_owned)))
+        .unwrap_or_else(|| entry.key.provider_track_id.clone());
+    let artist = non_empty(&entry.artist)
+        .or_else(|| fav.and_then(|v| v.get("artist").and_then(Value::as_str).map(str::to_owned)))
+        .unwrap_or_default();
+    let album = fav
+        .and_then(|v| v.get("album").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_default();
+    let file_name = entry
+        .audio_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("audio")
+        .to_owned();
+    CacheEntryView {
+        provider_id: entry.key.provider_id.clone(),
+        provider_track_id: entry.key.provider_track_id.clone(),
+        quality: entry.key.quality.clone(),
+        title,
+        artist,
+        album,
+        byte_len: entry.byte_len,
+        source_sample_rate: entry.source_sample_rate,
+        source_bit_depth: entry.source_bit_depth,
+        source_channels: entry.source_channels,
+        media_type: entry.media_type.clone(),
+        pinned: entry.pinned,
+        last_accessed_at_ms: entry.last_accessed_at_ms,
+        completed_at_ms: entry.completed_at_ms,
+        file_name,
+    }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("JSON path has no parent")?;
     fs::create_dir_all(parent)?;
@@ -718,6 +839,40 @@ mod tests {
         store.set_limit_bytes(1024 * 1024).unwrap();
         assert!(store.lookup(&pinned).is_some());
         assert!(store.lookup(&key("old", "320k")).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_entries_hides_paths_and_remove_deletes_files() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        let plan = store.prepare_with_meta(key("song-a", "320k"), MediaType::Mp3, "歌A", "歌手A");
+        let mut writer = plan.begin().unwrap();
+        writer.append(b"audio-bytes-here");
+        writer.finish(Some(16));
+
+        let listed = store.list_entries();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "歌A");
+        assert_eq!(listed[0].artist, "歌手A");
+        assert_eq!(listed[0].quality, "320k");
+        assert_eq!(listed[0].byte_len, 16);
+        assert!(!listed[0].file_name.contains('\\'));
+        assert!(!listed[0].file_name.contains('/'));
+        // Absolute path must not appear in serialized view.
+        let json = serde_json::to_string(&listed[0]).unwrap();
+        assert!(!json.contains(root.to_str().unwrap_or("___")));
+
+        let audio = store.lookup(&key("song-a", "320k")).unwrap().audio_path;
+        let sidecar = audio.with_extension("json");
+        assert!(audio.is_file());
+        assert!(sidecar.is_file());
+
+        store.remove_entry(&key("song-a", "320k")).unwrap();
+        assert!(store.list_entries().is_empty());
+        assert!(!audio.is_file());
+        assert!(!sidecar.is_file());
+        assert_eq!(store.status().entry_count, 0);
         fs::remove_dir_all(root).unwrap();
     }
 

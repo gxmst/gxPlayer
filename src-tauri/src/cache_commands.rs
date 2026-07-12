@@ -1,4 +1,5 @@
-use gx_cache::{CacheStatus, CacheStore};
+use gx_audio::engine::LocalAudioEngine;
+use gx_cache::{CacheEntryView, CacheKey, CacheStatus, CacheStore};
 use gx_metadata::CatalogTrack;
 use tauri::WebviewWindow;
 
@@ -101,5 +102,60 @@ pub fn cache_set_online_favorite(
             favorite.then_some(value),
             favorite,
         )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn cache_list_entries(
+    window: WebviewWindow,
+    cache: tauri::State<'_, CacheStore>,
+) -> Result<Vec<CacheEntryView>, String> {
+    require_window(&window, "main")?;
+    Ok(cache.list_entries())
+}
+
+#[tauri::command]
+pub fn cache_remove_entry(
+    window: WebviewWindow,
+    cache: tauri::State<'_, CacheStore>,
+    provider_id: String,
+    provider_track_id: String,
+    quality: String,
+) -> Result<CacheStatus, String> {
+    require_window(&window, "main")?;
+    cache
+        .remove_entry(&CacheKey {
+            provider_id,
+            provider_track_id,
+            quality,
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Play a completed cache entry via the local path (no LX resolve).
+#[tauri::command]
+pub fn player_play_cache_entry(
+    window: WebviewWindow,
+    cache: tauri::State<'_, CacheStore>,
+    engine: tauri::State<'_, LocalAudioEngine>,
+    provider_id: String,
+    provider_track_id: String,
+    quality: String,
+    title: Option<String>,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    let key = CacheKey {
+        provider_id,
+        provider_track_id,
+        quality,
+    };
+    let hit = cache
+        .lookup(&key)
+        .ok_or_else(|| "该缓存条目不存在或文件已丢失".to_owned())?;
+    let play_title = title
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| hit.key.provider_track_id.clone());
+    engine
+        .load_cached_online(hit.audio_path, play_title)
         .map_err(|error| error.to_string())
 }

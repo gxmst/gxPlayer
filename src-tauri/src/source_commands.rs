@@ -345,13 +345,15 @@ fn play_online_track(
                     }
                     let resolved_quality =
                         request.quality.clone().unwrap_or_else(|| attempt.clone());
-                    let cache_plan = app.state::<CacheStore>().prepare(
+                    let cache_plan = app.state::<CacheStore>().prepare_with_meta(
                         CacheKey {
                             provider_id: candidate.provider_id.clone(),
                             provider_track_id: candidate.provider_track_id.clone(),
                             quality: resolved_quality.clone(),
                         },
                         request.media_type.clone(),
+                        candidate.title.clone(),
+                        candidate.artist.clone(),
                     );
                     app.state::<LocalAudioEngine>()
                         .load_resolved_cached(request, candidate.title.clone(), Some(cache_plan))

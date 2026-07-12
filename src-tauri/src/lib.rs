@@ -19,8 +19,9 @@ mod source_commands;
 mod source_runtime;
 
 use cache_commands::{
-    cache_clear, cache_online_favorites, cache_reset_directory, cache_set_directory,
-    cache_set_limit, cache_set_online_favorite, cache_status,
+    cache_clear, cache_list_entries, cache_online_favorites, cache_remove_entry,
+    cache_reset_directory, cache_set_directory, cache_set_limit, cache_set_online_favorite,
+    cache_status, player_play_cache_entry,
 };
 use metadata_commands::{
     maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
@@ -952,8 +953,11 @@ pub fn run() {
             cache_set_directory,
             cache_reset_directory,
             cache_clear,
+            cache_list_entries,
+            cache_remove_entry,
             cache_online_favorites,
-            cache_set_online_favorite
+            cache_set_online_favorite,
+            player_play_cache_entry
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

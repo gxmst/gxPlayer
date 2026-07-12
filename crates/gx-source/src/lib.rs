@@ -5,12 +5,14 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub mod safe_http;
 
 const MAX_SCRIPT_BYTES: usize = 5 * 1024 * 1024;
+const MAX_CONFIG_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +34,8 @@ pub struct ManagedSource {
     pub metadata: ScriptMetadata,
     #[serde(default = "default_true")]
     pub updates_enabled: bool,
+    #[serde(default = "empty_config")]
+    pub config: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +53,8 @@ pub struct BackupSource {
     pub fallback_name: String,
     pub updates_enabled: bool,
     pub script: String,
+    #[serde(default = "empty_config")]
+    pub config: Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +78,10 @@ pub enum SourceStoreError {
     InvalidBackupVersion(u32),
     #[error("source backup exceeds the allowed source count or total size")]
     BackupTooLarge,
+    #[error("source config must be a JSON object")]
+    InvalidConfig,
+    #[error("source config is larger than 256 KiB")]
+    ConfigTooLarge,
     #[error("source storage I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("source storage JSON failed: {0}")]
@@ -144,6 +154,7 @@ impl SourceStore {
             imported_at_ms: unix_time_ms(),
             metadata,
             updates_enabled: true,
+            config: empty_config(),
         };
         self.config.sources.push(source.clone());
         if self.config.active_source_id.is_none() {
@@ -287,6 +298,27 @@ impl SourceStore {
         self.persist()
     }
 
+    pub fn config(&self, id: &str) -> Result<Value, SourceStoreError> {
+        self.config
+            .sources
+            .iter()
+            .find(|source| source.id == id)
+            .map(|source| source.config.clone())
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))
+    }
+
+    pub fn set_config(&mut self, id: &str, config: Value) -> Result<(), SourceStoreError> {
+        validate_config(&config)?;
+        let source = self
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == id)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
+        source.config = config;
+        self.persist()
+    }
+
     pub fn active_updates_enabled(&self) -> bool {
         self.config
             .active_source_id
@@ -360,6 +392,7 @@ impl SourceStore {
                     fallback_name: source.metadata.name.clone(),
                     updates_enabled: source.updates_enabled,
                     script: fs::read_to_string(&source.script_path)?,
+                    config: source.config.clone(),
                 })
             })
             .collect::<Result<Vec<_>, SourceStoreError>>()?;
@@ -374,18 +407,17 @@ impl SourceStore {
         if backup.version != 1 {
             return Err(SourceStoreError::InvalidBackupVersion(backup.version));
         }
-        if backup.sources.len() > 64
-            || backup
-                .sources
-                .iter()
-                .map(|source| source.script.len())
-                .sum::<usize>()
-                > 20 * 1024 * 1024
-        {
+        let total_size = backup.sources.iter().try_fold(0usize, |total, source| {
+            Ok::<_, SourceStoreError>(
+                total + source.script.len() + serde_json::to_vec(&source.config)?.len(),
+            )
+        })?;
+        if backup.sources.len() > 64 || total_size > 20 * 1024 * 1024 {
             return Err(SourceStoreError::BackupTooLarge);
         }
         for source in &backup.sources {
             validate_script(&source.script)?;
+            validate_config(&source.config)?;
         }
         let mut restored = Vec::with_capacity(backup.sources.len());
         for source in backup.sources {
@@ -405,6 +437,7 @@ impl SourceStore {
                 imported_at_ms: unix_time_ms(),
                 metadata: parse_script_metadata(&source.script, &source.fallback_name),
                 updates_enabled: source.updates_enabled,
+                config: source.config,
             });
         }
         for old in &self.config.sources {
@@ -442,6 +475,55 @@ impl SourceStore {
 
 fn default_true() -> bool {
     true
+}
+
+fn empty_config() -> Value {
+    Value::Object(Default::default())
+}
+
+fn validate_config(config: &Value) -> Result<(), SourceStoreError> {
+    if !config.is_object() {
+        return Err(SourceStoreError::InvalidConfig);
+    }
+    if let Some(ls_config) = config.get("lsConfig")
+        && !ls_config.is_object()
+    {
+        return Err(SourceStoreError::InvalidConfig);
+    }
+    if let Some(overrides) = config.get("keyOverrides") {
+        let Some(overrides) = overrides.as_array() else {
+            return Err(SourceStoreError::InvalidConfig);
+        };
+        for item in overrides {
+            let Some(item) = item.as_object() else {
+                return Err(SourceStoreError::InvalidConfig);
+            };
+            let Some(const_name) = item.get("constName").and_then(Value::as_str) else {
+                return Err(SourceStoreError::InvalidConfig);
+            };
+            if !is_safe_const_name(const_name)
+                || item.get("value").and_then(Value::as_str).is_none()
+            {
+                return Err(SourceStoreError::InvalidConfig);
+            }
+        }
+    }
+    let size = serde_json::to_vec(config)?.len();
+    if size > MAX_CONFIG_BYTES {
+        return Err(SourceStoreError::ConfigTooLarge);
+    }
+    Ok(())
+}
+
+fn is_safe_const_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && chars.all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '$'
+        })
 }
 
 pub fn parse_script_metadata(script: &str, fallback_name: &str) -> ScriptMetadata {
@@ -528,6 +610,12 @@ mod tests {
         let second = store.import_script(script_b, "test:b", "b.js").unwrap();
         store.activate(&second.id).unwrap();
         store.set_updates_enabled(&second.id, false).unwrap();
+        store
+            .set_config(
+                &second.id,
+                serde_json::json!({ "api": { "addr": "https://example.com", "pass": "secret" } }),
+            )
+            .unwrap();
         assert!(!store.active_updates_enabled());
         let backup = store.export_backup().unwrap();
         assert_eq!(store.active_script().unwrap().unwrap().0.id, second.id);
@@ -536,6 +624,7 @@ mod tests {
         store.restore_backup(backup).unwrap();
         assert_eq!(store.active_script().unwrap().unwrap().0.id, second.id);
         assert!(!store.active_updates_enabled());
+        assert_eq!(store.config(&second.id).unwrap()["api"]["pass"], "secret");
         drop(store);
         assert_eq!(SourceStore::open(&root).unwrap().list().len(), 2);
         fs::remove_dir_all(root).unwrap();
@@ -558,6 +647,23 @@ mod tests {
                 )
                 .is_ok()
         );
+        let source = store
+            .import_script("lx.on('request', () => 1)", "test", "valid.js")
+            .unwrap();
+        assert!(matches!(
+            store.set_config(&source.id, Value::String("secret".into())),
+            Err(SourceStoreError::InvalidConfig)
+        ));
+        assert!(matches!(
+            store.set_config(
+                &source.id,
+                serde_json::json!({
+                    "lsConfig": {},
+                    "keyOverrides": [{"constName":"bad-name","value":"secret"}]
+                })
+            ),
+            Err(SourceStoreError::InvalidConfig)
+        ));
         let oversized = format!(
             "globalThis.lx.on('request',()=>0);{}",
             " ".repeat(MAX_SCRIPT_BYTES)

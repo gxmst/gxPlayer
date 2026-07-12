@@ -31,4 +31,5 @@ gx-source = { path = "../crates/gx-source" }
 gx-metadata = { path = "../crates/gx-metadata" }
 gx-library = { path = "../crates/gx-library" }
 reqwest.workspace = true
+regex.workspace = true
 url.workspace = true

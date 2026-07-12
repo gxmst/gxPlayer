@@ -37,6 +37,7 @@ export type ListedSource = {
   };
   updatesEnabled: boolean;
   active: boolean;
+  hasConfig: boolean;
 };
 
 export type CatalogTrack = {

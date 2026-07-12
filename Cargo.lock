@@ -1714,6 +1714,7 @@ dependencies = [
  "gx-library",
  "gx-metadata",
  "gx-source",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

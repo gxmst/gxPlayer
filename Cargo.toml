@@ -28,6 +28,7 @@ anyhow = "1.0.103"
 cpal = "0.15.3"
 crossbeam-channel = "0.5.15"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
+regex = "=1.13.0"
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 ringbuf = "0.4.8"
 rubato = "0.16.2"

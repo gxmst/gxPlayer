@@ -15,7 +15,8 @@ use serde_json::{Map, Value, json};
 use tauri::{AppHandle, Manager, WebviewWindow};
 
 use crate::source_runtime::{
-    ListedSource, RuntimeStatus, ScriptLaunch, SourceRuntime, normalize_media_request,
+    ListedSource, PublicSource, RuntimeStatus, ScriptLaunch, SourceRuntime, ensure_json_size,
+    normalize_media_request,
 };
 use crate::{LxHttpResponse, LxPocState, SANDBOX_LABEL, require_window};
 
@@ -28,7 +29,7 @@ const RUNTIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportResult {
-    pub source: gx_source::ManagedSource,
+    pub source: PublicSource,
     pub runtime: RuntimeStatus,
 }
 
@@ -77,7 +78,7 @@ pub fn source_import_file(
         Ok::<_, String>(source)
     })?;
     Ok(ImportResult {
-        source,
+        source: PublicSource::from(&source),
         runtime: runtime.status(),
     })
 }
@@ -123,7 +124,7 @@ pub async fn source_import_url(
         Ok::<_, String>(source)
     })?;
     Ok(ImportResult {
-        source,
+        source: PublicSource::from(&source),
         runtime: runtime.status(),
     })
 }
@@ -190,6 +191,51 @@ pub fn source_set_updates_enabled(
             .set_updates_enabled(&id, enabled)
             .map_err(|error| error.to_string())
     })
+}
+
+#[tauri::command]
+pub fn source_get_config(
+    window: WebviewWindow,
+    runtime: tauri::State<SourceRuntime>,
+    id: String,
+) -> Result<Value, String> {
+    require_window(&window, "main")?;
+    runtime.config(&id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn source_set_config(
+    window: WebviewWindow,
+    runtime: tauri::State<SourceRuntime>,
+    id: String,
+    config: Value,
+) -> Result<RuntimeStatus, String> {
+    require_window(&window, "main")?;
+    ensure_json_size(
+        &config,
+        crate::source_runtime::MAX_RUNTIME_PAYLOAD_BYTES,
+        "source config",
+    )?;
+    if !config.is_object() {
+        return Err("source config must be a JSON object".into());
+    }
+    runtime.serialized(|| {
+        let is_active = runtime
+            .list()
+            .into_iter()
+            .any(|source| source.active && source.source.id == id);
+        runtime
+            .set_config(&id, config)
+            .map_err(|error| error.to_string())?;
+        if is_active {
+            reload_runtime(
+                &window.app_handle().get_webview_window(SANDBOX_LABEL),
+                &runtime,
+            )?;
+        }
+        Ok::<_, String>(())
+    })?;
+    Ok(runtime.status())
 }
 
 #[tauri::command]
@@ -1004,11 +1050,13 @@ fn reload_runtime(sandbox: &Option<WebviewWindow>, runtime: &SourceRuntime) -> R
 }
 
 fn evaluate_launch(window: &WebviewWindow, launch: &ScriptLaunch) -> Result<(), String> {
-    let script = serde_json::to_string(&launch.script).map_err(|error| error.to_string())?;
+    let (ls_config, key_overrides) = split_source_config(&launch.source.config);
+    let executable_script = apply_key_overrides(&launch.script, key_overrides)?;
+    let script = serde_json::to_string(&executable_script).map_err(|error| error.to_string())?;
     let config = if std::env::var_os("GX_PHASE2_LX_MOCK").is_some() {
         json!({ "api": { "addr": "http://gx.invalid/", "pass": "" } })
     } else {
-        json!({})
+        ls_config
     };
     let context = json!({
         "generation": launch.generation,
@@ -1018,7 +1066,7 @@ fn evaluate_launch(window: &WebviewWindow, launch: &ScriptLaunch) -> Result<(), 
             "version": launch.source.metadata.version,
             "author": launch.source.metadata.author,
             "homepage": launch.source.metadata.homepage,
-            "rawScript": launch.script
+            "rawScript": executable_script
         },
         "config": config
     });
@@ -1028,6 +1076,62 @@ fn evaluate_launch(window: &WebviewWindow, launch: &ScriptLaunch) -> Result<(), 
             "window.__gxRunCommunityScript({script}, {context})"
         ))
         .map_err(|error| error.to_string())
+}
+
+fn split_source_config(config: &Value) -> (Value, &[Value]) {
+    let Some(object) = config.as_object() else {
+        return (json!({}), &[]);
+    };
+    let is_structured = object.contains_key("lsConfig") || object.contains_key("keyOverrides");
+    let ls_config = if is_structured {
+        object.get("lsConfig").cloned().unwrap_or_else(|| json!({}))
+    } else {
+        config.clone()
+    };
+    let key_overrides = object
+        .get("keyOverrides")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    (ls_config, key_overrides)
+}
+
+fn apply_key_overrides(script: &str, overrides: &[Value]) -> Result<String, String> {
+    let mut output = script.to_owned();
+    for item in overrides {
+        let Some(const_name) = item.get("constName").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(value) = item.get("value").and_then(Value::as_str) else {
+            continue;
+        };
+        if !is_safe_const_name(const_name) {
+            continue;
+        }
+        let name = regex::escape(const_name);
+        let pattern = format!(
+            r#"(?m)^([\t ]*const[\t ]+{name}[\t ]*=[\t ]*)(?:'(?:\\.|[^'\\\r\n])*'|\"(?:\\.|[^\"\\\r\n])*\")"#
+        );
+        let regex = regex::Regex::new(&pattern).map_err(|error| error.to_string())?;
+        let literal = serde_json::to_string(value).map_err(|error| error.to_string())?;
+        output = regex
+            .replacen(&output, 1, |captures: &regex::Captures<'_>| {
+                format!("{}{}", &captures[1], literal)
+            })
+            .into_owned();
+    }
+    Ok(output)
+}
+
+fn is_safe_const_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && chars.all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '$'
+        })
 }
 
 fn parse_http_request(url: &str, options: Value) -> Result<SafeHttpRequest, String> {
@@ -1255,5 +1359,49 @@ mod tests {
             quality_attempts(&capabilities, "legacy", Some("flac")),
             ["320k", "128k"]
         );
+    }
+
+    #[test]
+    fn splits_structured_and_legacy_source_config() {
+        let structured = json!({
+            "lsConfig": { "api": { "addr": "https://api.example" } },
+            "keyOverrides": [{ "constName": "YuNingXi", "value": "secret" }]
+        });
+        let (ls_config, overrides) = split_source_config(&structured);
+        assert_eq!(ls_config["api"]["addr"], "https://api.example");
+        assert_eq!(overrides[0]["constName"], "YuNingXi");
+
+        let legacy = json!({ "api": { "pass": "old-secret" } });
+        let (ls_config, overrides) = split_source_config(&legacy);
+        assert_eq!(ls_config, legacy);
+        assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn key_override_only_replaces_first_anchored_const_declaration() {
+        let script = "const YuNingXi = ''; // key\nconst YuNingXi = 'second';\nlet YuNingXi = 'third';\nconst Other = 'YuNingXi';";
+        let output = apply_key_overrides(
+            script,
+            &[json!({ "constName": "YuNingXi", "value": "a'\\\"b\\nc" })],
+        )
+        .unwrap();
+        assert!(output.starts_with("const YuNingXi = \"a'\\\\\\\"b\\\\nc\"; // key"));
+        assert!(output.contains("const YuNingXi = 'second';"));
+        assert!(output.contains("let YuNingXi = 'third';"));
+        assert!(output.contains("const Other = 'YuNingXi';"));
+    }
+
+    #[test]
+    fn key_override_skips_missing_or_unsafe_constant_names() {
+        let script = "const Safe = 'original';";
+        let output = apply_key_overrides(
+            script,
+            &[
+                json!({ "constName": "Missing", "value": "x" }),
+                json!({ "constName": "Safe; globalThis.pwned", "value": "x" }),
+            ],
+        )
+        .unwrap();
+        assert_eq!(output, script);
     }
 }

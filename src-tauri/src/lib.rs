@@ -21,9 +21,9 @@ use metadata_commands::{
 };
 use source_commands::{
     lx_http_request, lx_runtime_failure, lx_runtime_result, lx_send, player_play_online_track,
-    source_activate, source_export_backup, source_import_file, source_import_url, source_list,
-    source_reload, source_remove, source_resolve, source_restore_backup,
-    source_set_updates_enabled, source_status,
+    source_activate, source_export_backup, source_get_config, source_import_file,
+    source_import_url, source_list, source_reload, source_remove, source_resolve,
+    source_restore_backup, source_set_config, source_set_updates_enabled, source_status,
 };
 use source_runtime::SourceRuntime;
 
@@ -767,6 +767,8 @@ pub fn run() {
             source_remove,
             source_reload,
             source_set_updates_enabled,
+            source_get_config,
+            source_set_config,
             source_export_backup,
             source_restore_backup,
             source_resolve,

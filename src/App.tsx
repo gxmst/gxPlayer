@@ -22,6 +22,13 @@ import {
 type SearchState = "idle" | "loading" | "ready" | "empty" | "error";
 type AudioMode = EngineSnapshot["audioMode"];
 type QualityPreference = "auto" | "128k" | "320k" | "flac" | "flac24bit";
+type SourceConfigDraft = {
+  lsConfig: Record<string, unknown>;
+  constName: string;
+  keyValue: string;
+  apiAddr: string;
+  apiPass: string;
+};
 
 const QUALITY_OPTIONS: Array<{ value: QualityPreference; label: string }> = [
   { value: "auto", label: "自动" },
@@ -248,6 +255,10 @@ function App() {
   const [sources, setSources] = useState<ListedSource[]>([]);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [sourceUrl, setSourceUrl] = useState("");
+  const [configSource, setConfigSource] = useState<ListedSource | null>(null);
+  const [sourceConfigDraft, setSourceConfigDraft] = useState<SourceConfigDraft | null>(null);
+  const [sourceConfigRevealed, setSourceConfigRevealed] = useState(false);
+  const [sourceConfigBusy, setSourceConfigBusy] = useState(false);
   const [backupText, setBackupText] = useState("");
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -547,6 +558,70 @@ function App() {
     window.localStorage.setItem("gxplayer.defaultQuality", preference);
   };
 
+  const openSourceConfig = async (source: ListedSource) => {
+    setSourceConfigBusy(true);
+    try {
+      const config = await invoke<Record<string, unknown>>("source_get_config", { id: source.id });
+      const structured = "lsConfig" in config || "keyOverrides" in config;
+      const lsConfig = (structured && config.lsConfig && typeof config.lsConfig === "object" && !Array.isArray(config.lsConfig)
+        ? config.lsConfig
+        : structured ? {} : config) as Record<string, unknown>;
+      const keyOverrides = structured && Array.isArray(config.keyOverrides) ? config.keyOverrides : [];
+      const firstOverride = keyOverrides.find((item): item is { constName: string; value: string } =>
+        Boolean(item && typeof item === "object" && "constName" in item && "value" in item
+          && typeof item.constName === "string" && typeof item.value === "string"));
+      const api = lsConfig.api && typeof lsConfig.api === "object" && !Array.isArray(lsConfig.api)
+        ? lsConfig.api as Record<string, unknown>
+        : {};
+      setConfigSource(source);
+      setSourceConfigDraft({
+        lsConfig,
+        constName: firstOverride?.constName ?? "YuNingXi",
+        keyValue: firstOverride?.value ?? "",
+        apiAddr: typeof api.addr === "string" ? api.addr : "",
+        apiPass: typeof api.pass === "string" ? api.pass : "",
+      });
+      setSourceConfigRevealed(false);
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setSourceConfigBusy(false);
+    }
+  };
+
+  const closeSourceConfig = () => {
+    setConfigSource(null);
+    setSourceConfigDraft(null);
+    setSourceConfigRevealed(false);
+  };
+
+  const saveSourceConfig = async () => {
+    if (!configSource || !sourceConfigDraft) return;
+    setSourceConfigBusy(true);
+    try {
+      const constName = sourceConfigDraft.constName.trim() || "YuNingXi";
+      if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(constName)) throw new Error("常量名不是有效的 JavaScript 标识符");
+      const existingApi = sourceConfigDraft.lsConfig.api && typeof sourceConfigDraft.lsConfig.api === "object" && !Array.isArray(sourceConfigDraft.lsConfig.api)
+        ? sourceConfigDraft.lsConfig.api as Record<string, unknown>
+        : {};
+      const config = {
+        lsConfig: {
+          ...sourceConfigDraft.lsConfig,
+          api: { ...existingApi, addr: sourceConfigDraft.apiAddr, pass: sourceConfigDraft.apiPass },
+        },
+        keyOverrides: sourceConfigDraft.keyValue ? [{ constName, value: sourceConfigDraft.keyValue }] : [],
+      };
+      await invoke("source_set_config", { id: configSource.id, config });
+      closeSourceConfig();
+      await refreshSources();
+      setMessage(configSource.active ? "音源配置已保存，沙箱已热重载。" : "音源配置已保存，下次启用时生效。");
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setSourceConfigBusy(false);
+    }
+  };
+
   const submitSearch = async (queryOverride?: string) => {
     const query = (queryOverride ?? searchQuery).trim();
     if (!query) return;
@@ -772,7 +847,7 @@ function App() {
       <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="音源脚本运行在独立沙箱中；程序启动时也会自动扫描 %APPDATA%\\com.gxplayer.desktop\\sources\\drop-in 里的 .js。" action={<button onClick={async () => { const selected = await open({ multiple: false, filters: [{ name: "LX 音源脚本", extensions: ["js"] }] }); if (selected && !Array.isArray(selected)) { await run("source_import_file", { path: selected }); await refreshSources(); } }}>导入脚本</button>} />
         <section className="source-status-card"><span className={`runtime-dot ${runtime?.state ?? "no_source"}`} /><div><strong>{sourceStatus.title}</strong><p>{sourceStatus.copy}</p></div><code>GEN {runtime?.generation ?? 0}</code></section>
         <div className="inline-form"><input aria-label="音源脚本 URL" placeholder="https://…/source.js" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} /><button className="primary" disabled={!sourceUrl.trim()} onClick={async () => { await run("source_import_url", { url: sourceUrl.trim() }); setSourceUrl(""); await refreshSources(); }}>从 URL 导入</button></div>
-        <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div><span className="source-badge">{source.active ? "正在使用" : "可用"}</span><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { await run("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); }} /> 更新提醒</label><button disabled={source.active} onClick={async () => { await run("source_activate", { id: source.id }); await refreshSources(); }}>启用</button><button className="danger" onClick={async () => { await run("source_remove", { id: source.id }); await refreshSources(); }}>删除</button></div></article>)}</div>
+        <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div><span className="source-badge">{source.active ? "正在使用" : source.hasConfig ? "已配置" : "可用"}</span><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { await run("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); }} /> 更新提醒</label><button disabled={sourceConfigBusy} onClick={() => void openSourceConfig(source)}>配置</button><button disabled={source.active} onClick={async () => { await run("source_activate", { id: source.id }); await refreshSources(); }}>启用</button><button className="danger" onClick={async () => { await run("source_remove", { id: source.id }); await refreshSources(); }}>删除</button></div></article>)}</div>
       </div>
     );
 
@@ -781,7 +856,7 @@ function App() {
         <div className="settings-grid"><section className="settings-card"><h3>输出设备</h3><p>切换时会从当前位置继续播放。</p><select value={snapshot.outputDevice ?? ""} onChange={(event) => void run("player_set_output_device", { name: event.target.value || null })}><option value="">系统默认设备</option>{outputDevices.map((device) => <option key={device} value={device}>{device}</option>)}</select></section>
         <section className="settings-card"><h3>默认音质</h3><p>自动会按当前平台能力从高到低尝试，并在解析失败时逐档回退。</p><select value={qualityPreference} onChange={(event) => updateQualityPreference(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></section>
         <section className="settings-card"><h3>默认听感</h3><p>音乐模式保持 DSP 透明旁路；影院/游戏模式启用空间处理。</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></section></div>
-        <section className="backup-card"><div className="section-heading"><div><h3>配置备份</h3><p>包含本地曲库索引、收藏、歌单和音源脚本。</p></div><div><button onClick={() => void exportBackup()}>生成备份</button><button className="primary" disabled={!backupText.trim()} onClick={() => void restoreBackup()}>恢复备份</button></div></div><textarea aria-label="GXPlayer 备份 JSON" placeholder="生成的备份会显示在这里，也可以粘贴已有备份。" value={backupText} onChange={(event) => setBackupText(event.target.value)} /></section>
+        <section className="backup-card"><div className="section-heading"><div><h3>配置备份</h3><p>包含本地曲库、歌单、音源脚本及音源密钥；备份内容请勿公开。</p></div><div><button onClick={() => void exportBackup()}>生成备份</button><button className="primary" disabled={!backupText.trim()} onClick={() => void restoreBackup()}>恢复备份</button></div></div><textarea aria-label="GXPlayer 备份 JSON" placeholder="生成的备份会显示在这里，也可以粘贴已有备份。" value={backupText} onChange={(event) => setBackupText(event.target.value)} /></section>
       </div>
     );
 
@@ -851,6 +926,8 @@ function App() {
       </aside>
 
       <main className="content">{renderView()}</main>
+
+      {configSource && sourceConfigDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSourceConfig(); }}><section className="config-modal" role="dialog" aria-modal="true" aria-label={`${configSource.metadata.name} 音源配置`}><div className="section-heading"><div><p className="eyebrow">SOURCE CONFIG</p><h3>{configSource.metadata.name || "音源配置"}</h3><p>同时支持源码常量 key 与 LX 全局 ls；关闭或保存后敏感值会从界面状态清空。</p></div><button onClick={closeSourceConfig} aria-label="关闭配置">×</button></div><div className="config-fields"><label><span>源码常量名</span><input value={sourceConfigDraft.constName} placeholder="YuNingXi" autoComplete="off" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, constName: event.target.value })} /></label><label><span>解析 Key</span><input type={sourceConfigRevealed ? "text" : "password"} value={sourceConfigDraft.keyValue} placeholder="留空则使用音源公益额度" autoComplete="new-password" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, keyValue: event.target.value })} /></label><label><span>ls.api.addr（可选）</span><input value={sourceConfigDraft.apiAddr} placeholder="https://…" autoComplete="off" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, apiAddr: event.target.value })} /></label><label><span>ls.api.pass（可选）</span><input type={sourceConfigRevealed ? "text" : "password"} value={sourceConfigDraft.apiPass} autoComplete="new-password" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, apiPass: event.target.value })} /></label></div><label className="config-reveal"><input type="checkbox" checked={sourceConfigRevealed} onChange={(event) => setSourceConfigRevealed(event.target.checked)} /> 临时显示敏感字段</label><div className="modal-actions"><button onClick={closeSourceConfig}>取消</button><button className="primary" disabled={sourceConfigBusy} onClick={() => void saveSourceConfig()}>保存并应用</button></div></section></div>}
 
       {(message || snapshot.error) && <div className="toast" role="status"><span>!</span><p>{snapshot.error ?? message}</p><button onClick={() => setMessage("")} aria-label="关闭提示">×</button></div>}
 

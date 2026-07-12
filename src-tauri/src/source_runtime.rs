@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use gx_contracts::{HttpHeader, MediaType, ResolvedMediaRequest};
-use gx_source::{ManagedSource, SourceBackup, SourceStore, SourceStoreError};
+use gx_source::{ManagedSource, ScriptMetadata, SourceBackup, SourceStore, SourceStoreError};
 use serde::Serialize;
 use serde_json::Value;
 use url::Url;
@@ -13,10 +13,35 @@ pub const MAX_RUNTIME_PAYLOAD_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PublicSource {
+    pub id: String,
+    pub script_path: std::path::PathBuf,
+    pub origin: String,
+    pub imported_at_ms: u64,
+    pub metadata: ScriptMetadata,
+    pub updates_enabled: bool,
+}
+
+impl From<&ManagedSource> for PublicSource {
+    fn from(source: &ManagedSource) -> Self {
+        Self {
+            id: source.id.clone(),
+            script_path: source.script_path.clone(),
+            origin: source.origin.clone(),
+            imported_at_ms: source.imported_at_ms,
+            metadata: source.metadata.clone(),
+            updates_enabled: source.updates_enabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListedSource {
     #[serde(flatten)]
-    pub source: ManagedSource,
+    pub source: PublicSource,
     pub active: bool,
+    pub has_config: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -101,7 +126,14 @@ impl SourceRuntime {
             .unwrap()
             .list()
             .into_iter()
-            .map(|(source, active)| ListedSource { source, active })
+            .map(|(source, active)| ListedSource {
+                source: PublicSource::from(&source),
+                active,
+                has_config: source
+                    .config
+                    .as_object()
+                    .is_some_and(|config| !config.is_empty()),
+            })
             .collect()
     }
 
@@ -131,6 +163,14 @@ impl SourceRuntime {
 
     pub fn set_updates_enabled(&self, id: &str, enabled: bool) -> Result<(), SourceStoreError> {
         self.store.lock().unwrap().set_updates_enabled(id, enabled)
+    }
+
+    pub fn config(&self, id: &str) -> Result<Value, SourceStoreError> {
+        self.store.lock().unwrap().config(id)
+    }
+
+    pub fn set_config(&self, id: &str, config: Value) -> Result<(), SourceStoreError> {
+        self.store.lock().unwrap().set_config(id, config)
     }
 
     pub fn export_backup(&self) -> Result<SourceBackup, SourceStoreError> {
@@ -448,7 +488,7 @@ fn infer_media_type(url: &str) -> MediaType {
     }
 }
 
-fn ensure_json_size(value: &Value, limit: usize, label: &str) -> Result<(), String> {
+pub(crate) fn ensure_json_size(value: &Value, limit: usize, label: &str) -> Result<(), String> {
     let size = serde_json::to_vec(value)
         .map_err(|error| format!("failed to serialize {label}: {error}"))?
         .len();
@@ -581,6 +621,32 @@ mod tests {
                 .begin_request(&serde_json::json!({"action":"lyric"}))
                 .is_err()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_reaches_launch_but_is_redacted_from_source_list() {
+        let (runtime, root) = runtime();
+        let source = runtime
+            .import_script(
+                "lx.on('request', () => 'https://example.com/a.mp3')",
+                "test",
+                "a",
+            )
+            .unwrap();
+        runtime
+            .set_config(
+                &source.id,
+                serde_json::json!({ "api": { "pass": "secret" } }),
+            )
+            .unwrap();
+
+        let listed = serde_json::to_string(&runtime.list()).unwrap();
+        assert!(!listed.contains("secret"));
+        assert!(!listed.contains("config"));
+        assert!(listed.contains("hasConfig"));
+        let launch = runtime.prepare_reload().unwrap().unwrap();
+        assert_eq!(launch.source.config["api"]["pass"], "secret");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

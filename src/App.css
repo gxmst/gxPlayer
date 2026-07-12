@@ -2472,7 +2472,7 @@ select option {
   grid-template-columns: 28px minmax(0, 1fr) 28px;
   align-items: center;
   gap: 10px;
-  max-width: 480px;
+  max-width: 420px;
   padding: 12px 14px;
   border: 1px solid color-mix(in srgb, var(--accent) 40%, rgba(255, 255, 255, 0.08));
   border-radius: 14px;
@@ -2480,6 +2480,25 @@ select option {
   box-shadow: var(--shadow-lg), var(--glass-inset);
   backdrop-filter: blur(24px);
   animation: toast-in 0.28s var(--ease-out);
+  pointer-events: auto;
+}
+
+.toast-ok {
+  border-color: color-mix(in srgb, #5ec8a0 45%, rgba(255, 255, 255, 0.08));
+}
+
+.toast-ok > span {
+  color: #0e1412;
+  background: color-mix(in srgb, #5ec8a0 85%, white);
+}
+
+.toast-error {
+  border-color: color-mix(in srgb, #e85a71 50%, rgba(255, 255, 255, 0.08));
+}
+
+.toast-error > span {
+  color: #140c0e;
+  background: color-mix(in srgb, #e85a71 88%, white);
 }
 
 .modal-backdrop {

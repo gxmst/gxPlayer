@@ -7,7 +7,6 @@ import "@fontsource-variable/geist-mono";
 import "@fontsource-variable/noto-sans-sc";
 import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
-import { OnboardingModal } from "./components/OnboardingModal";
 import { QueuePanel } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
 import { SourceGuide } from "./components/SourceGuide";
@@ -77,7 +76,8 @@ const PLAY_MODE_META: Record<PlayMode, { label: string; glyph: string }> = {
   shuffle: { label: "随机播放", glyph: "shuf" },
 };
 const RESOLVE_TIMEOUT_MS = 25_000;
-const ONBOARDING_KEY = "gxplayer.onboarding.v1";
+const TOAST_OK_MS = 3_000;
+const TOAST_ERROR_MS = 10_000;
 
 function catalogKey(track: CatalogTrack): string {
   return `${track.providerId}:${track.providerTrackId}`;
@@ -176,9 +176,7 @@ const PREMIUM_PALETTE = [
 ] as const;
 const NAV_ITEMS: Array<{ id: ViewId; icon: string; label: string }> = [
   { id: "discovery", icon: "⌂", label: "探索" },
-  { id: "search", icon: "⌕", label: "搜索" },
-  { id: "library", icon: "♫", label: "本地曲库" },
-  { id: "offline", icon: "⬇", label: "离线/缓存" },
+  { id: "library", icon: "♫", label: "曲库" },
   { id: "history", icon: "◷", label: "播放历史" },
   { id: "favorites", icon: "♥", label: "收藏" },
   { id: "sources", icon: "◈", label: "音源管理" },
@@ -186,9 +184,11 @@ const NAV_ITEMS: Array<{ id: ViewId; icon: string; label: string }> = [
 ];
 
 function initialView(): ViewId {
-  const requested = new URLSearchParams(window.location.search).get("view") as ViewId | null;
-  return requested && ["discovery", "search", "library", "offline", "history", "favorites", "playlist", "sources", "settings", "now-playing"].includes(requested)
-    ? requested
+  const requested = new URLSearchParams(window.location.search).get("view");
+  // offline merged into library; search is top-bar only (results page still reachable).
+  if (requested === "offline") return "library";
+  return requested && ["discovery", "search", "library", "history", "favorites", "playlist", "sources", "settings", "now-playing"].includes(requested)
+    ? (requested as ViewId)
     : "discovery";
 }
 
@@ -395,7 +395,8 @@ function App() {
   const [view, setView] = useState<ViewId>(initialView);
   const [viewHistory, setViewHistory] = useState<ViewId[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [message, setMessage] = useState("");
+  const [message, setMessageState] = useState("");
+  const [messageIsError, setMessageIsError] = useState(false);
   /** User dismissed the engine error toast; reset when generation/error changes. */
   const [engineErrorDismissed, setEngineErrorDismissed] = useState(false);
   const [accent, setAccent] = useState(FALLBACK_ACCENT);
@@ -430,17 +431,16 @@ function App() {
   const [onlineFavorites, setOnlineFavorites] = useState<CatalogTrack[]>([]);
   const [cacheEntries, setCacheEntries] = useState<CacheEntryView[]>([]);
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
-  const [showOnboarding, setShowOnboarding] = useState(() => !window.localStorage.getItem(ONBOARDING_KEY));
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
   const [miniMode, setMiniMode] = useState(false);
-  const [sleepMinutes, setSleepMinutes] = useState(0);
-  const [sleepDeadline, setSleepDeadline] = useState<number | null>(null);
   const [selectedCacheKeys, setSelectedCacheKeys] = useState<string[]>([]);
   const [coverCache, setCoverCache] = useState<Record<string, string>>({});
   const [resolveBanner, setResolveBanner] = useState<{ title: string; detail: string } | null>(null);
   const resolveGenerationRef = useRef(0);
   const resolveAbortRef = useRef(false);
   const windowSaveTimer = useRef<number | null>(null);
+  const searchShellRef = useRef<HTMLDivElement | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchState, setSearchState] = useState<SearchState>("idle");
@@ -470,13 +470,27 @@ function App() {
   playlistIndexRef.current = playlistIndex;
   snapshotRef.current = snapshot;
 
+  const pushMessage = (text: string, isError = false) => {
+    setMessageState(text);
+    setMessageIsError(isError);
+  };
+
+  const clearMessage = () => {
+    setMessageState("");
+    setMessageIsError(false);
+    setEngineErrorDismissed(true);
+  };
+
+  /** Convenience: treat as normal toast unless marked error. */
+  const setMessage = (text: string, isError = false) => pushMessage(text, isError);
+
   const run = async <T,>(command: string, args?: Record<string, unknown>): Promise<T | undefined> => {
     try {
       const result = await invoke<T>(command, args);
-      setMessage("");
+      // Don't clear existing toasts on every command — only setMessage callers manage UX.
       return result;
     } catch (error) {
-      setMessage(String(error));
+      pushMessage(String(error), true);
       return undefined;
     }
   };
@@ -545,17 +559,12 @@ function App() {
     }
   };
 
-  const finishOnboarding = () => {
-    window.localStorage.setItem(ONBOARDING_KEY, "1");
-    setShowOnboarding(false);
-  };
-
   const cancelResolve = () => {
     resolveAbortRef.current = true;
     resolveGenerationRef.current += 1;
     setPlayingCatalogKey(null);
     setResolveBanner(null);
-    setMessage("已取消解析");
+    pushMessage("已取消解析");
   };
 
   const scheduleWindowSave = () => {
@@ -568,10 +577,10 @@ function App() {
   useEffect(() => {
     // Window size is set once in Rust (setup) before first show — do not resize here
     // or the app will open at tauri.conf size then jump larger after React mounts.
-    void invoke("ui_ready").catch((error) => setMessage(String(error)));
-    void refreshLibrary().catch((error) => setMessage(String(error)));
-    void refreshSources().catch((error) => setMessage(String(error)));
-    void refreshCache().catch((error) => setMessage(String(error)));
+    void invoke("ui_ready").catch((error) => setMessage(String(error), true));
+    void refreshLibrary().catch((error) => setMessage(String(error), true));
+    void refreshSources().catch((error) => setMessage(String(error), true));
+    void refreshCache().catch((error) => setMessage(String(error), true));
     void refreshHistory().catch(() => undefined);
     void invoke<{ alwaysOnTop?: boolean; miniMode?: boolean }>("window_get_state")
       .then((state) => {
@@ -581,7 +590,7 @@ function App() {
       .catch(() => undefined);
     void invoke<string[]>("player_output_devices")
       .then(setOutputDevices)
-      .catch((error) => setMessage(String(error)));
+      .catch((error) => setMessage(String(error), true));
     void invoke<CatalogTrack[]>("metadata_chart", { limit: 12 })
       .then(setChartTracks)
       .catch(() => setChartTracks([]));
@@ -604,26 +613,48 @@ function App() {
     }
   }, [view]);
 
-  // Sleep timer — pause when deadline hits.
   useEffect(() => {
-    if (!sleepDeadline) return;
-    const timer = window.setInterval(() => {
-      if (Date.now() >= sleepDeadline) {
-        void run("player_pause");
-        setSleepDeadline(null);
-        setSleepMinutes(0);
-        setMessage("睡眠定时已到，已暂停播放。");
-      }
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [sleepDeadline]);
-
-  useEffect(() => {
-    if (view !== "settings" && view !== "offline" && view !== "library") return;
-    void refreshCache().catch((error) => setMessage(String(error)));
+    if (view !== "settings" && view !== "library") return;
+    void refreshCache().catch((error) => pushMessage(String(error), true));
     const timer = window.setInterval(() => void refreshCache().catch(() => undefined), 2000);
     return () => window.clearInterval(timer);
   }, [view]);
+
+  // Auto-dismiss toasts: normal 3s, error/engine 10s.
+  useEffect(() => {
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    const engineError = snapshot.error && !engineErrorDismissed ? snapshot.error : null;
+    const text = engineError || message;
+    if (!text) return;
+    const isError = Boolean(engineError) || messageIsError;
+    toastTimerRef.current = window.setTimeout(() => {
+      clearMessage();
+    }, isError ? TOAST_ERROR_MS : TOAST_OK_MS);
+    return () => {
+      if (toastTimerRef.current) {
+        window.clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+    };
+  }, [message, messageIsError, snapshot.error, engineErrorDismissed]);
+
+  // Close search suggestions when clicking outside the search shell.
+  useEffect(() => {
+    if (!suggestionOpen) return;
+    const onPointerDown = (event: MouseEvent) => {
+      const root = searchShellRef.current;
+      if (!root) return;
+      if (event.target instanceof Node && !root.contains(event.target)) {
+        setSuggestionOpen(false);
+        setSuggestionIndex(-1);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [suggestionOpen]);
 
   useEffect(() => {
     let disposed = false;
@@ -632,7 +663,7 @@ function App() {
         const next = await invoke<EngineSnapshot>("player_snapshot");
         if (!disposed) setSnapshot(next);
       } catch (error) {
-        if (!disposed) setMessage(String(error));
+        if (!disposed) setMessage(String(error), true);
       }
     };
     void update();
@@ -771,7 +802,7 @@ function App() {
       } catch (error) {
         if (!controller.signal.aborted) {
           setSearchState("error");
-          setMessage(String(error));
+          setMessage(String(error), true);
         }
       }
     }, 200);
@@ -886,7 +917,7 @@ function App() {
       if (!stillCurrent()) return null;
       console.warn("[GXPlayer] online resolve failed", { key, error: String(onlineError) });
       if (!opts?.allowPreviewFallback) {
-        setMessage(formatFailureMessage(onlineError, wanted.title));
+        setMessage(formatFailureMessage(onlineError, wanted.title), true);
         return null;
       }
       try {
@@ -920,7 +951,7 @@ function App() {
         };
       } catch (previewError) {
         if (!stillCurrent()) return null;
-        setMessage(formatFailureMessage(`${String(onlineError)}; ${String(previewError)}`, wanted.title));
+        setMessage(formatFailureMessage(`${String(onlineError)}; ${String(previewError)}`, wanted.title), true);
         return null;
       }
     } finally {
@@ -981,7 +1012,7 @@ function App() {
         void recordHistory({ kind: "local", title: entry.title, artist: entry.artist, path: entry.path });
         return true;
       } catch (error) {
-        setMessage(formatFailureMessage(error, entry.title));
+        setMessage(formatFailureMessage(error, entry.title), true);
         return false;
       }
     }
@@ -998,7 +1029,7 @@ function App() {
         });
         return true;
       } catch (error) {
-        setMessage(formatFailureMessage(error, entry.title));
+        setMessage(formatFailureMessage(error, entry.title), true);
         return false;
       }
     }
@@ -1056,12 +1087,12 @@ function App() {
         if (next === null) {
           setPlaylistIndex(cursor);
           if (opts?.fromFailure || attempt > 0) {
-            setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。");
+            setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。", true);
           }
           return false;
         }
         if (tried.has(next)) {
-          setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。");
+          setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。", true);
           return false;
         }
         tried.add(next);
@@ -1076,7 +1107,7 @@ function App() {
         // Subsequent picks in this chain are failure-skips (one pass, no infinite loop).
         opts = { fromFailure: true };
       }
-      setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。");
+      setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。", true);
       return false;
     } finally {
       advancingRef.current = false;
@@ -1136,7 +1167,7 @@ function App() {
       setLyrics(null);
       await refreshLibrary();
     } catch (error) {
-      setMessage(String(error));
+      setMessage(String(error), true);
     }
   };
 
@@ -1147,7 +1178,7 @@ function App() {
     try {
       await replacePlaylist(entries, startIndex === -1 ? 0 : startIndex);
     } catch (error) {
-      setMessage(String(error));
+      setMessage(String(error), true);
     }
   };
 
@@ -1159,7 +1190,7 @@ function App() {
       setPlaylist((prev) => [...prev, ...tracks.map(localEntryFromLibrary)]);
       setMessage(`已添加 ${tracks.length} 首到队列`);
     } catch (error) {
-      setMessage(String(error));
+      setMessage(String(error), true);
     }
   };
 
@@ -1185,7 +1216,7 @@ function App() {
     } catch (error) {
       setPlayingCatalogKey(null);
       advancingRef.current = false;
-      setMessage(`播放失败：${String(error)}`);
+      setMessage(`播放失败：${String(error)}`, true);
     }
   };
 
@@ -1281,7 +1312,7 @@ function App() {
     } catch (error) {
       setPlayingCatalogKey(null);
       advancingRef.current = false;
-      setMessage(String(error));
+      setMessage(String(error), true);
     }
   };
 
@@ -1302,7 +1333,7 @@ function App() {
       await refreshCache();
       setMessage(`已删除缓存《${entry.title}》· ${entry.quality}`);
     } catch (error) {
-      setMessage(String(error));
+      setMessage(String(error), true);
     }
   };
 
@@ -1317,7 +1348,7 @@ function App() {
       await refreshCache();
       setMessage(entry.pinned ? "已取消钉住" : "已收藏并钉住缓存");
     } catch (error) {
-      setMessage(String(error));
+      setMessage(String(error), true);
     }
   };
 
@@ -1405,17 +1436,6 @@ function App() {
     if (next) setAlwaysOnTop(true);
   };
 
-  const setSleepTimer = (minutes: number) => {
-    setSleepMinutes(minutes);
-    if (minutes <= 0) {
-      setSleepDeadline(null);
-      setMessage("已关闭睡眠定时");
-      return;
-    }
-    setSleepDeadline(Date.now() + minutes * 60_000);
-    setMessage(`将在 ${minutes} 分钟后暂停播放`);
-  };
-
   const exportBackupFile = async () => {
     const [libraryBackup, sourceBackup] = await Promise.all([
       invoke("library_export_backup"),
@@ -1500,7 +1520,7 @@ function App() {
       setCurrentQuality(online.quality);
       setMessage(online.cacheHit ? `已切换到本地缓存 ${online.quality ?? "自动"}。` : `已切换到 ${online.quality ?? "自动"}，并重新开始流式播放。`);
     } catch (error) {
-      setMessage(`切换音质失败，已保留当前播放：${String(error)}`);
+      setMessage(`切换音质失败，已保留当前播放：${String(error)}`, true);
     } finally {
       setQualitySwitching(false);
     }
@@ -1536,7 +1556,7 @@ function App() {
       });
       setSourceConfigRevealed(false);
     } catch (error) {
-      setMessage(String(error));
+      setMessage(String(error), true);
     } finally {
       setSourceConfigBusy(false);
     }
@@ -1569,7 +1589,7 @@ function App() {
       await refreshSources();
       setMessage(configSource.active ? "音源配置已保存，沙箱已热重载。" : "音源配置已保存，下次启用时生效。");
     } catch (error) {
-      setMessage(String(error));
+      setMessage(String(error), true);
     } finally {
       setSourceConfigBusy(false);
     }
@@ -1636,7 +1656,7 @@ function App() {
   const saveCacheLimit = async () => {
     const gib = Number(cacheLimitGiB);
     if (!Number.isFinite(gib) || gib <= 0) {
-      setMessage("缓存上限必须是正数。");
+      setMessage("缓存上限必须是正数。", true);
       return;
     }
     const status = await invoke<CacheStatus>("cache_set_limit", { limitBytes: Math.round(gib * 1024 * 1024 * 1024) });
@@ -1687,7 +1707,7 @@ function App() {
       await Promise.all([refreshLibrary(), refreshSources()]);
       setMessage("备份已恢复。");
     } catch (error) {
-      setMessage(String(error));
+      setMessage(String(error), true);
     }
   };
 
@@ -1699,7 +1719,7 @@ function App() {
       await invoke("player_seek", { seconds });
     } catch (error) {
       setPendingSeek(null);
-      setMessage(String(error));
+      setMessage(String(error), true);
     }
   };
 
@@ -1904,89 +1924,35 @@ function App() {
       </div>
     );
 
-    if (view === "library" || view === "favorites") {
-      const tracks = view === "library" ? library : favorites;
+    if (view === "library") {
       return (
         <div className="page">
           <PageHeading
-            eyebrow={view === "library" ? "LOCAL LIBRARY" : "FAVORITES"}
-            title={view === "library" ? "本地曲库" : "我的收藏"}
-            copy={view === "library"
-              ? `${library.length} 首本地导入 · ${cacheEntries.length} 首在线缓存。两者来源不同，都能在本机播放。`
-              : `${tracks.length + onlineFavorites.length} 首收藏；在线收藏的缓存会被钉住。`}
-            action={view === "library" ? <button className="primary" onClick={chooseFiles}>导入音乐</button> : undefined}
+            eyebrow="LIBRARY"
+            title="曲库"
+            copy={`${library.length} 首本地导入 · ${cacheEntries.length} 首在线缓存。本地文件与在线缓存分开展示。`}
+            action={<button className="primary" onClick={chooseFiles}>导入音乐</button>}
           />
-          {view === "favorites" && onlineFavorites.length > 0 && (
-            <section className="section-block">
-              <div className="section-heading"><div><h3>在线收藏</h3><p>尚未缓存的歌曲不会主动下载，会等你自然播放。</p></div></div>
-              {renderCatalogRows(onlineFavorites)}
-            </section>
-          )}
-          {view === "library" && cacheEntries.length > 0 && (
-            <section className="section-block">
-              <div className="section-heading">
-                <div>
-                  <h3>在线来源 · 已缓存</h3>
-                  <p>这些是播放在线歌曲时自然写入的缓存，不是你导入的本地文件。完整列表见「离线/缓存」。</p>
-                </div>
-                <button type="button" onClick={() => navigateTo("offline")}>查看全部 →</button>
+          <section className="section-block">
+            <div className="section-heading">
+              <div>
+                <h3>本地导入</h3>
+                <p>你从磁盘选择并导入的音频文件。</p>
               </div>
-              {renderCacheRows(cacheEntries.slice(0, 8))}
-            </section>
-          )}
-          {tracks.length ? (
-            <section className="section-block">
-              <div className="section-heading">
-                <div><h3>{view === "library" ? "本地导入" : "本地收藏"}</h3>
-                  {view === "library" && <p>你从磁盘选择并导入的音频文件。</p>}
-                </div>
+            </div>
+            {library.length
+              ? renderTrackRows(library)
+              : <EmptyState title="还没有本地导入" copy="选择音频文件导入，或先播放在线歌曲生成下方缓存。" action="选择音乐" onAction={chooseFiles} />}
+          </section>
+          <section className="section-block">
+            <div className="section-heading">
+              <div>
+                <h3>在线缓存</h3>
+                <p>完整播放在线歌曲后写入；不会预下载。收藏会钉住缓存。</p>
               </div>
-              {renderTrackRows(tracks)}
-            </section>
-          ) : view === "library" || onlineFavorites.length === 0 ? (
-            <EmptyState
-              title={view === "library" ? "还没有本地导入" : "还没有收藏"}
-              copy={view === "library" ? "选择音频文件导入，或先播放在线歌曲生成缓存。" : "播放在线歌曲或打开本地曲库，点一下心形即可收藏。"}
-              action={view === "library" ? "选择音乐" : undefined}
-              onAction={view === "library" ? chooseFiles : undefined}
-            />
-          ) : null}
-        </div>
-      );
-    }
-
-    if (view === "offline") {
-      return (
-        <div className="page">
-          <PageHeading
-            eyebrow="OFFLINE CACHE"
-            title="离线 / 缓存"
-            copy={cacheStatus
-              ? `共 ${cacheStatus.entryCount} 首已缓存 · 占用 ${formatBytes(cacheStatus.totalBytes)} · 钉住 ${cacheStatus.pinnedCount} 项。点击即从本地秒开，无需再次请求音源。`
-              : "读取缓存列表…"}
-            action={cacheEntries.length > 0 ? (
-              <button type="button" className="primary" onClick={() => enqueueCacheEntries(cacheEntries)}>全部加入队列</button>
-            ) : undefined}
-          />
-          <div className="tip-banner" role="note">
-            <strong>缓存说明</strong>
-            <span>只保存你自然完整播放时已收到的字节，不会预下载或批量抓取。收藏会钉住缓存；未钉住条目在超限时按 LRU 清理。</span>
-          </div>
-          {cacheEntries.length === 0 ? (
-            <EmptyState
-              title="还没有缓存"
-              copy="完整播放一首在线歌曲后，会把已接收的字节写入缓存。这里只展示已完成缓存，不会预下载。"
-              action="去搜索"
-              onAction={() => navigateTo("search")}
-            />
-          ) : (
-            <section className="section-block">
-              <div className="section-heading">
-                <div>
-                  <h3>已缓存歌曲</h3>
-                  <p>在线来源、离线可听。勾选后可批量删除；也可按音质清理未钉住项。</p>
-                </div>
+              {cacheEntries.length > 0 ? (
                 <div className="cache-bulk-actions">
+                  <button type="button" className="primary" onClick={() => enqueueCacheEntries(cacheEntries)}>全部入队</button>
                   <button type="button" disabled={!selectedCacheKeys.length} onClick={() => void removeSelectedCache()}>
                     删除所选 ({selectedCacheKeys.length})
                   </button>
@@ -2005,10 +1971,47 @@ function App() {
                     ))}
                   </select>
                 </div>
-              </div>
-              {renderCacheRows(cacheEntries)}
+              ) : null}
+            </div>
+            <div className="tip-banner" role="note">
+              <strong>缓存说明</strong>
+              <span>
+                {cacheStatus
+                  ? `当前 ${cacheStatus.entryCount} 项 · ${formatBytes(cacheStatus.totalBytes)} · 钉住 ${cacheStatus.pinnedCount}。只保存自然播放收到的字节。`
+                  : "只保存自然播放时已收到的字节，不会预抓或批量下载。"}
+              </span>
+            </div>
+            {cacheEntries.length
+              ? renderCacheRows(cacheEntries)
+              : <EmptyState title="还没有在线缓存" copy="完整播放一首在线歌曲后会出现在这里，可秒开离线听。" />}
+          </section>
+        </div>
+      );
+    }
+
+    if (view === "favorites") {
+      const tracks = favorites;
+      return (
+        <div className="page">
+          <PageHeading
+            eyebrow="FAVORITES"
+            title="我的收藏"
+            copy={`${tracks.length + onlineFavorites.length} 首收藏；在线收藏的缓存会被钉住。`}
+          />
+          {onlineFavorites.length > 0 && (
+            <section className="section-block">
+              <div className="section-heading"><div><h3>在线收藏</h3><p>尚未缓存的歌曲不会主动下载，会等你自然播放。</p></div></div>
+              {renderCatalogRows(onlineFavorites)}
             </section>
           )}
+          {tracks.length ? (
+            <section className="section-block">
+              <div className="section-heading"><div><h3>本地收藏</h3></div></div>
+              {renderTrackRows(tracks)}
+            </section>
+          ) : onlineFavorites.length === 0 ? (
+            <EmptyState title="还没有收藏" copy="播放在线歌曲或打开曲库，点一下心形即可收藏。" />
+          ) : null}
         </div>
       );
     }
@@ -2080,7 +2083,7 @@ function App() {
     );
 
     if (view === "settings") return (
-      <div className="page"><PageHeading eyebrow="SETTINGS" title="设置与备份" copy="输出设备、窗口、睡眠定时和本地数据都在这里管理。" />
+      <div className="page"><PageHeading eyebrow="SETTINGS" title="设置与备份" copy="输出设备、窗口和本地数据都在这里管理。" />
         <div className="settings-grid">
           <section className="settings-card"><h3>输出设备</h3><p>切换时会从当前位置继续播放。</p><select value={snapshot.outputDevice ?? ""} onChange={(event) => void run("player_set_output_device", { name: event.target.value || null })}><option value="">系统默认设备</option>{outputDevices.map((device) => <option key={device} value={device}>{device}</option>)}</select></section>
           <section className="settings-card"><h3>默认音质</h3><p>自动会按当前平台能力从高到低尝试，并在解析失败时逐档回退。</p><select value={qualityPreference} onChange={(event) => updateQualityPreference(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></section>
@@ -2093,17 +2096,7 @@ function App() {
               <button type="button" className={miniMode ? "primary" : ""} onClick={() => void toggleMiniMode()}>{miniMode ? "退出迷你" : "迷你模式"}</button>
             </div>
           </section>
-          <section className="settings-card">
-            <h3>睡眠定时</h3>
-            <p>{sleepDeadline ? `将在 ${Math.max(0, Math.ceil((sleepDeadline - Date.now()) / 60000))} 分钟内暂停。` : "到时自动暂停，不会退出程序。"}</p>
-            <div className="cache-actions">
-              {[15, 30, 45, 60].map((m) => (
-                <button key={m} type="button" className={sleepMinutes === m ? "primary" : ""} onClick={() => setSleepTimer(m)}>{m} 分钟</button>
-              ))}
-              <button type="button" onClick={() => setSleepTimer(0)}>关闭</button>
-            </div>
-          </section>
-          <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。批量管理请到「离线/缓存」页。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => setCacheLimitGiB(event.target.value)} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_clear", { includePinned: false }); setCacheStatus(status); }}>清未收藏</button><button className="danger" onClick={async () => { const status = await invoke<CacheStatus>("cache_clear", { includePinned: true }); setCacheStatus(status); }}>清空全部</button></div></section>
+          <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。批量管理请到「曲库」页的在线缓存分区。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => setCacheLimitGiB(event.target.value)} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_clear", { includePinned: false }); setCacheStatus(status); }}>清未收藏</button><button className="danger" onClick={async () => { const status = await invoke<CacheStatus>("cache_clear", { includePinned: true }); setCacheStatus(status); }}>清空全部</button></div></section>
         </div>
         <section className="backup-card">
           <div className="section-heading">
@@ -2190,17 +2183,97 @@ function App() {
           <button className="logo" onClick={() => navigateTo("discovery")} aria-label="返回探索页"><img src={gxplayerIcon} alt="" /></button>
           <button className="history-back" onClick={navigateBack} disabled={!viewHistory.length} aria-label="返回上一页" title="返回上一页">‹</button>
         </div>
-        <div className="global-search">
+        <div className="global-search" ref={searchShellRef}>
           <span aria-hidden="true">⌕</span>
-          <input aria-label="搜索歌曲、歌手、专辑" placeholder="搜索歌曲、歌手、专辑…" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} onFocus={() => searchQuery.trim() && setSuggestionOpen(true)} onKeyDown={onSearchKeyDown} />
+          <input
+            aria-label="搜索歌曲、歌手、专辑"
+            placeholder="搜索歌曲、歌手、专辑…"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            onFocus={() => searchQuery.trim() && setSuggestionOpen(true)}
+            onKeyDown={onSearchKeyDown}
+          />
           {searchState === "loading" && <i className="search-spinner" aria-label="正在搜索" />}
-          {suggestionOpen && <div className="suggestions" role="listbox">
-            {searchState === "empty" && <div className="suggestion-state">没有找到相关音乐</div>}
-            {suggestions.slice(0, 4).length > 0 && <SuggestionGroup label="歌曲">{suggestions.slice(0, 4).map((track, index) => { const trackKey = `${track.providerId}:${track.providerTrackId}`; const resolving = playingCatalogKey === trackKey; return <button role="option" aria-selected={index === suggestionIndex} aria-busy={resolving} disabled={resolving} className={index === suggestionIndex ? "selected" : ""} key={trackKey} onMouseDown={(event) => event.preventDefault()} onClick={() => void playCatalog(track)}><span>{resolving ? "…" : "♪"}</span><strong>{track.title}</strong><small>{resolving ? "正在解析整首播放…" : track.artist}</small></button>; })}</SuggestionGroup>}
-            {artists.length > 0 && <SuggestionGroup label="歌手">{artists.map((artist) => <button key={artist} onClick={() => { setSearchQuery(artist); void submitSearch(artist); }}><span>●</span><strong>{artist}</strong><small>歌手</small></button>)}</SuggestionGroup>}
-            {albums.length > 0 && <SuggestionGroup label="专辑">{albums.map((album) => <button key={album} onClick={() => { setSearchQuery(album); void submitSearch(album); }}><span>◉</span><strong>{album}</strong><small>专辑</small></button>)}</SuggestionGroup>}
-            <button className="view-all" onMouseDown={(event) => event.preventDefault()} onClick={() => void submitSearch()}>查看“{searchQuery}”的全部结果 <span>→</span></button>
-          </div>}
+          {suggestionOpen && (
+            <div className="suggestions" role="listbox">
+              {searchState === "empty" && <div className="suggestion-state">没有找到相关音乐</div>}
+              {suggestions.slice(0, 4).length > 0 && (
+                <SuggestionGroup label="歌曲">
+                  {suggestions.slice(0, 4).map((track, index) => {
+                    const trackKey = `${track.providerId}:${track.providerTrackId}`;
+                    const resolving = playingCatalogKey === trackKey;
+                    return (
+                      <button
+                        role="option"
+                        aria-selected={index === suggestionIndex}
+                        aria-busy={resolving}
+                        disabled={resolving}
+                        className={index === suggestionIndex ? "selected" : ""}
+                        key={trackKey}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => {
+                          setSuggestionOpen(false);
+                          void playCatalog(track);
+                        }}
+                      >
+                        <span>{resolving ? "…" : "♪"}</span>
+                        <strong>{track.title}</strong>
+                        <small>{resolving ? "正在解析整首播放…" : track.artist}</small>
+                      </button>
+                    );
+                  })}
+                </SuggestionGroup>
+              )}
+              {artists.length > 0 && (
+                <SuggestionGroup label="歌手">
+                  {artists.map((artist) => (
+                    <button
+                      key={artist}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => {
+                        setSearchQuery(artist);
+                        setSuggestionOpen(false);
+                        void submitSearch(artist);
+                      }}
+                    >
+                      <span>●</span>
+                      <strong>{artist}</strong>
+                      <small>歌手</small>
+                    </button>
+                  ))}
+                </SuggestionGroup>
+              )}
+              {albums.length > 0 && (
+                <SuggestionGroup label="专辑">
+                  {albums.map((album) => (
+                    <button
+                      key={album}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => {
+                        setSearchQuery(album);
+                        setSuggestionOpen(false);
+                        void submitSearch(album);
+                      }}
+                    >
+                      <span>◉</span>
+                      <strong>{album}</strong>
+                      <small>专辑</small>
+                    </button>
+                  ))}
+                </SuggestionGroup>
+              )}
+              <button
+                className="view-all"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  setSuggestionOpen(false);
+                  void submitSearch();
+                }}
+              >
+                查看“{searchQuery}”的全部结果 <span>→</span>
+              </button>
+            </div>
+          )}
         </div>
         <div className="top-bar-trail">
           <button className={`mode-pill ${snapshot.audioMode === "cinema_game" ? "active" : ""}`} onClick={() => navigateTo("now-playing")}><span>⊙</span>{snapshot.audioMode === "music" ? "原声" : "空间"}</button>
@@ -2219,19 +2292,13 @@ function App() {
       {configSource && sourceConfigDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSourceConfig(); }}><section className="config-modal" role="dialog" aria-modal="true" aria-label={`${configSource.metadata.name} 音源配置`}><div className="section-heading"><div><p className="eyebrow">SOURCE CONFIG</p><h3>{configSource.metadata.name || "音源配置"}</h3><p>同时支持源码常量 key 与 LX 全局 ls；关闭或保存后敏感值会从界面状态清空。</p></div><button onClick={closeSourceConfig} aria-label="关闭配置">×</button></div><div className="config-fields"><label><span>源码常量名</span><input value={sourceConfigDraft.constName} placeholder="YuNingXi" autoComplete="off" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, constName: event.target.value })} /></label><label><span>解析 Key</span><input type={sourceConfigRevealed ? "text" : "password"} value={sourceConfigDraft.keyValue} placeholder="留空则使用音源公益额度" autoComplete="new-password" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, keyValue: event.target.value })} /></label><label><span>ls.api.addr（可选）</span><input value={sourceConfigDraft.apiAddr} placeholder="https://…" autoComplete="off" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, apiAddr: event.target.value })} /></label><label><span>ls.api.pass（可选）</span><input type={sourceConfigRevealed ? "text" : "password"} value={sourceConfigDraft.apiPass} autoComplete="new-password" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, apiPass: event.target.value })} /></label></div><label className="config-reveal"><input type="checkbox" checked={sourceConfigRevealed} onChange={(event) => setSourceConfigRevealed(event.target.checked)} /> 临时显示敏感字段</label><div className="modal-actions"><button onClick={closeSourceConfig}>取消</button><button className="primary" disabled={sourceConfigBusy} onClick={() => void saveSourceConfig()}>保存并应用</button></div></section></div>}
 
       {(message || (snapshot.error && !engineErrorDismissed)) && (
-        <div className="toast" role="status">
-          <span>!</span>
+        <div
+          className={`toast ${snapshot.error && !engineErrorDismissed || messageIsError ? "toast-error" : "toast-ok"}`}
+          role="status"
+        >
+          <span>{snapshot.error && !engineErrorDismissed || messageIsError ? "!" : "✓"}</span>
           <p>{(!engineErrorDismissed && snapshot.error) ? snapshot.error : message}</p>
-          <button
-            type="button"
-            onClick={() => {
-              setMessage("");
-              setEngineErrorDismissed(true);
-            }}
-            aria-label="关闭提示"
-          >
-            ×
-          </button>
+          <button type="button" onClick={clearMessage} aria-label="关闭提示">×</button>
         </div>
       )}
 
@@ -2360,19 +2427,6 @@ function App() {
         title={resolveBanner?.title ?? "正在解析"}
         detail={resolveBanner?.detail}
         onCancel={cancelResolve}
-      />
-
-      <OnboardingModal
-        open={showOnboarding}
-        onClose={finishOnboarding}
-        onOpenSources={() => {
-          finishOnboarding();
-          navigateTo("sources");
-        }}
-        onImportLocal={() => {
-          finishOnboarding();
-          void chooseFiles();
-        }}
       />
     </div>
   );

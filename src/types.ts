@@ -168,7 +168,6 @@ export type ViewId =
   | "search"
   | "library"
   | "favorites"
-  | "offline"
   | "history"
   | "playlist"
   | "sources"

@@ -47,6 +47,24 @@ pub enum AudioMode {
     CinemaGame,
 }
 
+/// Playback progression mode for the engine queue.
+///
+/// Queue logic lives on the worker thread only — never on the cpal callback path.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayMode {
+    /// Play in order; stop after the last track.
+    #[default]
+    Sequential,
+    /// Play in order; wrap to index 0 after the last track.
+    RepeatAll,
+    /// When a track ends, restart the same index from 0.
+    /// Next/Previous still move to adjacent tracks.
+    RepeatOne,
+    /// Pick a random unplayed index each advance; reset after a full cycle.
+    Shuffle,
+}
+
 impl AudioMode {
     fn dsp_settings(self) -> DspSettings {
         match self {
@@ -97,6 +115,7 @@ pub struct EngineSnapshot {
     pub duration_seconds: Option<f64>,
     pub volume: f32,
     pub audio_mode: AudioMode,
+    pub play_mode: PlayMode,
     pub dsp_settings: DspSettings,
     pub generation: u64,
     pub underrun_callbacks: u64,
@@ -118,6 +137,7 @@ impl Default for EngineSnapshot {
             duration_seconds: None,
             volume: 1.0,
             audio_mode: AudioMode::Music,
+            play_mode: PlayMode::Sequential,
             dsp_settings: DspSettings::default(),
             generation: 0,
             underrun_callbacks: 0,
@@ -132,12 +152,20 @@ impl Default for EngineSnapshot {
 }
 
 enum EngineCommand {
-    Load(Vec<EngineQueueItem>),
+    Load {
+        items: Vec<EngineQueueItem>,
+        start_index: usize,
+    },
+    Enqueue(Vec<EngineQueueItem>),
+    Jump(usize),
+    Remove(usize),
+    ClearQueue,
     Play,
     Pause,
     Seek(f64),
     SetVolume(f32),
     SetAudioMode(AudioMode),
+    SetPlayMode(PlayMode),
     SetDspSettings(DspSettings),
     SetOutputDevice(Option<String>),
     Next,
@@ -168,10 +196,27 @@ impl LocalAudioEngine {
     }
 
     pub fn load(&self, paths: Vec<PathBuf>) -> Result<()> {
+        self.load_at(paths, 0)
+    }
+
+    pub fn load_at(&self, paths: Vec<PathBuf>, start_index: usize) -> Result<()> {
         if paths.is_empty() {
             bail!("at least one local audio path is required");
         }
-        self.send(EngineCommand::Load(
+        if start_index >= paths.len() {
+            bail!("start_index {start_index} is out of range for {} paths", paths.len());
+        }
+        self.send(EngineCommand::Load {
+            items: paths.into_iter().map(local_queue_item).collect(),
+            start_index,
+        })
+    }
+
+    pub fn enqueue(&self, paths: Vec<PathBuf>) -> Result<()> {
+        if paths.is_empty() {
+            bail!("at least one local audio path is required to enqueue");
+        }
+        self.send(EngineCommand::Enqueue(
             paths.into_iter().map(local_queue_item).collect(),
         ))
     }
@@ -190,30 +235,48 @@ impl LocalAudioEngine {
             bail!("HLS playback is not supported in v1");
         }
         let location = request.redacted_for_log();
-        self.send(EngineCommand::Load(vec![EngineQueueItem {
-            public: QueueItem {
-                location,
-                title,
-                duration_seconds: None,
-                online: true,
-            },
-            source: PlaybackSource::Online {
-                request,
-                cache_plan,
-            },
-        }]))
+        self.send(EngineCommand::Load {
+            items: vec![EngineQueueItem {
+                public: QueueItem {
+                    location,
+                    title,
+                    duration_seconds: None,
+                    online: true,
+                },
+                source: PlaybackSource::Online {
+                    request,
+                    cache_plan,
+                },
+            }],
+            start_index: 0,
+        })
     }
 
     pub fn load_cached_online(&self, path: PathBuf, title: String) -> Result<()> {
-        self.send(EngineCommand::Load(vec![EngineQueueItem {
-            public: QueueItem {
-                location: path.display().to_string(),
-                title,
-                duration_seconds: None,
-                online: true,
-            },
-            source: PlaybackSource::Local(path),
-        }]))
+        self.send(EngineCommand::Load {
+            items: vec![EngineQueueItem {
+                public: QueueItem {
+                    location: path.display().to_string(),
+                    title,
+                    duration_seconds: None,
+                    online: true,
+                },
+                source: PlaybackSource::Local(path),
+            }],
+            start_index: 0,
+        })
+    }
+
+    pub fn jump(&self, index: usize) -> Result<()> {
+        self.send(EngineCommand::Jump(index))
+    }
+
+    pub fn remove_queue_item(&self, index: usize) -> Result<()> {
+        self.send(EngineCommand::Remove(index))
+    }
+
+    pub fn clear_queue(&self) -> Result<()> {
+        self.send(EngineCommand::ClearQueue)
     }
 
     pub fn play(&self) -> Result<()> {
@@ -247,6 +310,10 @@ impl LocalAudioEngine {
         let settings = mode.dsp_settings();
         DspChain::new(48_000, 2, settings.clone())?;
         self.send(EngineCommand::SetAudioMode(mode))
+    }
+
+    pub fn set_play_mode(&self, mode: PlayMode) -> Result<()> {
+        self.send(EngineCommand::SetPlayMode(mode))
     }
 
     pub fn next(&self) -> Result<()> {
@@ -305,6 +372,12 @@ struct WorkerModel {
     start_seconds: f64,
     volume: f32,
     audio_mode: AudioMode,
+    play_mode: PlayMode,
+    /// Parallel to `queue`: whether each index has been played in the current shuffle cycle.
+    /// Resized/rebuilt whenever the queue length changes or indices are remapped.
+    shuffle_played: Vec<bool>,
+    /// LCG state for shuffle — no external RNG dependency.
+    shuffle_rng: u64,
     dsp_settings: DspSettings,
     generation: u64,
     error: Option<String>,
@@ -322,12 +395,195 @@ impl Default for WorkerModel {
             start_seconds: 0.0,
             volume: 1.0,
             audio_mode: AudioMode::Music,
+            play_mode: PlayMode::Sequential,
+            shuffle_played: Vec::new(),
+            // Mix process/thread entropy lightly without pulling in the rand crate.
+            shuffle_rng: default_shuffle_seed(),
             dsp_settings: DspSettings::default(),
             generation: 0,
             error: None,
             output_device: None,
         }
     }
+}
+
+fn default_shuffle_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0xC0FFEE);
+    nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(std::process::id() as u64)
+        .max(1)
+}
+
+/// Numerical Recipes LCG — worker-thread only, never on the audio callback path.
+fn lcg_next(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1);
+    *state
+}
+
+fn lcg_index(state: &mut u64, len: usize) -> usize {
+    debug_assert!(len > 0);
+    (lcg_next(state) as usize) % len
+}
+
+fn reset_shuffle_cycle(model: &mut WorkerModel) {
+    model.shuffle_played.clear();
+    model.shuffle_played.resize(model.queue.len(), false);
+}
+
+fn sync_shuffle_len(model: &mut WorkerModel) {
+    let n = model.queue.len();
+    if model.shuffle_played.len() != n {
+        // Queue mutated mid-cycle (enqueue/remove/load) — invalidate the played set.
+        reset_shuffle_cycle(model);
+    }
+}
+
+fn mark_shuffle_played(model: &mut WorkerModel, index: usize) {
+    sync_shuffle_len(model);
+    if index < model.shuffle_played.len() {
+        model.shuffle_played[index] = true;
+    }
+}
+
+/// Pick the next shuffle index. Prefers unplayed tracks; resets the cycle when exhausted.
+/// When `prefer_not` is set and the queue has more than one track, avoid immediately
+/// re-picking it after a full-cycle reset.
+fn pick_shuffle_index(model: &mut WorkerModel, prefer_not: Option<usize>) -> Option<usize> {
+    let n = model.queue.len();
+    if n == 0 {
+        return None;
+    }
+    sync_shuffle_len(model);
+
+    let mut available: Vec<usize> = (0..n).filter(|&i| !model.shuffle_played[i]).collect();
+    if available.is_empty() {
+        reset_shuffle_cycle(model);
+        available = (0..n).collect();
+        if let Some(skip) = prefer_not
+            && n > 1
+            && let Some(pos) = available.iter().position(|&i| i == skip)
+        {
+            available.swap_remove(pos);
+        }
+    }
+    if available.is_empty() {
+        return Some(0);
+    }
+    let choice = available[lcg_index(&mut model.shuffle_rng, available.len())];
+    Some(choice)
+}
+
+/// Decide the next queue index after natural end-of-track.
+/// Returns `None` when playback should stop.
+fn next_index_on_ended(model: &mut WorkerModel) -> Option<usize> {
+    let current = model.index?;
+    let n = model.queue.len();
+    if n == 0 {
+        return None;
+    }
+    match model.play_mode {
+        PlayMode::Sequential => {
+            let next = current + 1;
+            if next < n {
+                Some(next)
+            } else {
+                None
+            }
+        }
+        PlayMode::RepeatAll => {
+            if n == 1 {
+                Some(0)
+            } else {
+                Some((current + 1) % n)
+            }
+        }
+        PlayMode::RepeatOne => Some(current),
+        PlayMode::Shuffle => {
+            mark_shuffle_played(model, current);
+            pick_shuffle_index(model, Some(current))
+        }
+    }
+}
+
+/// Decide the next queue index for an explicit Next command.
+/// Returns `None` when the command is a no-op (e.g. sequential at last track).
+fn next_index_on_next(model: &mut WorkerModel) -> Option<usize> {
+    let current = model.index?;
+    let n = model.queue.len();
+    if n == 0 {
+        return None;
+    }
+    match model.play_mode {
+        PlayMode::Sequential | PlayMode::RepeatOne => {
+            let next = current + 1;
+            if next < n {
+                Some(next)
+            } else {
+                None
+            }
+        }
+        PlayMode::RepeatAll => {
+            if n == 1 {
+                // Restart the only track.
+                Some(0)
+            } else {
+                Some((current + 1) % n)
+            }
+        }
+        PlayMode::Shuffle => {
+            mark_shuffle_played(model, current);
+            pick_shuffle_index(model, Some(current))
+        }
+    }
+}
+
+/// Decide the previous queue index for an explicit Previous command.
+fn next_index_on_previous(model: &mut WorkerModel) -> Option<usize> {
+    let current = model.index?;
+    let n = model.queue.len();
+    if n == 0 {
+        return None;
+    }
+    match model.play_mode {
+        PlayMode::Sequential | PlayMode::RepeatOne => {
+            if current > 0 {
+                Some(current - 1)
+            } else {
+                // Restart current from the beginning.
+                Some(0)
+            }
+        }
+        PlayMode::RepeatAll => {
+            if n == 1 {
+                Some(0)
+            } else if current == 0 {
+                Some(n - 1)
+            } else {
+                Some(current - 1)
+            }
+        }
+        PlayMode::Shuffle => {
+            mark_shuffle_played(model, current);
+            pick_shuffle_index(model, Some(current))
+        }
+    }
+}
+
+fn request_track_change(model: &mut WorkerModel, index: usize, session: &mut Option<PlaybackSession>) {
+    model.index = Some(index);
+    model.start_seconds = 0.0;
+    model.reload_requested = true;
+    model.status = PlaybackStatus::Loading;
+    model.error = None;
+    model.generation = model.generation.wrapping_add(1);
+    *session = None;
 }
 
 fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<EngineSnapshot>>) {
@@ -404,19 +660,13 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                     };
                 }
                 Ok(PumpResult::Ended) => {
-                    if let Some(index) = model.index {
-                        if index + 1 < model.queue.len() {
-                            model.index = Some(index + 1);
-                            model.start_seconds = 0.0;
-                            model.generation += 1;
-                            model.reload_requested = true;
-                            session = None;
-                        } else {
-                            model.status = PlaybackStatus::Stopped;
-                            model.intent_playing = false;
-                            model.start_seconds = active.position_seconds();
-                            session = None;
-                        }
+                    if let Some(next) = next_index_on_ended(&mut model) {
+                        request_track_change(&mut model, next, &mut session);
+                    } else {
+                        model.status = PlaybackStatus::Stopped;
+                        model.intent_playing = false;
+                        model.start_seconds = active.position_seconds();
+                        session = None;
                     }
                 }
                 Err(error) => {
@@ -461,15 +711,109 @@ fn handle_command(
     session: &mut Option<PlaybackSession>,
 ) -> bool {
     match command {
-        EngineCommand::Load(items) => {
+        EngineCommand::Load {
+            items,
+            start_index,
+        } => {
+            let start = if items.is_empty() {
+                None
+            } else {
+                Some(start_index.min(items.len() - 1))
+            };
             model.queue = items;
-            model.index = (!model.queue.is_empty()).then_some(0);
+            model.index = start;
             model.start_seconds = 0.0;
-            model.intent_playing = true;
-            model.reload_requested = model.index.is_some();
-            model.status = PlaybackStatus::Loading;
+            model.intent_playing = start.is_some();
+            model.reload_requested = start.is_some();
+            model.status = if start.is_some() {
+                PlaybackStatus::Loading
+            } else {
+                PlaybackStatus::Idle
+            };
             model.error = None;
-            model.generation += 1;
+            model.generation = model.generation.wrapping_add(1);
+            reset_shuffle_cycle(model);
+            if let Some(idx) = start {
+                mark_shuffle_played(model, idx);
+            }
+            *session = None;
+        }
+        EngineCommand::Enqueue(items) => {
+            if items.is_empty() {
+                return false;
+            }
+            let was_empty = model.queue.is_empty();
+            // Preserve shuffle progress for existing indices; new tail is unplayed.
+            sync_shuffle_len(model);
+            let old_len = model.queue.len();
+            model.queue.extend(items);
+            model.shuffle_played.resize(model.queue.len(), false);
+            // If nothing was playing, start the first enqueued item.
+            if was_empty {
+                model.index = Some(0);
+                model.start_seconds = 0.0;
+                model.intent_playing = true;
+                model.reload_requested = true;
+                model.status = PlaybackStatus::Loading;
+                model.error = None;
+                model.generation = model.generation.wrapping_add(1);
+                mark_shuffle_played(model, 0);
+                *session = None;
+            } else {
+                let _ = old_len;
+            }
+        }
+        EngineCommand::Jump(index) => {
+            if index < model.queue.len() {
+                mark_shuffle_played(model, index);
+                request_track_change(model, index, session);
+                model.intent_playing = true;
+            }
+        }
+        EngineCommand::Remove(index) => {
+            if index >= model.queue.len() {
+                return false;
+            }
+            model.queue.remove(index);
+            if model.shuffle_played.len() > index {
+                model.shuffle_played.remove(index);
+            } else {
+                reset_shuffle_cycle(model);
+            }
+            match model.index {
+                None => {}
+                Some(_) if model.queue.is_empty() => {
+                    model.index = None;
+                    model.status = PlaybackStatus::Idle;
+                    model.intent_playing = false;
+                    model.start_seconds = 0.0;
+                    model.reload_requested = false;
+                    model.generation = model.generation.wrapping_add(1);
+                    *session = None;
+                }
+                Some(current) if current == index => {
+                    // Removed the playing track — land on the same slot (next item) or last.
+                    let next = index.min(model.queue.len() - 1);
+                    request_track_change(model, next, session);
+                    model.intent_playing = true;
+                    mark_shuffle_played(model, next);
+                }
+                Some(current) if current > index => {
+                    model.index = Some(current - 1);
+                }
+                Some(_) => {}
+            }
+        }
+        EngineCommand::ClearQueue => {
+            model.queue.clear();
+            model.index = None;
+            model.start_seconds = 0.0;
+            model.intent_playing = false;
+            model.reload_requested = false;
+            model.status = PlaybackStatus::Idle;
+            model.error = None;
+            model.generation = model.generation.wrapping_add(1);
+            reset_shuffle_cycle(model);
             *session = None;
         }
         EngineCommand::Play => {
@@ -477,7 +821,7 @@ fn handle_command(
                 if model.status == PlaybackStatus::Stopped {
                     model.start_seconds = 0.0;
                     model.status = PlaybackStatus::Loading;
-                    model.generation += 1;
+                    model.generation = model.generation.wrapping_add(1);
                 }
                 model.intent_playing = true;
                 if session.is_none() {
@@ -501,7 +845,7 @@ fn handle_command(
                 model.reload_requested = true;
                 model.status = PlaybackStatus::Loading;
                 model.error = None;
-                model.generation += 1;
+                model.generation = model.generation.wrapping_add(1);
                 *session = None;
             }
         }
@@ -518,6 +862,17 @@ fn handle_command(
                 model.audio_mode = mode;
             }
         }
+        EngineCommand::SetPlayMode(mode) => {
+            let previous = model.play_mode;
+            model.play_mode = mode;
+            if mode == PlayMode::Shuffle && previous != PlayMode::Shuffle {
+                // Fresh shuffle cycle when entering shuffle; mark current as already heard.
+                reset_shuffle_cycle(model);
+                if let Some(idx) = model.index {
+                    mark_shuffle_played(model, idx);
+                }
+            }
+        }
         EngineCommand::SetDspSettings(settings) => {
             apply_dsp_change(model, session.as_mut(), settings);
         }
@@ -530,36 +885,25 @@ fn handle_command(
                 model.reload_requested = true;
                 model.status = PlaybackStatus::Loading;
                 model.error = None;
-                model.generation += 1;
+                model.generation = model.generation.wrapping_add(1);
                 *session = None;
             }
         }
         EngineCommand::Next => {
-            if let Some(index) = model.index
-                && index + 1 < model.queue.len()
-            {
-                model.index = Some(index + 1);
-                model.start_seconds = 0.0;
-                model.reload_requested = true;
-                model.status = PlaybackStatus::Loading;
-                model.error = None;
-                model.generation += 1;
-                *session = None;
+            if let Some(next) = next_index_on_next(model) {
+                // RepeatAll with single track: still restart.
+                let same = model.index == Some(next);
+                request_track_change(model, next, session);
+                if same {
+                    // restart current
+                }
+                model.intent_playing = true;
             }
         }
         EngineCommand::Previous => {
-            if let Some(index) = model.index {
-                if index > 0 {
-                    model.index = Some(index - 1);
-                    model.start_seconds = 0.0;
-                } else {
-                    model.start_seconds = 0.0;
-                }
-                model.reload_requested = true;
-                model.status = PlaybackStatus::Loading;
-                model.error = None;
-                model.generation += 1;
-                *session = None;
+            if let Some(next) = next_index_on_previous(model) {
+                request_track_change(model, next, session);
+                model.intent_playing = true;
             }
         }
         EngineCommand::Shutdown => return true,
@@ -639,6 +983,7 @@ fn publish_snapshot(
         duration_seconds,
         volume: model.volume,
         audio_mode: model.audio_mode,
+        play_mode: model.play_mode,
         dsp_settings: model.dsp_settings.clone(),
         generation: model.generation,
         underrun_callbacks: underruns,
@@ -1071,6 +1416,35 @@ mod tests {
     #[global_allocator]
     static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
 
+    fn dummy_item(name: &str) -> EngineQueueItem {
+        EngineQueueItem {
+            public: QueueItem {
+                location: format!("{name}.wav"),
+                title: name.to_owned(),
+                duration_seconds: Some(120.0),
+                online: false,
+            },
+            source: PlaybackSource::Local(PathBuf::from(format!("{name}.wav"))),
+        }
+    }
+
+    fn model_with_queue(n: usize, index: usize, mode: PlayMode) -> WorkerModel {
+        let mut model = WorkerModel {
+            queue: (0..n).map(|i| dummy_item(&format!("t{i}"))).collect(),
+            index: Some(index),
+            status: PlaybackStatus::Playing,
+            intent_playing: true,
+            play_mode: mode,
+            generation: 1,
+            ..WorkerModel::default()
+        };
+        reset_shuffle_cycle(&mut model);
+        if mode == PlayMode::Shuffle {
+            mark_shuffle_played(&mut model, index);
+        }
+        model
+    }
+
     #[test]
     fn volume_hot_update_changes_atomic_without_reloading() {
         let mut model = WorkerModel {
@@ -1092,15 +1466,7 @@ mod tests {
     #[test]
     fn stopped_play_restarts_from_zero() {
         let mut model = WorkerModel {
-            queue: vec![EngineQueueItem {
-                public: QueueItem {
-                    location: "dummy.wav".into(),
-                    title: "Dummy".into(),
-                    duration_seconds: Some(120.0),
-                    online: false,
-                },
-                source: PlaybackSource::Local(PathBuf::from("dummy.wav")),
-            }],
+            queue: vec![dummy_item("Dummy")],
             index: Some(0),
             status: PlaybackStatus::Stopped,
             start_seconds: 120.0,
@@ -1120,6 +1486,174 @@ mod tests {
         assert!(model.intent_playing);
         assert!(model.reload_requested);
         assert_eq!(model.generation, 5);
+    }
+
+    #[test]
+    fn sequential_ended_advances_then_stops_at_end() {
+        let mut model = model_with_queue(3, 0, PlayMode::Sequential);
+        assert_eq!(next_index_on_ended(&mut model), Some(1));
+        model.index = Some(1);
+        assert_eq!(next_index_on_ended(&mut model), Some(2));
+        model.index = Some(2);
+        assert_eq!(next_index_on_ended(&mut model), None);
+    }
+
+    #[test]
+    fn sequential_next_does_not_wrap() {
+        let mut model = model_with_queue(3, 2, PlayMode::Sequential);
+        assert_eq!(next_index_on_next(&mut model), None);
+        model.index = Some(0);
+        assert_eq!(next_index_on_next(&mut model), Some(1));
+    }
+
+    #[test]
+    fn repeat_all_ended_wraps_to_zero() {
+        let mut model = model_with_queue(3, 2, PlayMode::RepeatAll);
+        assert_eq!(next_index_on_ended(&mut model), Some(0));
+        model.index = Some(0);
+        assert_eq!(next_index_on_ended(&mut model), Some(1));
+    }
+
+    #[test]
+    fn repeat_all_next_and_previous_wrap() {
+        let mut model = model_with_queue(3, 2, PlayMode::RepeatAll);
+        assert_eq!(next_index_on_next(&mut model), Some(0));
+        model.index = Some(0);
+        assert_eq!(next_index_on_previous(&mut model), Some(2));
+    }
+
+    #[test]
+    fn repeat_one_ended_stays_on_current() {
+        let mut model = model_with_queue(3, 1, PlayMode::RepeatOne);
+        assert_eq!(next_index_on_ended(&mut model), Some(1));
+        // Explicit Next still advances.
+        assert_eq!(next_index_on_next(&mut model), Some(2));
+    }
+
+    #[test]
+    fn shuffle_ended_and_next_cover_all_then_reset() {
+        let mut model = model_with_queue(4, 0, PlayMode::Shuffle);
+        model.shuffle_rng = 42;
+
+        let mut seen = [false; 4];
+        seen[0] = true; // starting track counted as played
+        for _ in 0..3 {
+            let next = next_index_on_ended(&mut model).expect("should pick next");
+            assert!(!seen[next], "shuffle should not repeat within a cycle: {next}");
+            seen[next] = true;
+            model.index = Some(next);
+        }
+        assert!(seen.iter().all(|&v| v), "all tracks should be covered once");
+
+        // Full cycle exhausted — next advance resets and still returns a valid index.
+        let after_reset = next_index_on_ended(&mut model).expect("shuffle must reset, not stall");
+        assert!(after_reset < 4);
+
+        // Next command also uses shuffle path.
+        model.index = Some(after_reset);
+        let via_next = next_index_on_next(&mut model).expect("shuffle next");
+        assert!(via_next < 4);
+    }
+
+    #[test]
+    fn shuffle_survives_mid_cycle_enqueue_and_remove() {
+        let mut model = model_with_queue(3, 0, PlayMode::Shuffle);
+        model.shuffle_rng = 7;
+        // Play through one advance so played set is non-trivial.
+        let first = next_index_on_ended(&mut model).unwrap();
+        model.index = Some(first);
+
+        let mut session = None;
+        assert!(!handle_command(
+            EngineCommand::Enqueue(vec![dummy_item("extra")]),
+            &mut model,
+            &mut session,
+        ));
+        // Length changed — sync path must not panic; further picks stay in range.
+        assert_eq!(model.queue.len(), 4);
+        let next = next_index_on_next(&mut model).unwrap();
+        assert!(next < model.queue.len());
+        model.index = Some(next);
+
+        // Remove an item before current index and ensure index/played set stay consistent.
+        let remove_at = 0;
+        assert!(!handle_command(
+            EngineCommand::Remove(remove_at),
+            &mut model,
+            &mut session,
+        ));
+        assert_eq!(model.queue.len(), 3);
+        if let Some(idx) = model.index {
+            assert!(idx < model.queue.len());
+        }
+        let again = next_index_on_ended(&mut model);
+        if let Some(idx) = again {
+            assert!(idx < model.queue.len());
+        }
+    }
+
+    #[test]
+    fn load_respects_start_index_and_enqueue_does_not_interrupt() {
+        let mut model = WorkerModel::default();
+        let mut session = None;
+        assert!(!handle_command(
+            EngineCommand::Load {
+                items: vec![dummy_item("a"), dummy_item("b"), dummy_item("c")],
+                start_index: 2,
+            },
+            &mut model,
+            &mut session,
+        ));
+        assert_eq!(model.index, Some(2));
+        assert!(model.intent_playing);
+        assert!(model.reload_requested);
+
+        model.reload_requested = false;
+        model.status = PlaybackStatus::Playing;
+        let generation = model.generation;
+        assert!(!handle_command(
+            EngineCommand::Enqueue(vec![dummy_item("d")]),
+            &mut model,
+            &mut session,
+        ));
+        assert_eq!(model.queue.len(), 4);
+        assert_eq!(model.index, Some(2));
+        assert!(!model.reload_requested);
+        assert_eq!(model.generation, generation);
+    }
+
+    #[test]
+    fn jump_and_clear_queue() {
+        let mut model = model_with_queue(3, 0, PlayMode::Sequential);
+        let mut session = None;
+        assert!(!handle_command(
+            EngineCommand::Jump(2),
+            &mut model,
+            &mut session,
+        ));
+        assert_eq!(model.index, Some(2));
+        assert!(model.reload_requested);
+
+        assert!(!handle_command(
+            EngineCommand::ClearQueue,
+            &mut model,
+            &mut session,
+        ));
+        assert!(model.queue.is_empty());
+        assert_eq!(model.index, None);
+        assert_eq!(model.status, PlaybackStatus::Idle);
+    }
+
+    #[test]
+    fn set_play_mode_command() {
+        let mut model = model_with_queue(2, 0, PlayMode::Sequential);
+        let mut session = None;
+        assert!(!handle_command(
+            EngineCommand::SetPlayMode(PlayMode::RepeatOne),
+            &mut model,
+            &mut session,
+        ));
+        assert_eq!(model.play_mode, PlayMode::RepeatOne);
     }
 
     #[test]

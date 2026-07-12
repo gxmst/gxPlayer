@@ -109,6 +109,8 @@ export type DspSettings = {
   limiter: { enabled: boolean; ceilingDb: number; releaseMs: number };
 };
 
+export type PlayMode = "sequential" | "repeat_all" | "repeat_one" | "shuffle";
+
 export type EngineSnapshot = {
   status: PlaybackStatus;
   queue: QueueItem[];
@@ -117,6 +119,7 @@ export type EngineSnapshot = {
   durationSeconds: number | null;
   volume: number;
   audioMode: "music" | "cinema_game";
+  playMode: PlayMode;
   dspSettings: DspSettings;
   generation: number;
   underrunCallbacks: number;
@@ -146,6 +149,7 @@ export const EMPTY_ENGINE: EngineSnapshot = {
   durationSeconds: null,
   volume: 1,
   audioMode: "music",
+  playMode: "sequential",
   dspSettings: {
     enabled: false,
     eqEnabled: false,

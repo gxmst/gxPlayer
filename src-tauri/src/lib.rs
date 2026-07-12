@@ -7,7 +7,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
-use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine};
+use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine, PlayMode};
 use gx_contracts::ResolvedMediaRequest;
 use gx_dsp::DspSettings;
 use gx_library::{LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistSummary};
@@ -114,9 +114,20 @@ fn player_load_local(
     engine: tauri::State<LocalAudioEngine>,
     library: tauri::State<LibraryStore>,
     paths: Vec<String>,
+    start_index: Option<usize>,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
     let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err("至少需要一首本地音频".into());
+    }
+    let start_index = start_index.unwrap_or(0);
+    if start_index >= paths.len() {
+        return Err(format!(
+            "start_index {start_index} 超出队列长度 {}",
+            paths.len()
+        ));
+    }
     let tracks = paths
         .iter()
         .map(|path| {
@@ -140,7 +151,90 @@ fn player_load_local(
     library
         .add_tracks(&tracks)
         .map_err(|error| error.to_string())?;
-    engine.load(paths).map_err(|error| error.to_string())
+    engine
+        .load_at(paths, start_index)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_enqueue_local(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    library: tauri::State<LibraryStore>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err("至少需要一首本地音频".into());
+    }
+    let tracks = paths
+        .iter()
+        .map(|path| {
+            let info = gx_audio::probe_local_file(path).map_err(|error| error.to_string())?;
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("未命名曲目");
+            let (filename_artist, filename_title) = stem
+                .split_once(" - ")
+                .map_or(("", stem), |(artist, title)| (artist, title));
+            Ok(NewTrack {
+                path: path.display().to_string(),
+                title: info.title.unwrap_or_else(|| filename_title.to_owned()),
+                artist: info.artist.unwrap_or_else(|| filename_artist.to_owned()),
+                album: info.album.unwrap_or_default(),
+                duration_seconds: info.duration_seconds,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    library
+        .add_tracks(&tracks)
+        .map_err(|error| error.to_string())?;
+    engine.enqueue(paths).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_jump(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    index: usize,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine.jump(index).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_remove_queue_item(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    index: usize,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine
+        .remove_queue_item(index)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_clear_queue(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine.clear_queue().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_set_play_mode(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    mode: PlayMode,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    engine
+        .set_play_mode(mode)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -797,6 +891,7 @@ pub fn run() {
             main_only_probe,
             ui_ready,
             player_load_local,
+            player_enqueue_local,
             player_load_resolved,
             player_play_online_track,
             player_play,
@@ -804,9 +899,13 @@ pub fn run() {
             player_seek,
             player_set_volume,
             player_set_audio_mode,
+            player_set_play_mode,
             player_set_dsp_settings,
             player_next,
             player_previous,
+            player_jump,
+            player_remove_queue_item,
+            player_clear_queue,
             player_snapshot,
             player_output_devices,
             player_set_output_device,

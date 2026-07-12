@@ -480,8 +480,9 @@ fn pick_shuffle_index(model: &mut WorkerModel, prefer_not: Option<usize>) -> Opt
     Some(choice)
 }
 
-/// Decide the next queue index after natural end-of-track.
-/// Returns `None` when playback should stop.
+/// Pure selection helper mirroring the frontend algorithm (tests only).
+/// Production Ended never auto-advances — the frontend owns next-track choice.
+#[cfg(test)]
 fn next_index_on_ended(model: &mut WorkerModel) -> Option<usize> {
     let current = model.index?;
     let n = model.queue.len();
@@ -660,14 +661,13 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                     };
                 }
                 Ok(PumpResult::Ended) => {
-                    if let Some(next) = next_index_on_ended(&mut model) {
-                        request_track_change(&mut model, next, &mut session);
-                    } else {
-                        model.status = PlaybackStatus::Stopped;
-                        model.intent_playing = false;
-                        model.start_seconds = active.position_seconds();
-                        session = None;
-                    }
+                    // Frontend is the sole authority for next-track selection (scheme-1 queues).
+                    // The engine only reports natural end as Stopped; it never auto-advances.
+                    // Explicit Next/Previous/Jump still change tracks when the UI commands them.
+                    model.status = PlaybackStatus::Stopped;
+                    model.intent_playing = false;
+                    model.start_seconds = active.position_seconds();
+                    session = None;
                 }
                 Err(error) => {
                     model.status = PlaybackStatus::Failed;

@@ -9,6 +9,7 @@ import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
 import {
   EMPTY_ENGINE,
+  type CacheEntryView,
   type CacheStatus,
   type CatalogTrack,
   type EngineSnapshot,
@@ -46,6 +47,15 @@ type PlaylistEntry =
       kind: "online";
       track: CatalogTrack;
       quality: QualityPreference;
+    }
+  | {
+      /** Completed online cache — play via local file, no LX resolve. */
+      kind: "cached";
+      providerId: string;
+      providerTrackId: string;
+      quality: string;
+      title: string;
+      artist: string;
     };
 
 const PLAY_MODE_ORDER: PlayMode[] = ["sequential", "repeat_all", "repeat_one", "shuffle"];
@@ -62,15 +72,52 @@ function catalogKey(track: CatalogTrack): string {
 
 function entryKey(entry: PlaylistEntry, index: number): string {
   if (entry.kind === "local") return `local:${entry.path}:${index}`;
+  if (entry.kind === "cached") {
+    return `cached:${entry.providerId}:${entry.providerTrackId}:${entry.quality}:${index}`;
+  }
   return `online:${catalogKey(entry.track)}:${index}`;
 }
 
 function entryTitle(entry: PlaylistEntry): string {
-  return entry.kind === "local" ? entry.title : entry.track.title;
+  if (entry.kind === "local" || entry.kind === "cached") return entry.title;
+  return entry.track.title;
 }
 
 function entryArtist(entry: PlaylistEntry): string {
-  return entry.kind === "local" ? entry.artist || "未知歌手" : entry.track.artist || "未知歌手";
+  if (entry.kind === "local") return entry.artist || "未知歌手";
+  if (entry.kind === "cached") return entry.artist || "未知歌手";
+  return entry.track.artist || "未知歌手";
+}
+
+function entrySourceLabel(entry: PlaylistEntry): string {
+  if (entry.kind === "local") return "本地";
+  if (entry.kind === "cached") return `缓存 · ${entry.quality}`;
+  return "在线";
+}
+
+function cacheEntryToPlaylist(entry: CacheEntryView): PlaylistEntry {
+  return {
+    kind: "cached",
+    providerId: entry.providerId,
+    providerTrackId: entry.providerTrackId,
+    quality: entry.quality,
+    title: entry.title,
+    artist: entry.artist,
+  };
+}
+
+function cacheEntryToCatalog(entry: CacheEntryView): CatalogTrack {
+  return {
+    providerId: entry.providerId,
+    providerTrackId: entry.providerTrackId,
+    title: entry.title,
+    artist: entry.artist,
+    album: entry.album,
+    durationMs: null,
+    artworkUrl: null,
+    resolverPayload: {},
+    preview: null,
+  };
 }
 
 function localEntryFromLibrary(track: LibraryTrack): PlaylistEntry {
@@ -91,34 +138,60 @@ function playlistIsLocalOnly(entries: PlaylistEntry[]): boolean {
   return entries.length > 0 && entries.every((entry) => entry.kind === "local");
 }
 
-/** Frontend-side next index for online/mixed playlists (engine only holds the resolved current track). */
-function pickPlaylistIndex(
+/**
+ * Sole authority for next-track selection (local + online + mixed).
+ * Engine always reports Stopped on natural end and never auto-advances.
+ *
+ * Shuffle semantics match the backend LCG path:
+ * - maintain a per-cycle "played" index set
+ * - pick uniformly among unplayed
+ * - when exhausted, reset the set and avoid immediately re-picking the just-played track
+ */
+function frontendNextIndex(
   mode: PlayMode,
   current: number,
   length: number,
   intent: "ended" | "next" | "previous",
   shufflePlayed: Set<number>,
+  rng: { state: number },
 ): number | null {
   if (length <= 0) return null;
   if (intent === "previous") {
     if (mode === "shuffle") {
       shufflePlayed.add(current);
-      return pickShuffle(length, shufflePlayed, current);
+      return pickShuffleIndex(length, shufflePlayed, current, rng);
     }
     if (mode === "repeat_all") return current === 0 ? length - 1 : current - 1;
+    // Sequential / repeat_one: step back, or restart track 0 at the head.
     return current > 0 ? current - 1 : 0;
   }
   if (mode === "repeat_one" && intent === "ended") return current;
   if (mode === "shuffle") {
     shufflePlayed.add(current);
-    return pickShuffle(length, shufflePlayed, current);
+    return pickShuffleIndex(length, shufflePlayed, current, rng);
   }
-  if (mode === "repeat_all") return (current + 1) % length;
+  if (mode === "repeat_all") {
+    if (length === 1) return 0;
+    return (current + 1) % length;
+  }
+  // sequential (+ explicit next under repeat_one)
   const next = current + 1;
   return next < length ? next : null;
 }
 
-function pickShuffle(length: number, played: Set<number>, preferNot: number): number {
+/** Numerical Recipes LCG (same family as engine) — no bare Math.random for shuffle. */
+function lcgNext(rng: { state: number }): number {
+  // Keep in uint32 space for stable JS bit ops.
+  rng.state = Math.imul(rng.state, 1664525) + 1013904223;
+  return rng.state >>> 0;
+}
+
+function pickShuffleIndex(
+  length: number,
+  played: Set<number>,
+  preferNot: number,
+  rng: { state: number },
+): number {
   let available = Array.from({ length }, (_, i) => i).filter((i) => !played.has(i));
   if (available.length === 0) {
     played.clear();
@@ -126,7 +199,7 @@ function pickShuffle(length: number, played: Set<number>, preferNot: number): nu
     if (length > 1) available = available.filter((i) => i !== preferNot);
   }
   if (available.length === 0) return 0;
-  const choice = available[Math.floor(Math.random() * available.length)]!;
+  const choice = available[lcgNext(rng) % available.length]!;
   played.add(choice);
   return choice;
 }
@@ -158,6 +231,7 @@ const NAV_ITEMS: Array<{ id: ViewId; icon: string; label: string }> = [
   { id: "discovery", icon: "⌂", label: "探索" },
   { id: "search", icon: "⌕", label: "搜索" },
   { id: "library", icon: "♫", label: "本地曲库" },
+  { id: "offline", icon: "⬇", label: "离线/缓存" },
   { id: "favorites", icon: "♥", label: "收藏" },
   { id: "sources", icon: "◈", label: "音源管理" },
   { id: "settings", icon: "⚙", label: "设置与备份" },
@@ -165,7 +239,7 @@ const NAV_ITEMS: Array<{ id: ViewId; icon: string; label: string }> = [
 
 function initialView(): ViewId {
   const requested = new URLSearchParams(window.location.search).get("view") as ViewId | null;
-  return requested && ["discovery", "search", "library", "favorites", "playlist", "sources", "settings", "now-playing"].includes(requested)
+  return requested && ["discovery", "search", "library", "offline", "favorites", "playlist", "sources", "settings", "now-playing"].includes(requested)
     ? requested
     : "discovery";
 }
@@ -404,6 +478,7 @@ function App() {
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
   const [cacheLimitGiB, setCacheLimitGiB] = useState("5");
   const [onlineFavorites, setOnlineFavorites] = useState<CatalogTrack[]>([]);
+  const [cacheEntries, setCacheEntries] = useState<CacheEntryView[]>([]);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchState, setSearchState] = useState<SearchState>("idle");
@@ -424,6 +499,7 @@ function App() {
   const [playlistIndex, setPlaylistIndex] = useState<number | null>(null);
   const [queuePanelOpen, setQueuePanelOpen] = useState(false);
   const shufflePlayedRef = useRef<Set<number>>(new Set());
+  const shuffleRngRef = useRef({ state: (Date.now() ^ 0x9e3779b9) >>> 0 || 1 });
   const advancingRef = useRef(false);
   const playlistRef = useRef(playlist);
   const playlistIndexRef = useRef(playlistIndex);
@@ -464,13 +540,15 @@ function App() {
   };
 
   const refreshCache = async () => {
-    const [status, favoriteTracks] = await Promise.all([
+    const [status, favoriteTracks, entries] = await Promise.all([
       invoke<CacheStatus>("cache_status"),
       invoke<CatalogTrack[]>("cache_online_favorites"),
+      invoke<CacheEntryView[]>("cache_list_entries"),
     ]);
     setCacheStatus(status);
     setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
     setOnlineFavorites(favoriteTracks);
+    setCacheEntries(entries);
   };
 
   useEffect(() => {
@@ -489,7 +567,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (view !== "settings") return;
+    if (view !== "settings" && view !== "offline" && view !== "library") return;
     void refreshCache().catch((error) => setMessage(String(error)));
     const timer = window.setInterval(() => void refreshCache().catch(() => undefined), 2000);
     return () => window.clearInterval(timer);
@@ -643,14 +721,6 @@ function App() {
     if (activeLyricIndex >= 0) lyricRefs.current[activeLyricIndex]?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [activeLyricIndex]);
 
-  // Local-only playlists: engine owns advancement — mirror queueIndex into playlistIndex.
-  useEffect(() => {
-    if (!playlistIsLocalOnly(playlist)) return;
-    if (snapshot.queueIndex !== null && snapshot.queueIndex !== playlistIndex) {
-      setPlaylistIndex(snapshot.queueIndex);
-    }
-  }, [snapshot.queueIndex, playlist, playlistIndex]);
-
   const artists = useMemo(
     () => [...new Set(suggestions.map((track) => track.artist).filter(Boolean))].slice(0, 2),
     [suggestions],
@@ -736,6 +806,35 @@ function App() {
     }
   };
 
+  const playCachedEntry = async (entry: Extract<PlaylistEntry, { kind: "cached" }>) => {
+    await invoke("player_play_cache_entry", {
+      providerId: entry.providerId,
+      providerTrackId: entry.providerTrackId,
+      quality: entry.quality,
+      title: entry.title,
+    });
+    setSelectedCatalogTrack(cacheEntryToCatalog({
+      providerId: entry.providerId,
+      providerTrackId: entry.providerTrackId,
+      quality: entry.quality,
+      title: entry.title,
+      artist: entry.artist,
+      album: "",
+      byteLen: 0,
+      sourceSampleRate: null,
+      sourceBitDepth: null,
+      sourceChannels: null,
+      mediaType: "unknown",
+      pinned: false,
+      lastAccessedAtMs: 0,
+      completedAtMs: 0,
+      fileName: "",
+    }));
+    setCurrentQuality(entry.quality);
+    setLyrics(null);
+    setMessage(`已从本地缓存秒开 · ${entry.quality}`);
+  };
+
   const playPlaylistEntry = async (entries: PlaylistEntry[], index: number, opts?: { allowPreviewFallback?: boolean }) => {
     const entry = entries[index];
     if (!entry) return;
@@ -749,6 +848,15 @@ function App() {
       setSelectedCatalogTrack(null);
       setCurrentQuality(null);
       setLyrics(null);
+      return;
+    }
+    if (entry.kind === "cached") {
+      try {
+        await playCachedEntry(entry);
+      } catch (error) {
+        setMessage(`《${entry.title}》缓存播放失败，已跳过：${String(error)}`);
+        await advanceFromIndex(entries, index, "ended");
+      }
       return;
     }
     const result = await resolveAndPlayOnline(entry.track, entry.quality, {
@@ -772,8 +880,15 @@ function App() {
       const mode = snapshotRef.current.playMode ?? "sequential";
       // Skip chain for failed resolves — walk until success or exhaustion (cap to list length).
       let cursor = current;
-      for (let attempt = 0; attempt < entries.length; attempt += 1) {
-        const next = pickPlaylistIndex(mode, cursor, entries.length, attempt === 0 ? intent : "ended", shufflePlayedRef.current);
+      for (let attempt = 0; attempt < Math.max(entries.length, 1); attempt += 1) {
+        const next = frontendNextIndex(
+          mode,
+          cursor,
+          entries.length,
+          attempt === 0 ? intent : "ended",
+          shufflePlayedRef.current,
+          shuffleRngRef.current,
+        );
         if (next === null) {
           setPlaylistIndex(cursor);
           return;
@@ -782,11 +897,26 @@ function App() {
         const entry = entries[next];
         if (!entry) return;
         if (entry.kind === "local") {
-          await invoke("player_load_local", { paths: [entry.path], startIndex: 0 });
+          // Local multi-item queues stay loaded in the engine for jump; mixed playlists load one path.
+          if (playlistIsLocalOnly(entries)) {
+            await invoke("player_jump", { index: next });
+          } else {
+            await invoke("player_load_local", { paths: [entry.path], startIndex: 0 });
+          }
           setSelectedCatalogTrack(null);
           setCurrentQuality(null);
           setLyrics(null);
           return;
+        }
+        if (entry.kind === "cached") {
+          try {
+            await playCachedEntry(entry);
+            return;
+          } catch (error) {
+            setMessage(`《${entry.title}》缓存播放失败，已跳过：${String(error)}`);
+            cursor = next;
+            continue;
+          }
         }
         const key = catalogKey(entry.track);
         setPlayingCatalogKey(key);
@@ -910,49 +1040,103 @@ function App() {
     const current = snapshot.playMode ?? "sequential";
     const index = PLAY_MODE_ORDER.indexOf(current);
     const next = PLAY_MODE_ORDER[(index + 1) % PLAY_MODE_ORDER.length] ?? "sequential";
-    if (next === "shuffle") shufflePlayedRef.current = new Set(playlistIndex !== null ? [playlistIndex] : []);
+    // Fresh shuffle cycle when entering shuffle; mark the current track as already heard.
+    if (next === "shuffle") {
+      shufflePlayedRef.current = new Set(playlistIndex !== null ? [playlistIndex] : []);
+      shuffleRngRef.current.state = (Date.now() ^ (playlistIndex ?? 0) ^ 0x9e3779b9) >>> 0 || 1;
+    }
     setSnapshot((state) => ({ ...state, playMode: next }));
+    // Keep engine snapshot.playMode in sync for UI; engine never auto-advances on Ended.
     await run("player_set_play_mode", { mode: next });
   };
 
   const handleTransportNext = async () => {
     const entries = playlistRef.current;
-    if (entries.length && !playlistIsLocalOnly(entries)) {
-      const current = playlistIndexRef.current ?? 0;
-      await advanceFromIndex(entries, current, "next");
+    if (!entries.length) {
+      await run("player_next");
       return;
     }
-    await run("player_next");
+    await advanceFromIndex(entries, playlistIndexRef.current ?? 0, "next");
   };
 
   const handleTransportPrevious = async () => {
     const entries = playlistRef.current;
-    if (entries.length && !playlistIsLocalOnly(entries)) {
-      const current = playlistIndexRef.current ?? 0;
-      await advanceFromIndex(entries, current, "previous");
+    if (!entries.length) {
+      await run("player_previous");
       return;
     }
-    await run("player_previous");
+    await advanceFromIndex(entries, playlistIndexRef.current ?? 0, "previous");
   };
 
   const jumpToPlaylistIndex = async (index: number) => {
     const entries = playlistRef.current;
     const target = entries[index];
     if (!target) return;
-    if (playlistIsLocalOnly(entries)) {
-      await run("player_jump", { index });
-      setPlaylistIndex(index);
-      setSelectedCatalogTrack(null);
-      return;
-    }
     shufflePlayedRef.current.add(index);
     setPlaylistIndex(index);
+    if (playlistIsLocalOnly(entries) && target.kind === "local") {
+      await run("player_jump", { index });
+      setSelectedCatalogTrack(null);
+      setCurrentQuality(null);
+      return;
+    }
     const key = target.kind === "online" ? catalogKey(target.track) : null;
     if (key) setPlayingCatalogKey(key);
     try {
       await playPlaylistEntry(entries, index);
     } finally {
       if (key) setPlayingCatalogKey(null);
+    }
+  };
+
+  const playCacheInList = async (entries: CacheEntryView[], wanted: CacheEntryView) => {
+    const startIndex = Math.max(0, entries.findIndex(
+      (item) => item.providerId === wanted.providerId
+        && item.providerTrackId === wanted.providerTrackId
+        && item.quality === wanted.quality,
+    ));
+    const playlistEntries = entries.map(cacheEntryToPlaylist);
+    try {
+      await replacePlaylist(playlistEntries, startIndex === -1 ? 0 : startIndex);
+      navigateTo("now-playing");
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+
+  const enqueueCacheEntries = (entries: CacheEntryView[]) => {
+    if (!entries.length) return;
+    setPlaylist((prev) => [...prev, ...entries.map(cacheEntryToPlaylist)]);
+    setMessage(`已添加 ${entries.length} 首缓存歌曲到队列`);
+  };
+
+  const removeCacheEntry = async (entry: CacheEntryView) => {
+    try {
+      const status = await invoke<CacheStatus>("cache_remove_entry", {
+        providerId: entry.providerId,
+        providerTrackId: entry.providerTrackId,
+        quality: entry.quality,
+      });
+      setCacheStatus(status);
+      await refreshCache();
+      setMessage(`已删除缓存《${entry.title}》· ${entry.quality}`);
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+
+  const toggleCachePinned = async (entry: CacheEntryView) => {
+    const track = cacheEntryToCatalog(entry);
+    // Prefer full catalog metadata from online favorites when available.
+    const known = onlineFavorites.find(
+      (item) => item.providerId === entry.providerId && item.providerTrackId === entry.providerTrackId,
+    ) ?? track;
+    try {
+      await invoke("cache_set_online_favorite", { track: known, favorite: !entry.pinned });
+      await refreshCache();
+      setMessage(entry.pinned ? "已取消钉住" : "已收藏并钉住缓存");
+    } catch (error) {
+      setMessage(String(error));
     }
   };
 
@@ -987,7 +1171,9 @@ function App() {
     else if (current > index) nextIndex = current - 1;
     else if (current === index) nextIndex = Math.min(index, entries.length - 1);
     setPlaylistIndex(nextIndex);
-    if (removedCurrent && nextIndex !== null && !playlistIsLocalOnly(entries)) {
+    // Local-only: engine Remove already reloads when the playing item is deleted.
+    // Online/mixed: engine only holds the current resolved track — resolve the replacement.
+    if (removedCurrent && nextIndex !== null && !wasLocalOnly) {
       await playPlaylistEntry(entries, nextIndex);
     }
   };
@@ -1000,8 +1186,8 @@ function App() {
     setMessage("队列已清空");
   };
 
-  // Online/mixed playlists: engine holds only the current resolved track.
-  // When it naturally ends (stopped), advance and resolve the next online item on demand.
+  // Engine always stops on natural end (no auto-advance). Frontend picks the next index
+  // for every non-empty playlist (local, online, mixed) and drives jump / resolve / load.
   const prevStatusRef = useRef(snapshot.status);
   useEffect(() => {
     const prev = prevStatusRef.current;
@@ -1009,7 +1195,7 @@ function App() {
     if (snapshot.status !== "stopped") return;
     if (prev === "stopped" || prev === "idle") return;
     const entries = playlistRef.current;
-    if (!entries.length || playlistIsLocalOnly(entries)) return;
+    if (!entries.length) return;
     const current = playlistIndexRef.current ?? 0;
     void advanceFromIndex(entries, current, "ended");
   }, [snapshot.status]);
@@ -1305,6 +1491,59 @@ function App() {
     </div>
   );
 
+  const renderCacheRows = (entries: CacheEntryView[]) => (
+    <div className="track-list cache-track-list" role="list">
+      {entries.map((entry, index) => (
+        <div className="track-row cache-row" role="listitem" key={`${entry.providerId}:${entry.providerTrackId}:${entry.quality}`}>
+          <button className="track-main" type="button" onClick={() => void playCacheInList(entries, entry)}>
+            <span className="track-index">{String(index + 1).padStart(2, "0")}</span>
+            <span>
+              <strong>{entry.title}</strong>
+              <small>
+                {entry.artist || "未知歌手"}
+                {entry.album ? ` · ${entry.album}` : ""}
+                {" · "}
+                {entry.quality}
+                {" · "}
+                {formatBytes(entry.byteLen)}
+                {entry.pinned ? " · 已钉住" : ""}
+              </small>
+            </span>
+          </button>
+          <span className="cache-quality-badge" title="音质档位">{entry.quality}</span>
+          <time title="缓存大小">{formatBytes(entry.byteLen)}</time>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={() => enqueueCacheEntries([entry])}
+            aria-label="添加到队列"
+            title="添加到队列"
+          >
+            ＋
+          </button>
+          <button
+            type="button"
+            className={`icon-button ${entry.pinned ? "active" : ""}`}
+            onClick={() => void toggleCachePinned(entry)}
+            aria-label={entry.pinned ? "取消钉住" : "收藏钉住"}
+            title={entry.pinned ? "取消钉住" : "收藏并钉住"}
+          >
+            {entry.pinned ? "♥" : "♡"}
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={() => void removeCacheEntry(entry)}
+            aria-label="删除缓存"
+            title="删除此缓存"
+          >
+            ×
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+
   const displayPlaylist = playlist;
   const displayIndex = playlistIndex;
   const upNext = displayPlaylist.length && displayIndex !== null
@@ -1361,7 +1600,88 @@ function App() {
 
     if (view === "library" || view === "favorites") {
       const tracks = view === "library" ? library : favorites;
-      return <div className="page"><PageHeading eyebrow={view === "library" ? "LOCAL LIBRARY" : "FAVORITES"} title={view === "library" ? "本地曲库" : "我的收藏"} copy={view === "library" ? `${library.length} 首本地音乐，播放不经过 WebView。` : `${tracks.length + onlineFavorites.length} 首收藏；在线收藏的缓存会被钉住。`} action={view === "library" ? <button className="primary" onClick={chooseFiles}>导入音乐</button> : undefined} />{view === "favorites" && onlineFavorites.length > 0 && <section className="section-block"><div className="section-heading"><div><h3>在线收藏</h3><p>尚未缓存的歌曲不会主动下载，会等你自然播放。</p></div></div>{renderCatalogRows(onlineFavorites)}</section>}{tracks.length ? <section className="section-block"><div className="section-heading"><div><h3>{view === "library" ? "本地音乐" : "本地收藏"}</h3></div></div>{renderTrackRows(tracks)}</section> : view === "library" || onlineFavorites.length === 0 ? <EmptyState title={view === "library" ? "还没有本地音乐" : "还没有收藏"} copy={view === "library" ? "选择音频文件，它们会自动进入曲库。" : "播放在线歌曲或打开本地曲库，点一下心形即可收藏。"} action={view === "library" ? "选择音乐" : undefined} onAction={view === "library" ? chooseFiles : undefined} /> : null}</div>;
+      return (
+        <div className="page">
+          <PageHeading
+            eyebrow={view === "library" ? "LOCAL LIBRARY" : "FAVORITES"}
+            title={view === "library" ? "本地曲库" : "我的收藏"}
+            copy={view === "library"
+              ? `${library.length} 首本地导入 · ${cacheEntries.length} 首在线缓存。两者来源不同，都能在本机播放。`
+              : `${tracks.length + onlineFavorites.length} 首收藏；在线收藏的缓存会被钉住。`}
+            action={view === "library" ? <button className="primary" onClick={chooseFiles}>导入音乐</button> : undefined}
+          />
+          {view === "favorites" && onlineFavorites.length > 0 && (
+            <section className="section-block">
+              <div className="section-heading"><div><h3>在线收藏</h3><p>尚未缓存的歌曲不会主动下载，会等你自然播放。</p></div></div>
+              {renderCatalogRows(onlineFavorites)}
+            </section>
+          )}
+          {view === "library" && cacheEntries.length > 0 && (
+            <section className="section-block">
+              <div className="section-heading">
+                <div>
+                  <h3>在线来源 · 已缓存</h3>
+                  <p>这些是播放在线歌曲时自然写入的缓存，不是你导入的本地文件。完整列表见「离线/缓存」。</p>
+                </div>
+                <button type="button" onClick={() => navigateTo("offline")}>查看全部 →</button>
+              </div>
+              {renderCacheRows(cacheEntries.slice(0, 8))}
+            </section>
+          )}
+          {tracks.length ? (
+            <section className="section-block">
+              <div className="section-heading">
+                <div><h3>{view === "library" ? "本地导入" : "本地收藏"}</h3>
+                  {view === "library" && <p>你从磁盘选择并导入的音频文件。</p>}
+                </div>
+              </div>
+              {renderTrackRows(tracks)}
+            </section>
+          ) : view === "library" || onlineFavorites.length === 0 ? (
+            <EmptyState
+              title={view === "library" ? "还没有本地导入" : "还没有收藏"}
+              copy={view === "library" ? "选择音频文件导入，或先播放在线歌曲生成缓存。" : "播放在线歌曲或打开本地曲库，点一下心形即可收藏。"}
+              action={view === "library" ? "选择音乐" : undefined}
+              onAction={view === "library" ? chooseFiles : undefined}
+            />
+          ) : null}
+        </div>
+      );
+    }
+
+    if (view === "offline") {
+      return (
+        <div className="page">
+          <PageHeading
+            eyebrow="OFFLINE CACHE"
+            title="离线 / 缓存"
+            copy={cacheStatus
+              ? `共 ${cacheStatus.entryCount} 首已缓存 · 占用 ${formatBytes(cacheStatus.totalBytes)} · 钉住 ${cacheStatus.pinnedCount} 项。点击即从本地秒开，无需再次请求音源。`
+              : "读取缓存列表…"}
+            action={cacheEntries.length > 0 ? (
+              <button type="button" className="primary" onClick={() => enqueueCacheEntries(cacheEntries)}>全部加入队列</button>
+            ) : undefined}
+          />
+          {cacheEntries.length === 0 ? (
+            <EmptyState
+              title="还没有缓存"
+              copy="完整播放一首在线歌曲后，会把已接收的字节写入缓存。这里只展示已完成缓存，不会预下载。"
+              action="去搜索"
+              onAction={() => navigateTo("search")}
+            />
+          ) : (
+            <section className="section-block">
+              <div className="section-heading">
+                <div>
+                  <h3>已缓存歌曲</h3>
+                  <p>在线来源、离线可听。与「本地导入」的用户文件不是同一类。</p>
+                </div>
+              </div>
+              {renderCacheRows(cacheEntries)}
+            </section>
+          )}
+        </div>
+      );
     }
 
     if (view === "playlist") return (
@@ -1430,7 +1750,7 @@ function App() {
                     <button type="button" onClick={() => void jumpToPlaylistIndex(absolute)}>
                       <span>{String(absolute + 1).padStart(2, "0")}</span>
                       <strong>{entryTitle(entry)}</strong>
-                      <small>{entryArtist(entry)}{entry.kind === "online" ? " · 待解析" : ""}</small>
+                      <small>{entryArtist(entry)}{entry.kind === "online" ? " · 待解析" : entry.kind === "cached" ? " · 缓存" : ""}</small>
                     </button>
                   </li>
                 );
@@ -1617,7 +1937,8 @@ function App() {
                         <strong>{entryTitle(entry)}</strong>
                         <small>
                           {entryArtist(entry)}
-                          {entry.kind === "online" ? " · 在线" : " · 本地"}
+                          {" · "}
+                          {entrySourceLabel(entry)}
                           {entry.kind === "online" && !active ? " · 待解析" : ""}
                         </small>
                       </span>

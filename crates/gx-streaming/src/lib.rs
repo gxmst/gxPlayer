@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, SendTimeoutError, bounded};
+use gx_cache::{CacheWritePlan, CacheWriter};
 use gx_contracts::ResolvedMediaRequest;
 use gx_source::safe_http::validate_and_resolve;
 use reqwest::StatusCode;
@@ -104,10 +105,19 @@ pub struct HttpMediaSource {
     supports_range: bool,
     final_url: reqwest::Url,
     metrics: Arc<StreamMetrics>,
+    cache_plan: Option<CacheWritePlan>,
+    reached_end: bool,
 }
 
 impl HttpMediaSource {
     pub fn new(request: ResolvedMediaRequest) -> Result<Self> {
+        Self::new_with_cache(request, None)
+    }
+
+    pub fn new_with_cache(
+        request: ResolvedMediaRequest,
+        cache_plan: Option<CacheWritePlan>,
+    ) -> Result<Self> {
         if request.is_expired_at(unix_time_ms()) {
             bail!("resolved media request has expired and must be resolved again");
         }
@@ -123,6 +133,8 @@ impl HttpMediaSource {
             supports_range: false,
             final_url: placeholder_url,
             metrics,
+            cache_plan,
+            reached_end: false,
         };
         source.restart(0)?;
         Ok(source)
@@ -141,6 +153,11 @@ impl HttpMediaSource {
     }
 
     fn restart(&mut self, offset: u64) -> Result<()> {
+        if offset > 0
+            && let Some(plan) = &self.cache_plan
+        {
+            plan.invalidate();
+        }
         self.stop_worker();
 
         let (sender, receiver) = bounded(CHANNEL_CAPACITY);
@@ -149,6 +166,9 @@ impl HttpMediaSource {
         let request = self.request_for_restart();
         let metrics = Arc::clone(&self.metrics);
         let cancel_for_worker = Arc::clone(&cancel);
+        let cache_writer = (offset == 0)
+            .then(|| self.cache_plan.as_ref().and_then(CacheWritePlan::begin))
+            .flatten();
         let handle = thread::Builder::new()
             .name("gx-http-stream".into())
             .spawn(move || {
@@ -159,6 +179,7 @@ impl HttpMediaSource {
                     ready_sender,
                     cancel_for_worker,
                     metrics,
+                    cache_writer,
                 );
             })
             .context("failed to spawn HTTP streaming worker")?;
@@ -173,6 +194,7 @@ impl HttpMediaSource {
         self.position = offset;
         self.current_chunk.clear();
         self.chunk_offset = 0;
+        self.reached_end = false;
         self.worker = Some(WorkerState {
             receiver,
             cancel,
@@ -225,7 +247,10 @@ impl Read for HttpMediaSource {
                     self.current_chunk = chunk;
                     self.chunk_offset = 0;
                 }
-                Ok(StreamMessage::End) => return Ok(0),
+                Ok(StreamMessage::End) => {
+                    self.reached_end = true;
+                    return Ok(0);
+                }
                 Ok(StreamMessage::Error(message)) => {
                     return Err(io::Error::other(message));
                 }
@@ -279,6 +304,11 @@ impl MediaSource for HttpMediaSource {
 
 impl Drop for HttpMediaSource {
     fn drop(&mut self) {
+        if !self.reached_end
+            && let Some(plan) = &self.cache_plan
+        {
+            plan.invalidate();
+        }
         self.stop_worker();
     }
 }
@@ -404,6 +434,7 @@ fn network_worker(
     ready_sender: crossbeam_channel::Sender<Result<ReadyInfo, String>>,
     cancel: Arc<AtomicBool>,
     metrics: Arc<StreamMetrics>,
+    mut cache_writer: Option<CacheWriter>,
 ) {
     let mut offset = initial_offset;
     let mut active_url = request.url.clone();
@@ -486,6 +517,9 @@ fn network_worker(
                     break Ok(());
                 }
                 Ok(count) => {
+                    if let Some(writer) = cache_writer.as_mut() {
+                        writer.append(&buffer[..count]);
+                    }
                     offset += count as u64;
                     metrics
                         .bytes_received
@@ -514,9 +548,15 @@ fn network_worker(
         match outcome {
             Ok(()) => {
                 let _ = sender.send(StreamMessage::End);
+                if let Some(writer) = cache_writer.take() {
+                    writer.finish(total_len);
+                }
                 return;
             }
             Err(_message) if reconnects < MAX_RECONNECTS => {
+                if let Some(writer) = cache_writer.as_mut() {
+                    writer.invalidate();
+                }
                 reconnects += 1;
                 metrics.reconnects.fetch_add(1, Ordering::Relaxed);
                 thread::sleep(Duration::from_millis(100 * reconnects));

@@ -1630,6 +1630,7 @@ dependencies = [
  "anyhow",
  "cpal",
  "crossbeam-channel",
+ "gx-cache",
  "gx-contracts",
  "gx-dsp",
  "gx-streaming",
@@ -1637,6 +1638,17 @@ dependencies = [
  "rubato",
  "serde",
  "symphonia",
+]
+
+[[package]]
+name = "gx-cache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gx-contracts",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1698,6 +1710,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "gx-cache",
  "gx-contracts",
  "gx-source",
  "reqwest",
@@ -1709,6 +1722,7 @@ name = "gxplayer"
 version = "0.1.0"
 dependencies = [
  "gx-audio",
+ "gx-cache",
  "gx-contracts",
  "gx-dsp",
  "gx-library",

@@ -57,6 +57,16 @@ export type OnlinePlaybackResult = {
   sourceId: string | null;
   sourceName: string | null;
   quality: string | null;
+  cacheHit: boolean;
+};
+
+export type CacheStatus = {
+  directory: string;
+  customDirectory: string | null;
+  limitBytes: number;
+  totalBytes: number;
+  entryCount: number;
+  pinnedCount: number;
 };
 
 export type LyricDocument = {

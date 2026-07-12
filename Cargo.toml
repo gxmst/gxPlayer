@@ -13,6 +13,7 @@ members = [
     "crates/gx-source",
     "crates/gx-metadata",
     "crates/gx-library",
+    "crates/gx-cache",
     "src-tauri",
 ]
 

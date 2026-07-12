@@ -1269,6 +1269,49 @@ select {
   margin-top: 18px;
 }
 
+.cache-settings {
+  grid-column: 1 / -1;
+}
+
+.cache-settings dl {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0;
+}
+
+.cache-settings dl > div {
+  display: grid;
+  grid-template-columns: 90px minmax(0, 1fr);
+  gap: 12px;
+}
+
+.cache-settings dt,
+.cache-settings > label > span {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.cache-settings dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-mute);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cache-settings > label > span {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.cache-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
 .backup-card {
   margin-top: 18px;
   padding: 22px;
@@ -1995,6 +2038,21 @@ input[type="range"]::-moz-range-thumb {
 
 .measured-quality.suspicious {
   color: #e5b86d;
+}
+
+.online-favorite {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 17px;
+}
+
+.online-favorite.active {
+  color: var(--accent);
 }
 
 .quality-select:hover,

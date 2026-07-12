@@ -9,6 +9,7 @@ import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
 import {
   EMPTY_ENGINE,
+  type CacheStatus,
   type CatalogTrack,
   type EngineSnapshot,
   type LibraryTrack,
@@ -74,6 +75,12 @@ function formatTime(seconds: number | null): string {
   if (seconds === null || !Number.isFinite(seconds)) return "--:--";
   const value = Math.max(0, Math.floor(seconds));
   return `${Math.floor(value / 60)}:${(value % 60).toString().padStart(2, "0")}`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
 }
 
 function formatSourceSpec(snapshot: EngineSnapshot): string | null {
@@ -294,6 +301,9 @@ function App() {
   const [sourceConfigRevealed, setSourceConfigRevealed] = useState(false);
   const [sourceConfigBusy, setSourceConfigBusy] = useState(false);
   const [backupText, setBackupText] = useState("");
+  const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
+  const [cacheLimitGiB, setCacheLimitGiB] = useState("5");
+  const [onlineFavorites, setOnlineFavorites] = useState<CatalogTrack[]>([]);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchState, setSearchState] = useState<SearchState>("idle");
@@ -340,12 +350,23 @@ function App() {
     setRuntime(nextRuntime);
   };
 
+  const refreshCache = async () => {
+    const [status, favoriteTracks] = await Promise.all([
+      invoke<CacheStatus>("cache_status"),
+      invoke<CatalogTrack[]>("cache_online_favorites"),
+    ]);
+    setCacheStatus(status);
+    setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
+    setOnlineFavorites(favoriteTracks);
+  };
+
   useEffect(() => {
     // Window size is set once in Rust (setup) before first show — do not resize here
     // or the app will open at tauri.conf size then jump larger after React mounts.
     void invoke("ui_ready").catch((error) => setMessage(String(error)));
     void refreshLibrary().catch((error) => setMessage(String(error)));
     void refreshSources().catch((error) => setMessage(String(error)));
+    void refreshCache().catch((error) => setMessage(String(error)));
     void invoke<string[]>("player_output_devices")
       .then(setOutputDevices)
       .catch((error) => setMessage(String(error)));
@@ -353,6 +374,13 @@ function App() {
       .then(setChartTracks)
       .catch(() => setChartTracks([]));
   }, []);
+
+  useEffect(() => {
+    if (view !== "settings") return;
+    void refreshCache().catch((error) => setMessage(String(error)));
+    const timer = window.setInterval(() => void refreshCache().catch(() => undefined), 2000);
+    return () => window.clearInterval(timer);
+  }, [view]);
 
   useEffect(() => {
     let disposed = false;
@@ -388,6 +416,9 @@ function App() {
   const shownPosition = dragPosition ?? pendingSeek?.target ?? snapshot.positionSeconds;
   const measuredSourceSpec = formatSourceSpec(snapshot);
   const suspiciousQuality = isSuspiciousQuality(currentQuality, snapshot);
+  const selectedOnlineFavorite = selectedCatalogTrack
+    ? onlineFavorites.some((track) => track.providerId === selectedCatalogTrack.providerId && track.providerTrackId === selectedCatalogTrack.providerTrackId)
+    : false;
   const activeSource = sources.find((source) => source.id === runtime?.activeSourceId || source.active) ?? null;
   const sourceStatus = (() => {
     switch (runtime?.state) {
@@ -549,7 +580,9 @@ function App() {
         selectedTrack = online.track;
         setCurrentQuality(online.quality);
         const sourceLabel = online.sourceName || activeSource?.metadata.name || "当前 LX 音源";
-        playbackMessage = `${sourceLabel} 已解析整首播放${online.quality ? ` · ${online.quality}` : ""}。`;
+        playbackMessage = online.cacheHit
+          ? `已命中本地缓存 · ${online.quality ?? "自动"}，无需再次请求音频直链。`
+          : `${sourceLabel} 已解析整首播放${online.quality ? ` · ${online.quality}` : ""}，本次播放会顺手写入缓存。`;
       } catch (onlineError) {
         try {
           const preview = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
@@ -596,7 +629,7 @@ function App() {
       });
       setSelectedCatalogTrack(online.track);
       setCurrentQuality(online.quality);
-      setMessage(`已切换到 ${online.quality ?? "自动"}，并重新开始流式播放。`);
+      setMessage(online.cacheHit ? `已切换到本地缓存 ${online.quality ?? "自动"}。` : `已切换到 ${online.quality ?? "自动"}，并重新开始流式播放。`);
     } catch (error) {
       setMessage(`切换音质失败，已保留当前播放：${String(error)}`);
     } finally {
@@ -714,6 +747,32 @@ function App() {
   const toggleFavorite = async (track: LibraryTrack) => {
     await run("library_set_favorite", { trackId: track.id, favorite: !track.favorite });
     await refreshLibrary();
+  };
+
+  const toggleOnlineFavorite = async (track: CatalogTrack) => {
+    const favorite = !onlineFavorites.some((item) => item.providerId === track.providerId && item.providerTrackId === track.providerTrackId);
+    await invoke("cache_set_online_favorite", { track, favorite });
+    await refreshCache();
+    setMessage(favorite ? "已收藏；现有缓存已钉住，未缓存时会在自然播放完成后自动钉住。" : "已取消收藏；对应缓存恢复为可淘汰状态。");
+  };
+
+  const chooseCacheDirectory = async () => {
+    const selected = await open({ multiple: false, directory: true });
+    if (!selected || Array.isArray(selected)) return;
+    const status = await invoke<CacheStatus>("cache_set_directory", { path: selected });
+    setCacheStatus(status);
+    setMessage("缓存目录已切换；已有缓存不会自动迁移。");
+  };
+
+  const saveCacheLimit = async () => {
+    const gib = Number(cacheLimitGiB);
+    if (!Number.isFinite(gib) || gib <= 0) {
+      setMessage("缓存上限必须是正数。");
+      return;
+    }
+    const status = await invoke<CacheStatus>("cache_set_limit", { limitBytes: Math.round(gib * 1024 * 1024 * 1024) });
+    setCacheStatus(status);
+    setMessage("缓存上限已保存，超限未收藏条目已按 LRU 清理。");
   };
 
   const createPlaylist = async () => {
@@ -887,7 +946,7 @@ function App() {
 
     if (view === "library" || view === "favorites") {
       const tracks = view === "library" ? library : favorites;
-      return <div className="page"><PageHeading eyebrow={view === "library" ? "LOCAL LIBRARY" : "FAVORITES"} title={view === "library" ? "本地曲库" : "我的收藏"} copy={view === "library" ? `${library.length} 首本地音乐，播放不经过 WebView。` : "留住真正想再听一遍的歌。"} action={view === "library" ? <button className="primary" onClick={chooseFiles}>导入音乐</button> : undefined} />{tracks.length ? renderTrackRows(tracks) : <EmptyState title={view === "library" ? "还没有本地音乐" : "还没有收藏"} copy={view === "library" ? "选择音频文件，它们会自动进入曲库。" : "在曲库里点一下心形，就会出现在这里。"} action={view === "library" ? "选择音乐" : undefined} onAction={view === "library" ? chooseFiles : undefined} />}</div>;
+      return <div className="page"><PageHeading eyebrow={view === "library" ? "LOCAL LIBRARY" : "FAVORITES"} title={view === "library" ? "本地曲库" : "我的收藏"} copy={view === "library" ? `${library.length} 首本地音乐，播放不经过 WebView。` : `${tracks.length + onlineFavorites.length} 首收藏；在线收藏的缓存会被钉住。`} action={view === "library" ? <button className="primary" onClick={chooseFiles}>导入音乐</button> : undefined} />{view === "favorites" && onlineFavorites.length > 0 && <section className="section-block"><div className="section-heading"><div><h3>在线收藏</h3><p>尚未缓存的歌曲不会主动下载，会等你自然播放。</p></div></div>{renderCatalogRows(onlineFavorites)}</section>}{tracks.length ? <section className="section-block"><div className="section-heading"><div><h3>{view === "library" ? "本地音乐" : "本地收藏"}</h3></div></div>{renderTrackRows(tracks)}</section> : view === "library" || onlineFavorites.length === 0 ? <EmptyState title={view === "library" ? "还没有本地音乐" : "还没有收藏"} copy={view === "library" ? "选择音频文件，它们会自动进入曲库。" : "播放在线歌曲或打开本地曲库，点一下心形即可收藏。"} action={view === "library" ? "选择音乐" : undefined} onAction={view === "library" ? chooseFiles : undefined} /> : null}</div>;
     }
 
     if (view === "playlist") return (
@@ -906,7 +965,8 @@ function App() {
       <div className="page"><PageHeading eyebrow="SETTINGS" title="设置与备份" copy="输出设备、音效模式和本地数据都在这里管理。" />
         <div className="settings-grid"><section className="settings-card"><h3>输出设备</h3><p>切换时会从当前位置继续播放。</p><select value={snapshot.outputDevice ?? ""} onChange={(event) => void run("player_set_output_device", { name: event.target.value || null })}><option value="">系统默认设备</option>{outputDevices.map((device) => <option key={device} value={device}>{device}</option>)}</select></section>
         <section className="settings-card"><h3>默认音质</h3><p>自动会按当前平台能力从高到低尝试，并在解析失败时逐档回退。</p><select value={qualityPreference} onChange={(event) => updateQualityPreference(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></section>
-        <section className="settings-card"><h3>默认听感</h3><p>音乐模式保持 DSP 透明旁路；影院/游戏模式启用空间处理。</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></section></div>
+        <section className="settings-card"><h3>默认听感</h3><p>音乐模式保持 DSP 透明旁路；影院/游戏模式启用空间处理。</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></section>
+        <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => setCacheLimitGiB(event.target.value)} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_clear", { includePinned: false }); setCacheStatus(status); }}>清未收藏</button><button className="danger" onClick={async () => { const status = await invoke<CacheStatus>("cache_clear", { includePinned: true }); setCacheStatus(status); }}>清空全部</button></div></section></div>
         <section className="backup-card"><div className="section-heading"><div><h3>配置备份</h3><p>包含本地曲库、歌单、音源脚本及音源密钥；备份内容请勿公开。</p></div><div><button onClick={() => void exportBackup()}>生成备份</button><button className="primary" disabled={!backupText.trim()} onClick={() => void restoreBackup()}>恢复备份</button></div></div><textarea aria-label="GXPlayer 备份 JSON" placeholder="生成的备份会显示在这里，也可以粘贴已有备份。" value={backupText} onChange={(event) => setBackupText(event.target.value)} /></section>
       </div>
     );
@@ -1029,6 +1089,7 @@ function App() {
           </div>
         </div>
         <div className="player-tools">
+          {selectedCatalogTrack && currentQueueItem?.online && <button className={`online-favorite ${selectedOnlineFavorite ? "active" : ""}`} onClick={() => void toggleOnlineFavorite(selectedCatalogTrack)} aria-label={selectedOnlineFavorite ? "取消在线收藏" : "收藏在线歌曲"} title={selectedOnlineFavorite ? "取消收藏" : "收藏并钉住缓存"}>{selectedOnlineFavorite ? "♥" : "♡"}</button>}
           {measuredSourceSpec && <span className={`measured-quality ${suspiciousQuality ? "suspicious" : ""}`} title={`${currentQuality ? `${currentQuality}（音源自报） · ` : ""}实测 ${measuredSourceSpec}${suspiciousQuality ? " · 疑似虚标" : ""}`}>{suspiciousQuality ? "⚠ " : ""}{measuredSourceSpec}</span>}
           {selectedCatalogTrack && currentQueueItem?.online && <select className="quality-select" aria-label="音源自报音质" title={`音源自报档位：${currentQuality ?? "自动"}`} value={QUALITY_OPTIONS.some((option) => option.value === currentQuality) ? currentQuality ?? "auto" : "auto"} disabled={qualitySwitching} onChange={(event) => void switchOnlineQuality(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.value === "auto" ? `自动${currentQuality ? ` · ${currentQuality}` : ""}` : option.label}</option>)}</select>}
           <div className="volume-cluster">

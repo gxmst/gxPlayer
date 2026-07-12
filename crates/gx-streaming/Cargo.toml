@@ -12,6 +12,7 @@ test-private-network = []
 anyhow.workspace = true
 crossbeam-channel.workspace = true
 gx-contracts = { path = "../gx-contracts" }
+gx-cache = { path = "../gx-cache" }
 gx-source = { path = "../gx-source" }
 reqwest.workspace = true
 symphonia.workspace = true

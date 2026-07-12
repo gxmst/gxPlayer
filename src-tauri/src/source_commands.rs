@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gx_audio::engine::LocalAudioEngine;
+use gx_cache::{CacheKey, CacheStore};
 use gx_contracts::ResolvedMediaRequest;
 use gx_metadata::{
     CatalogTrack, find_replacements, search_all, search_kugou, search_kuwo, search_netease,
@@ -40,6 +41,7 @@ pub struct OnlinePlaybackResult {
     pub source_id: Option<String>,
     pub source_name: Option<String>,
     pub quality: Option<String>,
+    pub cache_hit: bool,
 }
 
 #[tauri::command]
@@ -302,6 +304,14 @@ fn play_online_track(
     quality: Option<String>,
     source_id: Option<String>,
 ) -> Result<OnlinePlaybackResult, String> {
+    if let Some((source, _)) = lx_identity(&track) {
+        let capabilities = app.state::<SourceRuntime>().status().capabilities;
+        for attempt in quality_attempts(&capabilities, source, quality.as_deref()) {
+            if let Some(result) = play_cache_hit(app, &track, &attempt, &source_id)? {
+                return Ok(result);
+            }
+        }
+    }
     let candidates = select_lx_candidates(track)?;
     let mut errors = Vec::new();
     for candidate in candidates {
@@ -311,6 +321,9 @@ fn play_online_track(
         let capabilities = app.state::<SourceRuntime>().status().capabilities;
         let attempts = quality_attempts(&capabilities, source, quality.as_deref());
         for attempt in &attempts {
+            if let Some(result) = play_cache_hit(app, &candidate, attempt, &source_id)? {
+                return Ok(result);
+            }
             let payload = lx_music_url_payload(&candidate, attempt)?;
             match resolve_serialized(app, payload, Some(attempt), source_id.as_deref()) {
                 Ok(request) => {
@@ -322,28 +335,30 @@ fn play_online_track(
                         ));
                         continue;
                     }
-                    let resolved_quality = request.quality.clone();
+                    let resolved_quality =
+                        request.quality.clone().unwrap_or_else(|| attempt.clone());
+                    let cache_plan = app.state::<CacheStore>().prepare(
+                        CacheKey {
+                            provider_id: candidate.provider_id.clone(),
+                            provider_track_id: candidate.provider_track_id.clone(),
+                            quality: resolved_quality.clone(),
+                        },
+                        request.media_type.clone(),
+                    );
                     app.state::<LocalAudioEngine>()
-                        .load_resolved(request, candidate.title.clone())
+                        .load_resolved_cached(request, candidate.title.clone(), Some(cache_plan))
                         .map_err(|error| {
                             format!("Rust streaming engine rejected LX media: {error}")
                         })?;
 
-                    let selected_source_id = source_id
-                        .clone()
-                        .or_else(|| app.state::<SourceRuntime>().status().active_source_id);
-                    let selected_source_name = selected_source_id.as_deref().and_then(|id| {
-                        app.state::<SourceRuntime>()
-                            .list()
-                            .into_iter()
-                            .find(|source| source.source.id == id)
-                            .map(|source| source.source.metadata.name)
-                    });
+                    let (selected_source_id, selected_source_name) =
+                        selected_source(app, &source_id);
                     return Ok(OnlinePlaybackResult {
                         track: candidate,
                         source_id: selected_source_id,
                         source_name: selected_source_name,
-                        quality: resolved_quality,
+                        quality: Some(resolved_quality),
+                        cache_hit: false,
                     });
                 }
                 Err(error) => errors.push(format!(
@@ -357,6 +372,50 @@ fn play_online_track(
         "LX source could not resolve a verified full-track URL ({})",
         errors.join("; ")
     ))
+}
+
+fn play_cache_hit(
+    app: &AppHandle,
+    track: &CatalogTrack,
+    quality: &str,
+    source_id: &Option<String>,
+) -> Result<Option<OnlinePlaybackResult>, String> {
+    let key = CacheKey {
+        provider_id: track.provider_id.clone(),
+        provider_track_id: track.provider_track_id.clone(),
+        quality: quality.to_owned(),
+    };
+    let Some(hit) = app.state::<CacheStore>().lookup(&key) else {
+        return Ok(None);
+    };
+    app.state::<LocalAudioEngine>()
+        .load_cached_online(hit.audio_path, track.title.clone())
+        .map_err(|error| format!("Rust audio engine rejected cached media: {error}"))?;
+    let (selected_source_id, selected_source_name) = selected_source(app, source_id);
+    Ok(Some(OnlinePlaybackResult {
+        track: track.clone(),
+        source_id: selected_source_id,
+        source_name: selected_source_name,
+        quality: Some(quality.to_owned()),
+        cache_hit: true,
+    }))
+}
+
+fn selected_source(
+    app: &AppHandle,
+    requested_source_id: &Option<String>,
+) -> (Option<String>, Option<String>) {
+    let selected_source_id = requested_source_id
+        .clone()
+        .or_else(|| app.state::<SourceRuntime>().status().active_source_id);
+    let selected_source_name = selected_source_id.as_deref().and_then(|id| {
+        app.state::<SourceRuntime>()
+            .list()
+            .into_iter()
+            .find(|source| source.source.id == id)
+            .map(|source| source.source.metadata.name)
+    });
+    (selected_source_id, selected_source_name)
 }
 
 const QUALITY_ORDER: [&str; 4] = ["flac24bit", "flac", "320k", "128k"];
@@ -644,12 +703,18 @@ fn start_online_e2e(app: &AppHandle) -> Result<(), String> {
                 .ok_or_else(|| "online E2E search returned no LX-compatible track".to_owned())?;
             let result = play_online_track(&app_for_play, track, Some("320k".into()), None)?;
             println!(
-                "GX_ONLINE_SEARCH_RESOLVE_OK provider={} id={} quality={}",
+                "GX_ONLINE_SEARCH_RESOLVE_OK provider={} id={} quality={} cache_hit={}",
                 result.track.provider_id,
                 result.track.provider_track_id,
-                result.quality.as_deref().unwrap_or("unknown")
+                result.quality.as_deref().unwrap_or("unknown"),
+                result.cache_hit
             );
-            monitor_full_track_controls(&app_for_play)
+            if std::env::var_os("GX_CACHE_COMPLETE_E2E").is_some() {
+                monitor_cache_completion(&app_for_play, result)
+            } else {
+                monitor_full_track_controls(&app_for_play)?;
+                verify_interrupted_cache_was_discarded(&app_for_play, &result)
+            }
         })
         .await
         .map_err(|error| format!("online E2E task failed: {error}"))
@@ -668,6 +733,111 @@ fn start_online_e2e(app: &AppHandle) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+fn cache_key_for_result(result: &OnlinePlaybackResult) -> Result<CacheKey, String> {
+    Ok(CacheKey {
+        provider_id: result.track.provider_id.clone(),
+        provider_track_id: result.track.provider_track_id.clone(),
+        quality: result
+            .quality
+            .clone()
+            .ok_or_else(|| "online result has no quality for cache verification".to_owned())?,
+    })
+}
+
+fn verify_interrupted_cache_was_discarded(
+    app: &AppHandle,
+    result: &OnlinePlaybackResult,
+) -> Result<(), String> {
+    if result.cache_hit {
+        return Ok(());
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let cache = app.state::<CacheStore>();
+    let key = cache_key_for_result(result)?;
+    if cache.lookup(&key).is_some() {
+        return Err("seek-interrupted stream incorrectly became a complete cache entry".into());
+    }
+    let has_part = std::fs::read_dir(cache.status().directory)
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "part")
+        });
+    if has_part {
+        return Err("seek-interrupted stream left a .part file behind".into());
+    }
+    println!("GX_CACHE_SEEK_ABORT_OK no_entry=true no_part=true");
+    Ok(())
+}
+
+fn monitor_cache_completion(app: &AppHandle, first: OnlinePlaybackResult) -> Result<(), String> {
+    if first.cache_hit {
+        return Err("cache completion smoke requires an initial cache miss".into());
+    }
+    let key = cache_key_for_result(&first)?;
+    for _ in 0..7_200 {
+        let snapshot = app.state::<LocalAudioEngine>().snapshot();
+        if snapshot.status == gx_contracts::PlaybackStatus::Failed {
+            return Err(snapshot.error.unwrap_or_else(|| "playback failed".into()));
+        }
+        if snapshot.status == gx_contracts::PlaybackStatus::Stopped {
+            let cache = app.state::<CacheStore>();
+            let entry = (0..50)
+                .find_map(|_| {
+                    let hit = cache.lookup(&key);
+                    if hit.is_none() {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    hit
+                })
+                .ok_or_else(|| "completed playback did not produce a cache entry".to_owned())?;
+            if entry.source_sample_rate.is_none() || entry.source_channels.is_none() {
+                return Err("cache sidecar is missing measured source specifications".into());
+            }
+            println!(
+                "GX_CACHE_COMPLETE_OK bytes={} sample_rate={} bit_depth={} channels={}",
+                entry.byte_len,
+                entry.source_sample_rate.unwrap(),
+                entry
+                    .source_bit_depth
+                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                entry.source_channels.unwrap()
+            );
+            let replay = play_online_track(
+                app,
+                first.track.clone(),
+                first.quality.clone(),
+                first.source_id.clone(),
+            )?;
+            if !replay.cache_hit {
+                return Err("second playback did not hit the completed cache".into());
+            }
+            for _ in 0..300 {
+                let replay_snapshot = app.state::<LocalAudioEngine>().snapshot();
+                if replay_snapshot.status == gx_contracts::PlaybackStatus::Playing {
+                    app.state::<LocalAudioEngine>()
+                        .seek(30.0)
+                        .map_err(|error| error.to_string())?;
+                    println!("GX_CACHE_REPLAY_HIT_OK local=true seek_submitted=true");
+                    return Ok(());
+                }
+                if replay_snapshot.status == gx_contracts::PlaybackStatus::Failed {
+                    return Err(replay_snapshot
+                        .error
+                        .unwrap_or_else(|| "cached replay failed".into()));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return Err("cached replay did not start within 30 seconds".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("cache completion playback did not finish within 12 minutes".into())
 }
 
 fn start_phase2_auto_resolve(app: &AppHandle) -> Result<(), String> {

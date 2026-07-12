@@ -9,12 +9,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
+use gx_cache::CacheWritePlan;
 use gx_contracts::{MediaType, PlaybackStatus, ResolvedMediaRequest};
 use gx_dsp::{CrossfeedSettings, DspChain, DspSettings, HrtfSettings, LimiterSettings};
 use gx_streaming::HttpMediaSource;
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use serde::{Deserialize, Serialize};
 use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::{
+    CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_VORBIS, CodecType,
+};
 use symphonia::core::errors::Error as SymphoniaError;
 
 use super::{
@@ -71,7 +75,10 @@ impl AudioMode {
 #[derive(Clone)]
 enum PlaybackSource {
     Local(PathBuf),
-    Online(ResolvedMediaRequest),
+    Online {
+        request: ResolvedMediaRequest,
+        cache_plan: Option<CacheWritePlan>,
+    },
 }
 
 #[derive(Clone)]
@@ -170,6 +177,15 @@ impl LocalAudioEngine {
     }
 
     pub fn load_resolved(&self, request: ResolvedMediaRequest, title: String) -> Result<()> {
+        self.load_resolved_cached(request, title, None)
+    }
+
+    pub fn load_resolved_cached(
+        &self,
+        request: ResolvedMediaRequest,
+        title: String,
+        cache_plan: Option<CacheWritePlan>,
+    ) -> Result<()> {
         if request.media_type == MediaType::Hls {
             bail!("HLS playback is not supported in v1");
         }
@@ -181,7 +197,22 @@ impl LocalAudioEngine {
                 duration_seconds: None,
                 online: true,
             },
-            source: PlaybackSource::Online(request),
+            source: PlaybackSource::Online {
+                request,
+                cache_plan,
+            },
+        }]))
+    }
+
+    pub fn load_cached_online(&self, path: PathBuf, title: String) -> Result<()> {
+        self.send(EngineCommand::Load(vec![EngineQueueItem {
+            public: QueueItem {
+                location: path.display().to_string(),
+                title,
+                duration_seconds: None,
+                online: true,
+            },
+            source: PlaybackSource::Local(path),
         }]))
     }
 
@@ -661,16 +692,23 @@ impl PlaybackSession {
         dsp_settings: DspSettings,
         output_device_name: Option<&str>,
     ) -> Result<Self> {
+        let cache_plan = match source {
+            PlaybackSource::Online { cache_plan, .. } => cache_plan.clone(),
+            PlaybackSource::Local(_) => None,
+        };
         let (mut media, seek_discard_frames) = match source {
             PlaybackSource::Local(path) => {
                 let mut media = open_media(path)?;
                 seek_media(&mut media, start_seconds)?;
                 (media, 0)
             }
-            PlaybackSource::Online(request) => {
+            PlaybackSource::Online {
+                request,
+                cache_plan,
+            } => {
                 let extension = media_extension(&request.media_type);
                 let description = request.redacted_for_log();
-                let http = HttpMediaSource::new(request.clone())?;
+                let http = HttpMediaSource::new_with_cache(request.clone(), cache_plan.clone())?;
                 let mut media = open_media_source(Box::new(http), extension, &description)?;
                 let discard = seek_media_coarse(&mut media, start_seconds)?;
                 (media, discard)
@@ -686,6 +724,12 @@ impl PlaybackSession {
             .context("audio track does not declare a channel layout")?
             .count();
         let source_bit_depth = media.codec_params.bits_per_sample;
+        if let Some(plan) = &cache_plan {
+            plan.update_source_spec(sample_rate, source_bit_depth, channels as u16);
+            if let Some(media_type) = decoded_media_type(media.codec_params.codec) {
+                plan.update_media_type(media_type);
+            }
+        }
         let duration_seconds = media
             .codec_params
             .n_frames
@@ -899,6 +943,16 @@ fn media_extension(media_type: &MediaType) -> Option<&'static str> {
         MediaType::Ogg => Some("ogg"),
         MediaType::Wav => Some("wav"),
         MediaType::Hls | MediaType::Unknown => None,
+    }
+}
+
+fn decoded_media_type(codec: CodecType) -> Option<MediaType> {
+    match codec {
+        CODEC_TYPE_MP3 => Some(MediaType::Mp3),
+        CODEC_TYPE_FLAC => Some(MediaType::Flac),
+        CODEC_TYPE_AAC => Some(MediaType::Aac),
+        CODEC_TYPE_VORBIS => Some(MediaType::Ogg),
+        _ => None,
     }
 }
 

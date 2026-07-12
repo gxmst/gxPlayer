@@ -13,10 +13,15 @@ use gx_dsp::DspSettings;
 use gx_library::{LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistSummary};
 use gx_source::{SourceStore, safe_http};
 
+mod cache_commands;
 mod metadata_commands;
 mod source_commands;
 mod source_runtime;
 
+use cache_commands::{
+    cache_clear, cache_online_favorites, cache_reset_directory, cache_set_directory,
+    cache_set_limit, cache_set_online_favorite, cache_status,
+};
 use metadata_commands::{
     maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
     metadata_play_preview, metadata_search,
@@ -739,6 +744,10 @@ pub fn run() {
         .setup(|app| {
             let app_data = isolated_smoke_data_root().unwrap_or(app.path().app_data_dir()?);
             app.manage(LibraryStore::open(app_data.join("library.sqlite3"))?);
+            app.manage(gx_cache::CacheStore::open(
+                &app_data,
+                std::env::current_exe().ok().as_deref(),
+            )?);
             let source_root = app_data.join("sources");
             let drop_in_root = source_root.join("drop-in");
             let mut source_store = SourceStore::open(&source_root)?;
@@ -839,6 +848,13 @@ pub fn run() {
             lx_crypto_result,
             lx_security_result,
             lx_poc_failure
+            ,cache_status,
+            cache_set_limit,
+            cache_set_directory,
+            cache_reset_directory,
+            cache_clear,
+            cache_online_favorites,
+            cache_set_online_favorite
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,0 +1,12 @@
+[package]
+name = "gx-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gx-contracts = { path = "../gx-contracts" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

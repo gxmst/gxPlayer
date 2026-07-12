@@ -16,7 +16,11 @@ fn main() -> Result<()> {
         .next()
         .map(PathBuf::from)
         .context("usage: engine-smoke <audio-file>")?;
-    if args.next().as_deref() == Some("--stability") {
+    let mode = args.next();
+    if mode.as_deref() == Some("--spec-only") {
+        return run_spec(path);
+    }
+    if mode.as_deref() == Some("--stability") {
         let seconds = args
             .next()
             .map(|value| value.parse::<u64>())
@@ -195,6 +199,23 @@ fn main() -> Result<()> {
     );
     drop(engine);
     fs::remove_file(short_path)?;
+    Ok(())
+}
+
+fn run_spec(path: PathBuf) -> Result<()> {
+    let engine = LocalAudioEngine::new()?;
+    engine.load(vec![path])?;
+    let snapshot = wait_for(&engine, "source specification", |state| {
+        state.status == PlaybackStatus::Playing && state.source_sample_rate.is_some()
+    })?;
+    println!(
+        "GX_SOURCE_SPEC_OK sample_rate={} bit_depth={} channels={}",
+        snapshot.source_sample_rate.unwrap(),
+        snapshot
+            .source_bit_depth
+            .map_or_else(|| "unknown".into(), |value| value.to_string()),
+        snapshot.source_channels.unwrap_or_default()
+    );
     Ok(())
 }
 

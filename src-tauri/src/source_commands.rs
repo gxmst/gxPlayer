@@ -257,17 +257,13 @@ fn play_online_track(
     source_id: Option<String>,
 ) -> Result<OnlinePlaybackResult, String> {
     let candidates = select_lx_candidates(track)?;
-    let preferred_quality = quality
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("320k");
-    let mut attempts = vec![preferred_quality.to_owned()];
-    if preferred_quality != "128k" {
-        attempts.push("128k".into());
-    }
-
     let mut errors = Vec::new();
     for candidate in candidates {
+        let source = lx_identity(&candidate)
+            .map(|(source, _)| source)
+            .ok_or_else(|| "candidate lost its LX source identity".to_owned())?;
+        let capabilities = app.state::<SourceRuntime>().status().capabilities;
+        let attempts = quality_attempts(&capabilities, source, quality.as_deref());
         for attempt in &attempts {
             let payload = lx_music_url_payload(&candidate, attempt)?;
             match resolve_serialized(app, payload, Some(attempt), source_id.as_deref()) {
@@ -315,6 +311,52 @@ fn play_online_track(
         "LX source could not resolve a verified full-track URL ({})",
         errors.join("; ")
     ))
+}
+
+const QUALITY_ORDER: [&str; 4] = ["flac24bit", "flac", "320k", "128k"];
+
+fn quality_attempts(capabilities: &Value, source: &str, preference: Option<&str>) -> Vec<String> {
+    let supported = advertised_qualities(capabilities, source);
+    let preference = preference
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "auto")
+        .filter(|value| QUALITY_ORDER.contains(value));
+    let start = preference
+        .and_then(|value| QUALITY_ORDER.iter().position(|quality| *quality == value))
+        .unwrap_or(0);
+    let mut attempts = QUALITY_ORDER[start..]
+        .iter()
+        .filter(|quality| {
+            supported
+                .as_ref()
+                .is_none_or(|supported| supported.iter().any(|value| value == **quality))
+        })
+        .map(|quality| (*quality).to_owned())
+        .collect::<Vec<_>>();
+    if attempts.is_empty() {
+        attempts = if preference == Some("128k") {
+            vec!["128k".into()]
+        } else {
+            vec!["320k".into(), "128k".into()]
+        };
+    }
+    attempts
+}
+
+fn advertised_qualities(capabilities: &Value, source: &str) -> Option<Vec<String>> {
+    let source = capabilities.get("sources")?.get(source)?;
+    let values = source
+        .get("qualitys")
+        .or_else(|| source.get("qualities"))
+        .unwrap_or(source)
+        .as_array()?;
+    let qualities = values
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|quality| QUALITY_ORDER.contains(quality))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (!qualities.is_empty()).then_some(qualities)
 }
 
 fn select_lx_candidates(track: CatalogTrack) -> Result<Vec<CatalogTrack>, String> {
@@ -1186,5 +1228,32 @@ mod tests {
             Some(10_792_943)
         );
         assert_eq!(parse_content_range_total("bytes */*"), None);
+    }
+
+    #[test]
+    fn quality_attempts_follow_per_platform_capabilities() {
+        let capabilities = json!({
+            "sources": {
+                "wy": { "qualitys": ["128k", "320k", "flac", "hires"] },
+                "kg": { "qualitys": ["128k", "320k", "flac", "flac24bit"] },
+                "legacy": ["128k", "320k"]
+            }
+        });
+        assert_eq!(
+            quality_attempts(&capabilities, "wy", None),
+            ["flac", "320k", "128k"]
+        );
+        assert_eq!(
+            quality_attempts(&capabilities, "kg", None),
+            ["flac24bit", "flac", "320k", "128k"]
+        );
+        assert_eq!(
+            quality_attempts(&capabilities, "wy", Some("flac24bit")),
+            ["flac", "320k", "128k"]
+        );
+        assert_eq!(
+            quality_attempts(&capabilities, "legacy", Some("flac")),
+            ["320k", "128k"]
+        );
     }
 }

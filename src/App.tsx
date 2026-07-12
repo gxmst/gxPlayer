@@ -21,6 +21,15 @@ import {
 
 type SearchState = "idle" | "loading" | "ready" | "empty" | "error";
 type AudioMode = EngineSnapshot["audioMode"];
+type QualityPreference = "auto" | "128k" | "320k" | "flac" | "flac24bit";
+
+const QUALITY_OPTIONS: Array<{ value: QualityPreference; label: string }> = [
+  { value: "auto", label: "自动" },
+  { value: "128k", label: "128k" },
+  { value: "320k", label: "320k" },
+  { value: "flac", label: "无损 FLAC" },
+  { value: "flac24bit", label: "24-bit FLAC" },
+];
 
 /** Premium rose — clean on dark glass; used when there is no artwork. */
 const FALLBACK_ACCENT = "#e85a71";
@@ -222,6 +231,12 @@ function App() {
   const [dragPosition, setDragPosition] = useState<number | null>(null);
   const [pendingSeek, setPendingSeek] = useState<{ target: number; generation: number; queueKey: string } | null>(null);
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
+  const [qualityPreference, setQualityPreference] = useState<QualityPreference>(() => {
+    const stored = window.localStorage.getItem("gxplayer.defaultQuality");
+    return QUALITY_OPTIONS.some((option) => option.value === stored) ? stored as QualityPreference : "auto";
+  });
+  const [currentQuality, setCurrentQuality] = useState<string | null>(null);
+  const [qualitySwitching, setQualitySwitching] = useState(false);
 
   const [library, setLibrary] = useState<LibraryTrack[]>([]);
   const [favorites, setFavorites] = useState<LibraryTrack[]>([]);
@@ -433,19 +448,25 @@ function App() {
     });
     if (!selected) return;
     const paths = Array.isArray(selected) ? selected : [selected];
-    const loaded = await run("player_load_local", { paths });
-    if (loaded !== undefined) {
+    try {
+      await invoke("player_load_local", { paths });
       setSelectedCatalogTrack(null);
+      setCurrentQuality(null);
       setLyrics(null);
       await refreshLibrary();
+    } catch (error) {
+      setMessage(String(error));
     }
   };
 
   const playLocal = async (track: LibraryTrack) => {
-    const loaded = await run("player_load_local", { paths: [track.path] });
-    if (loaded !== undefined) {
+    try {
+      await invoke("player_load_local", { paths: [track.path] });
       setSelectedCatalogTrack(null);
+      setCurrentQuality(null);
       setLyrics(null);
+    } catch (error) {
+      setMessage(String(error));
     }
   };
 
@@ -460,10 +481,11 @@ function App() {
       try {
         const online = await invoke<OnlinePlaybackResult>("player_play_online_track", {
           track: wanted,
-          quality: "320k",
+          quality: qualityPreference === "auto" ? null : qualityPreference,
           sourceId: null,
         });
         selectedTrack = online.track;
+        setCurrentQuality(online.quality);
         const sourceLabel = online.sourceName || activeSource?.metadata.name || "当前 LX 音源";
         playbackMessage = `${sourceLabel} 已解析整首播放${online.quality ? ` · ${online.quality}` : ""}。`;
       } catch (onlineError) {
@@ -473,6 +495,7 @@ function App() {
             candidates: searchResults.length ? searchResults : suggestions,
           });
           selectedTrack = preview.track;
+          setCurrentQuality("preview");
           playbackMessage = `LX 整首解析失败，已回退为 ${preview.track.providerId} 官方 30 秒预览。原因：${String(onlineError)}`;
         } catch (previewError) {
           throw new Error(`LX 整首播放失败：${String(onlineError)}；官方 30 秒预览也失败：${String(previewError)}`);
@@ -498,6 +521,30 @@ function App() {
     } finally {
       setPlayingCatalogKey(null);
     }
+  };
+
+  const switchOnlineQuality = async (preference: QualityPreference) => {
+    if (!selectedCatalogTrack || !currentQueueItem?.online || qualitySwitching) return;
+    setQualitySwitching(true);
+    try {
+      const online = await invoke<OnlinePlaybackResult>("player_play_online_track", {
+        track: selectedCatalogTrack,
+        quality: preference === "auto" ? null : preference,
+        sourceId: null,
+      });
+      setSelectedCatalogTrack(online.track);
+      setCurrentQuality(online.quality);
+      setMessage(`已切换到 ${online.quality ?? "自动"}，并重新开始流式播放。`);
+    } catch (error) {
+      setMessage(`切换音质失败，已保留当前播放：${String(error)}`);
+    } finally {
+      setQualitySwitching(false);
+    }
+  };
+
+  const updateQualityPreference = (preference: QualityPreference) => {
+    setQualityPreference(preference);
+    window.localStorage.setItem("gxplayer.defaultQuality", preference);
   };
 
   const submitSearch = async (queryOverride?: string) => {
@@ -732,6 +779,7 @@ function App() {
     if (view === "settings") return (
       <div className="page"><PageHeading eyebrow="SETTINGS" title="设置与备份" copy="输出设备、音效模式和本地数据都在这里管理。" />
         <div className="settings-grid"><section className="settings-card"><h3>输出设备</h3><p>切换时会从当前位置继续播放。</p><select value={snapshot.outputDevice ?? ""} onChange={(event) => void run("player_set_output_device", { name: event.target.value || null })}><option value="">系统默认设备</option>{outputDevices.map((device) => <option key={device} value={device}>{device}</option>)}</select></section>
+        <section className="settings-card"><h3>默认音质</h3><p>自动会按当前平台能力从高到低尝试，并在解析失败时逐档回退。</p><select value={qualityPreference} onChange={(event) => updateQualityPreference(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></section>
         <section className="settings-card"><h3>默认听感</h3><p>音乐模式保持 DSP 透明旁路；影院/游戏模式启用空间处理。</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></section></div>
         <section className="backup-card"><div className="section-heading"><div><h3>配置备份</h3><p>包含本地曲库索引、收藏、歌单和音源脚本。</p></div><div><button onClick={() => void exportBackup()}>生成备份</button><button className="primary" disabled={!backupText.trim()} onClick={() => void restoreBackup()}>恢复备份</button></div></div><textarea aria-label="GXPlayer 备份 JSON" placeholder="生成的备份会显示在这里，也可以粘贴已有备份。" value={backupText} onChange={(event) => setBackupText(event.target.value)} /></section>
       </div>
@@ -852,6 +900,7 @@ function App() {
           </div>
         </div>
         <div className="player-tools">
+          {selectedCatalogTrack && currentQueueItem?.online && <select className="quality-select" aria-label="在线音质" title={`当前音质：${currentQuality ?? "自动"}`} value={QUALITY_OPTIONS.some((option) => option.value === currentQuality) ? currentQuality ?? "auto" : "auto"} disabled={qualitySwitching} onChange={(event) => void switchOnlineQuality(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.value === "auto" ? `自动${currentQuality ? ` · ${currentQuality}` : ""}` : option.label}</option>)}</select>}
           <div className="volume-cluster">
             <span className="volume-icon" aria-hidden="true" />
             <input

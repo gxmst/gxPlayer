@@ -180,7 +180,7 @@ Object.assign(window, {
     try {
       if (!requestHandler) throw new Error("Request event is not defined");
       const raw = await requestHandler(actualPayload);
-      const result = typeof raw === "string" ? { url: raw, type: "128k" } : raw;
+      const result = (isPocRequest || pocMode) && typeof raw === "string" ? { url: raw, type: "128k" } : raw;
       if (isPocRequest || pocMode) {
         await invoke("lx_poc_result", { result });
       } else {

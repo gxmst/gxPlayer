@@ -2342,12 +2342,15 @@ function App() {
     if (view === "search") return (
       <div className="page">
         <PageHeading eyebrow="SEARCH" title={resultsQuery ? `“${resultsQuery}” 的结果` : "搜索音乐"} copy={runtime?.state === "ready" ? `${sourceStatus.copy} 点击歌曲将优先解析整首播放，失败时会明确提示并回退官方 30 秒预览。` : `${sourceStatus.title}：${sourceStatus.copy} 当前仍可尝试官方 30 秒预览。`} />
-        {resultsState === "loading" ? (
+        {resultsState === "loading" && !searchResults.length ? (
           <LoadingState />
         ) : resultsState === "error" ? (
           <ErrorState title="搜索没有完成" copy={resultsError ?? "请检查网络或音源后重试。"} onRetry={retryResults} />
         ) : searchResults.length ? (
-          renderCatalogRows(searchResults)
+          <>
+            {resultsState === "loading" && <div className="search-progress"><i className="search-spinner" />已有结果，仍在搜索其他平台…</div>}
+            {renderCatalogRows(searchResults)}
+          </>
         ) : resultsState === "empty" ? (
           <EmptyState title="没有找到相关音乐" copy="换一个歌名、歌手或专辑关键词试试。" />
         ) : (

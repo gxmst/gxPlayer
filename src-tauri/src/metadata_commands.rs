@@ -1,12 +1,13 @@
 use gx_audio::engine::LocalAudioEngine;
 use gx_metadata::{
-    CatalogTrack, LyricDocument, ReplacementMatch, apple_chart, fetch_lyrics, fetch_preview_bytes,
-    find_replacements, preview_is_available, search_all, select_playable_with,
+    CatalogTrack, LyricDocument, ReplacementMatch, SearchBatch, apple_chart, fetch_lyrics,
+    fetch_preview_bytes, find_replacements, preview_is_available, search_all,
+    search_all_progressive, select_playable_with,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 use crate::require_window;
 use crate::source_commands::{ResolveCancellationRegistry, ResolveToken};
@@ -20,17 +21,43 @@ pub struct SelectedPlayback {
     pub replaced_provider_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogSearchBatchEvent {
+    request_id: String,
+    provider_id: String,
+    tracks: Vec<CatalogTrack>,
+    error: Option<String>,
+}
+
 #[tauri::command]
 pub async fn metadata_search(
     window: WebviewWindow,
     query: String,
     limit: Option<usize>,
+    request_id: Option<String>,
 ) -> Result<Vec<CatalogTrack>, String> {
     require_window(&window, "main")?;
-    tauri::async_runtime::spawn_blocking(move || search_all(&query, limit.unwrap_or(15)))
-        .await
-        .map_err(|error| format!("metadata search task failed: {error}"))?
-        .map_err(|error| error.to_string())
+    let event_window = window.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        search_all_progressive(&query, limit.unwrap_or(15), |batch: SearchBatch| {
+            let Some(request_id) = request_id.as_ref() else {
+                return;
+            };
+            let payload = CatalogSearchBatchEvent {
+                request_id: request_id.clone(),
+                provider_id: batch.provider_id,
+                tracks: batch.tracks,
+                error: batch.error,
+            };
+            if let Err(error) = event_window.emit("gx-catalog-search-batch", payload) {
+                eprintln!("catalog search batch emit failed: {error}");
+            }
+        })
+    })
+    .await
+    .map_err(|error| format!("metadata search task failed: {error}"))?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

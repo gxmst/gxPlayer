@@ -1293,6 +1293,20 @@ select {
   gap: var(--space-5) var(--space-4);
 }
 
+.search-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+  color: var(--text-mute);
+  font-size: 12px;
+}
+
+.search-progress .search-spinner {
+  position: static;
+  flex: 0 0 auto;
+}
+
 .catalog-card-wrap {
   display: grid;
   gap: 8px;

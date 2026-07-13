@@ -1,4 +1,6 @@
 use std::cmp::Ordering;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use gx_contracts::{MediaType, ResolvedMediaRequest};
@@ -23,6 +25,14 @@ pub struct CatalogTrack {
     pub artwork_url: Option<Url>,
     pub resolver_payload: Value,
     pub preview: Option<ResolvedMediaRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchBatch {
+    pub provider_id: String,
+    pub tracks: Vec<CatalogTrack>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,34 +71,83 @@ pub enum MetadataError {
 }
 
 pub fn search_all(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+    search_all_progressive(query, limit, |_| {})
+}
+
+pub fn search_all_progressive<F>(
+    query: &str,
+    limit: usize,
+    on_batch: F,
+) -> Result<Vec<CatalogTrack>, MetadataError>
+where
+    F: FnMut(SearchBatch),
+{
     let query = query.trim();
     if query.is_empty() {
         return Err(MetadataError::EmptyQuery);
     }
     let limit = limit.clamp(1, 50);
-    let (kugou, kuwo, netease, itunes, deezer) = std::thread::scope(|scope| {
-        let kugou = scope.spawn(|| search_kugou(query, limit));
-        let kuwo = scope.spawn(|| search_kuwo(query, limit));
-        let netease = scope.spawn(|| search_netease(query, limit));
-        let itunes = scope.spawn(|| search_itunes(query, limit));
-        let deezer = scope.spawn(|| search_deezer(query, limit));
-        (
-            kugou.join().unwrap(),
-            kuwo.join().unwrap(),
-            netease.join().unwrap(),
-            itunes.join().unwrap(),
-            deezer.join().unwrap(),
-        )
-    });
+    type SearchFn = fn(&str, usize) -> Result<Vec<CatalogTrack>, MetadataError>;
+    let providers: [(&'static str, SearchFn); 5] = [
+        ("kg", search_kugou),
+        ("kw", search_kuwo),
+        ("wy", search_netease),
+        ("itunes", search_itunes),
+        ("deezer", search_deezer),
+    ];
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for (provider_id, search) in providers {
+            let sender = sender.clone();
+            scope.spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| search(query, limit)))
+                    .unwrap_or_else(|_| {
+                        Err(MetadataError::Http(format!(
+                            "{provider_id} search worker panicked"
+                        )))
+                    });
+                let _ = sender.send((provider_id, result));
+            });
+        }
+        drop(sender);
+        collect_search_results(receiver, on_batch)
+    })
+}
+
+fn collect_search_results<I, F>(
+    results: I,
+    mut on_batch: F,
+) -> Result<Vec<CatalogTrack>, MetadataError>
+where
+    I: IntoIterator<Item = (&'static str, Result<Vec<CatalogTrack>, MetadataError>)>,
+    F: FnMut(SearchBatch),
+{
     let mut tracks = Vec::new();
     let mut errors = Vec::new();
-    for result in [kugou, kuwo, netease, itunes, deezer] {
+    let mut successful_providers = 0usize;
+    for (provider_id, result) in results {
         match result {
-            Ok(mut found) => tracks.append(&mut found),
-            Err(error) => errors.push(error.to_string()),
+            Ok(found) => {
+                successful_providers += 1;
+                on_batch(SearchBatch {
+                    provider_id: provider_id.to_owned(),
+                    tracks: found.clone(),
+                    error: None,
+                });
+                tracks.extend(found);
+            }
+            Err(error) => {
+                let error = error.to_string();
+                on_batch(SearchBatch {
+                    provider_id: provider_id.to_owned(),
+                    tracks: Vec::new(),
+                    error: Some(error.clone()),
+                });
+                errors.push(error);
+            }
         }
     }
-    if tracks.is_empty() && !errors.is_empty() {
+    if successful_providers == 0 && !errors.is_empty() {
         return Err(MetadataError::Http(errors.join("; ")));
     }
     Ok(tracks)
@@ -111,7 +170,7 @@ pub fn search_kugou(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Meta
         .append_pair("iscorrection", "1")
         .append_pair("privilege_filter", "0")
         .append_pair("area_code", "1");
-    let response: KugouResponse = request_json(url)?;
+    let response: KugouResponse = request_search_json(url)?;
     if response.error_code != 0 {
         return Err(MetadataError::HttpStatus(response.error_code.max(0) as u16));
     }
@@ -148,7 +207,7 @@ pub fn search_kuwo(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Metad
         .append_pair("vermerge", "1")
         .append_pair("mobi", "1")
         .append_pair("issubtitle", "1");
-    let response: KuwoResponse = request_json(url)?;
+    let response: KuwoResponse = request_search_json(url)?;
     Ok(response
         .tracks
         .into_iter()
@@ -185,7 +244,7 @@ pub fn search_netease(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Me
             ),
         ],
         body: Some(body),
-        timeout: Duration::from_secs(15),
+        timeout: Duration::from_secs(5),
         max_response_bytes: RESPONSE_LIMIT,
     })
     .map_err(|error| MetadataError::Http(error.to_string()))?;
@@ -212,7 +271,7 @@ pub fn search_itunes(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Met
         .append_pair("entity", "song")
         .append_pair("country", "CN")
         .append_pair("limit", &limit.clamp(1, 50).to_string());
-    let response: ItunesResponse = request_json(url)?;
+    let response: ItunesResponse = request_search_json(url)?;
     Ok(response
         .results
         .into_iter()
@@ -225,7 +284,7 @@ pub fn search_deezer(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Met
     url.query_pairs_mut()
         .append_pair("q", query)
         .append_pair("limit", &limit.clamp(1, 50).to_string());
-    let response: DeezerResponse = request_json(url)?;
+    let response: DeezerResponse = request_search_json(url)?;
     Ok(response
         .data
         .into_iter()
@@ -438,6 +497,22 @@ fn request_json<T: DeserializeOwned>(url: Url) -> Result<T, MetadataError> {
         }
     }
     Err(last_error.unwrap_or_else(|| MetadataError::Http("request did not run".into())))
+}
+
+fn request_search_json<T: DeserializeOwned>(url: Url) -> Result<T, MetadataError> {
+    let response = execute(SafeHttpRequest {
+        url,
+        method: Method::GET,
+        headers: vec![("user-agent".into(), "GXPlayer/0.1 metadata".into())],
+        body: None,
+        timeout: Duration::from_secs(5),
+        max_response_bytes: RESPONSE_LIMIT,
+    })
+    .map_err(|error| MetadataError::Http(error.to_string()))?;
+    if !(200..300).contains(&response.status) {
+        return Err(MetadataError::HttpStatus(response.status));
+    }
+    Ok(serde_json::from_slice(&response.body)?)
 }
 
 fn preview_request(url: Option<String>, media_type: MediaType) -> Option<ResolvedMediaRequest> {
@@ -1143,6 +1218,53 @@ mod tests {
             .into_catalog();
         assert_eq!(track.provider_id, "wy");
         assert_eq!(track.resolver_payload["musicInfo"]["songmid"], "123");
+    }
+
+    #[test]
+    fn progressive_search_emits_success_before_later_failure() {
+        let expected = track("fast", "Song", "Artist", 200_000);
+        let mut batches = Vec::new();
+        let result = collect_search_results(
+            vec![
+                ("fast", Ok(vec![expected.clone()])),
+                ("slow", Err(MetadataError::Http("timeout".into()))),
+            ],
+            |batch| batches.push(batch),
+        )
+        .unwrap();
+
+        assert_eq!(result, vec![expected]);
+        assert_eq!(batches[0].provider_id, "fast");
+        assert_eq!(batches[0].tracks.len(), 1);
+        assert_eq!(batches[1].provider_id, "slow");
+        assert_eq!(
+            batches[1].error.as_deref(),
+            Some("metadata HTTP failed: timeout")
+        );
+    }
+
+    #[test]
+    fn progressive_search_only_fails_when_every_provider_fails() {
+        let partial = collect_search_results(
+            vec![
+                ("empty", Ok(Vec::new())),
+                ("failed", Err(MetadataError::Http("offline".into()))),
+            ],
+            |_| {},
+        )
+        .unwrap();
+        assert!(partial.is_empty());
+
+        let failed = collect_search_results(
+            vec![
+                ("one", Err(MetadataError::Http("offline".into()))),
+                ("two", Err(MetadataError::HttpStatus(429))),
+            ],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(failed.to_string().contains("offline"));
+        assert!(failed.to_string().contains("429"));
     }
 
     #[test]

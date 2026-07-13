@@ -943,6 +943,13 @@ h3 {
   line-height: 1.7;
 }
 
+.page-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* Content buttons only — icon chrome is handled by tool/transport classes */
 button {
   border: 1px solid var(--glass-border);

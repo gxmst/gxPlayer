@@ -10,6 +10,7 @@ import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
 import { QueuePanel } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
+import { TextPlaylistImportDialog } from "./components/TextPlaylistImportDialog";
 import { isRemoteArtworkUrl, useArtworkUrl } from "./hooks/useArtwork";
 import { SourceGuide } from "./components/SourceGuide";
 import { useCatalogSearch } from "./hooks/useCatalogSearch";
@@ -490,6 +491,7 @@ function App() {
   });
   const [currentQuality, setCurrentQuality] = useState<string | null>(null);
   const [qualitySwitching, setQualitySwitching] = useState(false);
+  const [textPlaylistDialogOpen, setTextPlaylistDialogOpen] = useState(false);
 
   const [library, setLibrary] = useState<LibraryTrack[]>([]);
   const [favorites, setFavorites] = useState<LibraryTrack[]>([]);
@@ -2546,7 +2548,7 @@ function App() {
             eyebrow="LIBRARY"
             title="曲库"
             copy={`${library.length} 首本地导入 · ${cacheEntries.length} 首在线缓存。本地文件与在线缓存分开展示。`}
-            action={<button className="primary" onClick={chooseFiles}>导入音乐</button>}
+            action={<div className="page-heading-actions"><button type="button" onClick={() => setTextPlaylistDialogOpen(true)}>导入文本列表</button><button className="primary" onClick={chooseFiles}>导入音乐</button></div>}
           />
           <section className="section-block">
             <div className="section-heading">
@@ -3038,6 +3040,13 @@ function App() {
       <main className="content">{renderView()}</main>
 
       {configSource && sourceConfigDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSourceConfig(); }}><section className="config-modal" role="dialog" aria-modal="true" aria-label={`${configSource.metadata.name} 音源配置`}><div className="section-heading"><div><p className="eyebrow">SOURCE CONFIG</p><h3>{configSource.metadata.name || "音源配置"}</h3><p>同时支持源码常量 key 与 LX 全局 ls；关闭或保存后敏感值会从界面状态清空。</p></div><button onClick={closeSourceConfig} aria-label="关闭配置">×</button></div><div className="config-fields"><label><span>源码常量名</span><input value={sourceConfigDraft.constName} placeholder="YuNingXi" autoComplete="off" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, constName: event.target.value })} /></label><label><span>解析 Key</span><input type={sourceConfigRevealed ? "text" : "password"} value={sourceConfigDraft.keyValue} placeholder="留空则使用音源公益额度" autoComplete="new-password" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, keyValue: event.target.value })} /></label><label><span>ls.api.addr（可选）</span><input value={sourceConfigDraft.apiAddr} placeholder="https://…" autoComplete="off" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, apiAddr: event.target.value })} /></label><label><span>ls.api.pass（可选）</span><input type={sourceConfigRevealed ? "text" : "password"} value={sourceConfigDraft.apiPass} autoComplete="new-password" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, apiPass: event.target.value })} /></label></div><label className="config-reveal"><input type="checkbox" checked={sourceConfigRevealed} onChange={(event) => setSourceConfigRevealed(event.target.checked)} /> 临时显示敏感字段</label><div className="modal-actions"><button onClick={closeSourceConfig}>取消</button><button className="primary" disabled={sourceConfigBusy} onClick={() => void saveSourceConfig()}>保存并应用</button></div></section></div>}
+
+      <TextPlaylistImportDialog
+        open={textPlaylistDialogOpen}
+        onClose={() => setTextPlaylistDialogOpen(false)}
+        onEnqueue={enqueueCatalogTracks}
+        invoke={invoke}
+      />
 
       {(message || (snapshot.error && !engineErrorDismissed)) && (
         <div

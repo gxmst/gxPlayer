@@ -89,8 +89,8 @@
 .text-playlist-warnings {
   margin: 10px 0 0;
   padding: 8px 11px 8px 28px;
-  border-left: 2px solid #d8a852;
-  color: #e8c681;
+  border-left: 2px solid var(--warning-solid);
+  color: var(--warning-fg);
   font-size: 12px;
 }
 
@@ -150,12 +150,12 @@
 }
 
 .text-playlist-row.status-matched .text-playlist-row-status {
-  color: #69c89e;
+  color: var(--success-fg);
 }
 
 .text-playlist-row.status-error .text-playlist-row-status,
 .text-playlist-row.status-invalid .text-playlist-row-status {
-  color: #e5868c;
+  color: var(--error-fg);
 }
 
 .text-playlist-row.status-searching .text-playlist-row-status {
@@ -164,7 +164,7 @@
 
 .text-playlist-error {
   margin: 10px 0 0;
-  color: #e5868c;
+  color: var(--error-fg);
   font-size: 12px;
 }
 

@@ -22,6 +22,7 @@ import {
   moveIndex,
   pickFailureSkipIndex,
 } from "./lib/playlistLogic";
+import { splitArtistNames } from "./lib/artistNames";
 import {
   filterUnavailableLocalEntries,
   loadPlaylistSession,
@@ -442,6 +443,42 @@ function Cover({ artwork, title, className = "", eager = false }: { artwork?: st
     <div ref={placeholderRef} className={`cover cover-placeholder ${className}`} aria-label={`${title} 暂无封面`}>
       {initials(title)}
     </div>
+  );
+}
+
+function ArtistLinks({ artist, onSelect, className = "", fallback = "未知歌手" }: {
+  artist: string;
+  onSelect: (artist: string) => void;
+  className?: string;
+  fallback?: string;
+}) {
+  const names = splitArtistNames(artist);
+  if (!names.length) return <span className={className}>{fallback}</span>;
+  return (
+    <span className={`artist-links ${className}`.trim()}>
+      {names.map((name, index) => (
+        <span className="artist-credit" key={name}>
+          {index > 0 && <span className="artist-separator" aria-hidden="true">、</span>}
+          <span
+            className="artist-link"
+            role="link"
+            tabIndex={0}
+            aria-label={`查看歌手 ${name}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onSelect(name);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                event.stopPropagation();
+                onSelect(name);
+              }
+            }}
+          >{name}</span>
+        </span>
+      ))}
+    </span>
   );
 }
 
@@ -1105,7 +1142,7 @@ function App() {
   }, [activeLyricIndex]);
 
   const artists = useMemo(
-    () => [...new Set(suggestions.map((track) => track.artist).filter(Boolean))].slice(0, 2),
+    () => [...new Set(suggestions.flatMap((track) => splitArtistNames(track.artist)))].slice(0, 4),
     [suggestions],
   );
   const albums = useMemo(
@@ -2335,22 +2372,7 @@ function App() {
           <button className="catalog-card" disabled={resolving} aria-busy={resolving} onClick={() => void playCatalogInList(tracks, track)}>
             <Cover artwork={track.artworkUrl} title={track.title} />
             <strong>{track.title}</strong>
-            <span
-              className="catalog-artist-link"
-              role="link"
-              tabIndex={track.artist ? 0 : -1}
-              onClick={(event) => {
-                event.stopPropagation();
-                openArtistPage(track.artist);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  openArtistPage(track.artist);
-                }
-              }}
-            >{track.artist || "未知歌手"}</span>
+            <ArtistLinks artist={track.artist} onSelect={openArtistPage} className="catalog-artist-links" />
             <small>{resolving ? "正在解析整首播放…" : track.album || track.providerId}</small>
             <i aria-hidden="true">{resolving ? "…" : "▶"}</i>
           </button>
@@ -2800,7 +2822,7 @@ function App() {
             <p className="eyebrow">NOW PLAYING</p>
             <h1 className={isPlaying ? "title-live" : ""}>{currentTitle}</h1>
             {displayedCatalogTrack?.artist ? (
-              <button type="button" className="artist-line artist-line-link" onClick={() => openArtistPage(displayedCatalogTrack.artist)}>{currentArtist}</button>
+              <ArtistLinks artist={displayedCatalogTrack.artist} onSelect={openArtistPage} className="artist-line artist-line-links" />
             ) : <p className="artist-line">{currentArtist}</p>}
             {measuredSourceSpec && (
               <p className={`source-spec ${suspiciousQuality ? "suspicious" : ""}`}>

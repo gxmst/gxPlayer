@@ -23,6 +23,7 @@ pub struct PublicSource {
     pub origin: String,
     pub imported_at_ms: u64,
     pub metadata: ScriptMetadata,
+    pub enabled: bool,
     pub updates_enabled: bool,
 }
 
@@ -34,6 +35,7 @@ impl From<&ManagedSource> for PublicSource {
             origin: source.origin.clone(),
             imported_at_ms: source.imported_at_ms,
             metadata: source.metadata.clone(),
+            enabled: source.enabled,
             updates_enabled: source.updates_enabled,
         }
     }
@@ -45,6 +47,9 @@ pub struct ListedSource {
     #[serde(flatten)]
     pub source: PublicSource,
     pub active: bool,
+    pub preferred: bool,
+    pub user_priority: usize,
+    pub effective_priority: Option<usize>,
     pub has_config: bool,
     pub capabilities: Vec<PublicSourceCapability>,
     pub health: SourceHealthSummary,
@@ -141,15 +146,19 @@ impl SourceRuntime {
             .unwrap()
             .list()
             .into_iter()
-            .map(|(source, active)| ListedSource {
-                source: PublicSource::from(&source),
-                active,
-                has_config: source
+            .map(|entry| ListedSource {
+                source: PublicSource::from(&entry.source),
+                active: entry.preferred,
+                preferred: entry.preferred,
+                user_priority: entry.user_priority,
+                effective_priority: entry.effective_priority,
+                has_config: entry
+                    .source
                     .config
                     .as_object()
                     .is_some_and(|config| !config.is_empty()),
-                capabilities: public_source_capabilities(&source.capabilities),
-                health: source.health_summary(),
+                capabilities: public_source_capabilities(&entry.source.capabilities),
+                health: entry.source.health_summary(),
             })
             .collect()
     }
@@ -172,6 +181,14 @@ impl SourceRuntime {
 
     pub fn activate(&self, id: &str) -> Result<(), SourceStoreError> {
         self.store.lock().unwrap().activate(id)
+    }
+
+    pub fn set_order(&self, source_ids: Vec<String>) -> Result<(), SourceStoreError> {
+        self.store.lock().unwrap().set_order(source_ids)
+    }
+
+    pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), SourceStoreError> {
+        self.store.lock().unwrap().set_enabled(id, enabled)
     }
 
     pub fn remove(&self, id: &str) -> Result<(), SourceStoreError> {
@@ -240,6 +257,22 @@ impl SourceRuntime {
             .lock()
             .unwrap()
             .resolution_source_ids(requested_source_id)
+    }
+
+    pub fn source(&self, id: &str) -> Result<ManagedSource, SourceStoreError> {
+        self.store.lock().unwrap().source(id)
+    }
+
+    pub fn reimport_script(
+        &self,
+        id: &str,
+        script: &str,
+        fallback_name: &str,
+    ) -> Result<ManagedSource, SourceStoreError> {
+        self.store
+            .lock()
+            .unwrap()
+            .reimport_script(id, script, fallback_name)
     }
 
     pub fn export_backup(&self) -> Result<SourceBackup, SourceStoreError> {
@@ -432,7 +465,13 @@ impl SourceRuntime {
     }
 
     pub fn fail_if_not_started(&self, generation: u64, error: String) {
-        if self.store.lock().unwrap().list().is_empty() {
+        if self
+            .store
+            .lock()
+            .unwrap()
+            .resolution_source_ids(None)
+            .is_ok_and(|source_ids| source_ids.is_empty())
+        {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
@@ -837,6 +876,73 @@ mod tests {
         let public = serde_json::to_value(&listed[0]).unwrap();
         assert_eq!(public["health"]["state"], "healthy");
         assert!(public.get("healthSamples").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_list_exposes_user_and_effective_priority_for_disabled_sources() {
+        let (runtime, root) = runtime();
+        let first = runtime
+            .import_script(
+                "lx.on('request', () => 'https://example.com/a.mp3')",
+                "test:a",
+                "a",
+            )
+            .unwrap();
+        let second = runtime
+            .import_script(
+                "lx.on('request', () => 'https://example.com/b.mp3')",
+                "test:b",
+                "b",
+            )
+            .unwrap();
+        runtime
+            .set_order(vec![second.id.clone(), first.id.clone()])
+            .unwrap();
+        runtime.set_enabled(&second.id, false).unwrap();
+
+        let listed = runtime.list();
+        assert_eq!(listed[0].source.id, second.id);
+        assert!(!listed[0].source.enabled);
+        assert_eq!(listed[0].user_priority, 0);
+        assert_eq!(listed[0].effective_priority, None);
+        assert!(!listed[0].preferred);
+        assert_eq!(listed[1].source.id, first.id);
+        assert_eq!(listed[1].effective_priority, Some(0));
+        assert!(listed[1].preferred);
+        assert!(listed[1].active);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reload_uses_current_health_ranked_preferred_and_handles_all_disabled() {
+        let (runtime, root) = runtime();
+        let first = runtime
+            .import_script(
+                "lx.on('request', () => 'https://example.com/a.mp3')",
+                "test:a",
+                "a",
+            )
+            .unwrap();
+        let second = runtime
+            .import_script(
+                "lx.on('request', () => 'https://example.com/b.mp3')",
+                "test:b",
+                "b",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            runtime
+                .record_health_sample(&first.id, false, 5_000)
+                .unwrap();
+            runtime.record_health_sample(&second.id, true, 500).unwrap();
+        }
+        let launch = runtime.prepare_reload().unwrap().unwrap();
+        assert_eq!(launch.source.id, second.id);
+        runtime.set_enabled(&first.id, false).unwrap();
+        runtime.set_enabled(&second.id, false).unwrap();
+        assert!(runtime.prepare_reload().unwrap().is_none());
+        assert_eq!(runtime.status().state, RuntimeState::NoSource);
         std::fs::remove_dir_all(root).unwrap();
     }
 

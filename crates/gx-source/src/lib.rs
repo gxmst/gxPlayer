@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,8 @@ pub struct ManagedSource {
     pub origin: String,
     pub imported_at_ms: u64,
     pub metadata: ScriptMetadata,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default = "default_true")]
     pub updates_enabled: bool,
     #[serde(default = "empty_config")]
@@ -96,6 +98,9 @@ pub struct SourceBackup {
     /// `None` preserves automatic import-order fallback selection for older backups.
     #[serde(default)]
     pub fallback_source_ids: Option<Vec<String>>,
+    /// `None` keeps version-1 backups created before user ordering was introduced compatible.
+    #[serde(default)]
+    pub source_order: Option<Vec<String>>,
     pub sources: Vec<BackupSource>,
 }
 
@@ -113,6 +118,8 @@ pub struct SourceFallbackConfig {
 pub struct BackupSource {
     pub origin: String,
     pub fallback_name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub updates_enabled: bool,
     pub script: String,
     #[serde(default = "empty_config")]
@@ -127,6 +134,8 @@ struct SourceConfig {
     fallback_enabled: bool,
     #[serde(default)]
     fallback_source_ids: Option<Vec<String>>,
+    #[serde(default)]
+    source_order: Vec<String>,
     sources: Vec<ManagedSource>,
 }
 
@@ -136,6 +145,7 @@ impl Default for SourceConfig {
             active_source_id: None,
             fallback_enabled: true,
             fallback_source_ids: None,
+            source_order: Vec::new(),
             sources: Vec::new(),
         }
     }
@@ -163,6 +173,12 @@ pub enum SourceStoreError {
     CapabilitiesTooLarge,
     #[error("invalid source fallback order: {0}")]
     InvalidFallbackOrder(String),
+    #[error("invalid source order: {0}")]
+    InvalidSourceOrder(String),
+    #[error("source '{0}' is disabled")]
+    SourceDisabled(String),
+    #[error("reimported script conflicts with existing source '{0}'")]
+    SourceIdConflict(String),
     #[error("source storage I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("source storage JSON failed: {0}")]
@@ -184,6 +200,14 @@ pub struct DropInImportReport {
     pub active_source_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceListEntry {
+    pub source: ManagedSource,
+    pub preferred: bool,
+    pub user_priority: usize,
+    pub effective_priority: Option<usize>,
+}
+
 pub struct SourceStore {
     root: PathBuf,
     config: SourceConfig,
@@ -194,25 +218,52 @@ impl SourceStore {
         let root = root.into();
         fs::create_dir_all(root.join("scripts"))?;
         let config_path = root.join("sources.json");
-        let mut config: SourceConfig = if config_path.exists() {
-            serde_json::from_slice(&fs::read(config_path)?)?
+        let (mut config, had_source_order): (SourceConfig, bool) = if config_path.exists() {
+            let bytes = fs::read(&config_path)?;
+            let raw: Value = serde_json::from_slice(&bytes)?;
+            let had_source_order = raw.get("sourceOrder").is_some();
+            (serde_json::from_value(raw)?, had_source_order)
         } else {
-            SourceConfig::default()
+            (SourceConfig::default(), true)
         };
         for source in &mut config.sources {
             trim_health_samples(&mut source.health_samples);
         }
-        Ok(Self { root, config })
+        let mut changed = if had_source_order {
+            normalize_source_order(&mut config)
+        } else {
+            migrate_legacy_source_preferences(&mut config)
+        };
+        let mut store = Self { root, config };
+        let effective_preferred = store.effective_source_ids().into_iter().next();
+        if store.config.active_source_id != effective_preferred {
+            store.config.active_source_id = effective_preferred;
+            changed = true;
+        }
+        if changed {
+            store.persist()?;
+        }
+        Ok(store)
     }
 
-    pub fn list(&self) -> Vec<(ManagedSource, bool)> {
-        self.config
-            .sources
+    pub fn list(&self) -> Vec<SourceListEntry> {
+        let effective_ids = self.effective_source_ids();
+        let effective_priorities = effective_ids
             .iter()
-            .cloned()
-            .map(|source| {
-                let active = self.config.active_source_id.as_deref() == Some(source.id.as_str());
-                (source, active)
+            .enumerate()
+            .map(|(priority, id)| (id.as_str(), priority))
+            .collect::<HashMap<_, _>>();
+        self.ordered_sources()
+            .into_iter()
+            .enumerate()
+            .map(|(user_priority, source)| {
+                let effective_priority = effective_priorities.get(source.id.as_str()).copied();
+                SourceListEntry {
+                    source: source.clone(),
+                    preferred: effective_priority == Some(0),
+                    user_priority,
+                    effective_priority,
+                }
             })
             .collect()
     }
@@ -237,6 +288,7 @@ impl SourceStore {
             origin: origin.into(),
             imported_at_ms: unix_time_ms(),
             metadata,
+            enabled: true,
             updates_enabled: true,
             config: empty_config(),
             capabilities: Value::Null,
@@ -244,9 +296,8 @@ impl SourceStore {
             last_successful_route: None,
         };
         self.config.sources.push(source.clone());
-        if self.config.active_source_id.is_none() {
-            self.config.active_source_id = Some(id);
-        }
+        self.config.source_order.push(id);
+        self.sync_legacy_active_source_id();
         self.persist()?;
         Ok(source)
     }
@@ -367,10 +418,41 @@ impl SourceStore {
     }
 
     pub fn activate(&mut self, id: &str) -> Result<(), SourceStoreError> {
-        if !self.config.sources.iter().any(|source| source.id == id) {
-            return Err(SourceStoreError::SourceNotFound(id.into()));
+        let source = self
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == id)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
+        source.enabled = true;
+        self.config.source_order.retain(|source_id| source_id != id);
+        self.config.source_order.insert(0, id.to_owned());
+        self.sync_legacy_active_source_id();
+        self.persist()
+    }
+
+    pub fn set_order(&mut self, source_ids: Vec<String>) -> Result<(), SourceStoreError> {
+        validate_full_source_order(&self.config.sources, &source_ids)?;
+        if self.config.source_order == source_ids {
+            return Ok(());
         }
-        self.config.active_source_id = Some(id.into());
+        self.config.source_order = source_ids;
+        self.sync_legacy_active_source_id();
+        self.persist()
+    }
+
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<(), SourceStoreError> {
+        let source = self
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == id)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
+        if source.enabled == enabled {
+            return Ok(());
+        }
+        source.enabled = enabled;
+        self.sync_legacy_active_source_id();
         self.persist()
     }
 
@@ -433,18 +515,21 @@ impl SourceStore {
         success: bool,
         latency_ms: u64,
     ) -> Result<(), SourceStoreError> {
-        let source = self
-            .config
-            .sources
-            .iter_mut()
-            .find(|source| source.id == id)
-            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
-        source.health_samples.push(SourceHealthSample {
-            success,
-            latency_ms,
-            recorded_at_ms: unix_time_ms(),
-        });
-        trim_health_samples(&mut source.health_samples);
+        {
+            let source = self
+                .config
+                .sources
+                .iter_mut()
+                .find(|source| source.id == id)
+                .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
+            source.health_samples.push(SourceHealthSample {
+                success,
+                latency_ms,
+                recorded_at_ms: unix_time_ms(),
+            });
+            trim_health_samples(&mut source.health_samples);
+        }
+        self.sync_legacy_active_source_id();
         self.persist()
     }
 
@@ -476,34 +561,16 @@ impl SourceStore {
     }
 
     pub fn fallback_config(&self) -> SourceFallbackConfig {
-        let explicitly_configured = self.config.fallback_source_ids.is_some();
-        let configured = self
-            .config
-            .fallback_source_ids
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| {
-                self.config
-                    .sources
-                    .iter()
-                    .map(|source| source.id.clone())
-                    .collect()
-            });
-        let valid_ids = self
-            .config
-            .sources
-            .iter()
-            .map(|source| source.id.as_str())
-            .collect::<HashSet<_>>();
-        let mut seen = HashSet::new();
-        let source_ids = configured
+        let source_ids = self
+            .ordered_sources()
             .into_iter()
-            .filter(|id| valid_ids.contains(id.as_str()) && seen.insert(id.clone()))
-            .collect();
+            .filter(|source| source.enabled)
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
         SourceFallbackConfig {
-            enabled: self.config.fallback_enabled,
+            enabled: source_ids.len() > 1,
             source_ids,
-            explicitly_configured,
+            explicitly_configured: true,
         }
     }
 
@@ -529,40 +596,67 @@ impl SourceStore {
                 )));
             }
         }
+        let preferred = self.effective_source_ids().into_iter().next();
+        let mut enabled_ids = HashSet::new();
+        if let Some(preferred) = preferred.as_ref() {
+            enabled_ids.insert(preferred.clone());
+        }
+        if enabled {
+            enabled_ids.extend(source_ids.iter().cloned());
+        }
+        for source in &mut self.config.sources {
+            source.enabled = enabled_ids.contains(&source.id);
+        }
+        let mut order = Vec::with_capacity(self.config.sources.len());
+        if let Some(preferred) = preferred {
+            order.push(preferred);
+        }
+        for id in &source_ids {
+            if !order.contains(id) {
+                order.push(id.clone());
+            }
+        }
+        for id in &self.config.source_order {
+            if !order.contains(id) {
+                order.push(id.clone());
+            }
+        }
+        self.config.source_order = order;
         self.config.fallback_enabled = enabled;
         self.config.fallback_source_ids = Some(source_ids);
+        self.sync_legacy_active_source_id();
         self.persist()
     }
 
-    /// Returns the requested/active source first, then enabled fallbacks in stable order.
+    /// Returns enabled sources using health buckets and user order, with an explicit request first.
     pub fn resolution_source_ids(
         &self,
         requested_source_id: Option<&str>,
     ) -> Result<Vec<String>, SourceStoreError> {
-        let primary = requested_source_id
-            .map(str::to_owned)
-            .or_else(|| self.valid_active_source_id());
-        if let Some(id) = primary.as_deref()
-            && !self.config.sources.iter().any(|source| source.id == id)
-        {
-            return Err(SourceStoreError::SourceNotFound(id.into()));
-        }
-        let mut source_ids = primary.into_iter().collect::<Vec<_>>();
-        if !self.config.fallback_enabled {
-            return Ok(source_ids);
-        }
-        for id in self.fallback_config().source_ids {
-            if !source_ids.iter().any(|known| known == &id) {
-                source_ids.push(id);
-            }
-        }
-        Ok(source_ids)
+        let requested = requested_source_id
+            .map(|id| {
+                let source = self
+                    .config
+                    .sources
+                    .iter()
+                    .find(|source| source.id == id)
+                    .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
+                if !source.enabled {
+                    return Err(SourceStoreError::SourceDisabled(id.into()));
+                }
+                Ok(id.to_owned())
+            })
+            .transpose()?;
+        Ok(build_resolution_order(
+            &self.ordered_sources(),
+            requested.as_deref(),
+        ))
     }
 
     pub fn active_updates_enabled(&self) -> bool {
-        self.config
-            .active_source_id
-            .as_deref()
+        self.effective_source_ids()
+            .first()
+            .map(String::as_str)
             .and_then(|id| self.config.sources.iter().find(|source| source.id == id))
             .is_some_and(|source| source.updates_enabled)
     }
@@ -584,21 +678,19 @@ impl SourceStore {
             .position(|source| source.id == id)
             .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
         let removed = self.config.sources.remove(index);
+        self.config.source_order.retain(|source_id| source_id != id);
         if let Some(source_ids) = self.config.fallback_source_ids.as_mut() {
             source_ids.retain(|source_id| source_id != id);
         }
         if removed.script_path.starts_with(&self.root) {
             let _ = fs::remove_file(removed.script_path);
         }
-        if self.config.active_source_id.as_deref() == Some(id) {
-            self.config.active_source_id =
-                self.config.sources.first().map(|source| source.id.clone());
-        }
+        self.sync_legacy_active_source_id();
         self.persist()
     }
 
     pub fn active_script(&self) -> Result<Option<(ManagedSource, String)>, SourceStoreError> {
-        let Some(id) = self.config.active_source_id.as_deref() else {
+        let Some(id) = self.effective_source_ids().into_iter().next() else {
             return Ok(None);
         };
         let source = self
@@ -606,7 +698,7 @@ impl SourceStore {
             .sources
             .iter()
             .find(|source| source.id == id)
-            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.clone()))?
             .clone();
         let script = fs::read_to_string(&source.script_path)?;
         Ok(Some((source, script)))
@@ -620,8 +712,93 @@ impl SourceStore {
             .find(|source| source.id == id)
             .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?
             .clone();
+        if !source.enabled {
+            return Err(SourceStoreError::SourceDisabled(id.into()));
+        }
         let script = fs::read_to_string(&source.script_path)?;
         Ok((source, script))
+    }
+
+    pub fn source(&self, id: &str) -> Result<ManagedSource, SourceStoreError> {
+        self.config
+            .sources
+            .iter()
+            .find(|source| source.id == id)
+            .cloned()
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))
+    }
+
+    pub fn reimport_script(
+        &mut self,
+        id: &str,
+        script: &str,
+        fallback_name: &str,
+    ) -> Result<ManagedSource, SourceStoreError> {
+        validate_script(script)?;
+        let index = self
+            .config
+            .sources
+            .iter()
+            .position(|source| source.id == id)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
+        let old = self.config.sources[index].clone();
+        let new_id = script_id(script.as_bytes());
+        if new_id != id && self.config.sources.iter().any(|source| source.id == new_id) {
+            return Err(SourceStoreError::SourceIdConflict(new_id));
+        }
+
+        if new_id == id {
+            self.config.sources[index].metadata = parse_script_metadata(script, fallback_name);
+            self.persist()?;
+            return Ok(self.config.sources[index].clone());
+        }
+
+        let new_script_path = self.root.join("scripts").join(format!("{new_id}.js"));
+        let temporary_script_path = self.root.join("scripts").join(format!("{new_id}.js.tmp"));
+        fs::write(&temporary_script_path, script.as_bytes())?;
+        if let Err(error) = fs::rename(&temporary_script_path, &new_script_path) {
+            let _ = fs::remove_file(&temporary_script_path);
+            return Err(error.into());
+        }
+
+        let replacement = ManagedSource {
+            id: new_id.clone(),
+            script_path: new_script_path.clone(),
+            origin: old.origin.clone(),
+            imported_at_ms: old.imported_at_ms,
+            metadata: parse_script_metadata(script, fallback_name),
+            enabled: old.enabled,
+            updates_enabled: old.updates_enabled,
+            config: old.config.clone(),
+            capabilities: Value::Null,
+            health_samples: Vec::new(),
+            last_successful_route: old.last_successful_route,
+        };
+        self.config.sources[index] = replacement.clone();
+        replace_source_id(&mut self.config.source_order, id, &new_id);
+        if self.config.active_source_id.as_deref() == Some(id) {
+            self.config.active_source_id = Some(new_id.clone());
+        }
+        if let Some(source_ids) = self.config.fallback_source_ids.as_mut() {
+            replace_source_id(source_ids, id, &new_id);
+        }
+        self.sync_legacy_active_source_id();
+        if let Err(error) = self.persist() {
+            self.config.sources[index] = old;
+            replace_source_id(&mut self.config.source_order, &new_id, id);
+            if self.config.active_source_id.as_deref() == Some(new_id.as_str()) {
+                self.config.active_source_id = Some(id.to_owned());
+            }
+            if let Some(source_ids) = self.config.fallback_source_ids.as_mut() {
+                replace_source_id(source_ids, &new_id, id);
+            }
+            let _ = fs::remove_file(new_script_path);
+            return Err(error);
+        }
+        if old.script_path.starts_with(&self.root) && old.script_path != replacement.script_path {
+            let _ = fs::remove_file(old.script_path);
+        }
+        Ok(replacement)
     }
 
     pub fn export_backup(&self) -> Result<SourceBackup, SourceStoreError> {
@@ -633,6 +810,7 @@ impl SourceStore {
                 Ok(BackupSource {
                     origin: source.origin.clone(),
                     fallback_name: source.metadata.name.clone(),
+                    enabled: source.enabled,
                     updates_enabled: source.updates_enabled,
                     script: fs::read_to_string(&source.script_path)?,
                     config: source.config.clone(),
@@ -641,9 +819,10 @@ impl SourceStore {
             .collect::<Result<Vec<_>, SourceStoreError>>()?;
         Ok(SourceBackup {
             version: 1,
-            active_source_id: self.config.active_source_id.clone(),
-            fallback_enabled: self.config.fallback_enabled,
-            fallback_source_ids: self.config.fallback_source_ids.clone(),
+            active_source_id: self.effective_source_ids().into_iter().next(),
+            fallback_enabled: self.fallback_config().enabled,
+            fallback_source_ids: Some(self.fallback_config().source_ids),
+            source_order: Some(self.config.source_order.clone()),
             sources,
         })
     }
@@ -664,6 +843,10 @@ impl SourceStore {
             validate_script(&source.script)?;
             validate_config(&source.config)?;
         }
+        let legacy_active_source_id = backup.active_source_id.clone();
+        let legacy_fallback_enabled = backup.fallback_enabled;
+        let legacy_fallback_source_ids = backup.fallback_source_ids.clone();
+        let backup_source_order = backup.source_order.clone();
         let mut restored = Vec::with_capacity(backup.sources.len());
         for source in backup.sources {
             let id = script_id(source.script.as_bytes());
@@ -681,6 +864,7 @@ impl SourceStore {
                 origin: source.origin,
                 imported_at_ms: unix_time_ms(),
                 metadata: parse_script_metadata(&source.script, &source.fallback_name),
+                enabled: source.enabled,
                 updates_enabled: source.updates_enabled,
                 config: source.config,
                 capabilities: Value::Null,
@@ -698,12 +882,11 @@ impl SourceStore {
             }
         }
         self.config.sources = restored;
-        self.config.active_source_id = backup
-            .active_source_id
+        self.config.active_source_id = legacy_active_source_id
             .filter(|id| self.config.sources.iter().any(|source| &source.id == id))
             .or_else(|| self.config.sources.first().map(|source| source.id.clone()));
-        self.config.fallback_enabled = backup.fallback_enabled;
-        self.config.fallback_source_ids = backup.fallback_source_ids.map(|source_ids| {
+        self.config.fallback_enabled = legacy_fallback_enabled;
+        self.config.fallback_source_ids = legacy_fallback_source_ids.map(|source_ids| {
             let valid_ids = self
                 .config
                 .sources
@@ -716,6 +899,13 @@ impl SourceStore {
                 .filter(|id| valid_ids.contains(id.as_str()) && seen.insert(id.clone()))
                 .collect()
         });
+        if let Some(source_order) = backup_source_order {
+            self.config.source_order = source_order;
+            normalize_source_order(&mut self.config);
+        } else {
+            migrate_legacy_source_preferences(&mut self.config);
+        }
+        self.sync_legacy_active_source_id();
         self.persist()
     }
 
@@ -728,10 +918,175 @@ impl SourceStore {
     }
 
     fn valid_active_source_id(&self) -> Option<String> {
+        self.effective_source_ids().into_iter().next()
+    }
+
+    fn ordered_sources(&self) -> Vec<&ManagedSource> {
+        let sources = self
+            .config
+            .sources
+            .iter()
+            .map(|source| (source.id.as_str(), source))
+            .collect::<HashMap<_, _>>();
         self.config
-            .active_source_id
-            .clone()
-            .filter(|id| self.config.sources.iter().any(|source| source.id == *id))
+            .source_order
+            .iter()
+            .filter_map(|id| sources.get(id.as_str()).copied())
+            .collect()
+    }
+
+    fn effective_source_ids(&self) -> Vec<String> {
+        build_resolution_order(&self.ordered_sources(), None)
+    }
+
+    fn sync_legacy_active_source_id(&mut self) {
+        self.config.active_source_id = self.effective_source_ids().into_iter().next();
+    }
+}
+
+fn normalize_source_order(config: &mut SourceConfig) -> bool {
+    let valid_ids = config
+        .sources
+        .iter()
+        .map(|source| source.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut normalized = config
+        .source_order
+        .iter()
+        .filter(|id| valid_ids.contains(id.as_str()) && seen.insert((*id).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    normalized.extend(
+        config
+            .sources
+            .iter()
+            .filter(|source| seen.insert(source.id.clone()))
+            .map(|source| source.id.clone()),
+    );
+    if config.source_order == normalized {
+        false
+    } else {
+        config.source_order = normalized;
+        true
+    }
+}
+
+fn migrate_legacy_source_preferences(config: &mut SourceConfig) -> bool {
+    let valid_ids = config
+        .sources
+        .iter()
+        .map(|source| source.id.as_str())
+        .collect::<HashSet<_>>();
+    let active = config
+        .active_source_id
+        .clone()
+        .filter(|id| valid_ids.contains(id.as_str()));
+    let mut order = Vec::with_capacity(config.sources.len());
+    if let Some(active) = active.as_ref() {
+        order.push(active.clone());
+    }
+    if let Some(fallback_ids) = config.fallback_source_ids.as_ref() {
+        for id in fallback_ids {
+            if valid_ids.contains(id.as_str()) && !order.contains(id) {
+                order.push(id.clone());
+            }
+        }
+    }
+    for source in &config.sources {
+        if !order.contains(&source.id) {
+            order.push(source.id.clone());
+        }
+    }
+    config.source_order = order;
+
+    match (config.fallback_enabled, config.fallback_source_ids.as_ref()) {
+        (false, _) => {
+            for source in &mut config.sources {
+                source.enabled = active.as_deref() == Some(source.id.as_str());
+            }
+        }
+        (true, Some(fallback_ids)) => {
+            for source in &mut config.sources {
+                source.enabled = active.as_deref() == Some(source.id.as_str())
+                    || fallback_ids.iter().any(|id| id == &source.id);
+            }
+        }
+        (true, None) => {
+            for source in &mut config.sources {
+                source.enabled = true;
+            }
+        }
+    }
+    true
+}
+
+fn validate_full_source_order(
+    sources: &[ManagedSource],
+    source_ids: &[String],
+) -> Result<(), SourceStoreError> {
+    if source_ids.len() != sources.len() {
+        return Err(SourceStoreError::InvalidSourceOrder(format!(
+            "expected {} source ids, received {}",
+            sources.len(),
+            source_ids.len()
+        )));
+    }
+    let valid_ids = sources
+        .iter()
+        .map(|source| source.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    for id in source_ids {
+        if !valid_ids.contains(id.as_str()) {
+            return Err(SourceStoreError::SourceNotFound(id.clone()));
+        }
+        if !seen.insert(id.as_str()) {
+            return Err(SourceStoreError::InvalidSourceOrder(format!(
+                "source '{id}' appears more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn build_resolution_order(
+    sources: &[&ManagedSource],
+    requested_source_id: Option<&str>,
+) -> Vec<String> {
+    let mut ordered = sources
+        .iter()
+        .copied()
+        .filter(|source| source.enabled)
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|source| health_bucket(source.health_summary().state));
+
+    let mut result = Vec::with_capacity(ordered.len());
+    if let Some(requested) = requested_source_id {
+        result.push(requested.to_owned());
+    }
+    for source in ordered {
+        if !result.iter().any(|id| id == &source.id) {
+            result.push(source.id.clone());
+        }
+    }
+    result
+}
+
+fn health_bucket(state: SourceHealthState) -> u8 {
+    match state {
+        SourceHealthState::Healthy => 0,
+        SourceHealthState::Unknown => 1,
+        SourceHealthState::Degraded => 2,
+        SourceHealthState::Unhealthy => 3,
+    }
+}
+
+fn replace_source_id(source_ids: &mut [String], old_id: &str, new_id: &str) {
+    for id in source_ids {
+        if id == old_id {
+            *id = new_id.to_owned();
+        }
     }
 }
 
@@ -759,9 +1114,12 @@ fn summarize_source_health(samples: &[SourceHealthSample]) -> SourceHealthSummar
         && samples[sample_count - SOURCE_HEALTH_MIN_SAMPLES..]
             .iter()
             .all(|sample| !sample.success);
+    let last_success = last.map(|sample| sample.success);
     let state = if sample_count < SOURCE_HEALTH_MIN_SAMPLES {
         SourceHealthState::Unknown
-    } else if recent_failures || success_count * 100 < sample_count * 40 {
+    } else if recent_failures
+        || (success_count * 100 < sample_count * 40 && last_success != Some(true))
+    {
         SourceHealthState::Unhealthy
     } else if success_count * 100 >= sample_count * 80
         && average_latency_ms.is_some_and(|latency| latency <= SOURCE_HEALTH_FAST_MS)
@@ -776,7 +1134,7 @@ fn summarize_source_health(samples: &[SourceHealthSample]) -> SourceHealthSummar
         success_count,
         success_rate_percent,
         average_latency_ms,
-        last_success: last.map(|sample| sample.success),
+        last_success,
         last_latency_ms: last.map(|sample| sample.latency_ms),
         last_recorded_at_ms: last.map(|sample| sample.recorded_at_ms),
     }
@@ -1055,18 +1413,21 @@ mod tests {
             .unwrap();
         store.record_health_sample(&source.id, true, 1_200).unwrap();
         store.record_health_sample(&source.id, true, 1_300).unwrap();
-        assert_eq!(store.list()[0].0.health_summary().sample_count, 2);
+        assert_eq!(store.list()[0].source.health_summary().sample_count, 2);
 
         drop(store);
         let mut reopened = SourceStore::open(&root).unwrap();
         assert_eq!(
-            reopened.list()[0].0.health_summary().average_latency_ms,
+            reopened.list()[0]
+                .source
+                .health_summary()
+                .average_latency_ms,
             Some(1_250)
         );
         let backup = reopened.export_backup().unwrap();
         reopened.restore_backup(backup).unwrap();
         assert_eq!(
-            reopened.list()[0].0.health_summary().state,
+            reopened.list()[0].source.health_summary().state,
             SourceHealthState::Unknown
         );
         fs::remove_dir_all(root).unwrap();
@@ -1090,7 +1451,7 @@ mod tests {
         fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
         let reopened = SourceStore::open(&root).unwrap();
         assert_eq!(
-            reopened.list()[0].0.health_summary().state,
+            reopened.list()[0].source.health_summary().state,
             SourceHealthState::Unknown
         );
         fs::remove_dir_all(root).unwrap();
@@ -1228,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_chain_is_stable_configurable_and_survives_reopen() {
+    fn legacy_fallback_commands_adapt_to_order_and_enabled_sources() {
         let root = temporary_root();
         let mut store = SourceStore::open(&root).unwrap();
         let first = store
@@ -1245,7 +1606,6 @@ mod tests {
             store.resolution_source_ids(None).unwrap(),
             [first.id.clone(), second.id.clone(), third.id.clone()]
         );
-        assert!(!store.fallback_config().explicitly_configured);
 
         store.activate(&second.id).unwrap();
         store
@@ -1261,7 +1621,7 @@ mod tests {
             .import_script("lx.on('request', () => 4)", "test:fourth", "Fourth")
             .unwrap();
         assert!(
-            !store
+            store
                 .fallback_config()
                 .source_ids
                 .iter()
@@ -1272,14 +1632,458 @@ mod tests {
         let mut reopened = SourceStore::open(&root).unwrap();
         assert_eq!(
             reopened.resolution_source_ids(None).unwrap(),
-            [second.id.clone(), third.id.clone(), first.id.clone()]
+            [
+                second.id.clone(),
+                third.id.clone(),
+                first.id.clone(),
+                fourth.id.clone()
+            ]
         );
         reopened.set_fallback_config(false, vec![]).unwrap();
+        assert!(matches!(
+            reopened.resolution_source_ids(Some(&third.id)),
+            Err(SourceStoreError::SourceDisabled(_))
+        ));
+        assert_eq!(reopened.resolution_source_ids(None).unwrap(), [second.id]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_legacy_active_and_fallback_preferences_once() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        let first = store
+            .import_script("lx.on('request', () => 1)", "test:first", "First")
+            .unwrap();
+        let second = store
+            .import_script("lx.on('request', () => 2)", "test:second", "Second")
+            .unwrap();
+        let third = store
+            .import_script("lx.on('request', () => 3)", "test:third", "Third")
+            .unwrap();
+        let fourth = store
+            .import_script("lx.on('request', () => 4)", "test:fourth", "Fourth")
+            .unwrap();
+        drop(store);
+
+        let config_path = root.join("sources.json");
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config.as_object_mut().unwrap().remove("sourceOrder");
+        config["activeSourceId"] = Value::String(second.id.clone());
+        config["fallbackEnabled"] = Value::Bool(true);
+        config["fallbackSourceIds"] = serde_json::json!([third.id, first.id, third.id]);
+        for source in config["sources"].as_array_mut().unwrap() {
+            source.as_object_mut().unwrap().remove("enabled");
+        }
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let migrated = SourceStore::open(&root).unwrap();
+        let listed = migrated.list();
         assert_eq!(
-            reopened.resolution_source_ids(Some(&third.id)).unwrap(),
-            [third.id]
+            listed
+                .iter()
+                .map(|entry| entry.source.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                second.id.as_str(),
+                third.id.as_str(),
+                first.id.as_str(),
+                fourth.id.as_str()
+            ]
+        );
+        assert!(listed[0].source.enabled);
+        assert!(listed[1].source.enabled);
+        assert!(listed[2].source.enabled);
+        assert!(!listed[3].source.enabled);
+        let persisted: Value =
+            serde_json::from_slice(&fs::read(root.join("sources.json")).unwrap()).unwrap();
+        assert!(persisted.get("sourceOrder").is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_fallback_off_enables_only_active_and_none_enables_all() {
+        for (fallback_enabled, fallback_ids, expected_enabled) in [
+            (false, Some(Vec::<String>::new()), vec![false, true, false]),
+            (true, None, vec![true, true, true]),
+        ] {
+            let root = temporary_root();
+            let mut store = SourceStore::open(&root).unwrap();
+            let first = store
+                .import_script("lx.on('request', () => 1)", "test:first", "First")
+                .unwrap();
+            let second = store
+                .import_script("lx.on('request', () => 2)", "test:second", "Second")
+                .unwrap();
+            let third = store
+                .import_script("lx.on('request', () => 3)", "test:third", "Third")
+                .unwrap();
+            drop(store);
+            let config_path = root.join("sources.json");
+            let mut config: Value =
+                serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+            config.as_object_mut().unwrap().remove("sourceOrder");
+            config["activeSourceId"] = Value::String(second.id.clone());
+            config["fallbackEnabled"] = Value::Bool(fallback_enabled);
+            match fallback_ids {
+                Some(ids) => config["fallbackSourceIds"] = serde_json::json!(ids),
+                None => {
+                    config.as_object_mut().unwrap().remove("fallbackSourceIds");
+                }
+            }
+            for source in config["sources"].as_array_mut().unwrap() {
+                source.as_object_mut().unwrap().remove("enabled");
+            }
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let migrated = SourceStore::open(&root).unwrap();
+            let enabled_by_import = [first.id, second.id, third.id]
+                .iter()
+                .map(|id| {
+                    migrated
+                        .list()
+                        .into_iter()
+                        .find(|entry| &entry.source.id == id)
+                        .unwrap()
+                        .source
+                        .enabled
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(enabled_by_import, expected_enabled);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn effective_order_uses_health_then_user_order_and_rejects_disabled_requests() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        let unhealthy = store
+            .import_script("lx.on('request', () => 1)", "test:red", "Red")
+            .unwrap();
+        let unknown = store
+            .import_script("lx.on('request', () => 2)", "test:gray", "Gray")
+            .unwrap();
+        let degraded = store
+            .import_script("lx.on('request', () => 3)", "test:yellow", "Yellow")
+            .unwrap();
+        let healthy = store
+            .import_script("lx.on('request', () => 4)", "test:green", "Green")
+            .unwrap();
+        set_test_health(
+            &mut store,
+            &unhealthy.id,
+            &[(false, 1), (false, 2), (false, 3)],
+        );
+        set_test_health(
+            &mut store,
+            &degraded.id,
+            &[(true, 1), (true, 2), (false, 3)],
+        );
+        set_test_health(&mut store, &healthy.id, &[(true, 1), (true, 2), (true, 3)]);
+
+        assert_eq!(
+            store.resolution_source_ids(None).unwrap(),
+            [
+                healthy.id.clone(),
+                unknown.id.clone(),
+                degraded.id.clone(),
+                unhealthy.id.clone()
+            ]
+        );
+        assert_eq!(
+            store.resolution_source_ids(Some(&unhealthy.id)).unwrap()[0],
+            unhealthy.id
+        );
+        store.set_enabled(&unknown.id, false).unwrap();
+        assert!(matches!(
+            store.resolution_source_ids(Some(&unknown.id)),
+            Err(SourceStoreError::SourceDisabled(_))
+        ));
+        let listed = store.list();
+        assert_eq!(listed[0].user_priority, 0);
+        assert_eq!(listed[0].effective_priority, Some(2));
+        assert!(listed.iter().any(|entry| {
+            entry.source.id == healthy.id && entry.preferred && entry.effective_priority == Some(0)
+        }));
+        assert!(
+            listed.iter().any(|entry| {
+                entry.source.id == unknown.id && entry.effective_priority.is_none()
+            })
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn order_must_be_complete_unique_and_survives_reopen() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        let first = store
+            .import_script("lx.on('request', () => 1)", "test:first", "First")
+            .unwrap();
+        let second = store
+            .import_script("lx.on('request', () => 2)", "test:second", "Second")
+            .unwrap();
+        assert!(matches!(
+            store.set_order(vec![first.id.clone()]),
+            Err(SourceStoreError::InvalidSourceOrder(_))
+        ));
+        assert!(matches!(
+            store.set_order(vec![first.id.clone(), first.id.clone()]),
+            Err(SourceStoreError::InvalidSourceOrder(_))
+        ));
+        store
+            .set_order(vec![second.id.clone(), first.id.clone()])
+            .unwrap();
+        drop(store);
+        let reopened = SourceStore::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .list()
+                .iter()
+                .map(|entry| entry.source.id.as_str())
+                .collect::<Vec<_>>(),
+            [second.id.as_str(), first.id.as_str()]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn real_resolution_strictly_matches_effective_priority_and_recovers_from_real_successes() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        let unhealthy = store
+            .import_script("lx.on('request', () => 1)", "test:red", "Red")
+            .unwrap();
+        let healthy = store
+            .import_script("lx.on('request', () => 2)", "test:green", "Green")
+            .unwrap();
+        set_test_health(
+            &mut store,
+            &unhealthy.id,
+            &[(false, 1), (false, 2), (false, 3)],
+        );
+        set_test_health(&mut store, &healthy.id, &[(true, 1), (true, 2), (true, 3)]);
+        assert_eq!(
+            store.resolution_source_ids(None).unwrap(),
+            [healthy.id.clone(), unhealthy.id.clone()]
+        );
+        let effective_from_list = {
+            let mut listed = store
+                .list()
+                .into_iter()
+                .filter_map(|entry| {
+                    entry
+                        .effective_priority
+                        .map(|priority| (priority, entry.source.id))
+                })
+                .collect::<Vec<_>>();
+            listed.sort_by_key(|(priority, _)| *priority);
+            listed.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            effective_from_list,
+            store.resolution_source_ids(None).unwrap()
+        );
+
+        // A user may explicitly call a red source. Its real success sample moves it back through
+        // the ordinary health buckets; no elapsed time or hidden front-of-chain probe is involved.
+        assert_eq!(
+            store.resolution_source_ids(Some(&unhealthy.id)).unwrap(),
+            [unhealthy.id.clone(), healthy.id.clone()]
+        );
+        let source = store
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == unhealthy.id)
+            .unwrap();
+        source.health_samples.push(SourceHealthSample {
+            success: true,
+            latency_ms: 500,
+            recorded_at_ms: 4,
+        });
+        assert_eq!(source.health_summary().state, SourceHealthState::Degraded);
+        assert_eq!(
+            store.resolution_source_ids(None).unwrap(),
+            [healthy.id.clone(), unhealthy.id.clone()]
+        );
+
+        let source = store
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == unhealthy.id)
+            .unwrap();
+        source
+            .health_samples
+            .extend((5..=15).map(|recorded_at_ms| SourceHealthSample {
+                success: true,
+                latency_ms: 500,
+                recorded_at_ms,
+            }));
+        assert_eq!(source.health_summary().state, SourceHealthState::Healthy);
+        assert_eq!(
+            store.resolution_source_ids(None).unwrap(),
+            [unhealthy.id.clone(), healthy.id.clone()]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backups_preserve_order_and_enabled_but_clear_local_health_and_route() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        let first = store
+            .import_script("lx.on('request', () => 1)", "test:first", "First")
+            .unwrap();
+        let second = store
+            .import_script("lx.on('request', () => 2)", "test:second", "Second")
+            .unwrap();
+        store.set_enabled(&first.id, false).unwrap();
+        store
+            .set_order(vec![second.id.clone(), first.id.clone()])
+            .unwrap();
+        store.record_health_sample(&second.id, true, 300).unwrap();
+        store
+            .record_successful_route(&second.id, NetworkRoute::SystemProxy)
+            .unwrap();
+        let backup = store.export_backup().unwrap();
+        assert_eq!(
+            backup.source_order.as_ref().unwrap(),
+            &[second.id.clone(), first.id.clone()]
+        );
+        store.restore_backup(backup).unwrap();
+        let listed = store.list();
+        assert_eq!(listed[0].source.id, second.id);
+        assert_eq!(listed[1].source.id, first.id);
+        assert!(!listed[1].source.enabled);
+        assert_eq!(listed[0].source.health_summary().sample_count, 0);
+        assert_eq!(store.preferred_route(&second.id).unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn version_one_backups_without_order_or_enabled_still_restore() {
+        let root = temporary_root();
+        let script_a = "lx.on('request', () => 1)";
+        let script_b = "lx.on('request', () => 2)";
+        let id_a = script_id(script_a.as_bytes());
+        let id_b = script_id(script_b.as_bytes());
+        let backup: SourceBackup = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "activeSourceId": id_b.clone(),
+            "fallbackEnabled": false,
+            "fallbackSourceIds": [id_a.clone()],
+            "sources": [
+                {
+                    "origin": "local-a.js",
+                    "fallbackName": "A",
+                    "updatesEnabled": true,
+                    "script": script_a,
+                    "config": {}
+                },
+                {
+                    "origin": "local-b.js",
+                    "fallbackName": "B",
+                    "updatesEnabled": false,
+                    "script": script_b,
+                    "config": {}
+                }
+            ]
+        }))
+        .unwrap();
+        assert!(backup.source_order.is_none());
+        let mut store = SourceStore::open(&root).unwrap();
+        store.restore_backup(backup).unwrap();
+        let listed = store.list();
+        assert_eq!(listed[0].source.id, id_b);
+        assert!(listed[0].source.enabled);
+        assert_eq!(listed[1].source.id, id_a);
+        assert!(!listed[1].source.enabled);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reimport_atomically_replaces_changed_scripts_and_preserves_user_state() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        let old_script = "/*!\n * @name Old\n */\nlx.on('request', () => 1)";
+        let new_script = "/*!\n * @name New\n */\nlx.on('request', () => 2)";
+        let first = store
+            .import_script(old_script, "test:first", "First")
+            .unwrap();
+        let second = store
+            .import_script("lx.on('request', () => 3)", "test:second", "Second")
+            .unwrap();
+        store.set_enabled(&first.id, false).unwrap();
+        store.set_updates_enabled(&first.id, false).unwrap();
+        store
+            .set_config(&first.id, serde_json::json!({"token":"kept"}))
+            .unwrap();
+        store
+            .set_capabilities(&first.id, serde_json::json!({"sources": {}}))
+            .unwrap();
+        store.record_health_sample(&first.id, false, 5_000).unwrap();
+        store
+            .record_successful_route(&first.id, NetworkRoute::SystemProxy)
+            .unwrap();
+        let old_path = first.script_path.clone();
+
+        let replacement = store
+            .reimport_script(&first.id, new_script, "fallback")
+            .unwrap();
+        assert_ne!(replacement.id, first.id);
+        assert_eq!(replacement.metadata.name, "New");
+        assert!(!replacement.enabled);
+        assert!(!replacement.updates_enabled);
+        assert_eq!(replacement.config["token"], "kept");
+        assert_eq!(replacement.capabilities, Value::Null);
+        assert!(replacement.health_samples.is_empty());
+        assert_eq!(
+            replacement.last_successful_route,
+            Some(NetworkRoute::SystemProxy)
+        );
+        assert!(!old_path.exists());
+        assert!(replacement.script_path.exists());
+        assert_eq!(store.list()[0].source.id, replacement.id);
+        assert_eq!(store.list()[1].source.id, second.id);
+
+        assert!(matches!(
+            store.reimport_script(&replacement.id, "lx.on('request', () => 3)", "conflict"),
+            Err(SourceStoreError::SourceIdConflict(_))
+        ));
+
+        let replacement_id = replacement.id.clone();
+        store
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == replacement_id)
+            .unwrap()
+            .metadata
+            .name = "Stale".into();
+        let refreshed = store
+            .reimport_script(&replacement.id, new_script, "fallback")
+            .unwrap();
+        assert_eq!(refreshed.metadata.name, "New");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn set_test_health(store: &mut SourceStore, id: &str, samples: &[(bool, u64)]) {
+        store
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == id)
+            .unwrap()
+            .health_samples = samples
+            .iter()
+            .map(|(success, recorded_at_ms)| SourceHealthSample {
+                success: *success,
+                latency_ms: if *success { 500 } else { 5_000 },
+                recorded_at_ms: *recorded_at_ms,
+            })
+            .collect();
     }
 
     fn temporary_root() -> PathBuf {

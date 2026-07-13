@@ -36,7 +36,10 @@ export type ListedSource = {
     version: string;
   };
   updatesEnabled: boolean;
-  active: boolean;
+  enabled: boolean;
+  preferred: boolean;
+  userPriority: number;
+  effectivePriority: number | null;
   hasConfig: boolean;
   capabilities: Array<{
     platform: string;
@@ -88,12 +91,6 @@ export type ResolveAttemptDiagnostic = {
   stage: string;
   success: boolean;
   error: string | null;
-};
-
-export type SourceFallbackConfig = {
-  enabled: boolean;
-  sourceIds: string[];
-  explicitlyConfigured: boolean;
 };
 
 export type ProxyMode = "auto" | "on" | "off";

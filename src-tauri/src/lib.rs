@@ -48,8 +48,9 @@ use source_commands::{
     ResolveCancellationRegistry, lx_http_request, lx_runtime_failure, lx_runtime_result, lx_send,
     player_cancel_resolve, player_play_online_track, source_activate, source_export_backup,
     source_get_config, source_get_fallback_config, source_import_file, source_import_url,
-    source_list, source_reload, source_remove, source_resolve, source_restore_backup,
-    source_set_config, source_set_fallback_config, source_set_updates_enabled, source_status,
+    source_list, source_reimport, source_reload, source_remove, source_resolve,
+    source_restore_backup, source_set_config, source_set_enabled, source_set_fallback_config,
+    source_set_order, source_set_updates_enabled, source_status,
 };
 use source_runtime::SourceRuntime;
 
@@ -1055,6 +1056,9 @@ pub fn run() {
             source_import_file,
             source_import_url,
             source_activate,
+            source_set_order,
+            source_set_enabled,
+            source_reimport,
             source_remove,
             source_reload,
             source_set_updates_enabled,

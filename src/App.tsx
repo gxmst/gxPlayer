@@ -12,7 +12,6 @@ import { QueuePanel } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
 import { TextPlaylistImportDialog } from "./components/TextPlaylistImportDialog";
 import { isRemoteArtworkUrl, useArtworkUrl } from "./hooks/useArtwork";
-import { SourceGuide } from "./components/SourceGuide";
 import { useCatalogSearch } from "./hooks/useCatalogSearch";
 import { useEngineSnapshot } from "./hooks/useEngineSnapshot";
 import { useSystemProxySettings } from "./hooks/useSystemProxySettings";
@@ -65,17 +64,14 @@ import {
   type PlaylistSummary,
   type ResolveAttemptDiagnostic,
   type RuntimeStatus,
-  type SourceFallbackConfig,
   type ViewId,
 } from "./types";
 
 type AudioMode = EngineSnapshot["audioMode"];
 type SourceConfigDraft = {
-  lsConfig: Record<string, unknown>;
-  constName: string;
-  keyValue: string;
-  apiAddr: string;
-  apiPass: string;
+  json: string;
+  enabled: boolean;
+  updatesEnabled: boolean;
 };
 type SearchOption =
   | { id: string; kind: "track"; track: CatalogTrack }
@@ -539,19 +535,15 @@ function App() {
 
   const [sources, setSources] = useState<ListedSource[]>([]);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
-  const [sourceFallback, setSourceFallback] = useState<SourceFallbackConfig>({
-    enabled: true,
-    sourceIds: [],
-    explicitlyConfigured: false,
-  });
-  const [draggedFallbackSource, setDraggedFallbackSource] = useState<string | null>(null);
+  const [draggedSource, setDraggedSource] = useState<string | null>(null);
+  const [sourceOrderBusy, setSourceOrderBusy] = useState(false);
+  const [sourceActionBusy, setSourceActionBusy] = useState<{ id: string; kind: "toggle" | "reimport" | "remove" } | null>(null);
   const [sourceUrl, setSourceUrl] = useState("");
   const [sourceImportBusy, setSourceImportBusy] = useState<"file" | "url" | null>(null);
   const [configSource, setConfigSource] = useState<ListedSource | null>(null);
   const [sourceConfigDraft, setSourceConfigDraft] = useState<SourceConfigDraft | null>(null);
   const [sourceConfigRevealed, setSourceConfigRevealed] = useState(false);
   const [sourceConfigBusy, setSourceConfigBusy] = useState(false);
-  const [sourceFallbackBusy, setSourceFallbackBusy] = useState(false);
   const [backupText, setBackupText] = useState("");
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
   const [cacheLimitGiB, setCacheLimitGiB] = useState("5");
@@ -667,18 +659,12 @@ function App() {
   };
 
   const refreshSources = async () => {
-    const [nextSources, nextRuntime, nextFallback] = await Promise.all([
+    const [nextSources, nextRuntime] = await Promise.all([
       invoke<ListedSource[]>("source_list"),
       invoke<RuntimeStatus>("source_status"),
-      invoke<SourceFallbackConfig>("source_get_fallback_config").catch(() => ({
-        enabled: true,
-        sourceIds: [],
-        explicitlyConfigured: false,
-      })),
     ]);
     setSources(nextSources);
     setRuntime(nextRuntime);
-    setSourceFallback(nextFallback);
   };
 
   const refreshCache = async () => {
@@ -1045,20 +1031,19 @@ function App() {
   const selectedOnlineFavorite = selectedCatalogTrack
     ? onlineFavorites.some((track) => track.providerId === selectedCatalogTrack.providerId && track.providerTrackId === selectedCatalogTrack.providerTrackId)
     : false;
-  const activeSource = sources.find((source) => source.id === runtime?.activeSourceId || source.active) ?? null;
-  const fallbackSources = sourceFallback.sourceIds
-    .filter((id) => id !== activeSource?.id)
-    .map((id) => sources.find((source) => source.id === id))
-    .filter((source): source is ListedSource => Boolean(source));
-  const availableFallbackSources = sources.filter(
-    (source) => source.id !== activeSource?.id && !fallbackSources.some((fallback) => fallback.id === source.id),
+  const orderedSources = useMemo(
+    () => [...sources].sort((left, right) => left.userPriority - right.userPriority),
+    [sources],
   );
+  const activeSource = orderedSources.find((source) => source.id === runtime?.activeSourceId)
+    ?? orderedSources.find((source) => source.preferred)
+    ?? null;
   const sourceStatus = (() => {
     switch (runtime?.state) {
       case "ready":
         return {
           title: "音源已就绪",
-          copy: activeSource?.metadata.name ? `当前音源：${activeSource.metadata.name}` : "在线歌曲可解析为整首播放。",
+          copy: activeSource?.metadata.name ? `当前运行音源：${activeSource.metadata.name}` : "在线歌曲可解析为整首播放。",
         };
       case "initializing":
         return { title: "音源正在初始化", copy: activeSource?.metadata.name ? `正在启动：${activeSource.metadata.name}` : "请稍候，音源沙箱正在启动。" };
@@ -1986,77 +1971,101 @@ function App() {
     }
   };
 
-  const saveSourceFallback = async (enabled: boolean, sourceIds: string[]) => {
-    setSourceFallbackBusy(true);
+  const saveSourceOrder = async (nextOrderedSources: ListedSource[]) => {
+    if (sourceOrderBusy || sourceActionBusy) return;
+    const previousSources = sources;
+    const optimisticSources = nextOrderedSources.map((source, userPriority) => ({
+      ...source,
+      userPriority,
+    }));
+    setSources(optimisticSources);
+    setSourceOrderBusy(true);
     try {
-      const orderedIds = [...new Set([
-        ...(activeSource?.id ? [activeSource.id] : []),
-        ...sourceIds,
-      ])];
-      const saved = await invoke<SourceFallbackConfig>("source_set_fallback_config", { enabled, sourceIds: orderedIds });
-      setSourceFallback(saved);
-      setMessage(enabled ? "自动音源降级顺序已保存。" : "已关闭备用音源自动降级。");
+      await invoke("source_set_order", { sourceIds: optimisticSources.map((source) => source.id) });
+      await refreshSources();
+      setMessage("音源偏好顺序已保存；实际选源仍会优先选择健康状态更好的音源。");
     } catch (error) {
-      setMessage(String(error), true);
+      setSources(previousSources);
+      setMessage(`调整音源顺序失败，已恢复原顺序：${String(error)}`, true);
     } finally {
-      setSourceFallbackBusy(false);
+      setSourceOrderBusy(false);
     }
   };
 
-  const moveFallbackSource = (index: number, direction: -1 | 1) => {
+  const moveSource = (index: number, direction: -1 | 1) => {
     const target = index + direction;
-    if (target < 0 || target >= fallbackSources.length) return;
-    const next = fallbackSources.map((source) => source.id);
+    if (target < 0 || target >= orderedSources.length) return;
+    const next = [...orderedSources];
     [next[index], next[target]] = [next[target]!, next[index]!];
-    void saveSourceFallback(sourceFallback.enabled, next);
+    void saveSourceOrder(next);
   };
 
-  const addFallbackSource = (sourceId: string) => {
-    if (!sourceId) return;
-    const next = [...fallbackSources.map((source) => source.id), sourceId];
-    void saveSourceFallback(sourceFallback.enabled, next);
-  };
-
-  const removeFallbackSource = (sourceId: string) => {
-    const next = fallbackSources.map((source) => source.id).filter((id) => id !== sourceId);
-    void saveSourceFallback(sourceFallback.enabled, next);
-  };
-
-  const dropFallbackSource = (targetId: string) => {
-    const sourceId = draggedFallbackSource;
-    setDraggedFallbackSource(null);
+  const dropSource = (targetId: string) => {
+    const sourceId = draggedSource;
+    setDraggedSource(null);
     if (!sourceId || sourceId === targetId) return;
-    const next = fallbackSources.map((source) => source.id);
-    const from = next.indexOf(sourceId);
-    const to = next.indexOf(targetId);
+    const next = [...orderedSources];
+    const from = next.findIndex((source) => source.id === sourceId);
+    const to = next.findIndex((source) => source.id === targetId);
     if (from < 0 || to < 0) return;
     const [moved] = next.splice(from, 1);
     next.splice(to, 0, moved!);
-    void saveSourceFallback(sourceFallback.enabled, next);
+    void saveSourceOrder(next);
+  };
+
+  const setSourceEnabled = async (source: ListedSource, enabled: boolean) => {
+    if (sourceActionBusy || sourceOrderBusy) return;
+    setSourceActionBusy({ id: source.id, kind: "toggle" });
+    try {
+      await invoke("source_set_enabled", { id: source.id, enabled });
+      await refreshSources();
+      setMessage(enabled ? `已启用音源“${source.metadata.name || source.id}”。` : `已禁用音源“${source.metadata.name || source.id}”。`);
+    } catch (error) {
+      setMessage(String(error), true);
+    } finally {
+      setSourceActionBusy(null);
+    }
+  };
+
+  const reimportSource = async (source: ListedSource) => {
+    if (sourceActionBusy || sourceOrderBusy) return;
+    setSourceActionBusy({ id: source.id, kind: "reimport" });
+    try {
+      await invoke("source_reimport", { id: source.id });
+      await refreshSources();
+      setMessage(`已重新导入音源“${source.metadata.name || source.id}”。`);
+    } catch (error) {
+      setMessage(String(error), true);
+    } finally {
+      setSourceActionBusy(null);
+    }
+  };
+
+  const removeSource = async (source: ListedSource) => {
+    if (sourceActionBusy || sourceOrderBusy) return;
+    if (!window.confirm(`确定删除音源“${source.metadata.name || source.id}”吗？`)) return;
+    setSourceActionBusy({ id: source.id, kind: "remove" });
+    try {
+      await invoke("source_remove", { id: source.id });
+      await refreshSources();
+      setMessage(`已删除音源“${source.metadata.name || source.id}”。`);
+    } catch (error) {
+      setMessage(String(error), true);
+    } finally {
+      setSourceActionBusy(null);
+    }
   };
 
   const openSourceConfig = async (source: ListedSource) => {
+    if (sourceConfigBusy || sourceActionBusy || sourceOrderBusy) return;
     setSourceConfigBusy(true);
     try {
       const config = await invoke<Record<string, unknown>>("source_get_config", { id: source.id });
-      const structured = "lsConfig" in config || "keyOverrides" in config;
-      const lsConfig = (structured && config.lsConfig && typeof config.lsConfig === "object" && !Array.isArray(config.lsConfig)
-        ? config.lsConfig
-        : structured ? {} : config) as Record<string, unknown>;
-      const keyOverrides = structured && Array.isArray(config.keyOverrides) ? config.keyOverrides : [];
-      const firstOverride = keyOverrides.find((item): item is { constName: string; value: string } =>
-        Boolean(item && typeof item === "object" && "constName" in item && "value" in item
-          && typeof item.constName === "string" && typeof item.value === "string"));
-      const api = lsConfig.api && typeof lsConfig.api === "object" && !Array.isArray(lsConfig.api)
-        ? lsConfig.api as Record<string, unknown>
-        : {};
       setConfigSource(source);
       setSourceConfigDraft({
-        lsConfig,
-        constName: firstOverride?.constName ?? "YuNingXi",
-        keyValue: firstOverride?.value ?? "",
-        apiAddr: typeof api.addr === "string" ? api.addr : "",
-        apiPass: typeof api.pass === "string" ? api.pass : "",
+        json: JSON.stringify(config, null, 2),
+        enabled: source.enabled,
+        updatesEnabled: source.updatesEnabled,
       });
       setSourceConfigRevealed(false);
     } catch (error) {
@@ -2076,24 +2085,23 @@ function App() {
     if (!configSource || !sourceConfigDraft) return;
     setSourceConfigBusy(true);
     try {
-      const constName = sourceConfigDraft.constName.trim() || "YuNingXi";
-      if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(constName)) throw new Error("常量名不是有效的 JavaScript 标识符");
-      const existingApi = sourceConfigDraft.lsConfig.api && typeof sourceConfigDraft.lsConfig.api === "object" && !Array.isArray(sourceConfigDraft.lsConfig.api)
-        ? sourceConfigDraft.lsConfig.api as Record<string, unknown>
-        : {};
-      const config = {
-        lsConfig: {
-          ...sourceConfigDraft.lsConfig,
-          api: { ...existingApi, addr: sourceConfigDraft.apiAddr, pass: sourceConfigDraft.apiPass },
-        },
-        keyOverrides: sourceConfigDraft.keyValue ? [{ constName, value: sourceConfigDraft.keyValue }] : [],
-      };
+      const config: unknown = JSON.parse(sourceConfigDraft.json);
+      if (!config || typeof config !== "object" || Array.isArray(config)) {
+        throw new Error("音源配置必须是一个 JSON 对象");
+      }
       await invoke("source_set_config", { id: configSource.id, config });
+      if (sourceConfigDraft.enabled !== configSource.enabled) {
+        await invoke("source_set_enabled", { id: configSource.id, enabled: sourceConfigDraft.enabled });
+      }
+      if (sourceConfigDraft.updatesEnabled !== configSource.updatesEnabled) {
+        await invoke("source_set_updates_enabled", { id: configSource.id, enabled: sourceConfigDraft.updatesEnabled });
+      }
       closeSourceConfig();
       await refreshSources();
-      setMessage(configSource.active ? "音源配置已保存，沙箱已热重载。" : "音源配置已保存，下次启用时生效。");
+      setMessage(sourceConfigDraft.enabled ? "音源设置已保存并应用。" : "音源设置已保存；该音源当前不参与音源调用。");
     } catch (error) {
-      setMessage(String(error), true);
+      const detail = error instanceof SyntaxError ? `配置 JSON 格式有误：${error.message}` : String(error);
+      setMessage(detail, true);
     } finally {
       setSourceConfigBusy(false);
     }
@@ -2713,7 +2721,7 @@ function App() {
     );
 
     if (view === "sources") return (
-      <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="音源脚本运行在独立沙箱中；程序启动时也会自动扫描 %APPDATA%\\com.gxplayer.desktop\\sources\\drop-in 里的 .js。" action={<button disabled={Boolean(sourceImportBusy)} onClick={() => void importSourceFile()}>{sourceImportBusy === "file" ? "正在导入…" : "从本地文件导入"}</button>} />
+      <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="拖动卡片设置偏好顺序；实际请求会先按健康状态分档，再按你的顺序选择。" action={<button disabled={Boolean(sourceImportBusy)} onClick={() => void importSourceFile()}>{sourceImportBusy === "file" ? "正在导入…" : "从本地文件导入"}</button>} />
         <section className="source-import-band" aria-labelledby="source-import-title">
           <div className="source-import-copy">
             <p className="eyebrow">IMPORT</p>
@@ -2725,31 +2733,35 @@ function App() {
             <button type="submit" className="primary" disabled={!sourceUrl.trim() || Boolean(sourceImportBusy)}>{sourceImportBusy === "url" ? "正在导入…" : "导入 URL"}</button>
           </form>
         </section>
-        <SourceGuide />
         <section className="source-status-card"><span className={`runtime-dot ${runtime?.state ?? "no_source"}`} /><div><strong>{sourceStatus.title}</strong><p>{sourceStatus.copy}</p></div><code>GEN {runtime?.generation ?? 0}</code></section>
-        <section className="source-fallback-card" aria-labelledby="source-fallback-title">
-          <div className="source-fallback-heading">
-             <div><p className="eyebrow">FALLBACK</p><h3 id="source-fallback-title">自动降级</h3><p>主音源失败时按顺序尝试备用音源；每个音源内部仍会继续做音质降级。{sourceFallback.explicitlyConfigured ? " 当前顺序已手动保存。" : " 当前顺序跟随导入顺序。"}</p></div>
-            <label className="source-fallback-toggle"><input type="checkbox" checked={sourceFallback.enabled} disabled={sourceFallbackBusy} onChange={(event) => void saveSourceFallback(event.target.checked, fallbackSources.map((source) => source.id))} /> 启用</label>
+        <div className="source-list-heading">
+          <div><h2>音源优先序</h2><p>绿灯优先于黄灯、红灯；同一健康档位内按这里的顺序降级。</p></div>
+          <span>{orderedSources.filter((source) => source.enabled).length} / {orderedSources.length} 已启用</span>
+        </div>
+        <p className="source-health-note">健康度只记录真实解析调用结果，不会主动探测。双击卡片可编辑完整设置。</p>
+        {orderedSources.length ? (
+          <div className="source-list">
+            {orderedSources.map((source, index) => (
+              <SourceCard
+                key={source.id}
+                source={source}
+                index={index}
+                total={orderedSources.length}
+                dragging={draggedSource === source.id}
+                busy={sourceOrderBusy || Boolean(sourceActionBusy) || sourceConfigBusy}
+                reimporting={sourceActionBusy?.id === source.id && sourceActionBusy.kind === "reimport"}
+                onDragStart={() => setDraggedSource(source.id)}
+                onDragEnd={() => setDraggedSource(null)}
+                onDrop={() => dropSource(source.id)}
+                onMove={(direction) => moveSource(index, direction)}
+                onEdit={() => void openSourceConfig(source)}
+                onToggle={() => void setSourceEnabled(source, !source.enabled)}
+                onReimport={() => void reimportSource(source)}
+                onRemove={() => void removeSource(source)}
+              />
+            ))}
           </div>
-          <div className="fallback-main"><span>主音源</span><strong>{activeSource?.metadata.name || "尚未启用音源"}</strong></div>
-          {fallbackSources.length ? (
-            <ol className="fallback-list">
-               {fallbackSources.map((source, index) => <li
-                 key={source.id}
-                 draggable={!sourceFallbackBusy}
-                 onDragStart={() => setDraggedFallbackSource(source.id)}
-                 onDragOver={(event) => event.preventDefault()}
-                 onDrop={() => dropFallbackSource(source.id)}
-                 onDragEnd={() => setDraggedFallbackSource(null)}
-                 className={draggedFallbackSource === source.id ? "dragging" : ""}
-               ><span>{index + 1}</span><div><strong>{source.metadata.name || "未命名音源"}</strong><small>{source.metadata.author || source.id}</small></div><div className="fallback-actions"><button type="button" disabled={sourceFallbackBusy || index === 0} onClick={() => moveFallbackSource(index, -1)} aria-label={`上移 ${source.metadata.name}`}>↑</button><button type="button" disabled={sourceFallbackBusy || index === fallbackSources.length - 1} onClick={() => moveFallbackSource(index, 1)} aria-label={`下移 ${source.metadata.name}`}>↓</button><button type="button" disabled={sourceFallbackBusy} onClick={() => removeFallbackSource(source.id)}>移除</button></div></li>)}
-            </ol>
-          ) : <div className="fallback-empty">还没有备用音源。主源会继续逐档降低音质，最终可回退到官方 30 秒预览。</div>}
-          {availableFallbackSources.length > 0 && <select aria-label="添加备用音源" defaultValue="" disabled={sourceFallbackBusy} onChange={(event) => { addFallbackSource(event.target.value); event.target.value = ""; }}><option value="">＋ 添加备用音源…</option>{availableFallbackSources.map((source) => <option key={source.id} value={source.id}>{source.metadata.name || source.id}</option>)}</select>}
-        </section>
-        <p className="source-health-note">健康度仅统计正常搜索/解析调用，不会主动探测。</p>
-        <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div className="source-card-main"><div className="source-card-heading"><span className="source-badge">{source.active ? "正在使用" : source.hasConfig ? "已配置" : "可用"}</span><SourceHealthIndicator health={source.health} /></div><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p><SourceCapabilityDetails capabilities={source.capabilities} /></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { try { await invoke("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }} /> 更新提醒</label><button disabled={sourceConfigBusy} onClick={() => void openSourceConfig(source)}>配置</button><button disabled={source.active} onClick={async () => { try { await invoke("source_activate", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>启用</button><button className="danger" onClick={async () => { if (!window.confirm(`确定删除音源“${source.metadata.name || source.id}”吗？`)) return; try { await invoke("source_remove", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>删除</button></div></article>)}</div>
+        ) : <div className="source-empty-state">还没有导入音源。可从本地文件或你提供的 URL 导入脚本。</div>}
       </div>
     );
 
@@ -3061,7 +3073,31 @@ function App() {
 
       <main className="content">{renderView()}</main>
 
-      {configSource && sourceConfigDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSourceConfig(); }}><section className="config-modal" role="dialog" aria-modal="true" aria-label={`${configSource.metadata.name} 音源配置`}><div className="section-heading"><div><p className="eyebrow">SOURCE CONFIG</p><h3>{configSource.metadata.name || "音源配置"}</h3><p>同时支持源码常量 key 与 LX 全局 ls；关闭或保存后敏感值会从界面状态清空。</p></div><button onClick={closeSourceConfig} aria-label="关闭配置">×</button></div><div className="config-fields"><label><span>源码常量名</span><input value={sourceConfigDraft.constName} placeholder="YuNingXi" autoComplete="off" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, constName: event.target.value })} /></label><label><span>解析 Key</span><input type={sourceConfigRevealed ? "text" : "password"} value={sourceConfigDraft.keyValue} placeholder="留空则使用音源公益额度" autoComplete="new-password" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, keyValue: event.target.value })} /></label><label><span>ls.api.addr（可选）</span><input value={sourceConfigDraft.apiAddr} placeholder="https://…" autoComplete="off" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, apiAddr: event.target.value })} /></label><label><span>ls.api.pass（可选）</span><input type={sourceConfigRevealed ? "text" : "password"} value={sourceConfigDraft.apiPass} autoComplete="new-password" onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, apiPass: event.target.value })} /></label></div><label className="config-reveal"><input type="checkbox" checked={sourceConfigRevealed} onChange={(event) => setSourceConfigRevealed(event.target.checked)} /> 临时显示敏感字段</label><div className="modal-actions"><button onClick={closeSourceConfig}>取消</button><button className="primary" disabled={sourceConfigBusy} onClick={() => void saveSourceConfig()}>保存并应用</button></div></section></div>}
+      {configSource && sourceConfigDraft && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSourceConfig(); }}>
+          <section className="config-modal" role="dialog" aria-modal="true" aria-label={`${configSource.metadata.name} 音源配置`}>
+            <div className="section-heading">
+              <div><p className="eyebrow">SOURCE SETTINGS</p><h3>{configSource.metadata.name || "音源设置"}</h3><p>配置结构由音源脚本定义；应用不会猜测或改写其中字段。</p></div>
+              <button onClick={closeSourceConfig} aria-label="关闭配置">×</button>
+            </div>
+            <div className="config-toggles">
+              <label><span><strong>启用音源</strong><small>禁用后不参与音源调用和自动降级。</small></span><input type="checkbox" checked={sourceConfigDraft.enabled} onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, enabled: event.target.checked })} /></label>
+              <label><span><strong>更新提醒</strong><small>保留现有音源更新提示设置。</small></span><input type="checkbox" checked={sourceConfigDraft.updatesEnabled} onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, updatesEnabled: event.target.checked })} /></label>
+            </div>
+            <div className="config-json-section">
+              <div><strong>完整配置 JSON</strong><p>可能包含密钥等敏感内容，默认隐藏；显示后请勿截图或分享。</p></div>
+              <button type="button" aria-expanded={sourceConfigRevealed} onClick={() => setSourceConfigRevealed((revealed) => !revealed)}>{sourceConfigRevealed ? "隐藏配置" : "显示配置"}</button>
+            </div>
+            {sourceConfigRevealed && (
+              <label className="config-json-editor">
+                <span>按 JSON 对象原样保存</span>
+                <textarea className="config-editor" value={sourceConfigDraft.json} autoComplete="off" spellCheck={false} onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, json: event.target.value })} />
+              </label>
+            )}
+            <div className="modal-actions"><button onClick={closeSourceConfig}>取消</button><button className="primary" disabled={sourceConfigBusy} onClick={() => void saveSourceConfig()}>{sourceConfigBusy ? "正在保存…" : "保存并应用"}</button></div>
+          </section>
+        </div>
+      )}
 
       <TextPlaylistImportDialog
         open={textPlaylistDialogOpen}
@@ -3262,6 +3298,92 @@ function SuggestionGroup({ label, children }: { label: string; children: ReactNo
   return <section className="suggestion-group"><p>{label}</p>{children}</section>;
 }
 
+function SourceCard({
+  source,
+  index,
+  total,
+  dragging,
+  busy,
+  reimporting,
+  onDragStart,
+  onDragEnd,
+  onDrop,
+  onMove,
+  onEdit,
+  onToggle,
+  onReimport,
+  onRemove,
+}: {
+  source: ListedSource;
+  index: number;
+  total: number;
+  dragging: boolean;
+  busy: boolean;
+  reimporting: boolean;
+  onDragStart: () => void;
+  onDragEnd: () => void;
+  onDrop: () => void;
+  onMove: (direction: -1 | 1) => void;
+  onEdit: () => void;
+  onToggle: () => void;
+  onReimport: () => void;
+  onRemove: () => void;
+}) {
+  const displayName = source.metadata.name || "未命名音源";
+  const effectivePriority = source.effectivePriority === null ? "不参与" : `#${source.effectivePriority + 1}`;
+  return (
+    <article
+      className={`source-card ${source.preferred ? "preferred" : ""} ${source.enabled ? "" : "disabled"} ${dragging ? "dragging" : ""}`.trim()}
+      draggable={!busy}
+      onDragStart={(event) => {
+        if (busy) { event.preventDefault(); return; }
+        event.dataTransfer.effectAllowed = "move";
+        onDragStart();
+      }}
+      onDragOver={(event) => { if (!busy) event.preventDefault(); }}
+      onDrop={(event) => { event.preventDefault(); if (!busy) onDrop(); }}
+      onDragEnd={onDragEnd}
+      onDoubleClick={(event) => {
+        const target = event.target;
+        if (target instanceof HTMLElement && target.closest("button, input, label")) return;
+        onEdit();
+      }}
+      aria-label={`${displayName}，用户顺序第 ${source.userPriority + 1}，实际优先级 ${effectivePriority}`}
+    >
+      <div className="source-order-column" title="拖动卡片调整偏好顺序">
+        <span>{index + 1}</span>
+        <small>偏好</small>
+        <i aria-hidden="true">⋮⋮</i>
+      </div>
+      <div className="source-card-main">
+        <div className="source-card-heading">
+          {source.preferred && <span className="source-badge preferred">当前实际首选</span>}
+          <span className={`source-badge ${source.enabled ? "enabled" : "disabled"}`}>{source.enabled ? "已启用" : "已禁用"}</span>
+          {source.hasConfig && <span className="source-badge configured">有配置</span>}
+          <SourceHealthIndicator health={source.health} />
+        </div>
+        <h3>{displayName}</h3>
+        <p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p>
+        <SourceCapabilityDetails capabilities={source.capabilities} />
+        <div className="source-priority-summary">
+          <span>用户顺序 <strong>#{source.userPriority + 1}</strong></span>
+          <span>实际优先 <strong>{effectivePriority}</strong></span>
+        </div>
+      </div>
+      <div className="source-actions" draggable={false} onDragStart={(event) => { event.preventDefault(); event.stopPropagation(); }} onDoubleClick={(event) => event.stopPropagation()}>
+        <div className="source-order-buttons">
+          <button type="button" disabled={busy || index === 0} onClick={() => onMove(-1)} aria-label={`上移 ${displayName}`}>↑</button>
+          <button type="button" disabled={busy || index === total - 1} onClick={() => onMove(1)} aria-label={`下移 ${displayName}`}>↓</button>
+        </div>
+        <button type="button" disabled={busy} onClick={onToggle}>{source.enabled ? "禁用" : "启用"}</button>
+        <button type="button" disabled={busy} onClick={onEdit}>编辑</button>
+        <button type="button" disabled={busy} onClick={onReimport}>{reimporting ? "重新导入…" : "重新导入"}</button>
+        <button type="button" className="danger" disabled={busy} onClick={onRemove}>删除</button>
+      </div>
+    </article>
+  );
+}
+
 function SourceCapabilityDetails({ capabilities }: Pick<ListedSource, "capabilities">) {
   const platforms = capabilities.map((capability) => capability.platform);
   const qualities = [...new Set(capabilities.flatMap((capability) => capability.qualities))];
@@ -3279,7 +3401,7 @@ function SourceHealthIndicator({ health }: Pick<ListedSource, "health">) {
     unhealthy: "近期失败较多",
   };
   const detail = health.sampleCount === 0
-    ? "尚未发生可统计的真实搜索或解析调用"
+    ? "尚未发生可统计的真实解析调用"
     : `最近 ${health.sampleCount} 次：成功 ${health.successRatePercent ?? 0}% · 平均 ${health.averageLatencyMs ?? 0} ms · 最近一次 ${health.lastSuccess ? "成功" : "失败"}`;
   return (
     <span className={`source-health source-health-${health.state}`} title={`${stateLabels[health.state]}：${detail}`} aria-label={`音源健康度：${stateLabels[health.state]}`}>

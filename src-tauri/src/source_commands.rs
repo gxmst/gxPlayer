@@ -277,6 +277,110 @@ pub fn source_activate(
 }
 
 #[tauri::command]
+pub fn source_set_order(
+    window: WebviewWindow,
+    runtime: tauri::State<SourceRuntime>,
+    source_ids: Vec<String>,
+) -> Result<RuntimeStatus, String> {
+    require_window(&window, "main")?;
+    runtime.serialized(|| {
+        runtime
+            .set_order(source_ids)
+            .map_err(|error| error.to_string())?;
+        reload_runtime(
+            &window.app_handle().get_webview_window(SANDBOX_LABEL),
+            &runtime,
+        )
+    })?;
+    Ok(runtime.status())
+}
+
+#[tauri::command]
+pub fn source_set_enabled(
+    window: WebviewWindow,
+    runtime: tauri::State<SourceRuntime>,
+    id: String,
+    enabled: bool,
+) -> Result<RuntimeStatus, String> {
+    require_window(&window, "main")?;
+    runtime.serialized(|| {
+        runtime
+            .set_enabled(&id, enabled)
+            .map_err(|error| error.to_string())?;
+        reload_runtime(
+            &window.app_handle().get_webview_window(SANDBOX_LABEL),
+            &runtime,
+        )
+    })?;
+    Ok(runtime.status())
+}
+
+#[tauri::command]
+pub async fn source_reimport(
+    window: WebviewWindow,
+    runtime: tauri::State<'_, SourceRuntime>,
+    id: String,
+) -> Result<ImportResult, String> {
+    require_window(&window, "main")?;
+    let existing = runtime.source(&id).map_err(|error| error.to_string())?;
+    let origin = existing.origin.clone();
+    let parsed_origin = Url::parse(&origin)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"));
+    let fallback_name = parsed_origin
+        .as_ref()
+        .and_then(|url| url.path_segments().and_then(Iterator::last))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            Path::new(&origin)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| existing.metadata.name.clone());
+    let script = if let Some(url) = parsed_origin {
+        let request = SafeHttpRequest {
+            url,
+            method: Method::GET,
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(20),
+            max_response_bytes: MAX_SOURCE_DOWNLOAD_BYTES,
+        };
+        let response = tauri::async_runtime::spawn_blocking(move || execute(request))
+            .await
+            .map_err(|error| format!("source download task failed: {error}"))?
+            .map_err(|error| error.to_string())?;
+        if !(200..300).contains(&response.status) {
+            return Err(format!("source download returned HTTP {}", response.status));
+        }
+        String::from_utf8(response.body)
+            .map_err(|_| "source script is not valid UTF-8".to_owned())?
+    } else {
+        let path = Path::new(&origin).to_path_buf();
+        tauri::async_runtime::spawn_blocking(move || std::fs::read_to_string(path))
+            .await
+            .map_err(|error| format!("source file read task failed: {error}"))?
+            .map_err(|error| format!("source file read failed: {error}"))?
+    };
+    let source = runtime.serialized(|| {
+        let source = runtime
+            .reimport_script(&id, &script, &fallback_name)
+            .map_err(|error| error.to_string())?;
+        reload_runtime(
+            &window.app_handle().get_webview_window(SANDBOX_LABEL),
+            &runtime,
+        )?;
+        Ok::<_, String>(source)
+    })?;
+    Ok(ImportResult {
+        source: PublicSource::from(&source),
+        runtime: runtime.status(),
+    })
+}
+
+#[tauri::command]
 pub fn source_remove(
     window: WebviewWindow,
     runtime: tauri::State<SourceRuntime>,
@@ -350,10 +454,7 @@ pub fn source_set_config(
         return Err("source config must be a JSON object".into());
     }
     runtime.serialized(|| {
-        let is_active = runtime
-            .list()
-            .into_iter()
-            .any(|source| source.active && source.source.id == id);
+        let is_active = runtime.status().active_source_id.as_deref() == Some(id.as_str());
         runtime
             .set_config(&id, config)
             .map_err(|error| error.to_string())?;
@@ -564,15 +665,11 @@ fn play_online_track(
     }
 
     let runtime = app.state::<SourceRuntime>();
-    let source_ids = runtime
-        .resolution_source_ids(source_id.as_deref())
-        .map_err(|error| error.to_string())?;
 
     // A direct catalog identity lets us reuse an already verified cache without doing metadata
     // replacement searches or starting a JavaScript runtime.
     if let Some((provider, _)) = lx_identity(&track) {
-        let capabilities = runtime.status().capabilities;
-        for attempt in quality_attempts(&capabilities, provider, quality.as_deref()) {
+        for attempt in cache_quality_attempts(provider, quality.as_deref()) {
             if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
                 return Ok(terminal_playback_result(
                     original_track,
@@ -615,7 +712,7 @@ fn play_online_track(
         let provider = lx_identity(candidate)
             .map(|(provider, _)| provider)
             .ok_or_else(|| "candidate lost its LX source identity".to_owned())?;
-        for attempt in quality_attempts(&Value::Null, provider, quality.as_deref()) {
+        for attempt in cache_quality_attempts(provider, quality.as_deref()) {
             if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
                 return Ok(terminal_playback_result(
                     original_track,
@@ -631,6 +728,12 @@ fn play_online_track(
             }
         }
     }
+
+    // Keep all source selection after every source-independent cache path. A cache hit must never
+    // initialize a source runtime or trigger metadata/source network work.
+    let source_ids = runtime
+        .resolution_source_ids(source_id.as_deref())
+        .map_err(|error| error.to_string())?;
 
     // A cache miss is the point at which a live LX source becomes necessary.
     // Keep the cache-only path usable even when all imported sources are disabled.
@@ -1218,6 +1321,16 @@ fn resolve_candidates_on_route(
 }
 
 const QUALITY_ORDER: [&str; 4] = ["flac24bit", "flac", "320k", "128k"];
+
+fn cache_quality_attempts(source: &str, preference: Option<&str>) -> Vec<String> {
+    let mut attempts = quality_attempts(&Value::Null, source, preference);
+    for quality in QUALITY_ORDER {
+        if !attempts.iter().any(|attempt| attempt == quality) {
+            attempts.push(quality.to_owned());
+        }
+    }
+    attempts
+}
 
 fn quality_attempts(capabilities: &Value, source: &str, preference: Option<&str>) -> Vec<String> {
     let supported = advertised_qualities(capabilities, source);
@@ -2531,14 +2644,32 @@ mod tests {
     }
 
     #[test]
+    fn cache_lookup_enumerates_every_quality_without_capability_filtering() {
+        assert_eq!(
+            cache_quality_attempts("wy", None),
+            ["flac24bit", "flac", "320k", "128k"]
+        );
+        assert_eq!(
+            cache_quality_attempts("wy", Some("320k")),
+            ["320k", "128k", "flac24bit", "flac"]
+        );
+
+        let advertised = json!({
+            "sources": { "wy": { "qualitys": ["128k"] } }
+        });
+        assert_eq!(quality_attempts(&advertised, "wy", None), ["128k"]);
+        assert!(cache_quality_attempts("wy", None).contains(&"flac".into()));
+    }
+
+    #[test]
     fn splits_structured_and_legacy_source_config() {
         let structured = json!({
             "lsConfig": { "api": { "addr": "https://api.example" } },
-            "keyOverrides": [{ "constName": "YuNingXi", "value": "secret" }]
+            "keyOverrides": [{ "constName": "SOURCE_ACCESS_TOKEN", "value": "secret" }]
         });
         let (ls_config, overrides) = split_source_config(&structured);
         assert_eq!(ls_config["api"]["addr"], "https://api.example");
-        assert_eq!(overrides[0]["constName"], "YuNingXi");
+        assert_eq!(overrides[0]["constName"], "SOURCE_ACCESS_TOKEN");
 
         let legacy = json!({ "api": { "pass": "old-secret" } });
         let (ls_config, overrides) = split_source_config(&legacy);
@@ -2548,16 +2679,16 @@ mod tests {
 
     #[test]
     fn key_override_only_replaces_first_anchored_const_declaration() {
-        let script = "const YuNingXi = ''; // key\nconst YuNingXi = 'second';\nlet YuNingXi = 'third';\nconst Other = 'YuNingXi';";
+        let script = "const SOURCE_ACCESS_TOKEN = ''; // key\nconst SOURCE_ACCESS_TOKEN = 'second';\nlet SOURCE_ACCESS_TOKEN = 'third';\nconst Other = 'SOURCE_ACCESS_TOKEN';";
         let output = apply_key_overrides(
             script,
-            &[json!({ "constName": "YuNingXi", "value": "a'\\\"b\\nc" })],
+            &[json!({ "constName": "SOURCE_ACCESS_TOKEN", "value": "a'\\\"b\\nc" })],
         )
         .unwrap();
-        assert!(output.starts_with("const YuNingXi = \"a'\\\\\\\"b\\\\nc\"; // key"));
-        assert!(output.contains("const YuNingXi = 'second';"));
-        assert!(output.contains("let YuNingXi = 'third';"));
-        assert!(output.contains("const Other = 'YuNingXi';"));
+        assert!(output.starts_with("const SOURCE_ACCESS_TOKEN = \"a'\\\\\\\"b\\\\nc\"; // key"));
+        assert!(output.contains("const SOURCE_ACCESS_TOKEN = 'second';"));
+        assert!(output.contains("let SOURCE_ACCESS_TOKEN = 'third';"));
+        assert!(output.contains("const Other = 'SOURCE_ACCESS_TOKEN';"));
     }
 
     #[test]

@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 
 use gx_audio::engine::LocalAudioEngine;
 use gx_cache::{CacheKey, CacheStore};
-use gx_contracts::ResolvedMediaRequest;
+use gx_contracts::{NetworkRoute, ResolvedMediaRequest};
 use gx_metadata::{
     CatalogTrack, find_replacements, search_all, search_kugou, search_kuwo, search_netease,
 };
-use gx_source::safe_http::{SafeHttpError, SafeHttpRequest, execute};
+use gx_source::network_policy::source_route_attempts;
+use gx_source::safe_http::{SafeHttpError, SafeHttpRequest, execute, execute_on_route};
 use gx_source::{SourceBackup, SourceFallbackConfig};
 use reqwest::{Method, Url};
 use serde::Serialize;
@@ -442,8 +443,8 @@ fn resolve_with_fallback(
     quality: Option<&str>,
     requested_source_id: Option<&str>,
 ) -> Result<ResolvedMediaRequest, String> {
-    let source_ids = app
-        .state::<SourceRuntime>()
+    let runtime = app.state::<SourceRuntime>();
+    let source_ids = runtime
         .resolution_source_ids(requested_source_id)
         .map_err(|error| error.to_string())?;
     if source_ids.is_empty() {
@@ -452,17 +453,46 @@ fn resolve_with_fallback(
     let mut errors = Vec::new();
     for source_id in source_ids {
         let started = Instant::now();
-        let result = resolve_serialized(app, payload.clone(), quality, Some(&source_id));
-        record_source_health(app, &source_id, result.is_ok(), started.elapsed());
-        match result {
-            Ok(request) => return Ok(request),
-            Err(error) => errors.push(format!("{source_id}: {error}")),
+        let preferred_route = runtime
+            .preferred_route(&source_id)
+            .map_err(|error| error.to_string())?;
+        for route in source_route_attempts(preferred_route) {
+            match resolve_serialized(app, payload.clone(), quality, &source_id, route) {
+                Ok(mut request) => {
+                    request.network_route = Some(route);
+                    record_source_route(app, &source_id, route);
+                    record_source_health(app, &source_id, true, started.elapsed());
+                    return Ok(request);
+                }
+                Err(error) if should_stop_route_fallback(&error) => return Err(error),
+                Err(error) => errors.push(format!(
+                    "{source_id} ({}): {error}",
+                    network_route_label(route)
+                )),
+            }
         }
+        record_source_health(app, &source_id, false, started.elapsed());
     }
     Err(format!(
         "all LX source fallbacks failed ({})",
         errors.join("; ")
     ))
+}
+
+fn network_route_label(route: NetworkRoute) -> &'static str {
+    match route {
+        NetworkRoute::Direct => "direct",
+        NetworkRoute::SystemProxy => "system_proxy",
+    }
+}
+
+fn should_stop_route_fallback(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("cancelled")
+        || error.contains("canceled")
+        || error.contains("superseded")
+        || error.contains("stale")
+        || error.contains("generation changed")
 }
 
 #[tauri::command]
@@ -819,6 +849,15 @@ fn record_source_health(app: &AppHandle, source_id: &str, success: bool, elapsed
     }
 }
 
+fn record_source_route(app: &AppHandle, source_id: &str, route: NetworkRoute) {
+    if let Err(error) = app
+        .state::<SourceRuntime>()
+        .record_successful_route(source_id, route)
+    {
+        eprintln!("failed to persist source network route for {source_id}: {error}");
+    }
+}
+
 fn terminal_playback_result(
     track: CatalogTrack,
     outcome: ResolveOutcome,
@@ -939,6 +978,10 @@ fn resolve_candidates_with_source(
 ) -> Result<Option<ResolvedCandidate>, String> {
     let runtime = app.state::<SourceRuntime>();
     let (_, source_name) = source_identity(app, Some(source_id));
+    let preferred_route = runtime
+        .preferred_route(source_id)
+        .map_err(|error| error.to_string())?;
+    let routes = source_route_attempts(preferred_route);
     runtime.serialized(|| {
         let persistent_active = runtime
             .list()
@@ -946,159 +989,33 @@ fn resolve_candidates_with_source(
             .find(|source| source.active)
             .map(|source| source.source.id);
         let temporary = persistent_active.as_deref() != Some(source_id);
-        let status = runtime.status();
-        let needs_launch = status.active_source_id.as_deref() != Some(source_id)
-            || status.state != crate::source_runtime::RuntimeState::Ready;
-        if needs_launch {
-            let switched = (|| {
-                let launch = runtime
-                    .prepare_reload_for(source_id)
-                    .map_err(|error| error.to_string())?;
-                let sandbox = app
-                    .get_webview_window(SANDBOX_LABEL)
-                    .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
-                evaluate_launch(&sandbox, &launch)?;
-                wait_until_ready(
-                    &runtime,
-                    launch.generation,
-                    RUNTIME_INIT_TIMEOUT,
-                    cancellation,
-                )
-            })();
-            if let Err(error) = switched {
-                if cancellation.and_then(ResolveToken::outcome).is_none() {
-                    let first = candidates.first();
-                    diagnostics.push(ResolveAttemptDiagnostic {
-                        source_id: Some(source_id.to_owned()),
-                        source_name: source_name.clone(),
-                        provider_id: first
-                            .map_or_else(String::new, |track| track.provider_id.clone()),
-                        provider_track_id: first
-                            .map_or_else(String::new, |track| track.provider_track_id.clone()),
-                        quality: quality_preference.map(str::to_owned),
-                        stage: "initialize".into(),
-                        success: false,
-                        error: Some(public_attempt_error("initialize", &error)),
-                    });
-                }
-                if temporary {
-                    let _ = restore_persistent_runtime_background(app, &runtime);
-                }
-                return Ok(None);
-            }
-        }
-
-        let capabilities = runtime.status().capabilities;
         let mut resolved = None;
-        'candidate: for candidate in candidates {
+        let mut terminal_error = None;
+        for route in routes {
             if cancellation.and_then(ResolveToken::outcome).is_some() {
                 break;
             }
-            let Some(provider) = lx_identity(candidate).map(|(provider, _)| provider) else {
-                diagnostics.push(ResolveAttemptDiagnostic {
-                    source_id: Some(source_id.to_owned()),
-                    source_name: source_name.clone(),
-                    provider_id: candidate.provider_id.clone(),
-                    provider_track_id: candidate.provider_track_id.clone(),
-                    quality: quality_preference.map(str::to_owned),
-                    stage: "payload".into(),
-                    success: false,
-                    error: Some("invalid_candidate_identity".into()),
-                });
-                continue;
-            };
-            for quality in quality_attempts(&capabilities, provider, quality_preference) {
-                if cancellation.and_then(ResolveToken::outcome).is_some() {
-                    break 'candidate;
+            match resolve_candidates_on_route(
+                app,
+                &runtime,
+                source_id,
+                source_name.as_deref(),
+                candidates,
+                quality_preference,
+                route,
+                cancellation,
+                diagnostics,
+            ) {
+                Ok(Some(candidate)) => {
+                    record_source_route(app, source_id, route);
+                    resolved = Some(candidate);
+                    break;
                 }
-                let payload = match lx_music_url_payload(candidate, &quality) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        diagnostics.push(ResolveAttemptDiagnostic {
-                            source_id: Some(source_id.to_owned()),
-                            source_name: source_name.clone(),
-                            provider_id: candidate.provider_id.clone(),
-                            provider_track_id: candidate.provider_track_id.clone(),
-                            quality: Some(quality),
-                            stage: "payload".into(),
-                            success: false,
-                            error: Some(public_attempt_error("payload", &error)),
-                        });
-                        continue;
-                    }
-                };
-                let request = match dispatch_and_wait(
-                    app,
-                    &runtime,
-                    &payload,
-                    Some(&quality),
-                    cancellation,
-                ) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        if cancellation.and_then(ResolveToken::outcome).is_none() {
-                            diagnostics.push(ResolveAttemptDiagnostic {
-                                source_id: Some(source_id.to_owned()),
-                                source_name: source_name.clone(),
-                                provider_id: candidate.provider_id.clone(),
-                                provider_track_id: candidate.provider_track_id.clone(),
-                                quality: Some(quality),
-                                stage: "resolve".into(),
-                                success: false,
-                                error: Some(public_attempt_error("resolve", &error)),
-                            });
-                        }
-                        if should_skip_source(&error) {
-                            break 'candidate;
-                        }
-                        continue;
-                    }
-                };
-                if cancellation.and_then(ResolveToken::outcome).is_some() {
-                    break 'candidate;
+                Ok(None) => {}
+                Err(error) => {
+                    terminal_error = Some(error);
+                    break;
                 }
-                if let Err(error) =
-                    validate_full_track_request(&request, candidate.duration_ms, Some(&quality))
-                {
-                    if cancellation.and_then(ResolveToken::outcome).is_none() {
-                        diagnostics.push(ResolveAttemptDiagnostic {
-                            source_id: Some(source_id.to_owned()),
-                            source_name: source_name.clone(),
-                            provider_id: candidate.provider_id.clone(),
-                            provider_track_id: candidate.provider_track_id.clone(),
-                            quality: Some(quality),
-                            stage: "verify".into(),
-                            success: false,
-                            error: Some(public_attempt_error("verify", &error)),
-                        });
-                    }
-                    if should_skip_source(&error) {
-                        break 'candidate;
-                    }
-                    continue;
-                }
-                if cancellation.and_then(ResolveToken::outcome).is_some() {
-                    break 'candidate;
-                }
-                let resolved_quality = request.quality.clone().unwrap_or(quality);
-                diagnostics.push(ResolveAttemptDiagnostic {
-                    source_id: Some(source_id.to_owned()),
-                    source_name: source_name.clone(),
-                    provider_id: candidate.provider_id.clone(),
-                    provider_track_id: candidate.provider_track_id.clone(),
-                    quality: Some(resolved_quality.clone()),
-                    stage: "verify".into(),
-                    success: true,
-                    error: None,
-                });
-                resolved = Some(ResolvedCandidate {
-                    track: candidate.clone(),
-                    request,
-                    quality: resolved_quality,
-                    source_id: source_id.to_owned(),
-                    source_name: source_name.clone(),
-                });
-                break 'candidate;
             }
         }
 
@@ -1118,8 +1035,186 @@ fn resolve_candidates_with_source(
                 error: Some(public_attempt_error("restore", &error)),
             });
         }
-        Ok(resolved)
+        match terminal_error {
+            Some(error) => Err(error),
+            None => Ok(resolved),
+        }
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_candidates_on_route(
+    app: &AppHandle,
+    runtime: &SourceRuntime,
+    source_id: &str,
+    source_name: Option<&str>,
+    candidates: &[CatalogTrack],
+    quality_preference: Option<&str>,
+    route: NetworkRoute,
+    cancellation: Option<&ResolveToken>,
+    diagnostics: &mut Vec<ResolveAttemptDiagnostic>,
+) -> Result<Option<ResolvedCandidate>, String> {
+    let status = runtime.status();
+    let current_route = runtime
+        .source_id_and_route_for_generation(status.generation)
+        .ok()
+        .filter(|(current_source_id, _)| current_source_id == source_id)
+        .map(|(_, current_route)| current_route);
+    let needs_launch = status.active_source_id.as_deref() != Some(source_id)
+        || status.state != crate::source_runtime::RuntimeState::Ready
+        || current_route != Some(route);
+    if needs_launch {
+        let switched = (|| {
+            let launch = runtime
+                .prepare_reload_for_route(source_id, route)
+                .map_err(|error| error.to_string())?;
+            let sandbox = app
+                .get_webview_window(SANDBOX_LABEL)
+                .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
+            evaluate_launch(&sandbox, &launch)?;
+            wait_until_ready(
+                runtime,
+                launch.generation,
+                RUNTIME_INIT_TIMEOUT,
+                cancellation,
+            )
+        })();
+        if let Err(error) = switched {
+            if cancellation.and_then(ResolveToken::outcome).is_none() {
+                if should_stop_route_fallback(&error) {
+                    return Err(error);
+                }
+                let first = candidates.first();
+                diagnostics.push(ResolveAttemptDiagnostic {
+                    source_id: Some(source_id.to_owned()),
+                    source_name: source_name.map(str::to_owned),
+                    provider_id: first.map_or_else(String::new, |track| track.provider_id.clone()),
+                    provider_track_id: first
+                        .map_or_else(String::new, |track| track.provider_track_id.clone()),
+                    quality: quality_preference.map(str::to_owned),
+                    stage: "initialize".into(),
+                    success: false,
+                    error: Some(public_attempt_error("initialize", &error)),
+                });
+            }
+            return Ok(None);
+        }
+    }
+
+    let capabilities = runtime.status().capabilities;
+    'candidate: for candidate in candidates {
+        if cancellation.and_then(ResolveToken::outcome).is_some() {
+            break;
+        }
+        let Some(provider) = lx_identity(candidate).map(|(provider, _)| provider) else {
+            diagnostics.push(ResolveAttemptDiagnostic {
+                source_id: Some(source_id.to_owned()),
+                source_name: source_name.map(str::to_owned),
+                provider_id: candidate.provider_id.clone(),
+                provider_track_id: candidate.provider_track_id.clone(),
+                quality: quality_preference.map(str::to_owned),
+                stage: "payload".into(),
+                success: false,
+                error: Some("invalid_candidate_identity".into()),
+            });
+            continue;
+        };
+        for quality in quality_attempts(&capabilities, provider, quality_preference) {
+            if cancellation.and_then(ResolveToken::outcome).is_some() {
+                break 'candidate;
+            }
+            let payload = match lx_music_url_payload(candidate, &quality) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    diagnostics.push(ResolveAttemptDiagnostic {
+                        source_id: Some(source_id.to_owned()),
+                        source_name: source_name.map(str::to_owned),
+                        provider_id: candidate.provider_id.clone(),
+                        provider_track_id: candidate.provider_track_id.clone(),
+                        quality: Some(quality),
+                        stage: "payload".into(),
+                        success: false,
+                        error: Some(public_attempt_error("payload", &error)),
+                    });
+                    continue;
+                }
+            };
+            let mut request =
+                match dispatch_and_wait(app, runtime, &payload, Some(&quality), cancellation) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        if cancellation.and_then(ResolveToken::outcome).is_none() {
+                            if should_stop_route_fallback(&error) {
+                                return Err(error);
+                            }
+                            diagnostics.push(ResolveAttemptDiagnostic {
+                                source_id: Some(source_id.to_owned()),
+                                source_name: source_name.map(str::to_owned),
+                                provider_id: candidate.provider_id.clone(),
+                                provider_track_id: candidate.provider_track_id.clone(),
+                                quality: Some(quality),
+                                stage: "resolve".into(),
+                                success: false,
+                                error: Some(public_attempt_error("resolve", &error)),
+                            });
+                        }
+                        if should_skip_source(&error) {
+                            break 'candidate;
+                        }
+                        continue;
+                    }
+                };
+            if cancellation.and_then(ResolveToken::outcome).is_some() {
+                break 'candidate;
+            }
+            if let Err(error) =
+                validate_full_track_request(&request, candidate.duration_ms, Some(&quality), route)
+            {
+                if cancellation.and_then(ResolveToken::outcome).is_none() {
+                    if should_stop_route_fallback(&error) {
+                        return Err(error);
+                    }
+                    diagnostics.push(ResolveAttemptDiagnostic {
+                        source_id: Some(source_id.to_owned()),
+                        source_name: source_name.map(str::to_owned),
+                        provider_id: candidate.provider_id.clone(),
+                        provider_track_id: candidate.provider_track_id.clone(),
+                        quality: Some(quality),
+                        stage: "verify".into(),
+                        success: false,
+                        error: Some(public_attempt_error("verify", &error)),
+                    });
+                }
+                if should_skip_source(&error) {
+                    break 'candidate;
+                }
+                continue;
+            }
+            if cancellation.and_then(ResolveToken::outcome).is_some() {
+                break 'candidate;
+            }
+            request.network_route = Some(route);
+            let resolved_quality = request.quality.clone().unwrap_or(quality);
+            diagnostics.push(ResolveAttemptDiagnostic {
+                source_id: Some(source_id.to_owned()),
+                source_name: source_name.map(str::to_owned),
+                provider_id: candidate.provider_id.clone(),
+                provider_track_id: candidate.provider_track_id.clone(),
+                quality: Some(resolved_quality.clone()),
+                stage: "verify".into(),
+                success: true,
+                error: None,
+            });
+            return Ok(Some(ResolvedCandidate {
+                track: candidate.clone(),
+                request,
+                quality: resolved_quality,
+                source_id: source_id.to_owned(),
+                source_name: source_name.map(str::to_owned),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 const QUALITY_ORDER: [&str; 4] = ["flac24bit", "flac", "320k", "128k"];
@@ -1220,6 +1315,7 @@ fn validate_full_track_request(
     request: &ResolvedMediaRequest,
     expected_duration_ms: Option<u64>,
     requested_quality: Option<&str>,
+    route: NetworkRoute,
 ) -> Result<(), String> {
     let minimum_full_track_bytes =
         minimum_full_track_bytes(expected_duration_ms, requested_quality);
@@ -1230,14 +1326,17 @@ fn validate_full_track_request(
         .collect::<Vec<_>>();
     base_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("range"));
 
-    let head_length = execute(SafeHttpRequest {
-        url: request.url.clone(),
-        method: Method::HEAD,
-        headers: base_headers.clone(),
-        body: None,
-        timeout: MEDIA_PROBE_TIMEOUT,
-        max_response_bytes: 0,
-    })
+    let head_length = execute_on_route(
+        SafeHttpRequest {
+            url: request.url.clone(),
+            method: Method::HEAD,
+            headers: base_headers.clone(),
+            body: None,
+            timeout: MEDIA_PROBE_TIMEOUT,
+            max_response_bytes: 0,
+        },
+        route,
+    )
     .ok()
     .filter(|response| (200..300).contains(&response.status))
     .and_then(|response| header_u64(&response.headers, "content-length"));
@@ -1247,14 +1346,17 @@ fn validate_full_track_request(
 
     let mut headers = base_headers;
     headers.push(("range".into(), "bytes=0-0".into()));
-    let response = execute(SafeHttpRequest {
-        url: request.url.clone(),
-        method: Method::GET,
-        headers,
-        body: None,
-        timeout: MEDIA_PROBE_TIMEOUT,
-        max_response_bytes: minimum_full_track_bytes as usize,
-    });
+    let response = execute_on_route(
+        SafeHttpRequest {
+            url: request.url.clone(),
+            method: Method::GET,
+            headers,
+            body: None,
+            timeout: MEDIA_PROBE_TIMEOUT,
+            max_response_bytes: minimum_full_track_bytes as usize,
+        },
+        route,
+    );
     let total_length = match response {
         Ok(response) if response.status == 206 => response
             .headers
@@ -1378,8 +1480,10 @@ pub fn lx_runtime_failure(
 #[tauri::command]
 pub async fn lx_http_request(
     window: WebviewWindow,
+    runtime: tauri::State<'_, SourceRuntime>,
     url: String,
     options: Value,
+    generation: u64,
 ) -> Result<LxHttpResponse, String> {
     require_window(&window, SANDBOX_LABEL)?;
     if url.len() > 16 * 1024 {
@@ -1390,11 +1494,16 @@ pub async fn lx_http_request(
     {
         return crate::phase1_http_mock(&url, &options);
     }
+    let (source_id, route) = runtime.source_id_and_route_for_generation(generation)?;
     let request = parse_http_request(&url, options)?;
-    let response = tauri::async_runtime::spawn_blocking(move || execute(request))
+    let response = tauri::async_runtime::spawn_blocking(move || execute_on_route(request, route))
         .await
         .map_err(|error| format!("HTTP proxy task failed: {error}"))?
         .map_err(|error| error.to_string())?;
+    let current = runtime.source_id_and_route_for_generation(generation)?;
+    if current != (source_id, route) {
+        return Err("stale LX HTTP request route".into());
+    }
     let headers = response.headers.into_iter().collect::<BTreeMap<_, _>>();
     let content_type = headers
         .get("content-type")
@@ -1627,7 +1736,7 @@ fn start_phase2_auto_resolve(app: &AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         let app_for_resolve = app.clone();
         let result = tauri::async_runtime::spawn_blocking(move || {
-            resolve_serialized(&app_for_resolve, payload, Some("128k"), None)
+            resolve_with_fallback(&app_for_resolve, payload, Some("128k"), None)
         })
         .await
         .map_err(|error| format!("LX resolver task failed: {error}"))
@@ -1833,7 +1942,8 @@ fn resolve_serialized(
     app: &AppHandle,
     payload: Value,
     quality: Option<&str>,
-    source_id: Option<&str>,
+    source_id: &str,
+    route: NetworkRoute,
 ) -> Result<ResolvedMediaRequest, String> {
     let runtime = app.state::<SourceRuntime>();
     runtime.serialized(|| {
@@ -1842,11 +1952,20 @@ fn resolve_serialized(
             .into_iter()
             .find(|source| source.active)
             .map(|source| source.source.id);
-        let temporary = source_id.filter(|id| persistent_active.as_deref() != Some(*id));
-        if let Some(id) = temporary {
+        let temporary = persistent_active.as_deref() != Some(source_id);
+        let status = runtime.status();
+        let current_route = runtime
+            .source_id_and_route_for_generation(status.generation)
+            .ok()
+            .filter(|(current_source_id, _)| current_source_id == source_id)
+            .map(|(_, current_route)| current_route);
+        let needs_launch = status.active_source_id.as_deref() != Some(source_id)
+            || status.state != crate::source_runtime::RuntimeState::Ready
+            || current_route != Some(route);
+        if needs_launch {
             let switched = (|| {
                 let launch = runtime
-                    .prepare_reload_for(id)
+                    .prepare_reload_for_route(source_id, route)
                     .map_err(|error| error.to_string())?;
                 let sandbox = app
                     .get_webview_window(SANDBOX_LABEL)
@@ -1855,14 +1974,14 @@ fn resolve_serialized(
                 wait_until_ready(&runtime, launch.generation, RUNTIME_INIT_TIMEOUT, None)
             })();
             if let Err(error) = switched {
-                let _ = restore_persistent_runtime(app, &runtime);
+                if temporary {
+                    let _ = restore_persistent_runtime(app, &runtime);
+                }
                 return Err(error);
             }
         }
         let result = dispatch_and_wait(app, &runtime, &payload, quality, None);
-        if temporary.is_some()
-            && let Err(restore_error) = restore_persistent_runtime(app, &runtime)
-        {
+        if temporary && let Err(restore_error) = restore_persistent_runtime(app, &runtime) {
             return match result {
                 Ok(_) => Err(restore_error),
                 Err(resolve_error) => Err(format!(

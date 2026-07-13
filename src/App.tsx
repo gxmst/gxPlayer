@@ -2761,19 +2761,19 @@ function App() {
           <section className="settings-card"><h3>默认听感</h3><p>音乐模式保持 DSP 透明旁路；影院/游戏模式启用空间处理。</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></section>
           <section className="settings-card proxy-settings">
             <h3>网络代理</h3>
-            <p>使用你本机操作系统配置的第三方代理服务，非本应用提供，用于改善受限网络下的访问。</p>
+            <p>复用你本机操作系统配置的第三方代理服务，非本应用提供。音源连接优先直连，失败时才按需回退到代理。</p>
             <label className="settings-toggle">
-              <span><strong>使用系统代理</strong><small>对后续音源导入、在线搜索与解析、流媒体和封面连接生效。</small></span>
+              <span><strong>允许按需使用系统代理</strong><small>关闭后所有连接纯直连；开启或自动时，音源会记住最近成功的直连/代理路由。</small></span>
               <input
                 type="checkbox"
-                checked={proxyStatus?.mode === "on" || (proxyStatus?.mode === "auto" && proxyStatus.effective) || false}
+                checked={proxyStatus ? proxyStatus.mode !== "off" : false}
                 disabled={!proxyStatus || proxyBusy}
                 onChange={(event) => void setProxyMode(event.target.checked ? "on" : "off")}
               />
             </label>
             <div className="proxy-status-line">
-              <span>{proxyStatus?.mode === "auto" ? "自动检测" : proxyStatus?.mode === "on" ? "手动开启" : proxyStatus?.mode === "off" ? "手动关闭" : "正在读取"}</span>
-              <span>{proxyStatus ? (proxyStatus.detected ? "已检测到系统代理" : "未检测到系统代理，当前直连") : "正在检测系统代理"}</span>
+              <span>{proxyStatus?.mode === "auto" ? "自动允许" : proxyStatus?.mode === "on" ? "手动允许" : proxyStatus?.mode === "off" ? "仅直连" : "正在读取"}</span>
+              <span>{proxyStatus ? (proxyStatus.detected && proxyStatus.mode !== "off" ? "已检测到，可在直连失败时使用" : proxyStatus.detected ? "已检测到，但当前不允许使用" : "未检测到系统代理，当前直连") : "正在检测系统代理"}</span>
               <button type="button" disabled={!proxyStatus || proxyBusy || proxyStatus.mode === "auto"} onClick={() => void setProxyMode("auto")}>恢复自动检测</button>
             </div>
           </section>

@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use gx_contracts::NetworkRoute;
 use reqwest::blocking::ClientBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +54,20 @@ pub fn configure_client_builder(builder: ClientBuilder) -> ClientBuilder {
     }
 }
 
+pub fn configure_client_builder_for_route(
+    builder: ClientBuilder,
+    route: NetworkRoute,
+) -> ClientBuilder {
+    match route {
+        NetworkRoute::Direct => builder.no_proxy(),
+        NetworkRoute::SystemProxy => builder,
+    }
+}
+
+pub fn source_route_attempts(preferred: Option<NetworkRoute>) -> Vec<NetworkRoute> {
+    source_route_attempts_for(mode(), system_proxy_detected(), preferred)
+}
+
 pub fn system_proxy_detected() -> bool {
     if std::env::var_os("REQUEST_METHOD").is_some() {
         // Match reqwest's CGI protection: its system proxy matcher is disabled in this case.
@@ -75,6 +90,24 @@ fn route_for(mode: ProxyMode, detected: bool) -> ProxyRoute {
         ProxyMode::On => ProxyRoute::System,
         ProxyMode::Auto if detected => ProxyRoute::System,
         ProxyMode::Auto => ProxyRoute::Direct,
+    }
+}
+
+fn source_route_attempts_for(
+    mode: ProxyMode,
+    detected: bool,
+    preferred: Option<NetworkRoute>,
+) -> Vec<NetworkRoute> {
+    if mode == ProxyMode::Off || !detected {
+        return vec![NetworkRoute::Direct];
+    }
+    match preferred {
+        Some(NetworkRoute::SystemProxy) => {
+            vec![NetworkRoute::SystemProxy, NetworkRoute::Direct]
+        }
+        Some(NetworkRoute::Direct) | None => {
+            vec![NetworkRoute::Direct, NetworkRoute::SystemProxy]
+        }
     }
 }
 
@@ -165,6 +198,75 @@ mod tests {
         assert!(status_for(ProxyMode::On, true).effective);
         assert!(!status_for(ProxyMode::On, false).effective);
         assert!(!status_for(ProxyMode::Off, true).effective);
+    }
+
+    #[test]
+    fn source_routes_are_direct_first_unless_proxy_succeeded_last() {
+        assert_eq!(
+            source_route_attempts_for(ProxyMode::Off, true, Some(NetworkRoute::SystemProxy)),
+            [NetworkRoute::Direct]
+        );
+        assert_eq!(
+            source_route_attempts_for(ProxyMode::Auto, false, Some(NetworkRoute::SystemProxy)),
+            [NetworkRoute::Direct]
+        );
+        assert_eq!(
+            source_route_attempts_for(ProxyMode::On, true, None),
+            [NetworkRoute::Direct, NetworkRoute::SystemProxy]
+        );
+        assert_eq!(
+            source_route_attempts_for(ProxyMode::Auto, true, Some(NetworkRoute::Direct)),
+            [NetworkRoute::Direct, NetworkRoute::SystemProxy]
+        );
+        assert_eq!(
+            source_route_attempts_for(ProxyMode::Auto, true, Some(NetworkRoute::SystemProxy)),
+            [NetworkRoute::SystemProxy, NetworkRoute::Direct]
+        );
+    }
+
+    #[test]
+    fn explicit_route_configuration_uses_requested_route() {
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let proxy_server = serve_once(proxy, "proxy");
+        let unused_target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_url = format!("http://{}/route", unused_target.local_addr().unwrap());
+
+        let mut response = configure_client_builder_for_route(
+            reqwest::blocking::Client::builder()
+                .proxy(reqwest::Proxy::all(format!("http://{proxy_address}")).unwrap()),
+            NetworkRoute::SystemProxy,
+        )
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap()
+        .get(&target_url)
+        .send()
+        .unwrap();
+        let mut body = String::new();
+        response.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "proxy");
+        proxy_server.join().unwrap();
+        drop(unused_target);
+
+        let direct = TcpListener::bind("127.0.0.1:0").unwrap();
+        let direct_url = format!("http://{}/route", direct.local_addr().unwrap());
+        let direct_server = serve_once(direct, "direct");
+        let mut response = configure_client_builder_for_route(
+            reqwest::blocking::Client::builder()
+                .proxy(reqwest::Proxy::all(format!("http://{proxy_address}")).unwrap()),
+            NetworkRoute::Direct,
+        )
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap()
+        .get(direct_url)
+        .send()
+        .unwrap();
+        let mut body = String::new();
+        response.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "direct");
+        direct_server.join().unwrap();
     }
 
     #[test]

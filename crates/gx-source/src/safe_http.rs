@@ -2,6 +2,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use gx_contracts::NetworkRoute;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{
     AUTHORIZATION, COOKIE, HeaderMap, HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION,
@@ -9,7 +10,7 @@ use reqwest::header::{
 use reqwest::{Method, StatusCode, Url};
 use thiserror::Error;
 
-use crate::network_policy::configure_client_builder;
+use crate::network_policy::{configure_client_builder, configure_client_builder_for_route};
 
 const MAX_REDIRECTS: usize = 10;
 
@@ -55,20 +56,38 @@ pub enum SafeHttpError {
     ResponseTooLarge { limit: usize, status: u16 },
 }
 
-pub fn execute(mut request: SafeHttpRequest) -> Result<SafeHttpResponse, SafeHttpError> {
+pub fn execute(request: SafeHttpRequest) -> Result<SafeHttpResponse, SafeHttpError> {
+    execute_with_route(request, None)
+}
+
+pub fn execute_on_route(
+    request: SafeHttpRequest,
+    route: NetworkRoute,
+) -> Result<SafeHttpResponse, SafeHttpError> {
+    execute_with_route(request, Some(route))
+}
+
+fn execute_with_route(
+    mut request: SafeHttpRequest,
+    route: Option<NetworkRoute>,
+) -> Result<SafeHttpResponse, SafeHttpError> {
     for redirect_count in 0..=MAX_REDIRECTS {
         let resolved = validate_and_resolve(&request.url)?;
         let host = request.url.host_str().ok_or(SafeHttpError::MissingHost)?;
-        let client =
-            configure_client_builder(Client::builder().redirect(reqwest::redirect::Policy::none()))
-                // Private destinations are still rejected before every request and redirect. When
-                // the user enables an OS proxy, the proxy owns the final DNS resolution, so the
-                // direct-mode DNS pin below cannot constrain the proxy-side connection target.
-                .connect_timeout(request.timeout.min(Duration::from_secs(10)))
-                .timeout(request.timeout)
-                .resolve(host, resolved)
-                .build()
-                .map_err(|error| SafeHttpError::Request(error.to_string()))?;
+        let builder = Client::builder().redirect(reqwest::redirect::Policy::none());
+        let builder = match route {
+            Some(route) => configure_client_builder_for_route(builder, route),
+            None => configure_client_builder(builder),
+        };
+        let client = builder
+            // Private destinations are still rejected before every request and redirect. When
+            // the user enables an OS proxy, the proxy owns the final DNS resolution, so the
+            // direct-mode DNS pin below cannot constrain the proxy-side connection target.
+            .connect_timeout(request.timeout.min(Duration::from_secs(10)))
+            .timeout(request.timeout)
+            .resolve(host, resolved)
+            .build()
+            .map_err(|error| SafeHttpError::Request(error.to_string()))?;
         let mut builder = client.request(request.method.clone(), request.url.clone());
         for (name, value) in &request.headers {
             let name = HeaderName::from_bytes(name.as_bytes())

@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use gx_contracts::NetworkRoute;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -45,6 +46,8 @@ pub struct ManagedSource {
     pub capabilities: Value,
     #[serde(default)]
     pub health_samples: Vec<SourceHealthSample>,
+    #[serde(default)]
+    pub last_successful_route: Option<NetworkRoute>,
 }
 
 impl ManagedSource {
@@ -238,6 +241,7 @@ impl SourceStore {
             config: empty_config(),
             capabilities: Value::Null,
             health_samples: Vec::new(),
+            last_successful_route: None,
         };
         self.config.sources.push(source.clone());
         if self.config.active_source_id.is_none() {
@@ -441,6 +445,33 @@ impl SourceStore {
             recorded_at_ms: unix_time_ms(),
         });
         trim_health_samples(&mut source.health_samples);
+        self.persist()
+    }
+
+    pub fn preferred_route(&self, id: &str) -> Result<Option<NetworkRoute>, SourceStoreError> {
+        self.config
+            .sources
+            .iter()
+            .find(|source| source.id == id)
+            .map(|source| source.last_successful_route)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))
+    }
+
+    pub fn record_successful_route(
+        &mut self,
+        id: &str,
+        route: NetworkRoute,
+    ) -> Result<(), SourceStoreError> {
+        let source = self
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == id)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
+        if source.last_successful_route == Some(route) {
+            return Ok(());
+        }
+        source.last_successful_route = Some(route);
         self.persist()
     }
 
@@ -654,6 +685,7 @@ impl SourceStore {
                 config: source.config,
                 capabilities: Value::Null,
                 health_samples: Vec::new(),
+                last_successful_route: None,
             });
         }
         for old in &self.config.sources {
@@ -1061,6 +1093,57 @@ mod tests {
             reopened.list()[0].0.health_summary().state,
             SourceHealthState::Unknown
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn route_preferences_persist_locally_but_are_not_in_backups() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        let source = store
+            .import_script("lx.on('request', () => 1)", "test", "source.js")
+            .unwrap();
+        assert_eq!(store.preferred_route(&source.id).unwrap(), None);
+        store
+            .record_successful_route(&source.id, NetworkRoute::SystemProxy)
+            .unwrap();
+        store
+            .record_successful_route(&source.id, NetworkRoute::SystemProxy)
+            .unwrap();
+
+        drop(store);
+        let mut reopened = SourceStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.preferred_route(&source.id).unwrap(),
+            Some(NetworkRoute::SystemProxy)
+        );
+        let backup = reopened.export_backup().unwrap();
+        let serialized = serde_json::to_string(&backup).unwrap();
+        assert!(!serialized.contains("lastSuccessfulRoute"));
+        reopened.restore_backup(backup).unwrap();
+        assert_eq!(reopened.preferred_route(&source.id).unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_source_files_without_route_preferences_still_open() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        let source = store
+            .import_script("lx.on('request', () => 1)", "test", "source.js")
+            .unwrap();
+        drop(store);
+
+        let config_path = root.join("sources.json");
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config["sources"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("lastSuccessfulRoute");
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let reopened = SourceStore::open(&root).unwrap();
+        assert_eq!(reopened.preferred_route(&source.id).unwrap(), None);
         fs::remove_dir_all(root).unwrap();
     }
 

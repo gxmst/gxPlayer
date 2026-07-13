@@ -94,6 +94,7 @@ fn request_for(url: &str) -> Result<ResolvedMediaRequest> {
         media_type: MediaType::Mp3,
         quality: Some("self-test".into()),
         expires_at_ms: None,
+        network_route: None,
     })
 }
 

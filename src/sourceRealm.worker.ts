@@ -136,7 +136,7 @@ function installLxContract(scriptInfo?: Record<string, unknown>): void {
       callback: (error: Error | null, response?: LxHttpResponse, body?: unknown) => void,
     ) {
       let cancelled = false;
-      void bridge("http", { url, options })
+      void bridge("http", { url, options, generation: currentGeneration })
         .then((response) => {
           if (!cancelled) {
             const typed = response as LxHttpResponse;

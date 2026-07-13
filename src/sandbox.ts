@@ -63,6 +63,7 @@ async function handleBridgeCall(worker: Worker, nonce: string, message: RealmMes
       result = await invoke<LxHttpResponse>("lx_http_request", {
         url: message.payload.url,
         options: message.payload.options ?? {},
+        generation: message.payload.generation,
       });
     } else if (message.command === "send") {
       const eventName = message.payload.eventName;

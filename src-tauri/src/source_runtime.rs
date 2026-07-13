@@ -3,7 +3,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
-use gx_contracts::{HttpHeader, MediaType, ResolvedMediaRequest};
+use gx_contracts::{HttpHeader, MediaType, NetworkRoute, ResolvedMediaRequest};
+use gx_source::network_policy::source_route_attempts;
 use gx_source::{
     ManagedSource, ScriptMetadata, SourceBackup, SourceFallbackConfig, SourceHealthSummary,
     SourceStore, SourceStoreError,
@@ -97,6 +98,7 @@ struct PendingRequest {
 
 struct RuntimeInner {
     status: RuntimeStatus,
+    network_route: Option<NetworkRoute>,
     pending: HashMap<String, PendingRequest>,
 }
 
@@ -120,6 +122,7 @@ impl SourceRuntime {
                     error: None,
                     update_alert: None,
                 },
+                network_route: None,
                 pending: HashMap::new(),
             }),
             operation_lock: Mutex::new(()),
@@ -214,6 +217,21 @@ impl SourceRuntime {
             .record_health_sample(id, success, latency_ms)
     }
 
+    pub fn preferred_route(&self, id: &str) -> Result<Option<NetworkRoute>, SourceStoreError> {
+        self.store.lock().unwrap().preferred_route(id)
+    }
+
+    pub fn record_successful_route(
+        &self,
+        id: &str,
+        route: NetworkRoute,
+    ) -> Result<(), SourceStoreError> {
+        self.store
+            .lock()
+            .unwrap()
+            .record_successful_route(id, route)
+    }
+
     pub fn resolution_source_ids(
         &self,
         requested_source_id: Option<&str>,
@@ -265,6 +283,25 @@ impl SourceRuntime {
         self.inner.lock().unwrap().status.clone()
     }
 
+    pub fn source_id_and_route_for_generation(
+        &self,
+        generation: u64,
+    ) -> Result<(String, NetworkRoute), String> {
+        let inner = self.inner.lock().unwrap();
+        if generation != inner.status.generation {
+            return Err("stale LX HTTP request generation".into());
+        }
+        let source_id = inner
+            .status
+            .active_source_id
+            .clone()
+            .ok_or_else(|| "LX runtime has no active source".to_owned())?;
+        let route = inner
+            .network_route
+            .ok_or_else(|| "LX runtime has no active network route".to_owned())?;
+        Ok((source_id, route))
+    }
+
     pub fn prepare_reload(&self) -> Result<Option<ScriptLaunch>, SourceStoreError> {
         let active = self.store.lock().unwrap().active_script()?;
         let mut inner = self.inner.lock().unwrap();
@@ -280,10 +317,16 @@ impl SourceRuntime {
         let Some((source, script)) = active else {
             inner.status.state = RuntimeState::NoSource;
             inner.status.active_source_id = None;
+            inner.network_route = None;
             return Ok(None);
         };
+        let route = source_route_attempts(source.last_successful_route)
+            .into_iter()
+            .next()
+            .unwrap_or(NetworkRoute::Direct);
         inner.status.state = RuntimeState::Initializing;
         inner.status.active_source_id = Some(source.id.clone());
+        inner.network_route = Some(route);
         Ok(Some(ScriptLaunch {
             generation,
             script,
@@ -291,8 +334,21 @@ impl SourceRuntime {
         }))
     }
 
-    pub fn prepare_reload_for(&self, id: &str) -> Result<ScriptLaunch, SourceStoreError> {
+    pub fn prepare_reload_for_route(
+        &self,
+        id: &str,
+        route: NetworkRoute,
+    ) -> Result<ScriptLaunch, SourceStoreError> {
         let (source, script) = self.store.lock().unwrap().script_by_id(id)?;
+        self.prepare_launch_for_route(source, script, route)
+    }
+
+    fn prepare_launch_for_route(
+        &self,
+        source: ManagedSource,
+        script: String,
+        route: NetworkRoute,
+    ) -> Result<ScriptLaunch, SourceStoreError> {
         let mut inner = self.inner.lock().unwrap();
         inner.status.generation = inner.status.generation.wrapping_add(1);
         let generation = inner.status.generation;
@@ -302,6 +358,7 @@ impl SourceRuntime {
         );
         inner.status.state = RuntimeState::Initializing;
         inner.status.active_source_id = Some(source.id.clone());
+        inner.network_route = Some(route);
         inner.status.capabilities = Value::Null;
         inner.status.error = None;
         inner.status.update_alert = None;
@@ -531,6 +588,7 @@ pub fn normalize_media_request(
         media_type,
         quality: quality.or_else(|| requested_quality.map(str::to_owned)),
         expires_at_ms,
+        network_route: None,
     })
 }
 
@@ -799,7 +857,9 @@ mod tests {
                 "b",
             )
             .unwrap();
-        let temporary = runtime.prepare_reload_for(&second.id).unwrap();
+        let temporary = runtime
+            .prepare_reload_for_route(&second.id, NetworkRoute::Direct)
+            .unwrap();
         assert_eq!(temporary.source.id, second.id);
         let restored = runtime.prepare_reload().unwrap().unwrap();
         assert_eq!(restored.source.id, first.id);
@@ -807,6 +867,43 @@ mod tests {
             runtime
                 .begin_request(&serde_json::json!({"action":"lyric"}))
                 .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_routes_are_bound_to_the_runtime_generation() {
+        let (runtime, root) = runtime();
+        let source = runtime
+            .import_script(
+                "lx.on('request', () => 'https://example.com/a.mp3')",
+                "test",
+                "a",
+            )
+            .unwrap();
+        let direct = runtime
+            .prepare_reload_for_route(&source.id, NetworkRoute::Direct)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .source_id_and_route_for_generation(direct.generation)
+                .unwrap(),
+            (source.id.clone(), NetworkRoute::Direct)
+        );
+
+        let proxied = runtime
+            .prepare_reload_for_route(&source.id, NetworkRoute::SystemProxy)
+            .unwrap();
+        assert!(
+            runtime
+                .source_id_and_route_for_generation(direct.generation)
+                .is_err()
+        );
+        assert_eq!(
+            runtime
+                .source_id_and_route_for_generation(proxied.generation)
+                .unwrap(),
+            (source.id, NetworkRoute::SystemProxy)
         );
         std::fs::remove_dir_all(root).unwrap();
     }

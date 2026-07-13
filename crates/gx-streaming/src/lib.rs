@@ -14,8 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, bounded};
 use gx_cache::{CacheWritePlan, CacheWriter};
-use gx_contracts::{HttpHeader, ResolvedMediaRequest};
-use gx_source::network_policy::configure_client_builder;
+use gx_contracts::{HttpHeader, NetworkRoute, ResolvedMediaRequest};
+use gx_source::network_policy::{
+    configure_client_builder, configure_client_builder_for_route, source_route_attempts,
+};
 use gx_source::safe_http::validate_and_resolve;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -97,6 +99,7 @@ struct ReadyInfo {
 struct EffectiveRequest {
     url: reqwest::Url,
     headers: Vec<HttpHeader>,
+    network_route: Option<NetworkRoute>,
 }
 
 struct WorkerState {
@@ -178,6 +181,7 @@ impl HttpMediaSource {
         let effective_request = Arc::new(Mutex::new(EffectiveRequest {
             url: request.url.clone(),
             headers: request.headers.clone(),
+            network_route: request.network_route,
         }));
         let metrics = Arc::clone(&self.metrics);
         let cancel_for_worker = Arc::clone(&cancel);
@@ -254,6 +258,7 @@ impl HttpMediaSource {
         if let Ok(effective) = effective.lock() {
             self.request.url = effective.url.clone();
             self.request.headers = effective.headers.clone();
+            self.request.network_route = effective.network_route;
             self.final_url = effective.url.clone();
         }
     }
@@ -504,6 +509,7 @@ fn network_worker(args: NetworkWorkerArgs) {
     let mut offset = initial_offset;
     let mut active_url = request.url.clone();
     let mut active_headers = request.headers.clone();
+    let mut active_route = request.network_route;
     let mut total_len = None;
     let mut identity: Option<EntityIdentity> = None;
     let mut ready_sent = false;
@@ -518,12 +524,13 @@ fn network_worker(args: NetworkWorkerArgs) {
             metrics.range_requests.fetch_add(1, Ordering::Relaxed);
         }
 
-        let response = match send_request(
+        let (response, actual_route) = match send_request(
             &mut active_headers,
             active_url.clone(),
             offset,
             identity.as_ref().and_then(EntityIdentity::if_range),
             &effective_request,
+            active_route,
         ) {
             Ok(response) => response,
             Err(error) => {
@@ -535,10 +542,12 @@ fn network_worker(args: NetworkWorkerArgs) {
                 return;
             }
         };
+        active_route = actual_route;
         active_url = response.url().clone();
         if let Ok(mut effective) = effective_request.lock() {
             effective.url = active_url.clone();
             effective.headers = active_headers.clone();
+            effective.network_route = active_route;
         }
         let response_info = match inspect_response(&response, offset, total_len, identity.as_ref())
         {
@@ -788,45 +797,27 @@ fn send_request(
     offset: u64,
     if_range: Option<&str>,
     effective_request: &Mutex<EffectiveRequest>,
-) -> Result<Response, String> {
+    mut active_route: Option<NetworkRoute>,
+) -> Result<(Response, Option<NetworkRoute>), String> {
     for redirect_count in 0..=MAX_MEDIA_REDIRECTS {
         let resolved = resolve_media_destination(&url)
             .map_err(|error| format!("media destination denied: {error}"))?;
         let host = url
             .host_str()
             .ok_or_else(|| "media URL has no host".to_owned())?;
-        let client =
-            configure_client_builder(Client::builder().redirect(reqwest::redirect::Policy::none()))
-                .connect_timeout(CONNECT_TIMEOUT)
-                // The blocking response applies this deadline independently to each body read. It
-                // therefore acts as an idle timeout without limiting the total duration of a song.
-                .timeout(STREAM_IDLE_TIMEOUT)
-                .resolve(host, resolved)
-                .build()
-                .map_err(|error| format!("failed to build pinned media client: {error}"))?;
-        let mut builder = client.get(url.clone());
-        for header in headers.iter().filter(|header| {
-            !header.name.eq_ignore_ascii_case(RANGE.as_str())
-                && !header.name.eq_ignore_ascii_case(IF_RANGE.as_str())
-        }) {
-            let name = HeaderName::from_bytes(header.name.as_bytes())
-                .map_err(|error| format!("invalid media request header name: {error}"))?;
-            let value = HeaderValue::from_str(&header.value)
-                .map_err(|error| format!("invalid media request header value: {error}"))?;
-            builder = builder.header(name, value);
-        }
-        if offset > 0 {
-            builder = builder.header(RANGE, format!("bytes={offset}-"));
-            if let Some(if_range) = if_range {
-                builder = builder.header(IF_RANGE, if_range);
-            }
-        }
-        let response = builder
-            .send()
-            .map_err(|error| format!("media request failed: {error}"))?;
+        let (response, actual_route) = send_media_request(
+            &url,
+            host,
+            resolved,
+            headers,
+            offset,
+            if_range,
+            active_route,
+        )?;
+        active_route = actual_route;
         if !response.status().is_redirection() {
-            update_effective_request(effective_request, response.url(), headers);
-            return Ok(response);
+            update_effective_request(effective_request, response.url(), headers, active_route);
+            return Ok((response, active_route));
         }
         if redirect_count == MAX_MEDIA_REDIRECTS {
             return Err("media redirect limit exceeded".into());
@@ -845,19 +836,107 @@ fn send_request(
         url = next;
         // Publish sanitization at the redirect boundary, before the next socket request. A
         // concurrent Seek can now only inherit the already-sanitized header set.
-        update_effective_request(effective_request, &url, headers);
+        update_effective_request(effective_request, &url, headers, active_route);
     }
     Err("media redirect limit exceeded".into())
+}
+
+fn send_media_request(
+    url: &reqwest::Url,
+    host: &str,
+    resolved: std::net::SocketAddr,
+    headers: &[HttpHeader],
+    offset: u64,
+    if_range: Option<&str>,
+    preferred_route: Option<NetworkRoute>,
+) -> Result<(Response, Option<NetworkRoute>), String> {
+    let Some(preferred_route) = preferred_route else {
+        let client = build_media_client(host, resolved, None)?;
+        let response = build_media_get(&client, url, headers, offset, if_range)?
+            .send()
+            .map_err(|error| format!("media request failed: {error}"))?;
+        return Ok((response, None));
+    };
+
+    let mut last_error = None;
+    // The source policy yields at most the preferred route and one permitted fallback. Only a
+    // socket send failure advances to the fallback; destination and request validation failures
+    // remain terminal and cannot be bypassed by changing routes.
+    for route in source_route_attempts(Some(preferred_route))
+        .into_iter()
+        .take(2)
+    {
+        let client = build_media_client(host, resolved, Some(route))?;
+        let builder = build_media_get(&client, url, headers, offset, if_range)?;
+        match builder.send() {
+            Ok(response) => return Ok((response, Some(route))),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.map_or_else(
+        || "media request has no permitted network route".to_owned(),
+        |error| format!("media request failed: {error}"),
+    ))
+}
+
+fn build_media_client(
+    host: &str,
+    resolved: std::net::SocketAddr,
+    route: Option<NetworkRoute>,
+) -> Result<Client, String> {
+    let builder = Client::builder().redirect(reqwest::redirect::Policy::none());
+    let builder = match route {
+        Some(route) => configure_client_builder_for_route(builder, route),
+        None => configure_client_builder(builder),
+    };
+    builder
+        .connect_timeout(CONNECT_TIMEOUT)
+        // The blocking response applies this deadline independently to each body read. It
+        // therefore acts as an idle timeout without limiting the total duration of a song.
+        .timeout(STREAM_IDLE_TIMEOUT)
+        .resolve(host, resolved)
+        .build()
+        .map_err(|error| format!("failed to build pinned media client: {error}"))
+}
+
+fn build_media_get(
+    client: &Client,
+    url: &reqwest::Url,
+    headers: &[HttpHeader],
+    offset: u64,
+    if_range: Option<&str>,
+) -> Result<reqwest::blocking::RequestBuilder, String> {
+    let mut builder = client.get(url.clone());
+    for header in headers.iter().filter(|header| {
+        !header.name.eq_ignore_ascii_case(RANGE.as_str())
+            && !header.name.eq_ignore_ascii_case(IF_RANGE.as_str())
+    }) {
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|error| format!("invalid media request header name: {error}"))?;
+        let value = HeaderValue::from_str(&header.value)
+            .map_err(|error| format!("invalid media request header value: {error}"))?;
+        builder = builder.header(name, value);
+    }
+    if offset > 0 {
+        builder = builder.header(RANGE, format!("bytes={offset}-"));
+        if let Some(if_range) = if_range {
+            builder = builder.header(IF_RANGE, if_range);
+        }
+    }
+    Ok(builder)
 }
 
 fn update_effective_request(
     effective_request: &Mutex<EffectiveRequest>,
     url: &reqwest::Url,
     headers: &[HttpHeader],
+    network_route: Option<NetworkRoute>,
 ) {
     if let Ok(mut effective) = effective_request.lock() {
         effective.url = url.clone();
         effective.headers = headers.to_vec();
+        effective.network_route = network_route;
     }
 }
 
@@ -932,6 +1011,30 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn idle_media_source(route: Option<NetworkRoute>) -> HttpMediaSource {
+        let url = reqwest::Url::parse("https://media.example/song.mp3").unwrap();
+        HttpMediaSource {
+            request: ResolvedMediaRequest {
+                url: url.clone(),
+                headers: Vec::new(),
+                media_type: gx_contracts::MediaType::Mp3,
+                quality: None,
+                expires_at_ms: None,
+                network_route: route,
+            },
+            worker: None,
+            current_chunk: Vec::new(),
+            chunk_offset: 0,
+            position: 0,
+            total_len: None,
+            supports_range: false,
+            final_url: url,
+            metrics: Arc::new(StreamMetrics::default()),
+            cache_plan: None,
+            reached_end: false,
+        }
+    }
 
     #[test]
     fn parses_complete_content_ranges() {
@@ -1016,5 +1119,40 @@ mod tests {
             &reqwest::Url::parse("https://example.com/a").unwrap(),
             &reqwest::Url::parse("http://example.com/a").unwrap()
         ));
+    }
+
+    #[test]
+    fn successful_route_is_inherited_by_restarts() {
+        let mut source = idle_media_source(Some(NetworkRoute::Direct));
+        let redirected_url = reqwest::Url::parse("https://cdn.example/song.mp3").unwrap();
+        let effective = Mutex::new(EffectiveRequest {
+            url: redirected_url.clone(),
+            headers: vec![HttpHeader {
+                name: "Referer".into(),
+                value: "https://media.example/".into(),
+            }],
+            network_route: Some(NetworkRoute::SystemProxy),
+        });
+
+        source.apply_effective_request(&effective);
+        let restart = source.request_for_restart();
+
+        assert_eq!(restart.url, redirected_url);
+        assert_eq!(restart.headers.len(), 1);
+        assert_eq!(restart.network_route, Some(NetworkRoute::SystemProxy));
+    }
+
+    #[test]
+    fn generic_requests_keep_their_global_route_marker() {
+        let mut source = idle_media_source(None);
+        let effective = Mutex::new(EffectiveRequest {
+            url: source.request.url.clone(),
+            headers: Vec::new(),
+            network_route: None,
+        });
+
+        source.apply_effective_request(&effective);
+
+        assert_eq!(source.request_for_restart().network_route, None);
     }
 }

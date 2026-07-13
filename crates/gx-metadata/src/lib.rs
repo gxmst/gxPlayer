@@ -1,10 +1,11 @@
 use std::cmp::Ordering;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gx_contracts::{MediaType, ResolvedMediaRequest};
-use gx_source::safe_http::{SafeHttpRequest, execute};
+use gx_source::network_policy::source_route_attempts;
+use gx_source::safe_http::{SafeHttpRequest, SafeHttpResponse, execute, execute_on_route};
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
@@ -12,6 +13,8 @@ use thiserror::Error;
 
 const RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const PREVIEW_LIMIT: usize = 8 * 1024 * 1024;
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
+const DIRECT_SEARCH_BUDGET: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -229,7 +232,7 @@ pub fn search_netease(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Me
         .append_pair("limit", &limit.clamp(1, 50).to_string())
         .finish()
         .into_bytes();
-    let response = execute(SafeHttpRequest {
+    let response = execute_search_request(SafeHttpRequest {
         url,
         method: Method::POST,
         headers: vec![
@@ -244,13 +247,9 @@ pub fn search_netease(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Me
             ),
         ],
         body: Some(body),
-        timeout: Duration::from_secs(5),
+        timeout: SEARCH_TIMEOUT,
         max_response_bytes: RESPONSE_LIMIT,
-    })
-    .map_err(|error| MetadataError::Http(error.to_string()))?;
-    if !(200..300).contains(&response.status) {
-        return Err(MetadataError::HttpStatus(response.status));
-    }
+    })?;
     let response: NeteaseResponse = serde_json::from_slice(&response.body)?;
     if response.code != 200 {
         return Err(MetadataError::HttpStatus(response.code.max(0) as u16));
@@ -500,19 +499,45 @@ fn request_json<T: DeserializeOwned>(url: Url) -> Result<T, MetadataError> {
 }
 
 fn request_search_json<T: DeserializeOwned>(url: Url) -> Result<T, MetadataError> {
-    let response = execute(SafeHttpRequest {
+    let response = execute_search_request(SafeHttpRequest {
         url,
         method: Method::GET,
         headers: vec![("user-agent".into(), "GXPlayer/0.1 metadata".into())],
         body: None,
-        timeout: Duration::from_secs(5),
+        timeout: SEARCH_TIMEOUT,
         max_response_bytes: RESPONSE_LIMIT,
-    })
-    .map_err(|error| MetadataError::Http(error.to_string()))?;
-    if !(200..300).contains(&response.status) {
-        return Err(MetadataError::HttpStatus(response.status));
-    }
+    })?;
     Ok(serde_json::from_slice(&response.body)?)
+}
+
+fn execute_search_request(request: SafeHttpRequest) -> Result<SafeHttpResponse, MetadataError> {
+    let routes = source_route_attempts(None);
+    let deadline = Instant::now() + SEARCH_TIMEOUT;
+    let mut last_error = None;
+    for (index, route) in routes.iter().copied().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempts_left = routes.len() - index;
+        let timeout = search_attempt_timeout(remaining, attempts_left);
+        let mut attempt = request.clone();
+        attempt.timeout = timeout;
+        match execute_on_route(attempt, route) {
+            Ok(response) if (200..300).contains(&response.status) => return Ok(response),
+            Ok(response) => last_error = Some(MetadataError::HttpStatus(response.status)),
+            Err(error) => last_error = Some(MetadataError::Http(error.to_string())),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| MetadataError::Http("search request timed out".into())))
+}
+
+fn search_attempt_timeout(remaining: Duration, attempts_left: usize) -> Duration {
+    if attempts_left > 1 {
+        remaining.min(DIRECT_SEARCH_BUDGET)
+    } else {
+        remaining
+    }
 }
 
 fn preview_request(url: Option<String>, media_type: MediaType) -> Option<ResolvedMediaRequest> {
@@ -523,6 +548,7 @@ fn preview_request(url: Option<String>, media_type: MediaType) -> Option<Resolve
         media_type,
         quality: Some("preview".into()),
         expires_at_ms: None,
+        network_route: None,
     })
 }
 
@@ -1063,6 +1089,18 @@ mod tests {
             resolver_payload: Value::Null,
             preview: None,
         }
+    }
+
+    #[test]
+    fn search_route_retry_keeps_a_single_five_second_budget() {
+        assert_eq!(
+            search_attempt_timeout(Duration::from_secs(5), 2),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            search_attempt_timeout(Duration::from_secs(2), 1),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]

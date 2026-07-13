@@ -21,6 +21,13 @@ pub enum MediaType {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkRoute {
+    Direct,
+    SystemProxy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpHeader {
     pub name: String,
@@ -35,6 +42,8 @@ pub struct ResolvedMediaRequest {
     pub quality: Option<String>,
     /// Unix timestamp in milliseconds.
     pub expires_at_ms: Option<u64>,
+    #[serde(default)]
+    pub network_route: Option<NetworkRoute>,
 }
 
 impl ResolvedMediaRequest {
@@ -137,6 +146,7 @@ mod tests {
             media_type: MediaType::Mp3,
             quality: Some("320k".into()),
             expires_at_ms: Some(10_000),
+            network_route: None,
         };
 
         assert!(!request.is_expired_at(9_999));
@@ -154,11 +164,30 @@ mod tests {
             media_type: MediaType::Mp3,
             quality: None,
             expires_at_ms: None,
+            network_route: None,
         };
 
         let diagnostic = request.redacted_for_log();
         assert!(!diagnostic.contains("secret"));
         assert!(!diagnostic.contains("Authorization"));
         assert!(diagnostic.contains("media.example/song.mp3"));
+    }
+
+    #[test]
+    fn older_media_requests_deserialize_without_a_network_route() {
+        let request: ResolvedMediaRequest = serde_json::from_value(serde_json::json!({
+            "url": "https://media.example/song.mp3",
+            "headers": [],
+            "media_type": "mp3",
+            "quality": null,
+            "expires_at_ms": null
+        }))
+        .unwrap();
+
+        assert_eq!(request.network_route, None);
+        assert_eq!(
+            serde_json::to_value(NetworkRoute::SystemProxy).unwrap(),
+            serde_json::json!("system_proxy")
+        );
     }
 }

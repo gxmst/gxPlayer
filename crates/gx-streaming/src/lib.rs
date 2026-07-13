@@ -3,6 +3,7 @@
 //! Network I/O runs on a dedicated worker. The decoder only blocks on a bounded byte channel and
 //! asks the source to restart at a byte offset when Symphonia performs a seek.
 
+use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 #[cfg(feature = "test-private-network")]
 use std::net::{IpAddr, SocketAddr};
@@ -40,6 +41,45 @@ const MAX_MEDIA_REDIRECTS: usize = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(12);
+const DIAGNOSTIC_CAPACITY: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingDiagnostic {
+    pub category: &'static str,
+    pub source: &'static str,
+    pub summary: String,
+}
+
+#[derive(Clone)]
+pub struct StreamingDiagnosticQueue {
+    inner: Arc<Mutex<VecDeque<StreamingDiagnostic>>>,
+}
+
+impl Default for StreamingDiagnosticQueue {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::with_capacity(DIAGNOSTIC_CAPACITY))),
+        }
+    }
+}
+
+impl StreamingDiagnosticQueue {
+    pub fn drain(&self) -> Vec<StreamingDiagnostic> {
+        self.inner.lock().unwrap().drain(..).collect()
+    }
+
+    fn push(&self, category: &'static str, source: &'static str, summary: String) {
+        let mut diagnostics = self.inner.lock().unwrap();
+        if diagnostics.len() == DIAGNOSTIC_CAPACITY {
+            diagnostics.pop_front();
+        }
+        diagnostics.push_back(StreamingDiagnostic {
+            category,
+            source,
+            summary,
+        });
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct StreamMetrics {
@@ -120,6 +160,7 @@ pub struct HttpMediaSource {
     final_url: reqwest::Url,
     metrics: Arc<StreamMetrics>,
     cache_plan: Option<CacheWritePlan>,
+    diagnostics: StreamingDiagnosticQueue,
     reached_end: bool,
 }
 
@@ -131,6 +172,18 @@ impl HttpMediaSource {
     pub fn new_with_cache(
         request: ResolvedMediaRequest,
         cache_plan: Option<CacheWritePlan>,
+    ) -> Result<Self> {
+        Self::new_with_cache_and_diagnostics(
+            request,
+            cache_plan,
+            StreamingDiagnosticQueue::default(),
+        )
+    }
+
+    pub fn new_with_cache_and_diagnostics(
+        request: ResolvedMediaRequest,
+        cache_plan: Option<CacheWritePlan>,
+        diagnostics: StreamingDiagnosticQueue,
     ) -> Result<Self> {
         if request.is_expired_at(unix_time_ms()) {
             bail!("resolved media request has expired and must be resolved again");
@@ -148,6 +201,7 @@ impl HttpMediaSource {
             final_url: placeholder_url,
             metrics,
             cache_plan,
+            diagnostics,
             reached_end: false,
         };
         source.restart(0)?;
@@ -186,6 +240,7 @@ impl HttpMediaSource {
         let metrics = Arc::clone(&self.metrics);
         let cancel_for_worker = Arc::clone(&cancel);
         let effective_for_worker = Arc::clone(&effective_request);
+        let diagnostics = self.diagnostics.clone();
         let cache_writer = (offset == 0)
             .then(|| self.cache_plan.as_ref().and_then(CacheWritePlan::begin))
             .flatten();
@@ -201,6 +256,7 @@ impl HttpMediaSource {
                     metrics,
                     cache_writer,
                     effective_request: effective_for_worker,
+                    diagnostics,
                 });
             })
             .context("failed to spawn HTTP streaming worker")?;
@@ -493,6 +549,7 @@ struct NetworkWorkerArgs {
     metrics: Arc<StreamMetrics>,
     cache_writer: Option<CacheWriter>,
     effective_request: Arc<Mutex<EffectiveRequest>>,
+    diagnostics: StreamingDiagnosticQueue,
 }
 
 fn network_worker(args: NetworkWorkerArgs) {
@@ -505,6 +562,7 @@ fn network_worker(args: NetworkWorkerArgs) {
         metrics,
         mut cache_writer,
         effective_request,
+        diagnostics,
     } = args;
     let mut offset = initial_offset;
     let mut active_url = request.url.clone();
@@ -531,9 +589,19 @@ fn network_worker(args: NetworkWorkerArgs) {
             identity.as_ref().and_then(EntityIdentity::if_range),
             &effective_request,
             active_route,
+            &diagnostics,
         ) {
             Ok(response) => response,
             Err(error) => {
+                diagnostics.push(
+                    "stream_request_failed",
+                    "stream",
+                    format!(
+                        "route={} stage=request code={}",
+                        optional_route_label(active_route),
+                        stream_error_code(&error)
+                    ),
+                );
                 if !ready_sent {
                     let _ = ready_sender.send(Err(error));
                 } else {
@@ -553,6 +621,15 @@ fn network_worker(args: NetworkWorkerArgs) {
         {
             Ok(info) => info,
             Err(message) => {
+                diagnostics.push(
+                    "stream_response_failed",
+                    "stream",
+                    format!(
+                        "route={} stage=response code={}",
+                        optional_route_label(active_route),
+                        stream_error_code(&message)
+                    ),
+                );
                 if !ready_sent {
                     let _ = ready_sender.send(Err(message));
                 } else {
@@ -653,6 +730,15 @@ fn network_worker(args: NetworkWorkerArgs) {
                 thread::sleep(Duration::from_millis(100 * reconnects));
             }
             Err(message) => {
+                diagnostics.push(
+                    "stream_runtime_failed",
+                    "stream",
+                    format!(
+                        "route={} stage=body code={}",
+                        optional_route_label(active_route),
+                        stream_error_code(&message)
+                    ),
+                );
                 let _ = sender.send(StreamMessage::Error(format!(
                     "{message}; reconnect budget exhausted"
                 )));
@@ -798,6 +884,7 @@ fn send_request(
     if_range: Option<&str>,
     effective_request: &Mutex<EffectiveRequest>,
     mut active_route: Option<NetworkRoute>,
+    diagnostics: &StreamingDiagnosticQueue,
 ) -> Result<(Response, Option<NetworkRoute>), String> {
     for redirect_count in 0..=MAX_MEDIA_REDIRECTS {
         let resolved = resolve_media_destination(&url)
@@ -805,15 +892,16 @@ fn send_request(
         let host = url
             .host_str()
             .ok_or_else(|| "media URL has no host".to_owned())?;
-        let (response, actual_route) = send_media_request(
-            &url,
+        let (response, actual_route) = send_media_request(MediaRequestArgs {
+            url: &url,
             host,
             resolved,
             headers,
             offset,
             if_range,
-            active_route,
-        )?;
+            preferred_route: active_route,
+            diagnostics,
+        })?;
         active_route = actual_route;
         if !response.status().is_redirection() {
             update_effective_request(effective_request, response.url(), headers, active_route);
@@ -841,15 +929,30 @@ fn send_request(
     Err("media redirect limit exceeded".into())
 }
 
-fn send_media_request(
-    url: &reqwest::Url,
-    host: &str,
+struct MediaRequestArgs<'a> {
+    url: &'a reqwest::Url,
+    host: &'a str,
     resolved: std::net::SocketAddr,
-    headers: &[HttpHeader],
+    headers: &'a [HttpHeader],
     offset: u64,
-    if_range: Option<&str>,
+    if_range: Option<&'a str>,
     preferred_route: Option<NetworkRoute>,
+    diagnostics: &'a StreamingDiagnosticQueue,
+}
+
+fn send_media_request(
+    args: MediaRequestArgs<'_>,
 ) -> Result<(Response, Option<NetworkRoute>), String> {
+    let MediaRequestArgs {
+        url,
+        host,
+        resolved,
+        headers,
+        offset,
+        if_range,
+        preferred_route,
+        diagnostics,
+    } = args;
     let Some(preferred_route) = preferred_route else {
         let client = build_media_client(host, resolved, None)?;
         let response = build_media_get(&client, url, headers, offset, if_range)?
@@ -862,15 +965,30 @@ fn send_media_request(
     // The source policy yields at most the preferred route and one permitted fallback. Only a
     // socket send failure advances to the fallback; destination and request validation failures
     // remain terminal and cannot be bypassed by changing routes.
-    for route in source_route_attempts(Some(preferred_route))
+    let routes = source_route_attempts(Some(preferred_route))
         .into_iter()
         .take(2)
-    {
+        .collect::<Vec<_>>();
+    for (index, route) in routes.iter().copied().enumerate() {
         let client = build_media_client(host, resolved, Some(route))?;
         let builder = build_media_get(&client, url, headers, offset, if_range)?;
         match builder.send() {
             Ok(response) => return Ok((response, Some(route))),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                if let Some(next_route) = routes.get(index + 1).copied() {
+                    diagnostics.push(
+                        "stream_route_fallback",
+                        "stream",
+                        format!(
+                            "from={} to={} stage=request code={}",
+                            route_label(route),
+                            route_label(next_route),
+                            reqwest_error_code(&error)
+                        ),
+                    );
+                }
+                last_error = Some(error);
+            }
         }
     }
 
@@ -878,6 +996,66 @@ fn send_media_request(
         || "media request has no permitted network route".to_owned(),
         |error| format!("media request failed: {error}"),
     ))
+}
+
+fn route_label(route: NetworkRoute) -> &'static str {
+    match route {
+        NetworkRoute::Direct => "direct",
+        NetworkRoute::SystemProxy => "system_proxy",
+    }
+}
+
+fn optional_route_label(route: Option<NetworkRoute>) -> &'static str {
+    route.map_or("global", route_label)
+}
+
+fn reqwest_error_code(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_redirect() {
+        "redirect"
+    } else {
+        "network"
+    }
+}
+
+fn stream_error_code(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("timed out") || error.contains("timeout") {
+        "timeout"
+    } else if error.contains("destination denied") || error.contains("private") {
+        "policy_denied"
+    } else if error.contains("redirect") {
+        "redirect"
+    } else if error.contains("http 401") || error.contains("401 unauthorized") {
+        "http_401"
+    } else if error.contains("http 403") || error.contains("403 forbidden") {
+        "http_403"
+    } else if error.contains("http 404") || error.contains("404 not found") {
+        "http_404"
+    } else if error.contains("http 429") || error.contains("429 too many") {
+        "http_429"
+    } else if error.contains("http 5") {
+        "http_5xx"
+    } else if error.contains("range") || error.contains("content-length") {
+        "range_invalid"
+    } else if error.contains("ended early") || error.contains("unexpected eof") {
+        "early_eof"
+    } else if error.contains("body") || error.contains("connection") {
+        "transport"
+    } else if error.contains("header") {
+        "invalid_header"
+    } else {
+        "failed"
+    }
 }
 
 fn build_media_client(
@@ -1032,6 +1210,7 @@ mod tests {
             final_url: url,
             metrics: Arc::new(StreamMetrics::default()),
             cache_plan: None,
+            diagnostics: StreamingDiagnosticQueue::default(),
             reached_end: false,
         }
     }
@@ -1154,5 +1333,34 @@ mod tests {
         source.apply_effective_request(&effective);
 
         assert_eq!(source.request_for_restart().network_route, None);
+    }
+
+    #[test]
+    fn diagnostics_are_bounded_and_contain_only_structured_codes() {
+        let diagnostics = StreamingDiagnosticQueue::default();
+        for index in 0..(DIAGNOSTIC_CAPACITY + 3) {
+            diagnostics.push(
+                "stream_request_failed",
+                "stream",
+                format!("route=direct stage=request code=test_{index}"),
+            );
+        }
+        let drained = diagnostics.drain();
+        assert_eq!(drained.len(), DIAGNOSTIC_CAPACITY);
+        assert_eq!(drained[0].summary, "route=direct stage=request code=test_3");
+        assert!(drained.iter().all(|entry| !entry.summary.contains("http")));
+    }
+
+    #[test]
+    fn stream_error_classification_never_returns_the_original_message() {
+        assert_eq!(
+            stream_error_code("request to https://user:secret@example.test failed: timed out"),
+            "timeout"
+        );
+        assert_eq!(
+            stream_error_code("media request returned HTTP 429"),
+            "http_429"
+        );
+        assert_eq!(stream_error_code("opaque secret value"), "failed");
     }
 }

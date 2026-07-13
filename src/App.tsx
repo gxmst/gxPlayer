@@ -22,6 +22,7 @@ import {
   pickFailureSkipIndex,
 } from "./lib/playlistLogic";
 import { splitArtistNames } from "./lib/artistNames";
+import { diagnosticEntryDisplay } from "./lib/diagnosticDisplay";
 import { groupConsecutiveHistory } from "./lib/historyGrouping";
 import {
   filterUnavailableLocalEntries,
@@ -54,6 +55,9 @@ import {
   type CacheEntryView,
   type CacheStatus,
   type CatalogTrack,
+  type DiagnosticLogEntry,
+  type DiagnosticLogExportResult,
+  type DiagnosticLogStatus,
   type EngineSnapshot,
   type HistoryEntry,
   type LibraryImportResult,
@@ -546,6 +550,10 @@ function App() {
   const [sourceConfigRevealed, setSourceConfigRevealed] = useState(false);
   const [sourceConfigBusy, setSourceConfigBusy] = useState(false);
   const [backupText, setBackupText] = useState("");
+  const [diagnosticLogStatus, setDiagnosticLogStatus] = useState<DiagnosticLogStatus | null>(null);
+  const [diagnosticLogEntries, setDiagnosticLogEntries] = useState<DiagnosticLogEntry[]>([]);
+  const [diagnosticLogBusy, setDiagnosticLogBusy] = useState<"refresh" | "toggle" | "export" | "clear" | null>(null);
+  const diagnosticLogGenerationRef = useRef(0);
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
   const [cacheLimitGiB, setCacheLimitGiB] = useState("5");
   const cacheLimitDirtyRef = useRef(false);
@@ -687,6 +695,26 @@ function App() {
     setHistoryEntries(entries);
   };
 
+  const beginDiagnosticLogOperation = () => {
+    diagnosticLogGenerationRef.current += 1;
+    return diagnosticLogGenerationRef.current;
+  };
+
+  const isCurrentDiagnosticLogOperation = (generation: number) => (
+    diagnosticLogGenerationRef.current === generation
+  );
+
+  const refreshDiagnosticLog = async (generation: number) => {
+    const [status, entries] = await Promise.all([
+      invoke<DiagnosticLogStatus>("diagnostic_log_status"),
+      invoke<DiagnosticLogEntry[]>("diagnostic_log_recent", { limit: 100 }),
+    ]);
+    if (!isCurrentDiagnosticLogOperation(generation)) return false;
+    setDiagnosticLogStatus(status);
+    setDiagnosticLogEntries([...entries].reverse());
+    return true;
+  };
+
   const recordHistory = async (payload: {
     kind: string;
     title: string;
@@ -793,6 +821,22 @@ function App() {
   useEffect(() => {
     if (view === "history") void refreshHistory().catch(() => undefined);
     if (view === "sources") void refreshSources().catch(() => undefined);
+    if (view === "settings") {
+      const generation = beginDiagnosticLogOperation();
+      setDiagnosticLogBusy("refresh");
+      void refreshDiagnosticLog(generation)
+        .catch((error) => {
+          if (isCurrentDiagnosticLogOperation(generation)) setMessage(String(error), true);
+        })
+        .finally(() => {
+          if (isCurrentDiagnosticLogOperation(generation)) {
+            setDiagnosticLogBusy((busy) => busy === "refresh" ? null : busy);
+          }
+        });
+    } else {
+      diagnosticLogGenerationRef.current += 1;
+      setDiagnosticLogBusy(null);
+    }
     if (view === "library") {
       void invoke<LibraryTrack[]>("library_scan_missing")
         .then(setLibrary)
@@ -1828,6 +1872,78 @@ function App() {
     setMessage(`备份已写入 ${path}`);
   };
 
+  const refreshDiagnosticLogNow = async () => {
+    if (diagnosticLogBusy) return;
+    const generation = beginDiagnosticLogOperation();
+    setDiagnosticLogBusy("refresh");
+    try {
+      const applied = await refreshDiagnosticLog(generation);
+      if (applied) setMessage("诊断日志已刷新。");
+    } catch (error) {
+      if (isCurrentDiagnosticLogOperation(generation)) setMessage(String(error), true);
+    } finally {
+      if (isCurrentDiagnosticLogOperation(generation)) setDiagnosticLogBusy(null);
+    }
+  };
+
+  const setDiagnosticLogEnabled = async (enabled: boolean) => {
+    if (diagnosticLogBusy) return;
+    const generation = beginDiagnosticLogOperation();
+    setDiagnosticLogBusy("toggle");
+    try {
+      const status = await invoke<DiagnosticLogStatus>("diagnostic_log_set_enabled", { enabled });
+      if (!isCurrentDiagnosticLogOperation(generation)) return;
+      setDiagnosticLogStatus(status);
+      await refreshDiagnosticLog(generation);
+      if (isCurrentDiagnosticLogOperation(generation)) {
+        setMessage(status.enabled ? "诊断日志已开启。" : "诊断日志已关闭；已有记录仍保留在本地。");
+      }
+    } catch (error) {
+      if (isCurrentDiagnosticLogOperation(generation)) setMessage(String(error), true);
+    } finally {
+      if (isCurrentDiagnosticLogOperation(generation)) setDiagnosticLogBusy(null);
+    }
+  };
+
+  const exportDiagnosticLog = async () => {
+    if (diagnosticLogBusy) return;
+    const generation = beginDiagnosticLogOperation();
+    setDiagnosticLogBusy("export");
+    try {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const path = await save({
+        defaultPath: `gxplayer-diagnostic-${timestamp}.jsonl`,
+        filters: [{ name: "JSON Lines", extensions: ["jsonl"] }],
+      });
+      if (!path || Array.isArray(path)) return;
+      const result = await invoke<DiagnosticLogExportResult>("diagnostic_log_export", { path });
+      if (isCurrentDiagnosticLogOperation(generation)) {
+        setMessage(`已导出 ${result.entryCount} 条诊断日志到 ${result.path}`);
+      }
+    } catch (error) {
+      if (isCurrentDiagnosticLogOperation(generation)) setMessage(String(error), true);
+    } finally {
+      if (isCurrentDiagnosticLogOperation(generation)) setDiagnosticLogBusy(null);
+    }
+  };
+
+  const clearDiagnosticLog = async () => {
+    if (diagnosticLogBusy || !window.confirm("确定清空全部诊断日志吗？此操作无法撤销。")) return;
+    const generation = beginDiagnosticLogOperation();
+    setDiagnosticLogBusy("clear");
+    try {
+      await invoke("diagnostic_log_clear");
+      if (!isCurrentDiagnosticLogOperation(generation)) return;
+      setDiagnosticLogEntries([]);
+      await refreshDiagnosticLog(generation);
+      if (isCurrentDiagnosticLogOperation(generation)) setMessage("诊断日志已清空。");
+    } catch (error) {
+      if (isCurrentDiagnosticLogOperation(generation)) setMessage(String(error), true);
+    } finally {
+      if (isCurrentDiagnosticLogOperation(generation)) setDiagnosticLogBusy(null);
+    }
+  };
+
   const importBackupFile = async () => {
     const path = await open({
       multiple: false,
@@ -2801,6 +2917,49 @@ function App() {
             </div>
           </section>
           <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。批量管理请到「曲库」页的在线缓存分区。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => { cacheLimitDirtyRef.current = true; setCacheLimitGiB(event.target.value); }} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={async () => { if (!window.confirm("确定清理所有未收藏缓存吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: false }); setCacheStatus(status); }}>清未收藏</button><button className="danger" onClick={async () => { if (!window.confirm("确定清空全部缓存（包括收藏钉住项）吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: true }); setCacheStatus(status); }}>清空全部</button></div></section>
+          <section className="settings-card diagnostic-log-settings">
+            <div className="diagnostic-log-heading">
+              <div>
+                <h3>诊断日志</h3>
+                <p>默认开启，只记录异常和关键路由事件，不记录正常流水。敏感 URL、音源 key 等会脱敏，本地日志采用双文件约 2 MiB 轮转。</p>
+              </div>
+              <div className="diagnostic-log-actions">
+                <button type="button" disabled={Boolean(diagnosticLogBusy)} onClick={() => void refreshDiagnosticLogNow()}>{diagnosticLogBusy === "refresh" ? "正在刷新…" : "刷新"}</button>
+                <button type="button" disabled={Boolean(diagnosticLogBusy) || diagnosticLogEntries.length === 0} onClick={() => void exportDiagnosticLog()}>{diagnosticLogBusy === "export" ? "正在导出…" : "导出 JSONL"}</button>
+                <button type="button" className="danger" disabled={Boolean(diagnosticLogBusy) || diagnosticLogEntries.length === 0} onClick={() => void clearDiagnosticLog()}>{diagnosticLogBusy === "clear" ? "正在清空…" : "清空"}</button>
+              </div>
+            </div>
+            <label className="settings-toggle diagnostic-log-toggle">
+              <span>
+                <strong>{diagnosticLogStatus ? (diagnosticLogStatus.enabled ? "日志已开启" : "日志已关闭") : "正在读取日志状态"}</strong>
+                <small>关闭后停止写入新记录；已有日志仍可查看、导出或清空。</small>
+              </span>
+              <input type="checkbox" checked={diagnosticLogStatus?.enabled ?? false} disabled={!diagnosticLogStatus || Boolean(diagnosticLogBusy)} onChange={(event) => void setDiagnosticLogEnabled(event.target.checked)} />
+            </label>
+            <div className="diagnostic-log-meta">
+              <span className={diagnosticLogStatus?.enabled ? "enabled" : "disabled"}>{diagnosticLogStatus?.enabled ? "记录中" : "未记录"}</span>
+              <span>最近显示 {diagnosticLogEntries.length} / 100 条</span>
+              <span>最新记录在前 · 本地双文件约 2 MiB 轮转</span>
+            </div>
+            {diagnosticLogEntries.length ? (
+              <ol className="diagnostic-log-list">
+                {diagnosticLogEntries.map((entry, index) => {
+                  const timestamp = new Date(entry.timestampMs);
+                  const display = diagnosticEntryDisplay(entry);
+                  return (
+                    <li key={`${entry.timestampMs}:${entry.category}:${index}`}>
+                      <time dateTime={timestamp.toISOString()}>{timestamp.toLocaleString()}</time>
+                      <span className="diagnostic-log-category" title={display.category}>{display.category}</span>
+                      <span className="diagnostic-log-source" title={display.source}>{display.source}</span>
+                      <p title={display.summary}>{display.summary}</p>
+                    </li>
+                  );
+                })}
+              </ol>
+            ) : (
+              <div className="diagnostic-log-empty">{diagnosticLogBusy === "refresh" ? "正在读取最近日志…" : diagnosticLogStatus?.enabled ? "目前没有异常或关键事件。" : "日志已关闭，暂无可显示记录。"}</div>
+            )}
+          </section>
         </div>
         <section className="backup-card">
           <div className="section-heading">

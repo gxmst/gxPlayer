@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -12,7 +13,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use gx_cache::CacheWritePlan;
 use gx_contracts::{MediaType, PlaybackStatus, ResolvedMediaRequest};
 use gx_dsp::{CrossfeedSettings, DspChain, DspSettings, HrtfSettings, LimiterSettings};
-use gx_streaming::HttpMediaSource;
+use gx_streaming::{HttpMediaSource, StreamingDiagnosticQueue};
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use serde::{Deserialize, Serialize};
 use symphonia::core::audio::SampleBuffer;
@@ -30,6 +31,42 @@ use super::{
 const COMMAND_CAPACITY: usize = 64;
 const RING_SECONDS: f64 = 0.75;
 const PREBUFFER_SECONDS: f64 = 0.5;
+const DIAGNOSTIC_CAPACITY: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineDiagnostic {
+    pub category: &'static str,
+    pub source: &'static str,
+    pub summary: String,
+    pub generation: Option<u64>,
+}
+
+#[derive(Clone)]
+struct EngineDiagnosticQueue {
+    inner: Arc<Mutex<VecDeque<EngineDiagnostic>>>,
+}
+
+impl Default for EngineDiagnosticQueue {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::with_capacity(DIAGNOSTIC_CAPACITY))),
+        }
+    }
+}
+
+impl EngineDiagnosticQueue {
+    fn push(&self, diagnostic: EngineDiagnostic) {
+        let mut diagnostics = self.inner.lock().unwrap();
+        if diagnostics.len() == DIAGNOSTIC_CAPACITY {
+            diagnostics.pop_front();
+        }
+        diagnostics.push_back(diagnostic);
+    }
+
+    fn drain(&self) -> Vec<EngineDiagnostic> {
+        self.inner.lock().unwrap().drain(..).collect()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -98,6 +135,37 @@ enum PlaybackSource {
         request: ResolvedMediaRequest,
         cache_plan: Option<CacheWritePlan>,
     },
+}
+
+fn playback_source_label(source: &PlaybackSource, online: bool) -> &'static str {
+    match source {
+        PlaybackSource::Online { .. } => "online",
+        PlaybackSource::Local(_) if online => "cache",
+        PlaybackSource::Local(_) => "local",
+    }
+}
+
+fn playback_error_code(error: &anyhow::Error) -> &'static str {
+    let error = error.to_string().to_ascii_lowercase();
+    if error.contains("timed out") || error.contains("timeout") {
+        "timeout"
+    } else if error.contains("output device") || error.contains("default audio output") {
+        "output_device"
+    } else if error.contains("http") || error.contains("media request") {
+        "network"
+    } else if error.contains("decode") || error.contains("codec") {
+        "decode"
+    } else if error.contains("probe") || error.contains("format") {
+        "media_format"
+    } else if error.contains("sample rate") || error.contains("channel") {
+        "media_spec"
+    } else if error.contains("dsp") || error.contains("resampl") {
+        "audio_processing"
+    } else if error.contains("permission") || error.contains("not found") {
+        "io"
+    } else {
+        "failed"
+    }
 }
 
 #[derive(Clone)]
@@ -181,6 +249,8 @@ enum EngineCommand {
 pub struct LocalAudioEngine {
     commands: Sender<EngineCommand>,
     snapshot: Arc<Mutex<EngineSnapshot>>,
+    diagnostics: EngineDiagnosticQueue,
+    streaming_diagnostics: StreamingDiagnosticQueue,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -189,13 +259,26 @@ impl LocalAudioEngine {
         let (commands, receiver) = bounded(COMMAND_CAPACITY);
         let snapshot = Arc::new(Mutex::new(EngineSnapshot::default()));
         let snapshot_for_worker = Arc::clone(&snapshot);
+        let diagnostics = EngineDiagnosticQueue::default();
+        let diagnostics_for_worker = diagnostics.clone();
+        let streaming_diagnostics = StreamingDiagnosticQueue::default();
+        let streaming_diagnostics_for_worker = streaming_diagnostics.clone();
         let worker = thread::Builder::new()
             .name("gx-local-audio-engine".into())
-            .spawn(move || run_worker(receiver, snapshot_for_worker))
+            .spawn(move || {
+                run_worker(
+                    receiver,
+                    snapshot_for_worker,
+                    diagnostics_for_worker,
+                    streaming_diagnostics_for_worker,
+                )
+            })
             .context("failed to spawn local audio engine worker")?;
         Ok(Self {
             commands,
             snapshot,
+            diagnostics,
+            streaming_diagnostics,
             worker: Mutex::new(Some(worker)),
         })
     }
@@ -338,6 +421,22 @@ impl LocalAudioEngine {
 
     pub fn snapshot(&self) -> EngineSnapshot {
         self.snapshot.lock().unwrap().clone()
+    }
+
+    pub fn drain_diagnostics(&self) -> Vec<EngineDiagnostic> {
+        let mut diagnostics = self.diagnostics.drain();
+        diagnostics.extend(
+            self.streaming_diagnostics
+                .drain()
+                .into_iter()
+                .map(|diagnostic| EngineDiagnostic {
+                    category: diagnostic.category,
+                    source: diagnostic.source,
+                    summary: diagnostic.summary,
+                    generation: None,
+                }),
+        );
+        diagnostics
     }
 
     pub fn output_devices(&self) -> Result<Vec<String>> {
@@ -593,7 +692,12 @@ fn request_track_change(
     *session = None;
 }
 
-fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<EngineSnapshot>>) {
+fn run_worker(
+    commands: Receiver<EngineCommand>,
+    shared_snapshot: Arc<Mutex<EngineSnapshot>>,
+    diagnostics: EngineDiagnosticQueue,
+    streaming_diagnostics: StreamingDiagnosticQueue,
+) {
     let mut model = WorkerModel::default();
     let mut session: Option<PlaybackSession> = None;
 
@@ -631,6 +735,7 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                     model.volume,
                     model.dsp_settings.clone(),
                     model.output_device.as_deref(),
+                    streaming_diagnostics.clone(),
                 ) {
                     Ok(mut next_session) => {
                         if let Some(index) = model.index
@@ -649,6 +754,16 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                         model.error = None;
                     }
                     Err(error) => {
+                        diagnostics.push(EngineDiagnostic {
+                            category: "playback_start_failed",
+                            source: playback_source_label(&item.source, item.public.online),
+                            summary: format!(
+                                "stage=session_new code={} generation={}",
+                                playback_error_code(&error),
+                                model.generation
+                            ),
+                            generation: Some(model.generation),
+                        });
                         if let PlaybackSource::Online {
                             cache_plan: Some(plan),
                             ..
@@ -691,6 +806,22 @@ fn run_worker(commands: Receiver<EngineCommand>, shared_snapshot: Arc<Mutex<Engi
                     session = None;
                 }
                 Err(error) => {
+                    let source = model
+                        .index
+                        .and_then(|index| model.queue.get(index))
+                        .map_or("unknown", |item| {
+                            playback_source_label(&item.source, item.public.online)
+                        });
+                    diagnostics.push(EngineDiagnostic {
+                        category: "playback_runtime_failed",
+                        source,
+                        summary: format!(
+                            "stage=pump code={} generation={}",
+                            playback_error_code(&error),
+                            model.generation
+                        ),
+                        generation: Some(model.generation),
+                    });
                     active.invalidate_cache();
                     model.status = PlaybackStatus::Failed;
                     model.error = Some(error.to_string());
@@ -1079,6 +1210,7 @@ impl PlaybackSession {
         volume: f32,
         dsp_settings: DspSettings,
         output_device_name: Option<&str>,
+        streaming_diagnostics: StreamingDiagnosticQueue,
     ) -> Result<Self> {
         let cache_plan = match source {
             PlaybackSource::Online { cache_plan, .. } => cache_plan.clone(),
@@ -1096,7 +1228,11 @@ impl PlaybackSession {
             } => {
                 let extension = media_extension(&request.media_type);
                 let description = request.redacted_for_log();
-                let http = HttpMediaSource::new_with_cache(request.clone(), cache_plan.clone())?;
+                let http = HttpMediaSource::new_with_cache_and_diagnostics(
+                    request.clone(),
+                    cache_plan.clone(),
+                    streaming_diagnostics,
+                )?;
                 let mut media = open_media_source(Box::new(http), extension, &description)?;
                 let discard = seek_media_coarse(&mut media, start_seconds)?;
                 (media, discard)
@@ -1848,5 +1984,32 @@ mod tests {
         }
         assert_eq!(counters.played_samples.load(Ordering::Relaxed), 256);
         assert_eq!(counters.underruns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn engine_diagnostics_are_bounded_and_never_include_error_details() {
+        let diagnostics = EngineDiagnosticQueue::default();
+        for generation in 0..(DIAGNOSTIC_CAPACITY + 5) {
+            diagnostics.push(EngineDiagnostic {
+                category: "playback_start_failed",
+                source: "online",
+                summary: format!("stage=session_new code=network generation={generation}"),
+                generation: Some(generation as u64),
+            });
+        }
+        let drained = diagnostics.drain();
+        assert_eq!(drained.len(), DIAGNOSTIC_CAPACITY);
+        assert_eq!(drained[0].generation, Some(5));
+        assert!(drained.iter().all(|entry| !entry.summary.contains("http")));
+    }
+
+    #[test]
+    fn playback_error_codes_are_finite_and_path_free() {
+        let error = anyhow!("failed to open C:\\Users\\private\\song.flac: not found");
+        assert_eq!(playback_error_code(&error), "io");
+        assert_eq!(
+            playback_source_label(&PlaybackSource::Local(PathBuf::from("cache.bin")), true),
+            "cache"
+        );
     }
 }

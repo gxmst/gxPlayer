@@ -16,6 +16,7 @@ use gx_source::{SourceStore, safe_http};
 
 mod artwork;
 mod cache_commands;
+mod diagnostic_log;
 mod media_session;
 mod metadata_commands;
 mod network_settings;
@@ -32,6 +33,10 @@ use cache_commands::{
     cache_clear, cache_list_entries, cache_online_favorites, cache_remove_by_quality,
     cache_remove_entries, cache_remove_entry, cache_reset_directory, cache_set_directory,
     cache_set_limit, cache_set_online_favorite, cache_status, player_play_cache_entry,
+};
+use diagnostic_log::{
+    DiagnosticLogState, diagnostic_log_clear, diagnostic_log_export, diagnostic_log_recent,
+    diagnostic_log_set_enabled, diagnostic_log_status,
 };
 use metadata_commands::{
     maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
@@ -938,14 +943,24 @@ pub fn run() {
                 app_data.join("artwork-cache"),
             ));
             app.manage(network_settings::NetworkSettingsState::open(&app_data));
+            app.manage(DiagnosticLogState::open(&app_data));
             app.manage(window_state::WindowModeState::new(
                 window_state::load(&app_data).mini_mode,
             ));
             app.manage(LibraryStore::open(app_data.join("library.sqlite3"))?);
-            app.manage(gx_cache::CacheStore::open(
+            let cache_store = gx_cache::CacheStore::open(
                 &app_data,
                 std::env::current_exe().ok().as_deref(),
-            )?);
+            )
+            .inspect_err(|error| {
+                diagnostic_log::record_diagnostic(
+                    app.handle(),
+                    "cache_open_failed",
+                    Some("cache"),
+                    error.to_string(),
+                );
+            })?;
+            app.manage(cache_store);
             let source_root = app_data.join("sources");
             let drop_in_root = source_root.join("drop-in");
             let mut source_store = SourceStore::open(&source_root)?;
@@ -1002,6 +1017,11 @@ pub fn run() {
             ui_ready,
             network_proxy_status,
             network_set_proxy_mode,
+            diagnostic_log_status,
+            diagnostic_log_set_enabled,
+            diagnostic_log_recent,
+            diagnostic_log_clear,
+            diagnostic_log_export,
             artwork_get,
             player_load_local,
             player_enqueue_local,

@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
+const DIAGNOSTIC_DRAIN_INTERVAL: Duration = Duration::from_millis(500);
 const WINDOWS_MESSAGE_PUMP_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_SEEK_SECONDS: f64 = 10.0;
 
@@ -182,6 +183,7 @@ fn is_remote_url(url: &str) -> bool {
 }
 
 pub fn spawn_media_session(app: AppHandle) {
+    spawn_diagnostic_drain(app.clone());
     thread::Builder::new()
         .name("gx-media-session".into())
         .spawn(move || {
@@ -195,6 +197,79 @@ pub fn spawn_media_session(app: AppHandle) {
             eprintln!("GX_SMTC unavailable after retries (Windows media controls disabled)");
         })
         .ok();
+}
+
+fn spawn_diagnostic_drain(app: AppHandle) {
+    thread::Builder::new()
+        .name("gx-diagnostic-drain".into())
+        .spawn(move || {
+            let mut logged_failed_generation = None;
+            loop {
+                if let Some(cache) = app.try_state::<gx_cache::CacheStore>() {
+                    for diagnostic in cache.drain_diagnostics() {
+                        crate::diagnostic_log::record_diagnostic(
+                            &app,
+                            diagnostic.category,
+                            Some(diagnostic.source),
+                            diagnostic.summary,
+                        );
+                    }
+                }
+                if let Some(engine) = app.try_state::<LocalAudioEngine>() {
+                    for diagnostic in engine.drain_diagnostics() {
+                        if diagnostic.generation.is_some()
+                            && matches!(
+                                diagnostic.category,
+                                "playback_start_failed" | "playback_runtime_failed"
+                            )
+                        {
+                            logged_failed_generation = diagnostic.generation;
+                        }
+                        crate::diagnostic_log::record_diagnostic(
+                            &app,
+                            diagnostic.category,
+                            Some(diagnostic.source),
+                            diagnostic.summary,
+                        );
+                    }
+                    let snapshot = engine.snapshot();
+                    if snapshot.status == PlaybackStatus::Failed
+                        && mark_failed_generation_once(
+                            &mut logged_failed_generation,
+                            snapshot.generation,
+                        )
+                    {
+                        let source = snapshot
+                            .queue_index
+                            .and_then(|index| snapshot.queue.get(index))
+                            .map_or(
+                                "unknown",
+                                |item| if item.online { "online" } else { "local" },
+                            );
+                        crate::diagnostic_log::record_diagnostic(
+                            &app,
+                            "playback_runtime_failed",
+                            Some(source),
+                            format!(
+                                "stage=snapshot code=failed generation={}",
+                                snapshot.generation
+                            ),
+                        );
+                    }
+                }
+                thread::sleep(DIAGNOSTIC_DRAIN_INTERVAL);
+            }
+        })
+        .ok();
+}
+
+fn mark_failed_generation_once(last: &mut Option<u64>, generation: u64) -> bool {
+    if *last == Some(generation) {
+        false
+    } else {
+        *last = Some(generation);
+        true
+    }
 }
 
 pub(crate) fn main_hwnd(app: &AppHandle) -> Result<*mut std::ffi::c_void, String> {
@@ -684,6 +759,14 @@ mod tests {
         assert_eq!(window_title("Song", "Artist"), "Song — Artist · GXPlayer");
         assert_eq!(window_title("Song", ""), "Song · GXPlayer");
         assert_eq!(window_title("GXPlayer", "就绪"), "GXPlayer");
+    }
+
+    #[test]
+    fn failed_snapshots_are_logged_once_per_generation() {
+        let mut last = None;
+        assert!(mark_failed_generation_once(&mut last, 7));
+        assert!(!mark_failed_generation_once(&mut last, 7));
+        assert!(mark_failed_generation_once(&mut last, 8));
     }
 
     #[cfg(windows)]

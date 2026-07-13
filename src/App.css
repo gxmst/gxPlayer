@@ -2221,6 +2221,147 @@ select {
   margin-top: 12px;
 }
 
+.diagnostic-log-settings {
+  grid-column: 1 / -1;
+}
+
+.diagnostic-log-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.diagnostic-log-heading h3,
+.diagnostic-log-heading p {
+  margin: 0;
+}
+
+.diagnostic-log-heading p {
+  max-width: 760px;
+  margin-top: 6px;
+  color: var(--text-mute);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.diagnostic-log-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.diagnostic-log-actions button:disabled {
+  color: var(--text-disabled);
+  border-color: var(--glass-border);
+  background: var(--control-bg);
+  box-shadow: none;
+  opacity: 1;
+}
+
+.diagnostic-log-toggle {
+  margin-top: 16px;
+}
+
+.diagnostic-log-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px 14px;
+  margin: 12px 0;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.diagnostic-log-meta > span:first-child {
+  padding: 4px 8px;
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  font: 650 10px/1 "Geist Mono Variable", monospace;
+}
+
+.diagnostic-log-meta > span:first-child.enabled {
+  color: var(--success-fg);
+  border-color: color-mix(in srgb, var(--success-solid) 38%, var(--glass-border));
+  background: color-mix(in srgb, var(--success-solid) 9%, var(--control-bg));
+}
+
+.diagnostic-log-meta > span:first-child.disabled {
+  color: var(--text-dim);
+  background: var(--control-bg);
+}
+
+.diagnostic-log-list {
+  max-height: 360px;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--panel-bg) 72%, var(--base));
+  list-style: none;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+.diagnostic-log-list li {
+  display: grid;
+  grid-template-columns: 150px minmax(90px, 0.55fr) minmax(100px, 0.7fr) minmax(180px, 2fr);
+  align-items: start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--soft-border);
+}
+
+.diagnostic-log-list li:last-child {
+  border-bottom: 0;
+}
+
+.diagnostic-log-list time,
+.diagnostic-log-category,
+.diagnostic-log-source {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diagnostic-log-list time {
+  color: var(--text-dim);
+  font: 10px/1.5 "Geist Mono Variable", monospace;
+}
+
+.diagnostic-log-category {
+  color: var(--warning-fg);
+  font: 650 10px/1.5 "Geist Mono Variable", monospace;
+}
+
+.diagnostic-log-source {
+  color: var(--text-mute);
+  font-size: 11px;
+}
+
+.diagnostic-log-list p {
+  margin: 0;
+  color: var(--text-hi);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.diagnostic-log-empty {
+  padding: 30px 18px;
+  border: 1px dashed var(--interactive-border);
+  border-radius: var(--radius-md);
+  color: var(--text-mute);
+  background: var(--control-bg);
+  text-align: center;
+  font-size: 12px;
+}
+
 .backup-card {
   margin-top: 18px;
   padding: 22px;
@@ -3804,6 +3945,23 @@ select {
     grid-column: 2;
     justify-content: flex-start;
     max-width: none;
+  }
+
+  .diagnostic-log-heading {
+    flex-direction: column;
+  }
+
+  .diagnostic-log-actions {
+    justify-content: flex-start;
+  }
+
+  .diagnostic-log-list li {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .diagnostic-log-source,
+  .diagnostic-log-list p {
+    grid-column: 1 / -1;
   }
 }
 

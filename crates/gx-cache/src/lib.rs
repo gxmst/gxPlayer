@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,15 @@ const DEFAULT_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const CACHE_DIRECTORY_NAME: &str = "GXPlayerCache";
 const CACHE_FILE_PREFIX: &str = "gx-cache-";
 const MANIFEST_FILE_NAME: &str = "gx-cache-manifest.json";
+const DIAGNOSTIC_CAPACITY: usize = 128;
 static JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheDiagnostic {
+    pub category: &'static str,
+    pub source: &'static str,
+    pub summary: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -122,6 +130,7 @@ struct CacheState {
 #[derive(Clone)]
 pub struct CacheStore {
     inner: Arc<Mutex<CacheState>>,
+    diagnostics: Arc<Mutex<VecDeque<CacheDiagnostic>>>,
 }
 
 impl CacheStore {
@@ -148,7 +157,12 @@ impl CacheStore {
             });
         ensure_writable_directory(&root)?;
         cleanup_part_files(&root);
-        let manifest = load_manifest(&root);
+        let (manifest, initial_diagnostics) = load_manifest(&root);
+        let diagnostics = initial_diagnostics
+            .into_iter()
+            .rev()
+            .take(DIAGNOSTIC_CAPACITY)
+            .collect::<Vec<_>>();
         let store = Self {
             inner: Arc::new(Mutex::new(CacheState {
                 settings_path,
@@ -160,6 +174,7 @@ impl CacheStore {
                 next_writer_token: 0,
                 active_writers: BTreeMap::new(),
             })),
+            diagnostics: Arc::new(Mutex::new(diagnostics.into_iter().rev().collect())),
         };
         store.persist_all()?;
         Ok(store)
@@ -192,15 +207,48 @@ impl CacheStore {
         let id = cache_id(key);
         let mut state = self.inner.lock().unwrap();
         let entry = state.manifest.entries.get_mut(&id)?;
-        if !entry.audio_path.is_file() || !entry.sidecar_path.is_file() {
+        if let Some(code) = entry_file_error_code(entry) {
+            self.push_diagnostic(
+                "cache_read_failed",
+                "cache",
+                format!("stage=lookup code={code}"),
+            );
             state.manifest.entries.remove(&id);
-            let _ = persist_manifest(&state);
+            if persist_manifest(&state).is_err() {
+                self.push_diagnostic(
+                    "cache_write_failed",
+                    "cache",
+                    "stage=lookup_cleanup code=manifest_persist_failed".into(),
+                );
+            }
             return None;
         }
         entry.last_accessed_at_ms = now_ms();
         let result = entry.clone();
-        let _ = persist_manifest(&state);
+        if persist_manifest(&state).is_err() {
+            self.push_diagnostic(
+                "cache_write_failed",
+                "cache",
+                "stage=touch code=manifest_persist_failed".into(),
+            );
+        }
         Some(result)
+    }
+
+    pub fn drain_diagnostics(&self) -> Vec<CacheDiagnostic> {
+        self.diagnostics.lock().unwrap().drain(..).collect()
+    }
+
+    fn push_diagnostic(&self, category: &'static str, source: &'static str, summary: String) {
+        let mut diagnostics = self.diagnostics.lock().unwrap();
+        if diagnostics.len() == DIAGNOSTIC_CAPACITY {
+            diagnostics.pop_front();
+        }
+        diagnostics.push_back(CacheDiagnostic {
+            category,
+            source,
+            summary,
+        });
     }
 
     pub fn prepare(&self, key: CacheKey, media_type: MediaType) -> CacheWritePlan {
@@ -266,7 +314,28 @@ impl CacheStore {
     /// List all completed cache entries for the offline/cache UI.
     /// Absolute paths are never included — only `file_name` basenames.
     pub fn list_entries(&self) -> Vec<CacheEntryView> {
-        let state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock().unwrap();
+        let invalid = state
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| entry_file_error_code(entry).map(|code| (id.clone(), code)))
+            .collect::<Vec<_>>();
+        for (id, code) in &invalid {
+            state.manifest.entries.remove(id);
+            self.push_diagnostic(
+                "cache_read_failed",
+                "cache",
+                format!("stage=list code={code}"),
+            );
+        }
+        if !invalid.is_empty() && persist_manifest(&state).is_err() {
+            self.push_diagnostic(
+                "cache_write_failed",
+                "cache",
+                "stage=list_cleanup code=manifest_persist_failed".into(),
+            );
+        }
         let mut views = state
             .manifest
             .entries
@@ -370,7 +439,10 @@ impl CacheStore {
         let directory = dedicated_cache_root(&selected_directory);
         ensure_writable_directory(&directory)?;
         cleanup_part_files(&directory);
-        let manifest = load_manifest(&directory);
+        let (manifest, diagnostics) = load_manifest(&directory);
+        for diagnostic in diagnostics {
+            self.push_diagnostic(diagnostic.category, diagnostic.source, diagnostic.summary);
+        }
         {
             let mut state = self.inner.lock().unwrap();
             state.epoch = state.epoch.wrapping_add(1).max(1);
@@ -391,7 +463,10 @@ impl CacheStore {
             state.default_root.clone()
         };
         ensure_writable_directory(&default_root)?;
-        let manifest = load_manifest(&default_root);
+        let (manifest, diagnostics) = load_manifest(&default_root);
+        for diagnostic in diagnostics {
+            self.push_diagnostic(diagnostic.category, diagnostic.source, diagnostic.summary);
+        }
         {
             let mut state = self.inner.lock().unwrap();
             state.epoch = state.epoch.wrapping_add(1).max(1);
@@ -453,7 +528,16 @@ impl CacheStore {
                 && entry.key.provider_track_id == provider_track_id
             {
                 entry.pinned = favorite;
-                let _ = write_sidecar(entry);
+                if let Err(error) = write_sidecar(entry) {
+                    self.push_diagnostic(
+                        "cache_write_failed",
+                        "cache",
+                        format!(
+                            "stage=favorite_sidecar code={}",
+                            anyhow_io_error_code(&error)
+                        ),
+                    );
+                }
             }
         }
         persist_settings(&state)?;
@@ -515,7 +599,17 @@ impl CacheStore {
         {
             bail!("staged cache entry is unavailable or outside the active cache root");
         }
-        let staged_len = fs::metadata(staged_path)?.len();
+        let staged_len = match fs::metadata(staged_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                self.push_diagnostic(
+                    "cache_commit_failed",
+                    "cache",
+                    format!("stage=commit_metadata code={}", io_error_code(&error)),
+                );
+                return Err(error.into());
+            }
+        };
         if staged_len != entry.byte_len {
             bail!("staged cache entry length changed before commit");
         }
@@ -529,18 +623,30 @@ impl CacheStore {
         if entry.audio_path.exists() {
             bail!("cache destination unexpectedly already exists");
         }
-        fs::rename(staged_path, &entry.audio_path).with_context(|| {
-            format!(
-                "failed to promote staged cache file {}",
-                staged_path.display()
-            )
-        })?;
+        if let Err(error) = fs::rename(staged_path, &entry.audio_path) {
+            self.push_diagnostic(
+                "cache_commit_failed",
+                "cache",
+                format!("stage=commit_rename code={}", io_error_code(&error)),
+            );
+            return Err(error).context("failed to promote staged cache file");
+        }
         if let Err(error) = write_sidecar(&entry) {
+            self.push_diagnostic(
+                "cache_commit_failed",
+                "cache",
+                "stage=sidecar code=write_failed".into(),
+            );
             let _ = fs::remove_file(&entry.audio_path);
             return Err(error);
         }
         let previous = state.manifest.entries.insert(id.to_owned(), entry.clone());
         if let Err(error) = persist_manifest(&state) {
+            self.push_diagnostic(
+                "cache_commit_failed",
+                "cache",
+                "stage=manifest code=persist_failed".into(),
+            );
             if let Some(previous) = previous.clone() {
                 state.manifest.entries.insert(id.to_owned(), previous);
             } else {
@@ -557,7 +663,15 @@ impl CacheStore {
         {
             let _ = remove_entry_files(&previous);
         }
-        self.evict()
+        let result = self.evict();
+        if result.is_err() {
+            self.push_diagnostic(
+                "cache_commit_failed",
+                "cache",
+                "stage=evict code=persist_failed".into(),
+            );
+        }
+        result
     }
 
     fn evict(&self) -> Result<()> {
@@ -633,7 +747,12 @@ impl CacheWritePlan {
             .open(&self.inner.part_path)
         {
             Ok(file) => file,
-            Err(_) => {
+            Err(error) => {
+                self.inner.store.push_diagnostic(
+                    "cache_write_failed",
+                    "cache",
+                    format!("stage=begin code={}", io_error_code(&error)),
+                );
                 self.invalidate();
                 return None;
             }
@@ -722,7 +841,12 @@ impl CacheWriter {
             return;
         }
         let result = self.file.as_mut().unwrap().write_all(bytes);
-        if result.is_err() {
+        if let Err(error) = result {
+            self.plan.inner.store.push_diagnostic(
+                "cache_write_failed",
+                "cache",
+                format!("stage=append code={}", io_error_code(&error)),
+            );
             self.abandon();
         } else {
             self.written += bytes.len() as u64;
@@ -743,14 +867,33 @@ impl CacheWriter {
             self.abandon();
             return;
         }
-        if let Some(mut file) = self.file.take()
-            && (file.flush().is_err() || file.sync_data().is_err())
-        {
-            self.abandon();
-            return;
+        if let Some(mut file) = self.file.take() {
+            if let Err(error) = file.flush() {
+                self.plan.inner.store.push_diagnostic(
+                    "cache_write_failed",
+                    "cache",
+                    format!("stage=finish_flush code={}", io_error_code(&error)),
+                );
+                self.abandon();
+                return;
+            }
+            if let Err(error) = file.sync_data() {
+                self.plan.inner.store.push_diagnostic(
+                    "cache_write_failed",
+                    "cache",
+                    format!("stage=finish_sync code={}", io_error_code(&error)),
+                );
+                self.abandon();
+                return;
+            }
         }
         self.plan.inner.entry.lock().unwrap().byte_len = self.written;
-        if fs::rename(&self.plan.inner.part_path, &self.plan.inner.staged_path).is_err() {
+        if let Err(error) = fs::rename(&self.plan.inner.part_path, &self.plan.inner.staged_path) {
+            self.plan.inner.store.push_diagnostic(
+                "cache_write_failed",
+                "cache",
+                format!("stage=finish_rename code={}", io_error_code(&error)),
+            );
             self.abandon();
             return;
         }
@@ -809,6 +952,32 @@ fn media_extension(media_type: &MediaType) -> &'static str {
     }
 }
 
+fn io_error_code(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::NotFound => "not_found",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::AlreadyExists => "already_exists",
+        io::ErrorKind::WriteZero => "write_zero",
+        io::ErrorKind::BrokenPipe => "broken_pipe",
+        io::ErrorKind::StorageFull => "storage_full",
+        _ => "io_error",
+    }
+}
+
+fn anyhow_io_error_code(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<io::Error>()
+        .map_or("io_error", io_error_code)
+}
+
+fn entry_file_error_code(entry: &CacheEntry) -> Option<&'static str> {
+    File::open(&entry.audio_path)
+        .err()
+        .or_else(|| File::open(&entry.sidecar_path).err())
+        .as_ref()
+        .map(io_error_code)
+}
+
 fn dedicated_cache_root(selected_directory: &Path) -> PathBuf {
     selected_directory.join(CACHE_DIRECTORY_NAME)
 }
@@ -860,7 +1029,7 @@ fn cleanup_part_files(root: &Path) {
     }
 }
 
-fn load_manifest(root: &Path) -> Manifest {
+fn load_manifest(root: &Path) -> (Manifest, Vec<CacheDiagnostic>) {
     let path = root.join(MANIFEST_FILE_NAME);
     let backup = json_backup_path(&path);
     let legacy = root.join("manifest.json");
@@ -878,13 +1047,26 @@ fn load_manifest(root: &Path) -> Manifest {
     for (id, entry) in recover_manifest_from_sidecars(root).entries {
         manifest.entries.entry(id).or_insert(entry);
     }
+    let mut diagnostics = Vec::new();
     manifest.entries.retain(|_, entry| {
-        entry.audio_path.starts_with(root)
-            && entry.sidecar_path.starts_with(root)
-            && entry.audio_path.is_file()
-            && entry.sidecar_path.is_file()
+        let in_root = entry.audio_path.starts_with(root) && entry.sidecar_path.starts_with(root);
+        let file_error = in_root.then(|| entry_file_error_code(entry)).flatten();
+        let valid = in_root && file_error.is_none();
+        if !valid {
+            let code = if !in_root {
+                "outside_root"
+            } else {
+                file_error.unwrap_or("unreadable")
+            };
+            diagnostics.push(CacheDiagnostic {
+                category: "cache_read_failed",
+                source: "cache",
+                summary: format!("stage=manifest_reconcile code={code}"),
+            });
+        }
+        valid
     });
-    manifest
+    (manifest, diagnostics)
 }
 
 fn persist_settings(state: &CacheState) -> Result<()> {
@@ -1118,6 +1300,87 @@ mod tests {
         writer.append(b"audio");
         writer.finish(Some(5));
         assert!(store.lookup(&cache_key).is_none());
+        let diagnostics = store.drain_diagnostics();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.category == "cache_write_failed"
+                && diagnostic.summary.starts_with("stage=append code=")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_manifest_file_is_reported_without_exposing_its_path() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        let cache_key = key("missing-file", "320k");
+        assert!(store.lookup(&cache_key).is_none());
+        assert!(store.drain_diagnostics().is_empty());
+        write_entry(&store, cache_key.clone(), 32);
+        let hit = store.lookup(&cache_key).unwrap();
+        store.drain_diagnostics();
+        fs::remove_file(&hit.audio_path).unwrap();
+
+        assert!(store.lookup(&cache_key).is_none());
+        let diagnostics = store.drain_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].category, "cache_read_failed");
+        assert_eq!(diagnostics[0].summary, "stage=lookup code=not_found");
+        assert!(!diagnostics[0].summary.contains(root.to_str().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_queue_drops_oldest_entries_at_its_fixed_limit() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        for index in 0..(DIAGNOSTIC_CAPACITY + 7) {
+            store.push_diagnostic(
+                "cache_write_failed",
+                "cache",
+                format!("stage=test code={index}"),
+            );
+        }
+        let diagnostics = store.drain_diagnostics();
+        assert_eq!(diagnostics.len(), DIAGNOSTIC_CAPACITY);
+        assert_eq!(diagnostics[0].summary, "stage=test code=7");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn favorite_sidecar_write_failure_is_reported() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        let cache_key = key("favorite-sidecar-failure", "320k");
+        write_entry(&store, cache_key.clone(), 32);
+        store.drain_diagnostics();
+
+        let blocked_parent = root.join("blocked-sidecar-parent");
+        fs::write(&blocked_parent, b"not a directory").unwrap();
+        {
+            let mut state = store.inner.lock().unwrap();
+            let entry = state
+                .manifest
+                .entries
+                .get_mut(&cache_id(&cache_key))
+                .unwrap();
+            entry.sidecar_path = blocked_parent.join("entry.json");
+        }
+
+        store
+            .set_online_favorite(
+                &cache_key.provider_id,
+                &cache_key.provider_track_id,
+                Some(serde_json::json!({ "title": "Favorite" })),
+                true,
+            )
+            .unwrap();
+        let diagnostics = store.drain_diagnostics();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.category == "cache_write_failed"
+                && diagnostic
+                    .summary
+                    .starts_with("stage=favorite_sidecar code=")
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 

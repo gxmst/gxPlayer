@@ -19,6 +19,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
+use crate::diagnostic_log::record_diagnostic;
 use crate::source_runtime::{
     ListedSource, PublicSource, RuntimeStatus, ScriptLaunch, SourceRuntime, ensure_json_size,
     normalize_media_request,
@@ -197,20 +198,28 @@ pub fn source_import_file(
     path: String,
 ) -> Result<ImportResult, String> {
     require_window(&window, "main")?;
-    let source = runtime.serialized(|| {
-        let source = runtime
-            .import_file(Path::new(&path))
-            .map_err(|error| error.to_string())?;
-        reload_runtime(
-            &window.app_handle().get_webview_window(SANDBOX_LABEL),
-            &runtime,
-        )?;
-        Ok::<_, String>(source)
-    })?;
-    Ok(ImportResult {
-        source: PublicSource::from(&source),
-        runtime: runtime.status(),
-    })
+    let app = window.app_handle().clone();
+    let result = runtime
+        .serialized(|| {
+            let source = runtime
+                .import_file(Path::new(&path))
+                .map_err(|error| error.to_string())?;
+            reload_runtime(&app.get_webview_window(SANDBOX_LABEL), &runtime)?;
+            Ok::<_, String>(source)
+        })
+        .map(|source| ImportResult {
+            source: PublicSource::from(&source),
+            runtime: runtime.status(),
+        });
+    if let Err(error) = &result {
+        record_diagnostic(
+            &app,
+            "source_import_failed",
+            None,
+            diagnostic_error_code(error),
+        );
+    }
+    result
 }
 
 #[tauri::command]
@@ -220,43 +229,53 @@ pub async fn source_import_url(
     url: String,
 ) -> Result<ImportResult, String> {
     require_window(&window, "main")?;
-    let parsed = Url::parse(&url).map_err(|error| format!("invalid source URL: {error}"))?;
-    let request = SafeHttpRequest {
-        url: parsed.clone(),
-        method: Method::GET,
-        headers: Vec::new(),
-        body: None,
-        timeout: Duration::from_secs(20),
-        max_response_bytes: MAX_SOURCE_DOWNLOAD_BYTES,
-    };
-    let response = tauri::async_runtime::spawn_blocking(move || execute(request))
-        .await
-        .map_err(|error| format!("source download task failed: {error}"))?
-        .map_err(|error| error.to_string())?;
-    if !(200..300).contains(&response.status) {
-        return Err(format!("source download returned HTTP {}", response.status));
-    }
-    let script = String::from_utf8(response.body)
-        .map_err(|_| "source script is not valid UTF-8".to_owned())?;
-    let fallback = parsed
-        .path_segments()
-        .and_then(Iterator::last)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("LX Source");
-    let source = runtime.serialized(|| {
-        let source = runtime
-            .import_script(&script, url, fallback)
+    let app = window.app_handle().clone();
+    let result: Result<ImportResult, String> = async {
+        let parsed = Url::parse(&url).map_err(|error| format!("invalid source URL: {error}"))?;
+        let request = SafeHttpRequest {
+            url: parsed.clone(),
+            method: Method::GET,
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(20),
+            max_response_bytes: MAX_SOURCE_DOWNLOAD_BYTES,
+        };
+        let response = tauri::async_runtime::spawn_blocking(move || execute(request))
+            .await
+            .map_err(|error| format!("source download task failed: {error}"))?
             .map_err(|error| error.to_string())?;
-        reload_runtime(
-            &window.app_handle().get_webview_window(SANDBOX_LABEL),
-            &runtime,
-        )?;
-        Ok::<_, String>(source)
-    })?;
-    Ok(ImportResult {
-        source: PublicSource::from(&source),
-        runtime: runtime.status(),
-    })
+        if !(200..300).contains(&response.status) {
+            return Err(format!("source download returned HTTP {}", response.status));
+        }
+        let script = String::from_utf8(response.body)
+            .map_err(|_| "source script is not valid UTF-8".to_owned())?;
+        let fallback = parsed
+            .path_segments()
+            .and_then(Iterator::last)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("LX Source");
+        let source = runtime.serialized(|| {
+            let source = runtime
+                .import_script(&script, url, fallback)
+                .map_err(|error| error.to_string())?;
+            reload_runtime(&app.get_webview_window(SANDBOX_LABEL), &runtime)?;
+            Ok::<_, String>(source)
+        })?;
+        Ok(ImportResult {
+            source: PublicSource::from(&source),
+            runtime: runtime.status(),
+        })
+    }
+    .await;
+    if let Err(error) = &result {
+        record_diagnostic(
+            &app,
+            "source_import_failed",
+            None,
+            diagnostic_error_code(error),
+        );
+    }
+    result
 }
 
 #[tauri::command]
@@ -322,62 +341,73 @@ pub async fn source_reimport(
     id: String,
 ) -> Result<ImportResult, String> {
     require_window(&window, "main")?;
-    let existing = runtime.source(&id).map_err(|error| error.to_string())?;
-    let origin = existing.origin.clone();
-    let parsed_origin = Url::parse(&origin)
-        .ok()
-        .filter(|url| matches!(url.scheme(), "http" | "https"));
-    let fallback_name = parsed_origin
-        .as_ref()
-        .and_then(|url| url.path_segments().and_then(Iterator::last))
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            Path::new(&origin)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| existing.metadata.name.clone());
-    let script = if let Some(url) = parsed_origin {
-        let request = SafeHttpRequest {
-            url,
-            method: Method::GET,
-            headers: Vec::new(),
-            body: None,
-            timeout: Duration::from_secs(20),
-            max_response_bytes: MAX_SOURCE_DOWNLOAD_BYTES,
+    let app = window.app_handle().clone();
+    let diagnostic_source_id = id.clone();
+    let result: Result<ImportResult, String> = async {
+        let existing = runtime.source(&id).map_err(|error| error.to_string())?;
+        let origin = existing.origin.clone();
+        let parsed_origin = Url::parse(&origin)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"));
+        let fallback_name = parsed_origin
+            .as_ref()
+            .and_then(|url| url.path_segments().and_then(Iterator::last))
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                Path::new(&origin)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| existing.metadata.name.clone());
+        let script = if let Some(url) = parsed_origin {
+            let request = SafeHttpRequest {
+                url,
+                method: Method::GET,
+                headers: Vec::new(),
+                body: None,
+                timeout: Duration::from_secs(20),
+                max_response_bytes: MAX_SOURCE_DOWNLOAD_BYTES,
+            };
+            let response = tauri::async_runtime::spawn_blocking(move || execute(request))
+                .await
+                .map_err(|error| format!("source download task failed: {error}"))?
+                .map_err(|error| error.to_string())?;
+            if !(200..300).contains(&response.status) {
+                return Err(format!("source download returned HTTP {}", response.status));
+            }
+            String::from_utf8(response.body)
+                .map_err(|_| "source script is not valid UTF-8".to_owned())?
+        } else {
+            let path = Path::new(&origin).to_path_buf();
+            tauri::async_runtime::spawn_blocking(move || std::fs::read_to_string(path))
+                .await
+                .map_err(|error| format!("source file read task failed: {error}"))?
+                .map_err(|error| format!("source file read failed: {error}"))?
         };
-        let response = tauri::async_runtime::spawn_blocking(move || execute(request))
-            .await
-            .map_err(|error| format!("source download task failed: {error}"))?
-            .map_err(|error| error.to_string())?;
-        if !(200..300).contains(&response.status) {
-            return Err(format!("source download returned HTTP {}", response.status));
-        }
-        String::from_utf8(response.body)
-            .map_err(|_| "source script is not valid UTF-8".to_owned())?
-    } else {
-        let path = Path::new(&origin).to_path_buf();
-        tauri::async_runtime::spawn_blocking(move || std::fs::read_to_string(path))
-            .await
-            .map_err(|error| format!("source file read task failed: {error}"))?
-            .map_err(|error| format!("source file read failed: {error}"))?
-    };
-    let source = runtime.serialized(|| {
-        let source = runtime
-            .reimport_script(&id, &script, &fallback_name)
-            .map_err(|error| error.to_string())?;
-        reload_runtime(
-            &window.app_handle().get_webview_window(SANDBOX_LABEL),
-            &runtime,
-        )?;
-        Ok::<_, String>(source)
-    })?;
-    Ok(ImportResult {
-        source: PublicSource::from(&source),
-        runtime: runtime.status(),
-    })
+        let source = runtime.serialized(|| {
+            let source = runtime
+                .reimport_script(&id, &script, &fallback_name)
+                .map_err(|error| error.to_string())?;
+            reload_runtime(&app.get_webview_window(SANDBOX_LABEL), &runtime)?;
+            Ok::<_, String>(source)
+        })?;
+        Ok(ImportResult {
+            source: PublicSource::from(&source),
+            runtime: runtime.status(),
+        })
+    }
+    .await;
+    if let Err(error) = &result {
+        record_diagnostic(
+            &app,
+            "source_reimport_failed",
+            Some(&diagnostic_source_id),
+            diagnostic_error_code(error),
+        );
+    }
+    result
 }
 
 #[tauri::command]
@@ -531,11 +561,32 @@ pub async fn source_resolve(
 ) -> Result<ResolvedMediaRequest, String> {
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        resolve_with_fallback(&app, payload, quality.as_deref(), source_id.as_deref())
+    let diagnostic_source_id = source_id.clone();
+    let app_for_worker = app.clone();
+    let worker_result = tauri::async_runtime::spawn_blocking(move || {
+        resolve_with_fallback(
+            &app_for_worker,
+            payload,
+            quality.as_deref(),
+            source_id.as_deref(),
+        )
     })
-    .await
-    .map_err(|error| format!("LX resolver task failed: {error}"))?
+    .await;
+    let result = match worker_result {
+        Ok(result) => result,
+        Err(error) => Err(format!("LX resolver task failed: {error}")),
+    };
+    if let Err(error) = &result
+        && should_record_terminal_failure(error)
+    {
+        record_diagnostic(
+            &app,
+            "online_resolve_failed",
+            diagnostic_source_id.as_deref(),
+            diagnostic_error_code(error),
+        );
+    }
+    result
 }
 
 fn resolve_with_fallback(
@@ -557,7 +608,9 @@ fn resolve_with_fallback(
         let preferred_route = runtime
             .preferred_route(&source_id)
             .map_err(|error| error.to_string())?;
-        for route in source_route_attempts(preferred_route) {
+        let routes = source_route_attempts(preferred_route);
+        let mut last_error_code = "no_result";
+        for (route_index, route) in routes.iter().copied().enumerate() {
             match resolve_serialized(app, payload.clone(), quality, &source_id, route) {
                 Ok(mut request) => {
                     request.network_route = Some(route);
@@ -566,13 +619,34 @@ fn resolve_with_fallback(
                     return Ok(request);
                 }
                 Err(error) if should_stop_route_fallback(&error) => return Err(error),
-                Err(error) => errors.push(format!(
-                    "{source_id} ({}): {error}",
-                    network_route_label(route)
-                )),
+                Err(error) => {
+                    last_error_code = diagnostic_error_code(&error);
+                    if let Some(next_route) = routes.get(route_index + 1).copied() {
+                        record_diagnostic(
+                            app,
+                            "proxy_fallback",
+                            Some(&source_id),
+                            format!(
+                                "{}->{} code={last_error_code}",
+                                network_route_label(route),
+                                network_route_label(next_route)
+                            ),
+                        );
+                    }
+                    errors.push(format!(
+                        "{source_id} ({}): {error}",
+                        network_route_label(route)
+                    ));
+                }
             }
         }
         record_source_health(app, &source_id, false, started.elapsed());
+        record_diagnostic(
+            app,
+            "source_request_failed",
+            Some(&source_id),
+            format!("routes_exhausted code={last_error_code}"),
+        );
     }
     Err(format!(
         "all LX source fallbacks failed ({})",
@@ -596,6 +670,148 @@ fn should_stop_route_fallback(error: &str) -> bool {
         || error.contains("generation changed")
 }
 
+fn should_record_terminal_failure(error: &str) -> bool {
+    !should_stop_route_fallback(error)
+}
+
+fn should_record_http_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 408 | 429 | 500..=599)
+}
+
+fn safe_http_error_code(error: &SafeHttpError) -> &'static str {
+    match error {
+        SafeHttpError::InvalidScheme
+        | SafeHttpError::CredentialsDenied
+        | SafeHttpError::MissingHost
+        | SafeHttpError::InvalidHeader(_) => "invalid_request",
+        SafeHttpError::PrivateDestination => "blocked_destination",
+        SafeHttpError::Dns(_) => "dns_failed",
+        SafeHttpError::Request(message) => diagnostic_error_code(message),
+        SafeHttpError::InvalidRedirect | SafeHttpError::TooManyRedirects => "redirect_failed",
+        SafeHttpError::ResponseTooLarge { .. } => "response_too_large",
+    }
+}
+
+fn diagnostic_error_code(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("all lx source fallbacks failed") || error.contains("所有音源均无法返回结果")
+    {
+        "all_sources_failed"
+    } else if error.contains("no lx source") || error.contains("没有已导入且可用") {
+        "no_source"
+    } else if error.contains("timed out") || error.contains("timeout") {
+        "timeout"
+    } else if error.contains("http 401") || error.contains("http 403") {
+        "upstream_auth_rejected"
+    } else if error.contains("http 408") {
+        "upstream_timeout"
+    } else if error.contains("http 429") || error.contains("rate_limited") {
+        "upstream_rate_limited"
+    } else if error.contains("upstream_not_found") || error.contains("http 404") {
+        "upstream_not_found"
+    } else if error.contains("http 5") {
+        "upstream_server_error"
+    } else if error.contains("private destination")
+        || error.contains("loopback")
+        || error.contains("link-local")
+    {
+        "blocked_destination"
+    } else if error.contains("dns") || error.contains("resolve destination") {
+        "dns_failed"
+    } else if error.contains("permission denied") || error.contains("access is denied") {
+        "permission_denied"
+    } else if error.contains("not found")
+        || error.contains("does not exist")
+        || error.contains("cannot find the file")
+    {
+        "not_found"
+    } else if error.contains("too large") || error.contains("exceeds") {
+        "size_limit"
+    } else if error.contains("invalid") || error.contains("must be") {
+        "invalid_data"
+    } else if error.contains("channel") || error.contains("disconnected") {
+        "channel_disconnected"
+    } else if error.contains("preview_or_truncated_media") {
+        "preview_or_truncated_media"
+    } else if error.contains("range_verification_failed") {
+        "range_verification_failed"
+    } else if error.contains("source_initialization_failed") {
+        "source_initialization_failed"
+    } else if error.contains("invalid_candidate_payload") {
+        "invalid_candidate_payload"
+    } else if error.contains("media_verification_failed") {
+        "media_verification_failed"
+    } else if error.contains("active_source_restore_failed") {
+        "active_source_restore_failed"
+    } else if error.contains("source_resolution_failed") {
+        "source_resolution_failed"
+    } else if error.contains("sandbox") || error.contains("worker") {
+        "worker_failed"
+    } else if error.contains("read")
+        || error.contains("write")
+        || error.contains("storage")
+        || error.contains("i/o")
+    {
+        "io_failed"
+    } else {
+        "operation_failed"
+    }
+}
+
+fn diagnostic_label(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "init" | "initialize" | "initialization" => "initialize",
+        "resolve" | "resolver" => "resolve",
+        "verify" | "verification" => "verify",
+        "restore" => "restore",
+        "runtime" => "runtime",
+        "worker" | "worker_error" | "worker-error" | "source-worker" => "worker",
+        "script" | "eval" | "evaluate" | "community-script" => "script",
+        _ => "unknown",
+    }
+}
+
+fn attempts_called_source(attempts: &[ResolveAttemptDiagnostic]) -> bool {
+    attempts
+        .iter()
+        .any(|attempt| matches!(attempt.stage.as_str(), "initialize" | "resolve" | "verify"))
+}
+
+fn latest_attempt_error_code(attempts: &[ResolveAttemptDiagnostic]) -> &'static str {
+    attempts
+        .iter()
+        .rev()
+        .find(|attempt| !attempt.success)
+        .and_then(|attempt| attempt.error.as_deref())
+        .map(diagnostic_error_code)
+        .unwrap_or("no_result")
+}
+
+fn playback_failure_summary(playback: &OnlinePlaybackResult) -> String {
+    playback
+        .attempts
+        .iter()
+        .rev()
+        .find(|attempt| !attempt.success)
+        .map(|attempt| {
+            format!(
+                "stage={} code={}",
+                diagnostic_label(&attempt.stage),
+                attempt
+                    .error
+                    .as_deref()
+                    .map(diagnostic_error_code)
+                    .unwrap_or("no_result")
+            )
+        })
+        .unwrap_or_else(|| {
+            playback.error.as_deref().map_or_else(
+                || "operation_failed".to_owned(),
+                |error| diagnostic_error_code(error).to_owned(),
+            )
+        })
+}
+
 #[tauri::command]
 pub async fn player_play_online_track(
     window: WebviewWindow,
@@ -609,9 +825,10 @@ pub async fn player_play_online_track(
     let token = request_id
         .map(|request_id| app.state::<ResolveCancellationRegistry>().begin(request_id))
         .transpose()?;
+    let diagnostic_source_id = source_id.clone();
     let token_for_worker = token.clone();
     let app_for_worker = app.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let worker_result = tauri::async_runtime::spawn_blocking(move || {
         play_online_track(
             &app_for_worker,
             track,
@@ -620,10 +837,36 @@ pub async fn player_play_online_track(
             token_for_worker.as_ref(),
         )
     })
-    .await
-    .map_err(|error| format!("online playback task failed: {error}"))?;
+    .await;
     if let Some(token) = token.as_ref() {
         app.state::<ResolveCancellationRegistry>().finish(token);
+    }
+    let result = match worker_result {
+        Ok(result) => result,
+        Err(error) => Err(format!("online playback task failed: {error}")),
+    };
+    match &result {
+        Ok(playback) if playback.outcome == ResolveOutcome::Failed => {
+            let source_id = playback
+                .attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.source_id.as_deref())
+                .or(diagnostic_source_id.as_deref());
+            record_diagnostic(
+                &app,
+                "online_resolve_failed",
+                source_id,
+                playback_failure_summary(playback),
+            );
+        }
+        Err(error) if should_record_terminal_failure(error) => record_diagnostic(
+            &app,
+            "online_resolve_failed",
+            diagnostic_source_id.as_deref(),
+            diagnostic_error_code(error),
+        ),
+        _ => {}
     }
     result
 }
@@ -953,11 +1196,23 @@ fn record_source_health(app: &AppHandle, source_id: &str, success: bool, elapsed
 }
 
 fn record_source_route(app: &AppHandle, source_id: &str, route: NetworkRoute) {
-    if let Err(error) = app
-        .state::<SourceRuntime>()
-        .record_successful_route(source_id, route)
-    {
+    let runtime = app.state::<SourceRuntime>();
+    let previous = runtime.preferred_route(source_id).ok().flatten();
+    if let Err(error) = runtime.record_successful_route(source_id, route) {
         eprintln!("failed to persist source network route for {source_id}: {error}");
+    } else if let Some(previous) = previous
+        && previous != route
+    {
+        record_diagnostic(
+            app,
+            "route_switched",
+            Some(source_id),
+            format!(
+                "{}->{}",
+                network_route_label(previous),
+                network_route_label(route)
+            ),
+        );
     }
 }
 
@@ -1094,10 +1349,13 @@ fn resolve_candidates_with_source(
         let temporary = persistent_active.as_deref() != Some(source_id);
         let mut resolved = None;
         let mut terminal_error = None;
-        for route in routes {
+        let all_attempts_start = diagnostics.len();
+        let mut source_was_called = false;
+        for (route_index, route) in routes.iter().copied().enumerate() {
             if cancellation.and_then(ResolveToken::outcome).is_some() {
                 break;
             }
+            let route_attempts_start = diagnostics.len();
             match resolve_candidates_on_route(
                 app,
                 &runtime,
@@ -1114,12 +1372,47 @@ fn resolve_candidates_with_source(
                     resolved = Some(candidate);
                     break;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    let route_attempts = &diagnostics[route_attempts_start..];
+                    let route_called_source = attempts_called_source(route_attempts);
+                    source_was_called |= route_called_source;
+                    if route_called_source
+                        && cancellation.and_then(ResolveToken::outcome).is_none()
+                        && let Some(next_route) = routes.get(route_index + 1).copied()
+                    {
+                        record_diagnostic(
+                            app,
+                            "proxy_fallback",
+                            Some(source_id),
+                            format!(
+                                "{}->{} code={}",
+                                network_route_label(route),
+                                network_route_label(next_route),
+                                latest_attempt_error_code(route_attempts)
+                            ),
+                        );
+                    }
+                }
                 Err(error) => {
                     terminal_error = Some(error);
                     break;
                 }
             }
+        }
+        if resolved.is_none()
+            && terminal_error.is_none()
+            && source_was_called
+            && cancellation.and_then(ResolveToken::outcome).is_none()
+        {
+            record_diagnostic(
+                app,
+                "source_request_failed",
+                Some(source_id),
+                format!(
+                    "routes_exhausted code={}",
+                    latest_attempt_error_code(&diagnostics[all_attempts_start..])
+                ),
+            );
         }
 
         if temporary && let Err(error) = restore_persistent_runtime_background(app, &runtime) {
@@ -1586,6 +1879,19 @@ pub fn lx_runtime_failure(
     error: String,
 ) -> Result<(), String> {
     require_window(&window, SANDBOX_LABEL)?;
+    let status = runtime.status();
+    if status.generation == generation {
+        record_diagnostic(
+            window.app_handle(),
+            "source_worker_crashed",
+            status.active_source_id.as_deref(),
+            format!(
+                "stage={} code={}",
+                diagnostic_label(&stage),
+                diagnostic_error_code(&error)
+            ),
+        );
+    }
     runtime.mark_failed(generation, format!("{stage}: {error}"));
     Ok(())
 }
@@ -1609,13 +1915,66 @@ pub async fn lx_http_request(
     }
     let (source_id, route) = runtime.source_id_and_route_for_generation(generation)?;
     let request = parse_http_request(&url, options)?;
-    let response = tauri::async_runtime::spawn_blocking(move || execute_on_route(request, route))
-        .await
-        .map_err(|error| format!("HTTP proxy task failed: {error}"))?
-        .map_err(|error| error.to_string())?;
+    let response = match tauri::async_runtime::spawn_blocking(move || {
+        execute_on_route(request, route)
+    })
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let code = safe_http_error_code(&error);
+            let category = if code == "timeout" {
+                "source_http_timeout"
+            } else {
+                "source_http_failed"
+            };
+            if runtime
+                .source_id_and_route_for_generation(generation)
+                .is_ok_and(|(current_id, current_route)| {
+                    current_id == source_id && current_route == route
+                })
+            {
+                record_diagnostic(
+                    window.app_handle(),
+                    category,
+                    Some(&source_id),
+                    format!("route={} code={code}", network_route_label(route)),
+                );
+            }
+            return Err(error.to_string());
+        }
+        Err(error) => {
+            if runtime
+                .source_id_and_route_for_generation(generation)
+                .is_ok_and(|(current_id, current_route)| {
+                    current_id == source_id && current_route == route
+                })
+            {
+                record_diagnostic(
+                    window.app_handle(),
+                    "source_http_failed",
+                    Some(&source_id),
+                    format!("route={} code=http_task_failed", network_route_label(route)),
+                );
+            }
+            return Err(format!("HTTP proxy task failed: {error}"));
+        }
+    };
     let current = runtime.source_id_and_route_for_generation(generation)?;
-    if current != (source_id, route) {
+    if current.0 != source_id || current.1 != route {
         return Err("stale LX HTTP request route".into());
+    }
+    if should_record_http_status(response.status) {
+        record_diagnostic(
+            window.app_handle(),
+            "source_http_failed",
+            Some(&source_id),
+            format!(
+                "route={} http_status={}",
+                network_route_label(route),
+                response.status
+            ),
+        );
     }
     let headers = response.headers.into_iter().collect::<BTreeMap<_, _>>();
     let content_type = headers
@@ -2640,6 +2999,71 @@ mod tests {
         assert_eq!(
             quality_attempts(&capabilities, "legacy", Some("flac")),
             ["320k", "128k"]
+        );
+    }
+
+    #[test]
+    fn diagnostic_filters_only_record_actionable_failures() {
+        for status in [401, 403, 408, 429, 500, 503, 599] {
+            assert!(should_record_http_status(status));
+        }
+        for status in [200, 204, 301, 400, 404, 409] {
+            assert!(!should_record_http_status(status));
+        }
+        assert!(!should_record_terminal_failure(
+            "LX resolver request cancelled"
+        ));
+        assert!(!should_record_terminal_failure("stale LX runtime response"));
+        assert!(should_record_terminal_failure(
+            "all LX source fallbacks failed"
+        ));
+    }
+
+    #[test]
+    fn diagnostic_summaries_do_not_copy_urls_paths_or_secrets() {
+        let raw = "HTTP request timed out for https://media.example/a?token=secret at C:\\Users\\name\\source.js";
+        assert_eq!(diagnostic_error_code(raw), "timeout");
+        assert_eq!(
+            safe_http_error_code(&SafeHttpError::Request(raw.into())),
+            "timeout"
+        );
+        assert_eq!(diagnostic_label("worker error: token=secret"), "unknown");
+
+        let playback = OnlinePlaybackResult {
+            outcome: ResolveOutcome::Failed,
+            track: CatalogTrack {
+                provider_id: "wy".into(),
+                provider_track_id: "track".into(),
+                title: "Track".into(),
+                artist: "Artist".into(),
+                album: String::new(),
+                duration_ms: None,
+                artwork_url: None,
+                resolver_payload: Value::Null,
+                preview: None,
+            },
+            source_id: None,
+            source_name: None,
+            quality: None,
+            cache_hit: false,
+            attempts: vec![ResolveAttemptDiagnostic {
+                source_id: Some("source-id".into()),
+                source_name: None,
+                provider_id: "wy".into(),
+                provider_track_id: "track".into(),
+                quality: Some("320k".into()),
+                stage: "resolve".into(),
+                success: false,
+                error: Some("token=secret https://media.example/a?key=secret".into()),
+            }],
+            error: Some(raw.into()),
+        };
+        let summary = playback_failure_summary(&playback);
+        assert_eq!(summary, "stage=resolve code=operation_failed");
+        assert!(!summary.contains("secret"));
+        assert_eq!(
+            diagnostic_error_code("upstream_rate_limited"),
+            "upstream_rate_limited"
         );
     }
 

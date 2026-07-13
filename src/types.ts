@@ -101,6 +101,22 @@ export type ProxyStatus = {
   effective: boolean;
 };
 
+export type DiagnosticLogStatus = {
+  enabled: boolean;
+};
+
+export type DiagnosticLogEntry = {
+  timestampMs: number;
+  category: string;
+  source: string | null;
+  summary: string;
+};
+
+export type DiagnosticLogExportResult = {
+  path: string;
+  entryCount: number;
+};
+
 export type CacheStatus = {
   directory: string;
   customDirectory: string | null;

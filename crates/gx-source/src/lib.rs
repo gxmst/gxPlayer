@@ -13,6 +13,7 @@ pub mod safe_http;
 
 const MAX_SCRIPT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 256 * 1024;
+const MAX_CAPABILITIES_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +37,8 @@ pub struct ManagedSource {
     pub updates_enabled: bool,
     #[serde(default = "empty_config")]
     pub config: Value,
+    #[serde(default)]
+    pub capabilities: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +114,8 @@ pub enum SourceStoreError {
     InvalidConfig,
     #[error("source config is larger than 256 KiB")]
     ConfigTooLarge,
+    #[error("source capabilities are larger than 256 KiB")]
+    CapabilitiesTooLarge,
     #[error("invalid source fallback order: {0}")]
     InvalidFallbackOrder(String),
     #[error("source storage I/O failed: {0}")]
@@ -186,6 +191,7 @@ impl SourceStore {
             metadata,
             updates_enabled: true,
             config: empty_config(),
+            capabilities: Value::Null,
         };
         self.config.sources.push(source.clone());
         if self.config.active_source_id.is_none() {
@@ -347,6 +353,27 @@ impl SourceStore {
             .find(|source| source.id == id)
             .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
         source.config = config;
+        self.persist()
+    }
+
+    pub fn set_capabilities(
+        &mut self,
+        id: &str,
+        capabilities: Value,
+    ) -> Result<(), SourceStoreError> {
+        if serde_json::to_vec(&capabilities)?.len() > MAX_CAPABILITIES_BYTES {
+            return Err(SourceStoreError::CapabilitiesTooLarge);
+        }
+        let source = self
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == id)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
+        if source.capabilities == capabilities {
+            return Ok(());
+        }
+        source.capabilities = capabilities;
         self.persist()
     }
 
@@ -558,6 +585,7 @@ impl SourceStore {
                 metadata: parse_script_metadata(&source.script, &source.fallback_name),
                 updates_enabled: source.updates_enabled,
                 config: source.config,
+                capabilities: Value::Null,
             });
         }
         for old in &self.config.sources {

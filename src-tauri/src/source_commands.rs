@@ -16,7 +16,7 @@ use gx_source::{SourceBackup, SourceFallbackConfig};
 use reqwest::{Method, Url};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 use crate::source_runtime::{
     ListedSource, PublicSource, RuntimeStatus, ScriptLaunch, SourceRuntime, ensure_json_size,
@@ -1399,7 +1399,12 @@ pub fn lx_send(
     match event_name.as_str() {
         "updateAlert" => runtime.record_update_alert(generation, data),
         "inited" => {
-            runtime.mark_ready(generation, data)?;
+            let source_id = runtime.mark_ready(generation, data)?;
+            if let Some(main_window) = app.get_webview_window("main")
+                && let Err(error) = main_window.emit("gx-source-capabilities-updated", source_id)
+            {
+                eprintln!("source capabilities event failed: {error}");
+            }
             if std::env::var_os("GX_PHASE2_AUTO_RESOLVE").is_some() {
                 start_phase2_auto_resolve(&app)?;
             }

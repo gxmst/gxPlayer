@@ -38,6 +38,10 @@ export type ListedSource = {
   updatesEnabled: boolean;
   active: boolean;
   hasConfig: boolean;
+  capabilities: Array<{
+    platform: string;
+    qualities: string[];
+  }>;
 };
 
 export type CatalogTrack = {

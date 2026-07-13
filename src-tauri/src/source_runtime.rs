@@ -45,6 +45,14 @@ pub struct ListedSource {
     pub source: PublicSource,
     pub active: bool,
     pub has_config: bool,
+    pub capabilities: Vec<PublicSourceCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicSourceCapability {
+    pub platform: String,
+    pub qualities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -136,6 +144,7 @@ impl SourceRuntime {
                     .config
                     .as_object()
                     .is_some_and(|config| !config.is_empty()),
+                capabilities: public_source_capabilities(&source.capabilities),
             })
             .collect()
     }
@@ -289,7 +298,7 @@ impl SourceRuntime {
         })
     }
 
-    pub fn mark_ready(&self, generation: u64, capabilities: Value) -> Result<(), String> {
+    pub fn mark_ready(&self, generation: u64, capabilities: Value) -> Result<String, String> {
         ensure_json_size(
             &capabilities,
             MAX_RUNTIME_PAYLOAD_BYTES,
@@ -302,10 +311,24 @@ impl SourceRuntime {
         if inner.status.state != RuntimeState::Initializing {
             return Err("LX runtime is not initializing".into());
         }
+        let source_id = inner
+            .status
+            .active_source_id
+            .clone()
+            .ok_or_else(|| "LX runtime has no initializing source".to_owned())?;
         inner.status.state = RuntimeState::Ready;
-        inner.status.capabilities = capabilities;
+        inner.status.capabilities = capabilities.clone();
         inner.status.error = None;
-        Ok(())
+        drop(inner);
+        if let Err(error) = self
+            .store
+            .lock()
+            .unwrap()
+            .set_capabilities(&source_id, capabilities)
+        {
+            eprintln!("failed to persist LX runtime capabilities for {source_id}: {error}");
+        }
+        Ok(source_id)
     }
 
     pub fn mark_failed(&self, generation: u64, error: String) {
@@ -406,6 +429,46 @@ impl SourceRuntime {
             .send(result)
             .map_err(|_| "LX runtime requester was dropped".to_owned())
     }
+}
+
+fn public_source_capabilities(capabilities: &Value) -> Vec<PublicSourceCapability> {
+    let Some(sources) = capabilities.get("sources").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut result = sources
+        .iter()
+        .filter_map(|(platform, details)| {
+            let platform = public_capability_label(platform)?;
+            let values = details
+                .get("qualitys")
+                .or_else(|| details.get("qualities"))
+                .and_then(Value::as_array);
+            let mut qualities = Vec::new();
+            for quality in values.into_iter().flatten().filter_map(Value::as_str) {
+                let Some(quality) = public_capability_label(quality) else {
+                    continue;
+                };
+                if !qualities.contains(&quality) {
+                    qualities.push(quality);
+                }
+                if qualities.len() == 32 {
+                    break;
+                }
+            }
+            Some(PublicSourceCapability {
+                platform,
+                qualities,
+            })
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| left.platform.cmp(&right.platform));
+    result
+}
+
+fn public_capability_label(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.chars().count() <= 64 && !value.chars().any(char::is_control))
+        .then(|| value.to_owned())
 }
 
 pub fn normalize_media_request(
@@ -595,7 +658,12 @@ mod tests {
             .unwrap();
         let launch = runtime.prepare_reload().unwrap().unwrap();
         runtime
-            .mark_ready(launch.generation, serde_json::json!({"wy":["320k"]}))
+            .mark_ready(
+                launch.generation,
+                serde_json::json!({
+                    "sources": { "alpha": { "qualitys": ["standard"] } }
+                }),
+            )
             .unwrap();
         let pending = runtime
             .begin_request(&serde_json::json!({"action":"musicUrl","id":1}))
@@ -620,6 +688,58 @@ mod tests {
         assert_eq!(resolved.headers.len(), 1);
         assert_eq!(resolved.expires_at_ms, Some(123));
         assert!(!resolved.redacted_for_log().contains("secret"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reported_capabilities_are_scoped_sanitized_and_persisted() {
+        let (runtime, root) = runtime();
+        let source = runtime
+            .import_script(
+                "lx.on('request', () => 'https://example.com/a.mp3')",
+                "test",
+                "a",
+            )
+            .unwrap();
+        let launch = runtime.prepare_reload().unwrap().unwrap();
+        let source_id = runtime
+            .mark_ready(
+                launch.generation,
+                serde_json::json!({
+                    "sources": {
+                        " beta ": { "qualities": ["high", "high", 1] },
+                        "alpha": { "qualitys": ["standard"] },
+                        "\n": { "qualitys": ["hidden"] },
+                        "gamma": { "qualitys": ["\u{0000}"] }
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(source_id, source.id);
+
+        let listed = runtime.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].capabilities,
+            vec![
+                PublicSourceCapability {
+                    platform: "alpha".into(),
+                    qualities: vec!["standard".into()],
+                },
+                PublicSourceCapability {
+                    platform: "beta".into(),
+                    qualities: vec!["high".into()],
+                },
+                PublicSourceCapability {
+                    platform: "gamma".into(),
+                    qualities: Vec::new(),
+                },
+            ]
+        );
+
+        drop(runtime);
+        let reopened = SourceRuntime::new(SourceStore::open(&root).unwrap());
+        assert_eq!(reopened.list()[0].capabilities, listed[0].capabilities);
         std::fs::remove_dir_all(root).unwrap();
     }
 

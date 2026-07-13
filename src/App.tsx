@@ -723,12 +723,24 @@ function App() {
 
   useEffect(() => {
     if (view === "history") void refreshHistory().catch(() => undefined);
+    if (view === "sources") void refreshSources().catch(() => undefined);
     if (view === "library") {
       void invoke<LibraryTrack[]>("library_scan_missing")
         .then(setLibrary)
         .catch(() => undefined);
     }
   }, [view]);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisten = listen<string>("gx-source-capabilities-updated", () => {
+      if (!disposed) void refreshSources().catch(() => undefined);
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
 
   useEffect(() => {
     if (!playlistSessionReady) return;
@@ -2573,7 +2585,7 @@ function App() {
           ) : <div className="fallback-empty">还没有备用音源。主源会继续逐档降低音质，最终可回退到官方 30 秒预览。</div>}
           {availableFallbackSources.length > 0 && <select aria-label="添加备用音源" defaultValue="" disabled={sourceFallbackBusy} onChange={(event) => { addFallbackSource(event.target.value); event.target.value = ""; }}><option value="">＋ 添加备用音源…</option>{availableFallbackSources.map((source) => <option key={source.id} value={source.id}>{source.metadata.name || source.id}</option>)}</select>}
         </section>
-        <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div><span className="source-badge">{source.active ? "正在使用" : source.hasConfig ? "已配置" : "可用"}</span><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { try { await invoke("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }} /> 更新提醒</label><button disabled={sourceConfigBusy} onClick={() => void openSourceConfig(source)}>配置</button><button disabled={source.active} onClick={async () => { try { await invoke("source_activate", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>启用</button><button className="danger" onClick={async () => { if (!window.confirm(`确定删除音源“${source.metadata.name || source.id}”吗？`)) return; try { await invoke("source_remove", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>删除</button></div></article>)}</div>
+        <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div className="source-card-main"><span className="source-badge">{source.active ? "正在使用" : source.hasConfig ? "已配置" : "可用"}</span><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p><SourceCapabilityDetails capabilities={source.capabilities} /></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { try { await invoke("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }} /> 更新提醒</label><button disabled={sourceConfigBusy} onClick={() => void openSourceConfig(source)}>配置</button><button disabled={source.active} onClick={async () => { try { await invoke("source_activate", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>启用</button><button className="danger" onClick={async () => { if (!window.confirm(`确定删除音源“${source.metadata.name || source.id}”吗？`)) return; try { await invoke("source_remove", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>删除</button></div></article>)}</div>
       </div>
     );
 
@@ -3019,6 +3031,15 @@ function ModeButtons({ mode, onChange }: { mode: AudioMode; onChange: (mode: Aud
 
 function SuggestionGroup({ label, children }: { label: string; children: ReactNode }) {
   return <section className="suggestion-group"><p>{label}</p>{children}</section>;
+}
+
+function SourceCapabilityDetails({ capabilities }: Pick<ListedSource, "capabilities">) {
+  const platforms = capabilities.map((capability) => capability.platform);
+  const qualities = [...new Set(capabilities.flatMap((capability) => capability.qualities))];
+  return <dl className="source-capabilities">
+    <div><dt>平台</dt><dd>{platforms.length ? platforms.join(" / ") : "未提供"}</dd></div>
+    <div><dt>音质</dt><dd>{qualities.length ? qualities.join(" / ") : "未提供"}</dd></div>
+  </dl>;
 }
 
 function VirtualTrackList({ tracks, renderRow }: { tracks: LibraryTrack[]; renderRow: (track: LibraryTrack, index: number) => ReactNode }) {

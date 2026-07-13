@@ -17,3 +17,6 @@ ringbuf.workspace = true
 rubato.workspace = true
 serde.workspace = true
 symphonia.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_System_Threading"] }

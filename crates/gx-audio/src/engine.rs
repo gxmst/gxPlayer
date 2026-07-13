@@ -27,6 +27,7 @@ use super::{
     OpenedMedia, RateAdapter, choose_output_config, open_media, open_media_source, remap_channels,
     seek_media, seek_media_coarse,
 };
+use crate::mmcss::AudioThreadPriority;
 
 const COMMAND_CAPACITY: usize = 64;
 const RING_SECONDS: f64 = 0.75;
@@ -1577,9 +1578,13 @@ fn build_typed_engine_stream<T>(
 where
     T: Sample + SizedSample + FromSample<f32>,
 {
+    let mut callback_thread_priority = AudioThreadPriority::default();
     let stream = device.build_output_stream(
         config,
-        move |output: &mut [T], _| render_output_callback(output, &mut consumer, &counters),
+        move |output: &mut [T], _| {
+            callback_thread_priority.ensure_registered();
+            render_output_callback(output, &mut consumer, &counters);
+        },
         |error| eprintln!("audio output stream error: {error}"),
         None,
     )?;

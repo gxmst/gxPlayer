@@ -14,6 +14,7 @@ import { TextPlaylistImportDialog } from "./components/TextPlaylistImportDialog"
 import { isRemoteArtworkUrl, useArtworkUrl } from "./hooks/useArtwork";
 import { useCatalogSearch } from "./hooks/useCatalogSearch";
 import { useEngineSnapshot } from "./hooks/useEngineSnapshot";
+import { useLiveVolume } from "./hooks/useLiveVolume";
 import { useSystemProxySettings } from "./hooks/useSystemProxySettings";
 import { useWindowActivity } from "./hooks/useWindowActivity";
 import { useWindowPreferences } from "./hooks/useWindowPreferences";
@@ -522,7 +523,6 @@ function App() {
   const [theme, setTheme] = useState<ThemeId>(() => loadThemePreference());
   const [themePickerOpen, setThemePickerOpen] = useState(false);
   const [dragPosition, setDragPosition] = useState<number | null>(null);
-  const [volumeDraft, setVolumeDraft] = useState<number | null>(null);
   const [pendingSeek, setPendingSeek] = useState<{ target: number; generation: number; queueKey: string } | null>(null);
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
   const [qualityPreference, setQualityPreference] = useState<QualityPreference>(() => {
@@ -1040,6 +1040,7 @@ function App() {
   }, [currentLibraryTrack?.path]);
   // Loading only while a session is opening — failed must not look like "still playing".
   const isPlaying = snapshot.status === "playing" || snapshot.status === "loading";
+  const animatePlayback = snapshot.status === "playing";
   const hasEngineCurrent = currentQueueItem !== null;
   useEffect(() => {
     const useFrontendQueue = playlist.length > 0;
@@ -1072,7 +1073,11 @@ function App() {
     snapshot.queueIndex,
   ]);
   const shownPosition = dragPosition ?? pendingSeek?.target ?? snapshot.positionSeconds;
-  const shownVolume = volumeDraft ?? snapshot.volume;
+  const { shownVolume, isAdjustingVolume, previewVolume, commitVolume } = useLiveVolume(
+    snapshot.volume,
+    (volume) => invoke("player_set_volume", { volume }),
+    (error) => setMessage(String(error), true),
+  );
   const measuredSourceSpec = formatSourceSpec(snapshot);
   const suspiciousQuality = isSuspiciousQuality(currentQuality, snapshot);
   const selectedOnlineFavorite = selectedCatalogTrack
@@ -1116,11 +1121,6 @@ function App() {
       return history.slice(0, -1);
     });
   };
-
-  useEffect(() => {
-    if (volumeDraft === null) return;
-    if (Math.abs(snapshot.volume - volumeDraft) < 0.005) setVolumeDraft(null);
-  }, [snapshot.volume, volumeDraft]);
 
   useEffect(() => {
     if (!pendingSeek) return;
@@ -2388,16 +2388,6 @@ function App() {
     }
   };
 
-  const commitVolume = async (volume: number) => {
-    setVolumeDraft(volume);
-    try {
-      await invoke("player_set_volume", { volume });
-    } catch (error) {
-      setVolumeDraft(null);
-      setMessage(String(error), true);
-    }
-  };
-
   const handlePlayPause = async () => {
     const currentSnapshot = snapshotRef.current;
     const currentlyPlaying = currentSnapshot.status === "playing" || currentSnapshot.status === "loading";
@@ -2607,7 +2597,7 @@ function App() {
             </div>
           </div>
           <div
-            className={`mini-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"}`}
+            className={`mini-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"} ${animatePlayback ? "is-playing" : ""}`}
             aria-label={`当前音效模式：${snapshot.audioMode === "music" ? "原声音乐" : "影院游戏"}`}
           >
             <div className="stage-glow" aria-hidden="true" />
@@ -2984,19 +2974,19 @@ function App() {
     return (
       <div className="page now-playing-page">
         <div className="now-grid">
-          <section className={`record-column ${isPlaying ? "is-playing" : ""}`}>
-            <div className={`record-stage ${isPlaying ? "live" : ""}`}>
+          <section className={`record-column ${animatePlayback ? "is-playing" : ""}`}>
+            <div className={`record-stage ${animatePlayback ? "live" : ""}`}>
               <div className="record-glow" aria-hidden="true" />
-              <div className={`record ${isPlaying ? "spinning" : ""}`}>
+              <div className={`record ${animatePlayback ? "spinning" : ""}`}>
                 <Cover artwork={currentArtwork} title={currentTitle} className="record-cover" eager />
                 <span className="record-hole" />
               </div>
-              <div className={`eq-bars ${isPlaying ? "active" : ""}`} aria-hidden="true">
+              <div className={`eq-bars ${animatePlayback ? "active" : ""}`} aria-hidden="true">
                 <i /><i /><i /><i /><i />
               </div>
             </div>
             <p className="eyebrow">NOW PLAYING</p>
-            <h1 className={isPlaying ? "title-live" : ""}>{currentTitle}</h1>
+            <h1 className={animatePlayback ? "title-live" : ""}>{currentTitle}</h1>
             {displayedCatalogTrack?.artist ? (
               <ArtistLinks artist={displayedCatalogTrack.artist} onSelect={openArtistPage} className="artist-line artist-line-links" />
             ) : <p className="artist-line">{currentArtist}</p>}
@@ -3009,7 +2999,7 @@ function App() {
             )}
           </section>
           <section className="stage-panel">
-            <div className={`sound-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"}`} aria-label="声场模式盘">
+            <div className={`sound-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"} ${animatePlayback ? "is-playing" : ""}`} aria-label="声场模式盘">
               <div className="stage-field" aria-hidden="true" />
               <div className="stage-ring stage-ring-outer" aria-hidden="true" />
               <div className="orbit orbit-one" />
@@ -3304,10 +3294,10 @@ function App() {
             }}
           />
         </div>
-        <button className={`player-track ${isPlaying ? "is-playing" : ""}`} onClick={() => navigateTo("now-playing")}>
-          <span className={`player-cover-wrap ${isPlaying ? "live" : ""}`}>
+        <button className={`player-track ${animatePlayback ? "is-playing" : ""}`} onClick={() => navigateTo("now-playing")}>
+          <span className={`player-cover-wrap ${animatePlayback ? "live" : ""}`}>
             <Cover artwork={currentArtwork} title={currentTitle} eager />
-            {isPlaying && <span className="player-eq" aria-hidden="true"><i /><i /><i /></span>}
+            {animatePlayback && <span className="player-eq" aria-hidden="true"><i /><i /><i /></span>}
           </span>
           <span>
             <strong>{currentTitle}</strong>
@@ -3343,7 +3333,16 @@ function App() {
         </div>
         <div className="player-tools">
           {selectedCatalogTrack && currentQueueItem?.online && <button className={`online-favorite ${selectedOnlineFavorite ? "active" : ""}`} onClick={() => void toggleOnlineFavorite(selectedCatalogTrack)} aria-label={selectedOnlineFavorite ? "取消在线收藏" : "收藏在线歌曲"} title={selectedOnlineFavorite ? "取消收藏" : "收藏并钉住缓存"}>{selectedOnlineFavorite ? "♥" : "♡"}</button>}
-          {measuredSourceSpec && <span className={`measured-quality ${suspiciousQuality ? "suspicious" : ""}`} title={`${currentQuality ? `${currentQuality}（音源自报） · ` : ""}实测 ${measuredSourceSpec}${suspiciousQuality ? " · 疑似虚标" : ""}`}>{suspiciousQuality ? "⚠ " : ""}{measuredSourceSpec}</span>}
+          <span
+            className={`measured-quality ${suspiciousQuality ? "suspicious" : ""} ${measuredSourceSpec ? "" : "is-placeholder"}`}
+            role={measuredSourceSpec ? "img" : undefined}
+            tabIndex={measuredSourceSpec ? 0 : -1}
+            aria-hidden={measuredSourceSpec ? undefined : true}
+            aria-label={measuredSourceSpec ? `${currentQuality ? `${currentQuality}（音源自报） · ` : ""}实测 ${measuredSourceSpec}${suspiciousQuality ? " · 疑似虚标" : ""}` : undefined}
+            title={measuredSourceSpec ? `${currentQuality ? `${currentQuality}（音源自报） · ` : ""}实测 ${measuredSourceSpec}${suspiciousQuality ? " · 疑似虚标" : ""}` : undefined}
+          >
+            {measuredSourceSpec && <span aria-hidden="true">{suspiciousQuality ? "!" : "i"}</span>}
+          </span>
           {selectedCatalogTrack && currentQueueItem?.online && <select className="quality-select" aria-label="音源自报音质" title={`音源自报档位：${currentQuality ?? "自动"}`} value={QUALITY_OPTIONS.some((option) => option.value === currentQuality) ? currentQuality ?? "auto" : "auto"} disabled={qualitySwitching || Boolean(resolveBanner)} onChange={(event) => void switchOnlineQuality(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.value === "auto" ? `自动${currentQuality ? ` · ${currentQuality}` : ""}` : option.label}</option>)}</select>}
           <div className="volume-cluster">
             <span className="volume-icon" aria-hidden="true" />
@@ -3356,18 +3355,21 @@ function App() {
               step={0.01}
               value={shownVolume}
               style={{ "--fill": `${shownVolume * 100}%` } as CSSProperties}
-              onChange={(event) => setVolumeDraft(Number(event.target.value))}
+              onChange={(event) => previewVolume(Number(event.target.value))}
               onPointerUp={(event) => {
                 const volume = Number(event.currentTarget.value);
-                void commitVolume(volume);
+                commitVolume(volume);
+              }}
+              onPointerCancel={(event) => {
+                commitVolume(Number(event.currentTarget.value));
               }}
               onKeyUp={(event) => {
                 if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
-                  void commitVolume(Number(event.currentTarget.value));
+                  commitVolume(Number(event.currentTarget.value));
                 }
               }}
               onBlur={(event) => {
-                if (volumeDraft !== null) void commitVolume(Number(event.currentTarget.value));
+                if (isAdjustingVolume) commitVolume(Number(event.currentTarget.value));
               }}
             />
           </div>

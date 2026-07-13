@@ -1785,6 +1785,12 @@ select {
   gap: 12px;
 }
 
+.source-health-note {
+  margin: 12px 0;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
 .source-card {
   display: flex;
   align-items: center;
@@ -1803,6 +1809,45 @@ select {
 
 .source-card-main {
   min-width: 0;
+}
+
+.source-card-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.source-health {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-mute);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.source-health i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--text-dim) 18%, transparent);
+}
+
+.source-health-healthy i {
+  background: #39c979;
+  box-shadow: 0 0 0 2px color-mix(in srgb, #39c979 20%, transparent), 0 0 10px color-mix(in srgb, #39c979 58%, transparent);
+}
+
+.source-health-degraded i {
+  background: #e5ad3f;
+  box-shadow: 0 0 0 2px color-mix(in srgb, #e5ad3f 20%, transparent), 0 0 10px color-mix(in srgb, #e5ad3f 48%, transparent);
+}
+
+.source-health-unhealthy i {
+  background: #e45c68;
+  box-shadow: 0 0 0 2px color-mix(in srgb, #e45c68 20%, transparent), 0 0 10px color-mix(in srgb, #e45c68 48%, transparent);
 }
 
 .source-capabilities {

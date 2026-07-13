@@ -451,7 +451,10 @@ fn resolve_with_fallback(
     }
     let mut errors = Vec::new();
     for source_id in source_ids {
-        match resolve_serialized(app, payload.clone(), quality, Some(&source_id)) {
+        let started = Instant::now();
+        let result = resolve_serialized(app, payload.clone(), quality, Some(&source_id));
+        record_source_health(app, &source_id, result.is_ok(), started.elapsed());
+        match result {
             Ok(request) => return Ok(request),
             Err(error) => errors.push(format!("{source_id}: {error}")),
         }
@@ -619,14 +622,29 @@ fn play_online_track(
                 None,
             ));
         }
-        if let Some(resolved) = resolve_candidates_with_source(
+        let diagnostics_start = diagnostics.len();
+        let started = Instant::now();
+        let resolved = resolve_candidates_with_source(
             app,
             runtime_source_id,
             &candidates,
             quality.as_deref(),
             cancellation,
             &mut diagnostics,
-        )? {
+        );
+        let source_was_called = diagnostics[diagnostics_start..].iter().any(|attempt| {
+            attempt.source_id.as_deref() == Some(runtime_source_id.as_str())
+                && matches!(attempt.stage.as_str(), "initialize" | "resolve" | "verify")
+        });
+        if source_was_called && cancellation.and_then(ResolveToken::outcome).is_none() {
+            record_source_health(
+                app,
+                runtime_source_id,
+                matches!(&resolved, Ok(Some(_))),
+                started.elapsed(),
+            );
+        }
+        if let Some(resolved) = resolved? {
             if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
                 return Ok(terminal_playback_result(
                     original_track,
@@ -783,6 +801,22 @@ fn source_identity(app: &AppHandle, source_id: Option<&str>) -> (Option<String>,
             .map(|source| source.source.metadata.name)
     });
     (selected_source_id, selected_source_name)
+}
+
+fn record_source_health(app: &AppHandle, source_id: &str, success: bool, elapsed: Duration) {
+    let latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    if let Err(error) = app
+        .state::<SourceRuntime>()
+        .record_health_sample(source_id, success, latency_ms)
+    {
+        eprintln!("failed to persist source health for {source_id}: {error}");
+        return;
+    }
+    if let Some(main_window) = app.get_webview_window("main")
+        && let Err(error) = main_window.emit("gx-source-health-updated", source_id.to_owned())
+    {
+        eprintln!("source health event failed: {error}");
+    }
 }
 
 fn terminal_playback_result(

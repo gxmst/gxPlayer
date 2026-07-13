@@ -15,6 +15,9 @@ pub mod safe_http;
 const MAX_SCRIPT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 256 * 1024;
 const MAX_CAPABILITIES_BYTES: usize = 256 * 1024;
+const SOURCE_HEALTH_WINDOW_SIZE: usize = 16;
+const SOURCE_HEALTH_MIN_SAMPLES: usize = 3;
+const SOURCE_HEALTH_FAST_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +43,44 @@ pub struct ManagedSource {
     pub config: Value,
     #[serde(default)]
     pub capabilities: Value,
+    #[serde(default)]
+    pub health_samples: Vec<SourceHealthSample>,
+}
+
+impl ManagedSource {
+    pub fn health_summary(&self) -> SourceHealthSummary {
+        summarize_source_health(&self.health_samples)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceHealthState {
+    Unknown,
+    Healthy,
+    Degraded,
+    Unhealthy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceHealthSample {
+    pub success: bool,
+    pub latency_ms: u64,
+    pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceHealthSummary {
+    pub state: SourceHealthState,
+    pub sample_count: usize,
+    pub success_count: usize,
+    pub success_rate_percent: Option<u8>,
+    pub average_latency_ms: Option<u64>,
+    pub last_success: Option<bool>,
+    pub last_latency_ms: Option<u64>,
+    pub last_recorded_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,11 +191,14 @@ impl SourceStore {
         let root = root.into();
         fs::create_dir_all(root.join("scripts"))?;
         let config_path = root.join("sources.json");
-        let config = if config_path.exists() {
+        let mut config: SourceConfig = if config_path.exists() {
             serde_json::from_slice(&fs::read(config_path)?)?
         } else {
             SourceConfig::default()
         };
+        for source in &mut config.sources {
+            trim_health_samples(&mut source.health_samples);
+        }
         Ok(Self { root, config })
     }
 
@@ -193,6 +237,7 @@ impl SourceStore {
             updates_enabled: true,
             config: empty_config(),
             capabilities: Value::Null,
+            health_samples: Vec::new(),
         };
         self.config.sources.push(source.clone());
         if self.config.active_source_id.is_none() {
@@ -375,6 +420,27 @@ impl SourceStore {
             return Ok(());
         }
         source.capabilities = capabilities;
+        self.persist()
+    }
+
+    pub fn record_health_sample(
+        &mut self,
+        id: &str,
+        success: bool,
+        latency_ms: u64,
+    ) -> Result<(), SourceStoreError> {
+        let source = self
+            .config
+            .sources
+            .iter_mut()
+            .find(|source| source.id == id)
+            .ok_or_else(|| SourceStoreError::SourceNotFound(id.into()))?;
+        source.health_samples.push(SourceHealthSample {
+            success,
+            latency_ms,
+            recorded_at_ms: unix_time_ms(),
+        });
+        trim_health_samples(&mut source.health_samples);
         self.persist()
     }
 
@@ -587,6 +653,7 @@ impl SourceStore {
                 updates_enabled: source.updates_enabled,
                 config: source.config,
                 capabilities: Value::Null,
+                health_samples: Vec::new(),
             });
         }
         for old in &self.config.sources {
@@ -633,6 +700,53 @@ impl SourceStore {
             .active_source_id
             .clone()
             .filter(|id| self.config.sources.iter().any(|source| source.id == *id))
+    }
+}
+
+fn trim_health_samples(samples: &mut Vec<SourceHealthSample>) {
+    let excess = samples.len().saturating_sub(SOURCE_HEALTH_WINDOW_SIZE);
+    if excess > 0 {
+        samples.drain(..excess);
+    }
+}
+
+fn summarize_source_health(samples: &[SourceHealthSample]) -> SourceHealthSummary {
+    let sample_count = samples.len();
+    let success_count = samples.iter().filter(|sample| sample.success).count();
+    let success_rate_percent =
+        (sample_count > 0).then(|| ((success_count * 100) / sample_count).min(100) as u8);
+    let average_latency_ms = (sample_count > 0).then(|| {
+        let total = samples
+            .iter()
+            .map(|sample| u128::from(sample.latency_ms))
+            .sum::<u128>();
+        u64::try_from(total / sample_count as u128).unwrap_or(u64::MAX)
+    });
+    let last = samples.last();
+    let recent_failures = sample_count >= SOURCE_HEALTH_MIN_SAMPLES
+        && samples[sample_count - SOURCE_HEALTH_MIN_SAMPLES..]
+            .iter()
+            .all(|sample| !sample.success);
+    let state = if sample_count < SOURCE_HEALTH_MIN_SAMPLES {
+        SourceHealthState::Unknown
+    } else if recent_failures || success_count * 100 < sample_count * 40 {
+        SourceHealthState::Unhealthy
+    } else if success_count * 100 >= sample_count * 80
+        && average_latency_ms.is_some_and(|latency| latency <= SOURCE_HEALTH_FAST_MS)
+    {
+        SourceHealthState::Healthy
+    } else {
+        SourceHealthState::Degraded
+    };
+    SourceHealthSummary {
+        state,
+        sample_count,
+        success_count,
+        success_rate_percent,
+        average_latency_ms,
+        last_success: last.map(|sample| sample.success),
+        last_latency_ms: last.map(|sample| sample.latency_ms),
+        last_recorded_at_ms: last.map(|sample| sample.recorded_at_ms),
     }
 }
 
@@ -835,6 +949,118 @@ mod tests {
             store.import_script(&oversized, "test", "large.js"),
             Err(SourceStoreError::ScriptTooLarge)
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn health_summary_uses_a_bounded_window_and_clear_states() {
+        let mut samples = (0..18)
+            .map(|index| SourceHealthSample {
+                success: true,
+                latency_ms: 1_000 + index,
+                recorded_at_ms: index,
+            })
+            .collect::<Vec<_>>();
+        trim_health_samples(&mut samples);
+        assert_eq!(samples.len(), SOURCE_HEALTH_WINDOW_SIZE);
+        let healthy = summarize_source_health(&samples);
+        assert_eq!(healthy.state, SourceHealthState::Healthy);
+        assert_eq!(healthy.sample_count, SOURCE_HEALTH_WINDOW_SIZE);
+        assert_eq!(healthy.success_rate_percent, Some(100));
+        assert_eq!(healthy.average_latency_ms, Some(1_009));
+
+        samples.extend((0..3).map(|index| SourceHealthSample {
+            success: false,
+            latency_ms: 8_000,
+            recorded_at_ms: 20 + index,
+        }));
+        trim_health_samples(&mut samples);
+        let unhealthy = summarize_source_health(&samples);
+        assert_eq!(unhealthy.state, SourceHealthState::Unhealthy);
+        assert_eq!(unhealthy.success_count, SOURCE_HEALTH_WINDOW_SIZE - 3);
+        assert_eq!(unhealthy.last_success, Some(false));
+
+        let degraded = summarize_source_health(&[
+            SourceHealthSample {
+                success: true,
+                latency_ms: 1_000,
+                recorded_at_ms: 1,
+            },
+            SourceHealthSample {
+                success: true,
+                latency_ms: 1_000,
+                recorded_at_ms: 2,
+            },
+            SourceHealthSample {
+                success: false,
+                latency_ms: 8_000,
+                recorded_at_ms: 3,
+            },
+        ]);
+        assert_eq!(degraded.state, SourceHealthState::Degraded);
+
+        let unknown = summarize_source_health(&[
+            SourceHealthSample {
+                success: true,
+                latency_ms: 1_000,
+                recorded_at_ms: 1,
+            },
+            SourceHealthSample {
+                success: true,
+                latency_ms: 1_000,
+                recorded_at_ms: 2,
+            },
+        ]);
+        assert_eq!(unknown.state, SourceHealthState::Unknown);
+    }
+
+    #[test]
+    fn health_samples_persist_locally_but_are_not_in_backups() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        let source = store
+            .import_script("lx.on('request', () => 1)", "test", "source.js")
+            .unwrap();
+        store.record_health_sample(&source.id, true, 1_200).unwrap();
+        store.record_health_sample(&source.id, true, 1_300).unwrap();
+        assert_eq!(store.list()[0].0.health_summary().sample_count, 2);
+
+        drop(store);
+        let mut reopened = SourceStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.list()[0].0.health_summary().average_latency_ms,
+            Some(1_250)
+        );
+        let backup = reopened.export_backup().unwrap();
+        reopened.restore_backup(backup).unwrap();
+        assert_eq!(
+            reopened.list()[0].0.health_summary().state,
+            SourceHealthState::Unknown
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_source_files_without_health_samples_still_open() {
+        let root = temporary_root();
+        let mut store = SourceStore::open(&root).unwrap();
+        store
+            .import_script("lx.on('request', () => 1)", "test", "source.js")
+            .unwrap();
+        drop(store);
+
+        let config_path = root.join("sources.json");
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config["sources"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("healthSamples");
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let reopened = SourceStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.list()[0].0.health_summary().state,
+            SourceHealthState::Unknown
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

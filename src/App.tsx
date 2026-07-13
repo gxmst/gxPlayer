@@ -785,6 +785,17 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let disposed = false;
+    const unlisten = listen<string>("gx-source-health-updated", () => {
+      if (!disposed) void refreshSources().catch(() => undefined);
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
     if (!playlistSessionReady) return;
     savePlaylistSession({
       playlist,
@@ -2658,7 +2669,8 @@ function App() {
           ) : <div className="fallback-empty">还没有备用音源。主源会继续逐档降低音质，最终可回退到官方 30 秒预览。</div>}
           {availableFallbackSources.length > 0 && <select aria-label="添加备用音源" defaultValue="" disabled={sourceFallbackBusy} onChange={(event) => { addFallbackSource(event.target.value); event.target.value = ""; }}><option value="">＋ 添加备用音源…</option>{availableFallbackSources.map((source) => <option key={source.id} value={source.id}>{source.metadata.name || source.id}</option>)}</select>}
         </section>
-        <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div className="source-card-main"><span className="source-badge">{source.active ? "正在使用" : source.hasConfig ? "已配置" : "可用"}</span><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p><SourceCapabilityDetails capabilities={source.capabilities} /></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { try { await invoke("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }} /> 更新提醒</label><button disabled={sourceConfigBusy} onClick={() => void openSourceConfig(source)}>配置</button><button disabled={source.active} onClick={async () => { try { await invoke("source_activate", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>启用</button><button className="danger" onClick={async () => { if (!window.confirm(`确定删除音源“${source.metadata.name || source.id}”吗？`)) return; try { await invoke("source_remove", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>删除</button></div></article>)}</div>
+        <p className="source-health-note">健康度仅统计正常搜索/解析调用，不会主动探测。</p>
+        <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div className="source-card-main"><div className="source-card-heading"><span className="source-badge">{source.active ? "正在使用" : source.hasConfig ? "已配置" : "可用"}</span><SourceHealthIndicator health={source.health} /></div><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p><SourceCapabilityDetails capabilities={source.capabilities} /></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { try { await invoke("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }} /> 更新提醒</label><button disabled={sourceConfigBusy} onClick={() => void openSourceConfig(source)}>配置</button><button disabled={source.active} onClick={async () => { try { await invoke("source_activate", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>启用</button><button className="danger" onClick={async () => { if (!window.confirm(`确定删除音源“${source.metadata.name || source.id}”吗？`)) return; try { await invoke("source_remove", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>删除</button></div></article>)}</div>
       </div>
     );
 
@@ -3169,6 +3181,24 @@ function SourceCapabilityDetails({ capabilities }: Pick<ListedSource, "capabilit
     <div><dt>平台</dt><dd>{platforms.length ? platforms.join(" / ") : "未提供"}</dd></div>
     <div><dt>音质</dt><dd>{qualities.length ? qualities.join(" / ") : "未提供"}</dd></div>
   </dl>;
+}
+
+function SourceHealthIndicator({ health }: Pick<ListedSource, "health">) {
+  const stateLabels: Record<typeof health.state, string> = {
+    unknown: "暂无样本",
+    healthy: "稳定",
+    degraded: "偶有波动",
+    unhealthy: "近期失败较多",
+  };
+  const detail = health.sampleCount === 0
+    ? "尚未发生可统计的真实搜索或解析调用"
+    : `最近 ${health.sampleCount} 次：成功 ${health.successRatePercent ?? 0}% · 平均 ${health.averageLatencyMs ?? 0} ms · 最近一次 ${health.lastSuccess ? "成功" : "失败"}`;
+  return (
+    <span className={`source-health source-health-${health.state}`} title={`${stateLabels[health.state]}：${detail}`} aria-label={`音源健康度：${stateLabels[health.state]}`}>
+      <i aria-hidden="true" />
+      <span>{stateLabels[health.state]}</span>
+    </span>
+  );
 }
 
 function VirtualTrackList({ tracks, renderRow }: { tracks: LibraryTrack[]; renderRow: (track: LibraryTrack, index: number) => ReactNode }) {

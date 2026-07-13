@@ -5,8 +5,8 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use gx_contracts::{HttpHeader, MediaType, ResolvedMediaRequest};
 use gx_source::{
-    ManagedSource, ScriptMetadata, SourceBackup, SourceFallbackConfig, SourceStore,
-    SourceStoreError,
+    ManagedSource, ScriptMetadata, SourceBackup, SourceFallbackConfig, SourceHealthSummary,
+    SourceStore, SourceStoreError,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -46,6 +46,7 @@ pub struct ListedSource {
     pub active: bool,
     pub has_config: bool,
     pub capabilities: Vec<PublicSourceCapability>,
+    pub health: SourceHealthSummary,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -145,6 +146,7 @@ impl SourceRuntime {
                     .as_object()
                     .is_some_and(|config| !config.is_empty()),
                 capabilities: public_source_capabilities(&source.capabilities),
+                health: source.health_summary(),
             })
             .collect()
     }
@@ -198,6 +200,18 @@ impl SourceRuntime {
             .lock()
             .unwrap()
             .set_fallback_config(enabled, source_ids)
+    }
+
+    pub fn record_health_sample(
+        &self,
+        id: &str,
+        success: bool,
+        latency_ms: u64,
+    ) -> Result<(), SourceStoreError> {
+        self.store
+            .lock()
+            .unwrap()
+            .record_health_sample(id, success, latency_ms)
     }
 
     pub fn resolution_source_ids(
@@ -740,6 +754,31 @@ mod tests {
         drop(runtime);
         let reopened = SourceRuntime::new(SourceStore::open(&root).unwrap());
         assert_eq!(reopened.list()[0].capabilities, listed[0].capabilities);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_list_exposes_health_summary_without_raw_samples() {
+        let (runtime, root) = runtime();
+        let source = runtime
+            .import_script(
+                "lx.on('request', () => 'https://example.com/a.mp3')",
+                "test",
+                "a",
+            )
+            .unwrap();
+        for latency_ms in [800, 1_000, 1_200] {
+            runtime
+                .record_health_sample(&source.id, true, latency_ms)
+                .unwrap();
+        }
+
+        let listed = runtime.list();
+        assert_eq!(listed[0].health.sample_count, 3);
+        assert_eq!(listed[0].health.success_rate_percent, Some(100));
+        let public = serde_json::to_value(&listed[0]).unwrap();
+        assert_eq!(public["health"]["state"], "healthy");
+        assert!(public.get("healthSamples").is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -42,6 +42,18 @@ export type ListedSource = {
     platform: string;
     qualities: string[];
   }>;
+  health: SourceHealthSummary;
+};
+
+export type SourceHealthSummary = {
+  state: "unknown" | "healthy" | "degraded" | "unhealthy";
+  sampleCount: number;
+  successCount: number;
+  successRatePercent: number | null;
+  averageLatencyMs: number | null;
+  lastSuccess: boolean | null;
+  lastLatencyMs: number | null;
+  lastRecordedAtMs: number | null;
 };
 
 export type CatalogTrack = {

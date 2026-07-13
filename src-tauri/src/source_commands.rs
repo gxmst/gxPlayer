@@ -2467,14 +2467,16 @@ fn resolve_serialized(
 
 fn restore_persistent_runtime(app: &AppHandle, runtime: &SourceRuntime) -> Result<(), String> {
     let restore = runtime
-        .prepare_reload()
+        .prepare_reload_plan()
         .map_err(|error| error.to_string())?;
-    if let Some(launch) = restore {
+    if let Some(launch) = restore.launch {
         let sandbox = app
             .get_webview_window(SANDBOX_LABEL)
             .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
         evaluate_launch(&sandbox, &launch)?;
         wait_until_ready(runtime, launch.generation, RUNTIME_INIT_TIMEOUT, None)?;
+    } else if let Some(sandbox) = app.get_webview_window(SANDBOX_LABEL) {
+        evaluate_clear_realm(&sandbox, restore.generation)?;
     }
     Ok(())
 }
@@ -2484,14 +2486,16 @@ fn restore_persistent_runtime_background(
     runtime: &SourceRuntime,
 ) -> Result<(), String> {
     let restore = runtime
-        .prepare_reload()
+        .prepare_reload_plan()
         .map_err(|error| error.to_string())?;
-    if let Some(launch) = restore {
+    if let Some(launch) = restore.launch {
         let sandbox = app
             .get_webview_window(SANDBOX_LABEL)
             .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
         evaluate_launch(&sandbox, &launch)?;
         schedule_runtime_timeout(app.clone(), launch.generation);
+    } else if let Some(sandbox) = app.get_webview_window(SANDBOX_LABEL) {
+        evaluate_clear_realm(&sandbox, restore.generation)?;
     }
     Ok(())
 }
@@ -2525,12 +2529,18 @@ fn dispatch_and_wait(
                 ResolveOutcome::Stale => "LX resolver request superseded",
                 _ => "LX resolver request stopped",
             };
-            runtime.cancel_request(&request_id, reason);
+            abort_runtime_request(&sandbox, runtime, &request_id, generation, reason);
             return Err(reason.into());
         }
         let now = Instant::now();
         if now >= deadline {
-            runtime.cancel_request(&request_id, "LX resolver request timed out");
+            abort_runtime_request(
+                &sandbox,
+                runtime,
+                &request_id,
+                generation,
+                "LX resolver request timed out",
+            );
             return Err("LX resolver request timed out".into());
         }
         let wait = (deadline - now).min(Duration::from_millis(75));
@@ -2543,6 +2553,20 @@ fn dispatch_and_wait(
         }
     };
     normalize_media_request(raw, quality)
+}
+
+fn abort_runtime_request(
+    sandbox: &WebviewWindow,
+    runtime: &SourceRuntime,
+    request_id: &str,
+    generation: u64,
+    reason: &str,
+) {
+    if runtime.abort_request_generation(request_id, generation, reason)
+        && let Err(error) = evaluate_retire_realm(sandbox, generation)
+    {
+        eprintln!("failed to terminate retired LX source realm: {error}");
+    }
 }
 
 fn wait_until_ready(
@@ -2602,10 +2626,13 @@ pub fn sandbox_became_ready(
 }
 
 fn reload_runtime(sandbox: &Option<WebviewWindow>, runtime: &SourceRuntime) -> Result<(), String> {
-    let launch = runtime
-        .prepare_reload()
+    let reload = runtime
+        .prepare_reload_plan()
         .map_err(|error| error.to_string())?;
-    let Some(launch) = launch else {
+    let Some(launch) = reload.launch else {
+        if let Some(sandbox) = sandbox {
+            evaluate_clear_realm(sandbox, reload.generation)?;
+        }
         return Ok(());
     };
     let sandbox = sandbox
@@ -2614,6 +2641,18 @@ fn reload_runtime(sandbox: &Option<WebviewWindow>, runtime: &SourceRuntime) -> R
     evaluate_launch(sandbox, &launch)?;
     schedule_runtime_timeout(sandbox.app_handle().clone(), launch.generation);
     Ok(())
+}
+
+fn evaluate_retire_realm(window: &WebviewWindow, generation: u64) -> Result<(), String> {
+    window
+        .eval(format!("window.__gxRetireSourceRealm({generation})"))
+        .map_err(|error| error.to_string())
+}
+
+fn evaluate_clear_realm(window: &WebviewWindow, generation: u64) -> Result<(), String> {
+    window
+        .eval(format!("window.__gxClearSourceRealm({generation})"))
+        .map_err(|error| error.to_string())
 }
 
 fn schedule_runtime_timeout(app: AppHandle, generation: u64) {

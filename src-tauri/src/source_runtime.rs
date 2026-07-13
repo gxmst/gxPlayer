@@ -90,6 +90,11 @@ pub struct ScriptLaunch {
     pub source: ManagedSource,
 }
 
+pub struct PreparedReload {
+    pub generation: u64,
+    pub launch: Option<ScriptLaunch>,
+}
+
 pub struct RuntimeRequest {
     pub request_id: String,
     pub generation: u64,
@@ -335,7 +340,7 @@ impl SourceRuntime {
         Ok((source_id, route))
     }
 
-    pub fn prepare_reload(&self) -> Result<Option<ScriptLaunch>, SourceStoreError> {
+    pub fn prepare_reload_plan(&self) -> Result<PreparedReload, SourceStoreError> {
         let active = self.store.lock().unwrap().active_script()?;
         let mut inner = self.inner.lock().unwrap();
         inner.status.generation = inner.status.generation.wrapping_add(1);
@@ -351,7 +356,10 @@ impl SourceRuntime {
             inner.status.state = RuntimeState::NoSource;
             inner.status.active_source_id = None;
             inner.network_route = None;
-            return Ok(None);
+            return Ok(PreparedReload {
+                generation,
+                launch: None,
+            });
         };
         let route = source_route_attempts(source.last_successful_route)
             .into_iter()
@@ -360,11 +368,14 @@ impl SourceRuntime {
         inner.status.state = RuntimeState::Initializing;
         inner.status.active_source_id = Some(source.id.clone());
         inner.network_route = Some(route);
-        Ok(Some(ScriptLaunch {
+        Ok(PreparedReload {
             generation,
-            script,
-            source,
-        }))
+            launch: Some(ScriptLaunch {
+                generation,
+                script,
+                source,
+            }),
+        })
     }
 
     pub fn prepare_reload_for_route(
@@ -515,6 +526,32 @@ impl SourceRuntime {
         if let Some(pending) = self.inner.lock().unwrap().pending.remove(request_id) {
             let _ = pending.sender.send(Err(reason.into()));
         }
+    }
+
+    pub fn abort_request_generation(
+        &self,
+        request_id: &str,
+        generation: u64,
+        reason: &str,
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(pending) = inner.pending.remove(request_id) else {
+            return false;
+        };
+        let pending_generation = pending.generation;
+        let _ = pending.sender.send(Err(reason.into()));
+        if pending_generation != generation || inner.status.generation != generation {
+            return false;
+        }
+
+        // The extra generation is a tombstone for late worker and HTTP bridge responses.
+        inner.status.generation = inner.status.generation.wrapping_add(1);
+        inner.status.state = RuntimeState::Failed;
+        inner.status.capabilities = Value::Null;
+        inner.status.error = Some(reason.into());
+        inner.status.update_alert = None;
+        reject_all_pending(&mut inner, reason);
+        true
     }
 
     pub fn complete_request(
@@ -733,27 +770,111 @@ mod tests {
                 "a",
             )
             .unwrap();
-        let launch = runtime.prepare_reload().unwrap().unwrap();
+        let launch = runtime.prepare_reload_plan().unwrap().launch.unwrap();
         runtime.mark_ready(launch.generation, Value::Null).unwrap();
         let pending = runtime
             .begin_request(&serde_json::json!({"action":"musicUrl"}))
             .unwrap();
         assert!(runtime.fail_current("sandbox crashed".into()));
         assert!(pending.receiver.recv().unwrap().is_err());
-        runtime.prepare_reload().unwrap();
+        runtime.prepare_reload_plan().unwrap();
         runtime
             .mark_ready(runtime.status().generation, Value::Null)
             .unwrap();
         let pending = runtime
             .begin_request(&serde_json::json!({"action":"musicUrl"}))
             .unwrap();
-        runtime.prepare_reload().unwrap();
+        runtime.prepare_reload_plan().unwrap();
         assert!(pending.receiver.recv().unwrap().is_err());
         assert!(
             runtime
                 .complete_request(&pending.request_id, pending.generation, Ok(Value::Null))
                 .is_err()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_source_reload_plan_carries_its_own_generation() {
+        let (runtime, root) = runtime();
+        let empty = runtime.prepare_reload_plan().unwrap();
+        assert!(empty.launch.is_none());
+        assert_eq!(empty.generation, runtime.status().generation);
+
+        runtime
+            .import_script("lx.on('request', () => null)", "test", "a")
+            .unwrap();
+        let replacement = runtime.prepare_reload_plan().unwrap();
+        assert!(replacement.launch.is_some());
+        assert_ne!(replacement.generation, empty.generation);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn aborted_request_retires_only_its_runtime_generation() {
+        let (runtime, root) = runtime();
+        runtime
+            .import_script("lx.on('request', () => new Promise(() => {}))", "test", "a")
+            .unwrap();
+        let launch = runtime.prepare_reload_plan().unwrap().launch.unwrap();
+        runtime.mark_ready(launch.generation, Value::Null).unwrap();
+        let pending = runtime
+            .begin_request(&serde_json::json!({"action":"musicUrl"}))
+            .unwrap();
+
+        assert!(runtime.abort_request_generation(
+            &pending.request_id,
+            pending.generation,
+            "LX resolver request timed out",
+        ));
+        assert!(pending.receiver.recv().unwrap().is_err());
+        let retired = runtime.status();
+        assert_ne!(retired.generation, pending.generation);
+        assert_eq!(retired.state, RuntimeState::Failed);
+        assert_eq!(
+            retired.error.as_deref(),
+            Some("LX resolver request timed out")
+        );
+        assert!(
+            runtime
+                .complete_request(&pending.request_id, pending.generation, Ok(Value::Null))
+                .is_err()
+        );
+
+        let replacement = runtime.prepare_reload_plan().unwrap().launch.unwrap();
+        assert_ne!(replacement.generation, pending.generation);
+        runtime
+            .mark_ready(replacement.generation, Value::Null)
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn late_abort_cannot_retire_a_replacement_generation() {
+        let (runtime, root) = runtime();
+        runtime
+            .import_script("lx.on('request', () => new Promise(() => {}))", "test", "a")
+            .unwrap();
+        let first = runtime.prepare_reload_plan().unwrap().launch.unwrap();
+        runtime.mark_ready(first.generation, Value::Null).unwrap();
+        let pending = runtime
+            .begin_request(&serde_json::json!({"action":"musicUrl"}))
+            .unwrap();
+        let replacement = runtime.prepare_reload_plan().unwrap().launch.unwrap();
+        assert!(pending.receiver.recv().unwrap().is_err());
+        runtime
+            .mark_ready(replacement.generation, Value::Null)
+            .unwrap();
+
+        assert!(!runtime.abort_request_generation(
+            &pending.request_id,
+            pending.generation,
+            "late cancellation",
+        ));
+        let status = runtime.status();
+        assert_eq!(status.generation, replacement.generation);
+        assert_eq!(status.state, RuntimeState::Ready);
+        assert_eq!(status.error, None);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -767,7 +888,7 @@ mod tests {
                 "a",
             )
             .unwrap();
-        let launch = runtime.prepare_reload().unwrap().unwrap();
+        let launch = runtime.prepare_reload_plan().unwrap().launch.unwrap();
         runtime
             .mark_ready(
                 launch.generation,
@@ -812,7 +933,7 @@ mod tests {
                 "a",
             )
             .unwrap();
-        let launch = runtime.prepare_reload().unwrap().unwrap();
+        let launch = runtime.prepare_reload_plan().unwrap().launch.unwrap();
         let source_id = runtime
             .mark_ready(
                 launch.generation,
@@ -937,11 +1058,11 @@ mod tests {
                 .unwrap();
             runtime.record_health_sample(&second.id, true, 500).unwrap();
         }
-        let launch = runtime.prepare_reload().unwrap().unwrap();
+        let launch = runtime.prepare_reload_plan().unwrap().launch.unwrap();
         assert_eq!(launch.source.id, second.id);
         runtime.set_enabled(&first.id, false).unwrap();
         runtime.set_enabled(&second.id, false).unwrap();
-        assert!(runtime.prepare_reload().unwrap().is_none());
+        assert!(runtime.prepare_reload_plan().unwrap().launch.is_none());
         assert_eq!(runtime.status().state, RuntimeState::NoSource);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -967,7 +1088,7 @@ mod tests {
             .prepare_reload_for_route(&second.id, NetworkRoute::Direct)
             .unwrap();
         assert_eq!(temporary.source.id, second.id);
-        let restored = runtime.prepare_reload().unwrap().unwrap();
+        let restored = runtime.prepare_reload_plan().unwrap().launch.unwrap();
         assert_eq!(restored.source.id, first.id);
         assert!(
             runtime
@@ -1035,7 +1156,7 @@ mod tests {
         assert!(!listed.contains("secret"));
         assert!(!listed.contains("config"));
         assert!(listed.contains("hasConfig"));
-        let launch = runtime.prepare_reload().unwrap().unwrap();
+        let launch = runtime.prepare_reload_plan().unwrap().launch.unwrap();
         assert_eq!(launch.source.config["api"]["pass"], "secret");
         std::fs::remove_dir_all(root).unwrap();
     }

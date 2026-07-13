@@ -26,6 +26,8 @@ type RealmMessage = {
 let realmWorker: Worker | null = null;
 let realmNonce = "";
 let currentGeneration = 0;
+// Prevent a delayed eval for an aborted generation from recreating its terminated worker.
+let retiredGeneration = -1;
 let pocMode = false;
 
 function randomNonce(): string {
@@ -40,6 +42,20 @@ function destroySourceRealm(): void {
     realmWorker.terminate();
     realmWorker = null;
   }
+}
+
+function retireSourceRealm(generation: number): void {
+  if (!Number.isSafeInteger(generation) || generation !== currentGeneration) return;
+  retiredGeneration = Math.max(retiredGeneration, generation);
+  destroySourceRealm();
+}
+
+function clearSourceRealm(generation: number): void {
+  if (!Number.isSafeInteger(generation) || generation < currentGeneration) return;
+  currentGeneration = generation;
+  retiredGeneration = Math.max(retiredGeneration, generation);
+  pocMode = false;
+  destroySourceRealm();
 }
 
 function isActiveRealm(worker: Worker, nonce: string): boolean {
@@ -140,7 +156,11 @@ function createSourceRealm(
     config?: Record<string, unknown>;
   },
 ): void {
+  const generation = context.generation ?? 0;
+  if (!context.poc && (generation < currentGeneration || generation <= retiredGeneration)) return;
   destroySourceRealm();
+  currentGeneration = generation;
+  pocMode = context.poc ?? false;
   const nonce = randomNonce();
   const worker = new SourceRealmWorker({ name: "gx-lx-source-realm" });
   realmWorker = worker;
@@ -172,9 +192,13 @@ Object.assign(window, {
       config?: Record<string, unknown>;
     } = {},
   ) {
-    currentGeneration = context.generation ?? 0;
-    pocMode = context.poc ?? false;
     createSourceRealm(script, context);
+  },
+  __gxRetireSourceRealm(generation: number) {
+    retireSourceRealm(generation);
+  },
+  __gxClearSourceRealm(generation: number) {
+    clearSourceRealm(generation);
   },
   async __gxDispatchRequest(requestId: string | unknown, payload?: unknown, generation?: number) {
     const worker = realmWorker;

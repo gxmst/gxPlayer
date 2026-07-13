@@ -28,7 +28,9 @@ const MAX_HTTP_OPTIONS_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SOURCE_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
-const RUNTIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const RUNTIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const RUNTIME_INIT_TIMEOUT: Duration = Duration::from_secs(8);
+const MEDIA_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -532,14 +534,6 @@ fn play_online_track(
     let source_ids = runtime
         .resolution_source_ids(source_id.as_deref())
         .map_err(|error| error.to_string())?;
-    if source_ids.is_empty() {
-        return Ok(terminal_playback_result(
-            original_track,
-            ResolveOutcome::Failed,
-            diagnostics,
-            Some("没有已导入且可用的 LX 音源".into()),
-        ));
-    }
 
     // A direct catalog identity lets us reuse an already verified cache without doing metadata
     // replacement searches or starting a JavaScript runtime.
@@ -554,14 +548,9 @@ fn play_online_track(
                     None,
                 ));
             }
-            if let Some(result) = play_cache_hit(
-                app,
-                &track,
-                &attempt,
-                source_ids.first().map(String::as_str),
-                cancellation,
-                &mut diagnostics,
-            )? {
+            if let Some(result) =
+                play_cache_hit(app, &track, &attempt, cancellation, &mut diagnostics)?
+            {
                 return Ok(result);
             }
         }
@@ -602,17 +591,23 @@ fn play_online_track(
                     None,
                 ));
             }
-            if let Some(result) = play_cache_hit(
-                app,
-                candidate,
-                &attempt,
-                source_ids.first().map(String::as_str),
-                cancellation,
-                &mut diagnostics,
-            )? {
+            if let Some(result) =
+                play_cache_hit(app, candidate, &attempt, cancellation, &mut diagnostics)?
+            {
                 return Ok(result);
             }
         }
+    }
+
+    // A cache miss is the point at which a live LX source becomes necessary.
+    // Keep the cache-only path usable even when all imported sources are disabled.
+    if source_ids.is_empty() {
+        return Ok(terminal_playback_result(
+            original_track,
+            ResolveOutcome::Failed,
+            diagnostics,
+            Some("没有已导入且可用的 LX 音源".into()),
+        ));
     }
 
     for runtime_source_id in &source_ids {
@@ -722,7 +717,6 @@ fn play_cache_hit(
     app: &AppHandle,
     track: &CatalogTrack,
     quality: &str,
-    source_id: Option<&str>,
     cancellation: Option<&ResolveToken>,
     diagnostics: &mut Vec<ResolveAttemptDiagnostic>,
 ) -> Result<Option<OnlinePlaybackResult>, String> {
@@ -755,10 +749,9 @@ fn play_cache_hit(
             )));
         }
     }
-    let (selected_source_id, selected_source_name) = source_identity(app, source_id);
     diagnostics.push(ResolveAttemptDiagnostic {
-        source_id: selected_source_id.clone(),
-        source_name: selected_source_name.clone(),
+        source_id: None,
+        source_name: None,
         provider_id: track.provider_id.clone(),
         provider_track_id: track.provider_track_id.clone(),
         quality: Some(quality.to_owned()),
@@ -769,8 +762,8 @@ fn play_cache_hit(
     Ok(Some(OnlinePlaybackResult {
         outcome: ResolveOutcome::Started,
         track: track.clone(),
-        source_id: selected_source_id,
-        source_name: selected_source_name,
+        source_id: None,
+        source_name: None,
         quality: Some(quality.to_owned()),
         cache_hit: true,
         attempts: diagnostics.clone(),
@@ -841,12 +834,9 @@ fn format_attempt_failure(attempts: &[ResolveAttemptDiagnostic]) -> String {
         })
         .collect::<Vec<_>>();
     if details.is_empty() {
-        "LX source could not resolve a verified full-track URL".into()
+        "所有音源均无法返回结果".into()
     } else {
-        format!(
-            "LX source could not resolve a verified full-track URL ({})",
-            details.join("; ")
-        )
+        format!("所有音源均无法返回结果（{}）", details.join("; "))
     }
 }
 
@@ -884,6 +874,17 @@ fn public_attempt_error(stage: &str, error: &str) -> String {
         _ => "source_resolution_failed",
     }
     .into()
+}
+
+fn should_skip_source(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("timed out")
+        || error.contains("timeout")
+        || error.contains("http 401")
+        || error.contains("http 403")
+        || error.contains("http 429")
+        || error.contains("runtime failed")
+        || error.contains("sandbox window is unavailable")
 }
 
 struct ResolvedCandidate {
@@ -926,7 +927,7 @@ fn resolve_candidates_with_source(
                 wait_until_ready(
                     &runtime,
                     launch.generation,
-                    Duration::from_secs(15),
+                    RUNTIME_INIT_TIMEOUT,
                     cancellation,
                 )
             })();
@@ -1013,6 +1014,9 @@ fn resolve_candidates_with_source(
                                 error: Some(public_attempt_error("resolve", &error)),
                             });
                         }
+                        if should_skip_source(&error) {
+                            break 'candidate;
+                        }
                         continue;
                     }
                 };
@@ -1033,6 +1037,9 @@ fn resolve_candidates_with_source(
                             success: false,
                             error: Some(public_attempt_error("verify", &error)),
                         });
+                    }
+                    if should_skip_source(&error) {
+                        break 'candidate;
                     }
                     continue;
                 }
@@ -1194,7 +1201,7 @@ fn validate_full_track_request(
         method: Method::HEAD,
         headers: base_headers.clone(),
         body: None,
-        timeout: Duration::from_secs(10),
+        timeout: MEDIA_PROBE_TIMEOUT,
         max_response_bytes: 0,
     })
     .ok()
@@ -1211,7 +1218,7 @@ fn validate_full_track_request(
         method: Method::GET,
         headers,
         body: None,
-        timeout: Duration::from_secs(10),
+        timeout: MEDIA_PROBE_TIMEOUT,
         max_response_bytes: minimum_full_track_bytes as usize,
     });
     let total_length = match response {
@@ -1806,7 +1813,7 @@ fn resolve_serialized(
                     .get_webview_window(SANDBOX_LABEL)
                     .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
                 evaluate_launch(&sandbox, &launch)?;
-                wait_until_ready(&runtime, launch.generation, Duration::from_secs(15), None)
+                wait_until_ready(&runtime, launch.generation, RUNTIME_INIT_TIMEOUT, None)
             })();
             if let Err(error) = switched {
                 let _ = restore_persistent_runtime(app, &runtime);
@@ -1837,7 +1844,7 @@ fn restore_persistent_runtime(app: &AppHandle, runtime: &SourceRuntime) -> Resul
             .get_webview_window(SANDBOX_LABEL)
             .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
         evaluate_launch(&sandbox, &launch)?;
-        wait_until_ready(runtime, launch.generation, Duration::from_secs(15), None)?;
+        wait_until_ready(runtime, launch.generation, RUNTIME_INIT_TIMEOUT, None)?;
     }
     Ok(())
 }
@@ -1981,7 +1988,7 @@ fn reload_runtime(sandbox: &Option<WebviewWindow>, runtime: &SourceRuntime) -> R
 
 fn schedule_runtime_timeout(app: AppHandle, generation: u64) {
     tauri::async_runtime::spawn_blocking(move || {
-        std::thread::sleep(Duration::from_secs(15));
+        std::thread::sleep(RUNTIME_INIT_TIMEOUT);
         app.state::<SourceRuntime>()
             .fail_if_initializing(generation, "LX runtime initialization timed out".into());
     });
@@ -2228,6 +2235,31 @@ mod tests {
         assert_eq!(request.method, Method::POST);
         assert_eq!(request.timeout, Duration::from_secs(30));
         assert_eq!(request.body.unwrap(), b"q=hello+world");
+    }
+
+    #[test]
+    fn source_scoped_failures_skip_to_the_next_imported_source() {
+        assert!(should_skip_source("LX resolver request timed out"));
+        assert!(should_skip_source("upstream HTTP 429"));
+        assert!(should_skip_source("HTTP 403 from source"));
+        assert!(!should_skip_source(
+            "resolved media failed content-range verification"
+        ));
+    }
+
+    #[test]
+    fn exhausted_fallbacks_have_a_clear_user_facing_error() {
+        let message = format_attempt_failure(&[ResolveAttemptDiagnostic {
+            source_id: Some("source-a".into()),
+            source_name: Some("测试音源".into()),
+            provider_id: "wy".into(),
+            provider_track_id: "1".into(),
+            quality: Some("320k".into()),
+            stage: "resolve".into(),
+            success: false,
+            error: Some("timeout".into()),
+        }]);
+        assert!(message.starts_with("所有音源均无法返回结果"));
     }
 
     #[test]

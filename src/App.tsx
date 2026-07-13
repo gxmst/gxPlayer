@@ -82,7 +82,6 @@ const PLAY_MODE_META: Record<PlayMode, { label: string; glyph: string }> = {
   repeat_one: { label: "单曲循环", glyph: "one" },
   shuffle: { label: "随机播放", glyph: "shuf" },
 };
-const RESOLVE_TIMEOUT_MS = 25_000;
 const TOAST_OK_MS = 3_000;
 const TOAST_ERROR_MS = 10_000;
 const COVER_CACHE_LIMIT = 96;
@@ -465,6 +464,7 @@ function App() {
     sourceIds: [],
     explicitlyConfigured: false,
   });
+  const [draggedFallbackSource, setDraggedFallbackSource] = useState<string | null>(null);
   const [sourceUrl, setSourceUrl] = useState("");
   const [configSource, setConfigSource] = useState<ListedSource | null>(null);
   const [sourceConfigDraft, setSourceConfigDraft] = useState<SourceConfigDraft | null>(null);
@@ -1057,7 +1057,8 @@ function App() {
   /**
    * Resolve and play a single online CatalogTrack into the engine.
    * Constraint 2: only called when the playhead actually reaches this track — never batch.
-   * Supports cancel + client-side timeout (default 25s).
+   * Supports explicit cancellation. The backend owns bounded per-stage timeouts so a
+   * fixed client deadline cannot cut off later sources in the fallback chain.
    */
   const resolveAndPlayOnline = async (
     wanted: CatalogTrack,
@@ -1072,28 +1073,8 @@ function App() {
     resolveAbortRef.current = false;
     activeResolveRequestRef.current = requestId;
     suppressNextTerminalAdvanceRef.current = false;
-    setResolveBanner({ title: `正在解析《${wanted.title}》`, detail: "可取消 · 超时自动停止 · 仅解析当前这一首" });
+    setResolveBanner({ title: `正在解析《${wanted.title}》`, detail: "可取消 · 仅解析当前这一首" });
     console.info("[GXPlayer] online resolve request", { key, requestId, title: wanted.title, quality });
-
-    const timed = <T,>(promise: Promise<T>, cancelOnTimeout = false): Promise<T> =>
-      new Promise<T>((resolve, reject) => {
-        const timer = window.setTimeout(() => {
-          if (cancelOnTimeout) {
-            void invoke("player_cancel_resolve", { requestId }).catch(() => undefined);
-          }
-          reject(new Error("timeout: 解析超时"));
-        }, RESOLVE_TIMEOUT_MS);
-        promise.then(
-          (value) => {
-            window.clearTimeout(timer);
-            resolve(value);
-          },
-          (error) => {
-            window.clearTimeout(timer);
-            reject(error);
-          },
-        );
-      });
 
     const interruptedOutcome = (): PlaybackStartResult | null => {
       if (cancelledResolveRequestsRef.current.has(requestId) || resolveAbortRef.current) {
@@ -1106,15 +1087,12 @@ function App() {
     };
 
     try {
-      const online = await timed(
-        invoke<OnlinePlaybackResult>("player_play_online_track", {
-          track: wanted,
-          quality: quality === "auto" ? null : quality,
-          sourceId: null,
-          requestId,
-        }),
-        true,
-      );
+      const online = await invoke<OnlinePlaybackResult>("player_play_online_track", {
+        track: wanted,
+        quality: quality === "auto" ? null : quality,
+        sourceId: null,
+        requestId,
+      });
       const interrupted = interruptedOutcome();
       if (interrupted) return interrupted;
       if (online.outcome === "cancelled" || online.outcome === "stale") {
@@ -1156,13 +1134,11 @@ function App() {
         return { outcome: "failed", error: onlineError };
       }
       try {
-        const preview = await timed(
-          invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
-            wanted,
-            candidates: opts.candidates ?? [wanted],
-            requestId,
-          }),
-        );
+        const preview = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
+          wanted,
+          candidates: opts.candidates ?? [wanted],
+          requestId,
+        });
         const previewInterrupted = interruptedOutcome();
         if (previewInterrupted) return previewInterrupted;
         setSelectedCatalogTrack(preview.track);
@@ -1841,7 +1817,11 @@ function App() {
   const saveSourceFallback = async (enabled: boolean, sourceIds: string[]) => {
     setSourceFallbackBusy(true);
     try {
-      const saved = await invoke<SourceFallbackConfig>("source_set_fallback_config", { enabled, sourceIds });
+      const orderedIds = [...new Set([
+        ...(activeSource?.id ? [activeSource.id] : []),
+        ...sourceIds,
+      ])];
+      const saved = await invoke<SourceFallbackConfig>("source_set_fallback_config", { enabled, sourceIds: orderedIds });
       setSourceFallback(saved);
       setMessage(enabled ? "自动音源降级顺序已保存。" : "已关闭备用音源自动降级。");
     } catch (error) {
@@ -1867,6 +1847,19 @@ function App() {
 
   const removeFallbackSource = (sourceId: string) => {
     const next = fallbackSources.map((source) => source.id).filter((id) => id !== sourceId);
+    void saveSourceFallback(sourceFallback.enabled, next);
+  };
+
+  const dropFallbackSource = (targetId: string) => {
+    const sourceId = draggedFallbackSource;
+    setDraggedFallbackSource(null);
+    if (!sourceId || sourceId === targetId) return;
+    const next = fallbackSources.map((source) => source.id);
+    const from = next.indexOf(sourceId);
+    const to = next.indexOf(targetId);
+    if (from < 0 || to < 0) return;
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved!);
     void saveSourceFallback(sourceFallback.enabled, next);
   };
 
@@ -2514,13 +2507,21 @@ function App() {
         <section className="source-status-card"><span className={`runtime-dot ${runtime?.state ?? "no_source"}`} /><div><strong>{sourceStatus.title}</strong><p>{sourceStatus.copy}</p></div><code>GEN {runtime?.generation ?? 0}</code></section>
         <section className="source-fallback-card" aria-labelledby="source-fallback-title">
           <div className="source-fallback-heading">
-            <div><p className="eyebrow">FALLBACK</p><h3 id="source-fallback-title">自动降级</h3><p>主音源失败时按顺序尝试备用音源；每个音源内部仍会继续做音质降级。</p></div>
+             <div><p className="eyebrow">FALLBACK</p><h3 id="source-fallback-title">自动降级</h3><p>主音源失败时按顺序尝试备用音源；每个音源内部仍会继续做音质降级。{sourceFallback.explicitlyConfigured ? " 当前顺序已手动保存。" : " 当前顺序跟随导入顺序。"}</p></div>
             <label className="source-fallback-toggle"><input type="checkbox" checked={sourceFallback.enabled} disabled={sourceFallbackBusy} onChange={(event) => void saveSourceFallback(event.target.checked, fallbackSources.map((source) => source.id))} /> 启用</label>
           </div>
           <div className="fallback-main"><span>主音源</span><strong>{activeSource?.metadata.name || "尚未启用音源"}</strong></div>
           {fallbackSources.length ? (
             <ol className="fallback-list">
-              {fallbackSources.map((source, index) => <li key={source.id}><span>{index + 1}</span><div><strong>{source.metadata.name || "未命名音源"}</strong><small>{source.metadata.author || source.id}</small></div><div className="fallback-actions"><button type="button" disabled={sourceFallbackBusy || index === 0} onClick={() => moveFallbackSource(index, -1)} aria-label={`上移 ${source.metadata.name}`}>↑</button><button type="button" disabled={sourceFallbackBusy || index === fallbackSources.length - 1} onClick={() => moveFallbackSource(index, 1)} aria-label={`下移 ${source.metadata.name}`}>↓</button><button type="button" disabled={sourceFallbackBusy} onClick={() => removeFallbackSource(source.id)}>移除</button></div></li>)}
+               {fallbackSources.map((source, index) => <li
+                 key={source.id}
+                 draggable={!sourceFallbackBusy}
+                 onDragStart={() => setDraggedFallbackSource(source.id)}
+                 onDragOver={(event) => event.preventDefault()}
+                 onDrop={() => dropFallbackSource(source.id)}
+                 onDragEnd={() => setDraggedFallbackSource(null)}
+                 className={draggedFallbackSource === source.id ? "dragging" : ""}
+               ><span>{index + 1}</span><div><strong>{source.metadata.name || "未命名音源"}</strong><small>{source.metadata.author || source.id}</small></div><div className="fallback-actions"><button type="button" disabled={sourceFallbackBusy || index === 0} onClick={() => moveFallbackSource(index, -1)} aria-label={`上移 ${source.metadata.name}`}>↑</button><button type="button" disabled={sourceFallbackBusy || index === fallbackSources.length - 1} onClick={() => moveFallbackSource(index, 1)} aria-label={`下移 ${source.metadata.name}`}>↓</button><button type="button" disabled={sourceFallbackBusy} onClick={() => removeFallbackSource(source.id)}>移除</button></div></li>)}
             </ol>
           ) : <div className="fallback-empty">还没有备用音源。主源会继续逐档降低音质，最终可回退到官方 30 秒预览。</div>}
           {availableFallbackSources.length > 0 && <select aria-label="添加备用音源" defaultValue="" disabled={sourceFallbackBusy} onChange={(event) => { addFallbackSource(event.target.value); event.target.value = ""; }}><option value="">＋ 添加备用音源…</option>{availableFallbackSources.map((source) => <option key={source.id} value={source.id}>{source.metadata.name || source.id}</option>)}</select>}

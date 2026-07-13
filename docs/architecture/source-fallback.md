@@ -34,8 +34,10 @@ previous request stale. User cancellation marks it cancelled. A cancelled or
 stale request may finish background cleanup, but it must never load or replace
 the audio engine session and must never trigger automatic queue advancement.
 
-The backend is authoritative for cancellation. A frontend timeout is only a UI
-deadline and must also call the backend cancellation command.
+The backend is authoritative for cancellation and owns bounded initialization,
+resolver, HTTP, and media-probe timeouts for every source attempt. The frontend
+does not impose a shorter fixed deadline on the whole chain because that could
+cancel the request before a later imported source is tried.
 
 The cancellation token is held while the final engine-load and media-metadata
 commit is submitted. A stale token therefore cannot replace a newer session in

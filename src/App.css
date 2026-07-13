@@ -3491,6 +3491,14 @@ select {
 
 .fallback-list li {
   grid-template-columns: 24px minmax(0, 1fr) auto;
+  cursor: grab;
+  transition: opacity 160ms var(--ease-soft), border-color 160ms var(--ease-soft), background 160ms var(--ease-soft);
+}
+
+.fallback-list li.dragging {
+  cursor: grabbing;
+  opacity: 0.5;
+  border: 1px dashed color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .fallback-list strong,

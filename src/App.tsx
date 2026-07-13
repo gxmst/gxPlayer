@@ -466,6 +466,7 @@ function App() {
   });
   const [draggedFallbackSource, setDraggedFallbackSource] = useState<string | null>(null);
   const [sourceUrl, setSourceUrl] = useState("");
+  const [sourceImportBusy, setSourceImportBusy] = useState<"file" | "url" | null>(null);
   const [configSource, setConfigSource] = useState<ListedSource | null>(null);
   const [sourceConfigDraft, setSourceConfigDraft] = useState<SourceConfigDraft | null>(null);
   const [sourceConfigRevealed, setSourceConfigRevealed] = useState(false);
@@ -577,7 +578,7 @@ function App() {
       setChartTracks(await invoke<CatalogTrack[]>("metadata_chart", { limit: 12 }));
     } catch (error) {
       setChartTracks([]);
-      setMessage(`在线推荐暂时不可用：${String(error)}`, true);
+      setMessage(`在线榜单暂时不可用：${String(error)}`, true);
     } finally {
       setChartLoading(false);
     }
@@ -1814,6 +1815,41 @@ function App() {
     window.localStorage.setItem("gxplayer.defaultQuality", preference);
   };
 
+  const importSourceFile = async () => {
+    if (sourceImportBusy) return;
+    setSourceImportBusy("file");
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "LX 音源脚本", extensions: ["js"] }],
+      });
+      if (!selected || Array.isArray(selected)) return;
+      await invoke("source_import_file", { path: selected });
+      await refreshSources();
+      setMessage("已从本地文件导入音源脚本。");
+    } catch (error) {
+      setMessage(String(error), true);
+    } finally {
+      setSourceImportBusy(null);
+    }
+  };
+
+  const importSourceUrl = async () => {
+    const url = sourceUrl.trim();
+    if (!url || sourceImportBusy) return;
+    setSourceImportBusy("url");
+    try {
+      await invoke("source_import_url", { url });
+      setSourceUrl("");
+      await refreshSources();
+      setMessage("已从 URL 导入音源脚本。");
+    } catch (error) {
+      setMessage(String(error), true);
+    } finally {
+      setSourceImportBusy(null);
+    }
+  };
+
   const saveSourceFallback = async (enabled: boolean, sourceIds: string[]) => {
     setSourceFallbackBusy(true);
     try {
@@ -2323,9 +2359,9 @@ function App() {
           {chartTracks.length > 0
             ? renderCatalogRows(chartTracks.slice(0, 6))
             : <EmptyState
-                title={chartLoading ? "正在加载在线推荐" : "在线推荐尚未加载"}
+                title={chartLoading ? "正在加载在线榜单" : "在线榜单尚未加载"}
                 copy="为了保持启动安静，在线内容会在你明确需要时再联网获取。"
-                action={chartLoading ? undefined : "加载在线推荐"}
+                action={chartLoading ? undefined : "加载在线榜单"}
                 onAction={() => void loadChart()}
               />}
         </section>
@@ -2502,7 +2538,18 @@ function App() {
     );
 
     if (view === "sources") return (
-      <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="音源脚本运行在独立沙箱中；程序启动时也会自动扫描 %APPDATA%\\com.gxplayer.desktop\\sources\\drop-in 里的 .js。" action={<button onClick={async () => { const selected = await open({ multiple: false, filters: [{ name: "LX 音源脚本", extensions: ["js"] }] }); if (selected && !Array.isArray(selected)) { try { await invoke("source_import_file", { path: selected }); await refreshSources(); } catch (error) { setMessage(String(error), true); } } }}>导入脚本</button>} />
+      <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="音源脚本运行在独立沙箱中；程序启动时也会自动扫描 %APPDATA%\\com.gxplayer.desktop\\sources\\drop-in 里的 .js。" action={<button disabled={Boolean(sourceImportBusy)} onClick={() => void importSourceFile()}>{sourceImportBusy === "file" ? "正在导入…" : "从本地文件导入"}</button>} />
+        <section className="source-import-band" aria-labelledby="source-import-title">
+          <div className="source-import-copy">
+            <p className="eyebrow">IMPORT</p>
+            <h2 id="source-import-title">从 URL 导入</h2>
+            <p>应用不内置任何音源目录或链接。仅下载你主动提供的脚本，并在隔离沙箱中运行。</p>
+          </div>
+          <form className="inline-form source-url-form" onSubmit={(event) => { event.preventDefault(); void importSourceUrl(); }}>
+            <input type="url" aria-label="音源脚本 URL" placeholder="https://example.com/source.js" autoComplete="off" spellCheck={false} value={sourceUrl} disabled={Boolean(sourceImportBusy)} onChange={(event) => setSourceUrl(event.target.value)} />
+            <button type="submit" className="primary" disabled={!sourceUrl.trim() || Boolean(sourceImportBusy)}>{sourceImportBusy === "url" ? "正在导入…" : "导入 URL"}</button>
+          </form>
+        </section>
         <SourceGuide />
         <section className="source-status-card"><span className={`runtime-dot ${runtime?.state ?? "no_source"}`} /><div><strong>{sourceStatus.title}</strong><p>{sourceStatus.copy}</p></div><code>GEN {runtime?.generation ?? 0}</code></section>
         <section className="source-fallback-card" aria-labelledby="source-fallback-title">
@@ -2526,7 +2573,6 @@ function App() {
           ) : <div className="fallback-empty">还没有备用音源。主源会继续逐档降低音质，最终可回退到官方 30 秒预览。</div>}
           {availableFallbackSources.length > 0 && <select aria-label="添加备用音源" defaultValue="" disabled={sourceFallbackBusy} onChange={(event) => { addFallbackSource(event.target.value); event.target.value = ""; }}><option value="">＋ 添加备用音源…</option>{availableFallbackSources.map((source) => <option key={source.id} value={source.id}>{source.metadata.name || source.id}</option>)}</select>}
         </section>
-        <div className="inline-form"><input aria-label="音源脚本 URL" placeholder="https://…/source.js" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} /><button className="primary" disabled={!sourceUrl.trim()} onClick={async () => { try { await invoke("source_import_url", { url: sourceUrl.trim() }); setSourceUrl(""); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>从 URL 导入</button></div>
         <div className="source-list">{sources.map((source) => <article className={`source-card ${source.active ? "active" : ""}`} key={source.id}><div><span className="source-badge">{source.active ? "正在使用" : source.hasConfig ? "已配置" : "可用"}</span><h3>{source.metadata.name || "未命名音源"}</h3><p>{source.metadata.author || "未知作者"} · v{source.metadata.version || "?"}</p></div><div className="source-actions"><label><input type="checkbox" checked={source.updatesEnabled} onChange={async (event) => { try { await invoke("source_set_updates_enabled", { id: source.id, enabled: event.target.checked }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }} /> 更新提醒</label><button disabled={sourceConfigBusy} onClick={() => void openSourceConfig(source)}>配置</button><button disabled={source.active} onClick={async () => { try { await invoke("source_activate", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>启用</button><button className="danger" onClick={async () => { if (!window.confirm(`确定删除音源“${source.metadata.name || source.id}”吗？`)) return; try { await invoke("source_remove", { id: source.id }); await refreshSources(); } catch (error) { setMessage(String(error), true); } }}>删除</button></div></article>)}</div>
       </div>
     );

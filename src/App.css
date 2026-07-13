@@ -1504,6 +1504,37 @@ select {
   margin: 16px 0 22px;
 }
 
+.source-import-band {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.7fr) minmax(320px, 1.3fr);
+  align-items: center;
+  gap: 28px;
+  margin-bottom: 18px;
+  padding: 18px 0;
+  border-top: 1px solid var(--glass-border);
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.source-import-copy h2,
+.source-import-copy p {
+  margin: 0;
+}
+
+.source-import-copy h2 {
+  margin-top: 3px;
+  font-size: 19px;
+}
+
+.source-import-copy > p:last-child {
+  margin-top: 7px;
+  color: var(--text-mute);
+  font-size: 12px;
+}
+
+.source-url-form {
+  margin: 0;
+}
+
 .source-list {
   display: grid;
   gap: 12px;
@@ -3190,6 +3221,15 @@ select {
 
   .source-actions {
     flex-wrap: wrap;
+  }
+
+  .source-import-band,
+  .source-url-form {
+    grid-template-columns: 1fr;
+  }
+
+  .source-url-form button {
+    width: 100%;
   }
 
   .track-row {

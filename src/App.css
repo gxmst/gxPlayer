@@ -45,7 +45,7 @@
   --stage-panel-end: rgba(12, 12, 18, 0.45);
   --text-hi: #f2f3f7;
   --text-mute: #a4a6b4;
-  --text-dim: #61636f;
+  --text-dim: #818490;
   --text-disabled: var(--text-dim);
   --accent: #e85a71;
   --accent-fallback: #e85a71;
@@ -137,9 +137,9 @@
   --stage-panel-start: var(--panel-strong);
   --stage-panel-end: color-mix(in srgb, var(--panel-bg) 82%, var(--base));
   --text-hi: #18202c;
-  --text-mute: #526071;
-  --text-dim: #5f6c7e;
-  --text-disabled: #667085;
+  --text-mute: #49586b;
+  --text-dim: #596779;
+  --text-disabled: var(--text-dim);
   --accent-readable: color-mix(in srgb, var(--accent) 42%, #111827);
   --accent-contrast: var(--accent-readable);
   --accent-fill: var(--accent-readable);
@@ -194,7 +194,7 @@
   --glass-inset: inset 0 1px 0 rgba(255, 238, 244, 0.07);
   --text-hi: #f7eef2;
   --text-mute: #c2aeb7;
-  --text-dim: #836f79;
+  --text-dim: #9b8790;
   --accent-readable: var(--accent);
   color-scheme: dark;
 }
@@ -226,7 +226,7 @@
   --glass-inset: inset 0 1px 0 rgba(220, 255, 252, 0.065);
   --text-hi: #e9f5f5;
   --text-mute: #a6c1c3;
-  --text-dim: #668386;
+  --text-dim: #7c9da0;
   --accent-readable: var(--accent);
   color-scheme: dark;
 }
@@ -260,6 +260,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 /* ── Shell ─────────────────────────────────────────────── */
 
 .app-shell {
+  --text-disabled: var(--text-dim);
   position: relative;
   display: grid;
   grid-template: 60px minmax(0, 1fr) 92px / 228px minmax(0, 1fr);
@@ -268,6 +269,8 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   overflow: hidden;
   border: 1px solid var(--soft-border);
   border-radius: var(--radius-md);
+  /* Theme tokens live on this element, so inherited text must resolve here too. */
+  color: var(--text-hi);
   /* Quieter base: soft wash, not neon flood */
   background:
     radial-gradient(90% 70% at 70% -5%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 52%),

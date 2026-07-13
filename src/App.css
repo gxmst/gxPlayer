@@ -1608,6 +1608,26 @@ select {
   color: var(--text-mute);
 }
 
+.catalog-card .catalog-artist-link {
+  width: fit-content;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  color: var(--text-mute);
+  background: transparent;
+  text-align: left;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: 3px;
+}
+
+.catalog-card .catalog-artist-link:hover,
+.catalog-card .catalog-artist-link:focus-visible {
+  color: var(--accent-readable);
+  text-decoration-color: currentColor;
+  outline: none;
+}
+
 .catalog-card small {
   color: var(--text-dim);
 }
@@ -2165,6 +2185,25 @@ select {
   color: var(--text-mute);
   font-size: 17px;
   transition: color 0.3s;
+}
+
+.artist-line-link {
+  display: inline-block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: 4px;
+}
+
+.artist-line-link:hover,
+.artist-line-link:focus-visible {
+  color: var(--accent-readable);
+  text-decoration-color: currentColor;
+  outline: none;
 }
 
 .record-column.is-playing .artist-line {

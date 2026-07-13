@@ -202,7 +202,7 @@ function initialView(): ViewId {
   const requested = new URLSearchParams(window.location.search).get("view");
   // offline merged into library; search is top-bar only (results page still reachable).
   if (requested === "offline") return "library";
-  return requested && ["discovery", "search", "library", "history", "favorites", "playlist", "sources", "settings", "now-playing"].includes(requested)
+  return requested && ["discovery", "search", "artist", "library", "history", "favorites", "playlist", "sources", "settings", "now-playing"].includes(requested)
     ? (requested as ViewId)
     : "discovery";
 }
@@ -535,6 +535,7 @@ function App() {
   const toastTimerRef = useRef<number | null>(null);
 
   const [searchQuery, setSearchQuery] = useState("");
+  const [artistQuery, setArtistQuery] = useState("");
   const {
     suggestions,
     suggestionState,
@@ -2070,6 +2071,17 @@ function App() {
     await searchCatalog(query);
   };
 
+  const openArtistPage = (rawArtist: string) => {
+    const artist = rawArtist.trim();
+    if (!artist) return;
+    setArtistQuery(artist);
+    setSearchQuery(artist);
+    setSuggestionOpen(false);
+    setSuggestionIndex(-1);
+    navigateTo("artist");
+    void searchCatalog(artist);
+  };
+
   const activateSearchOption = (option: SearchOption) => {
     setSuggestionOpen(false);
     setSuggestionIndex(-1);
@@ -2079,6 +2091,10 @@ function App() {
     }
     if (option.kind === "all") {
       void submitSearch();
+      return;
+    }
+    if (option.kind === "artist") {
+      openArtistPage(option.query);
       return;
     }
     void submitSearch(option.query);
@@ -2317,7 +2333,22 @@ function App() {
           <button className="catalog-card" disabled={resolving} aria-busy={resolving} onClick={() => void playCatalogInList(tracks, track)}>
             <Cover artwork={track.artworkUrl} title={track.title} />
             <strong>{track.title}</strong>
-            <span>{track.artist}</span>
+            <span
+              className="catalog-artist-link"
+              role="link"
+              tabIndex={track.artist ? 0 : -1}
+              onClick={(event) => {
+                event.stopPropagation();
+                openArtistPage(track.artist);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  openArtistPage(track.artist);
+                }
+              }}
+            >{track.artist || "未知歌手"}</span>
             <small>{resolving ? "正在解析整首播放…" : track.album || track.providerId}</small>
             <i aria-hidden="true">{resolving ? "…" : "▶"}</i>
           </button>
@@ -2480,6 +2511,30 @@ function App() {
           <EmptyState title="没有找到相关音乐" copy="换一个歌名、歌手或专辑关键词试试。" />
         ) : (
           <EmptyState title="从顶栏开始搜索" copy="输入歌名、歌手或专辑，联想结果会按类型分组。" />
+        )}
+      </div>
+    );
+
+    if (view === "artist") return (
+      <div className="page">
+        <PageHeading
+          eyebrow="ARTIST SEARCH"
+          title={artistQuery ? `歌手：${artistQuery}` : "歌手搜索"}
+          copy="以下是按歌手名搜索的结果，可能包含同名、翻唱或相关条目，不是该歌手的权威作品全集。"
+        />
+        {resultsState === "loading" && !searchResults.length ? (
+          <LoadingState />
+        ) : resultsState === "error" ? (
+          <ErrorState title="歌手搜索没有完成" copy={resultsError ?? "请检查网络后重试。"} onRetry={retryResults} />
+        ) : searchResults.length ? (
+          <>
+            {resultsState === "loading" && <div className="search-progress"><i className="search-spinner" />已有结果，仍在搜索其他平台…</div>}
+            {renderCatalogRows(searchResults)}
+          </>
+        ) : resultsState === "empty" ? (
+          <EmptyState title="没有找到相关音乐" copy="换一个歌手名试试。" />
+        ) : (
+          <EmptyState title="还没有开始搜索" copy="从搜索联想中点击歌手名即可查看结果。" />
         )}
       </div>
     );
@@ -2742,7 +2797,9 @@ function App() {
             </div>
             <p className="eyebrow">NOW PLAYING</p>
             <h1 className={isPlaying ? "title-live" : ""}>{currentTitle}</h1>
-            <p className="artist-line">{currentArtist}</p>
+            {displayedCatalogTrack?.artist ? (
+              <button type="button" className="artist-line artist-line-link" onClick={() => openArtistPage(displayedCatalogTrack.artist)}>{currentArtist}</button>
+            ) : <p className="artist-line">{currentArtist}</p>}
             {measuredSourceSpec && (
               <p className={`source-spec ${suspiciousQuality ? "suspicious" : ""}`}>
                 {currentQuality && currentQueueItem?.online ? <><span>{currentQuality}（自报）</span><b>·</b></> : null}

@@ -215,6 +215,7 @@ export type EngineSnapshot = {
 export type ViewId =
   | "discovery"
   | "search"
+  | "artist"
   | "library"
   | "favorites"
   | "history"

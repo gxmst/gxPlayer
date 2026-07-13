@@ -19,6 +19,13 @@ import {
   moveIndex,
   pickFailureSkipIndex,
 } from "./lib/playlistLogic";
+import {
+  filterUnavailableLocalEntries,
+  loadPlaylistSession,
+  savePlaylistSession,
+  type PersistablePlaylistEntry,
+  type QualityPreference,
+} from "./lib/playlistPersistence";
 import { formatFailureMessage } from "./lib/resolveErrors";
 import {
   STARTED,
@@ -53,7 +60,6 @@ import {
 } from "./types";
 
 type AudioMode = EngineSnapshot["audioMode"];
-type QualityPreference = "auto" | "128k" | "320k" | "flac" | "flac24bit";
 type SourceConfigDraft = {
   lsConfig: Record<string, unknown>;
   constName: string;
@@ -66,29 +72,8 @@ type SearchOption =
   | { id: string; kind: "artist" | "album"; query: string }
   | { id: string; kind: "all" };
 
-/** Frontend playlist entry. Online items store metadata only — never pre-resolved URLs. */
-type PlaylistEntry =
-  | {
-      kind: "local";
-      path: string;
-      title: string;
-      artist: string;
-      durationSeconds: number | null;
-    }
-  | {
-      kind: "online";
-      track: CatalogTrack;
-      quality: QualityPreference;
-    }
-  | {
-      /** Completed online cache — play via local file, no LX resolve. */
-      kind: "cached";
-      providerId: string;
-      providerTrackId: string;
-      quality: string;
-      title: string;
-      artist: string;
-    };
+/** Frontend playlist entry. Online items store metadata only, never resolved URLs. */
+type PlaylistEntry = PersistablePlaylistEntry;
 
 const PLAY_MODE_ORDER: PlayMode[] = ["sequential", "repeat_all", "repeat_one", "shuffle"];
 const PLAY_MODE_META: Record<PlayMode, { label: string; glyph: string }> = {
@@ -431,6 +416,7 @@ function Cover({ artwork, title, className = "" }: { artwork?: string | null; ti
 }
 
 function App() {
+  const [restoredPlaylistSession] = useState(loadPlaylistSession);
   const [view, setView] = useState<ViewId>(initialView);
   const [viewHistory, setViewHistory] = useState<ViewId[]>([]);
   const [message, setMessageState] = useState("");
@@ -520,6 +506,7 @@ function App() {
     seedResults,
   } = useCatalogSearch(searchQuery);
   const [chartTracks, setChartTracks] = useState<CatalogTrack[]>([]);
+  const [chartLoading, setChartLoading] = useState(false);
   const [suggestionOpen, setSuggestionOpen] = useState(false);
   const [suggestionIndex, setSuggestionIndex] = useState(-1);
   const [playingCatalogKey, setPlayingCatalogKey] = useState<string | null>(null);
@@ -530,8 +517,9 @@ function App() {
   const lyricRefs = useRef<Array<HTMLParagraphElement | null>>([]);
 
   /** Logical playlist (local paths + online CatalogTrack metadata). Online never pre-resolved. */
-  const [playlist, setPlaylist] = useState<PlaylistEntry[]>([]);
-  const [playlistIndex, setPlaylistIndex] = useState<number | null>(null);
+  const [playlist, setPlaylist] = useState<PlaylistEntry[]>(restoredPlaylistSession.playlist);
+  const [playlistIndex, setPlaylistIndex] = useState<number | null>(restoredPlaylistSession.currentIndex);
+  const [playlistSessionReady, setPlaylistSessionReady] = useState(false);
   const [queuePanelOpen, setQueuePanelOpen] = useState(false);
   const shufflePlayedRef = useRef<Set<number>>(new Set());
   const shuffleRngRef = useRef({ state: (Date.now() ^ 0x9e3779b9) >>> 0 || 1 });
@@ -570,15 +558,29 @@ function App() {
     }
   };
 
-  const refreshLibrary = async () => {
+  const refreshLibrary = async (scanMissing = false): Promise<LibraryTrack[]> => {
     const [tracks, favoriteTracks, nextPlaylists] = await Promise.all([
-      invoke<LibraryTrack[]>("library_tracks"),
+      invoke<LibraryTrack[]>(scanMissing ? "library_scan_missing" : "library_tracks"),
       invoke<LibraryTrack[]>("library_favorites"),
       invoke<PlaylistSummary[]>("library_playlists"),
     ]);
     setLibrary(tracks);
     setFavorites(favoriteTracks);
     setPlaylists(nextPlaylists);
+    return tracks;
+  };
+
+  const loadChart = async () => {
+    if (chartLoading || chartTracks.length > 0) return;
+    setChartLoading(true);
+    try {
+      setChartTracks(await invoke<CatalogTrack[]>("metadata_chart", { limit: 12 }));
+    } catch (error) {
+      setChartTracks([]);
+      setMessage(`在线推荐暂时不可用：${String(error)}`, true);
+    } finally {
+      setChartLoading(false);
+    }
   };
 
   const refreshSources = async () => {
@@ -663,19 +665,42 @@ function App() {
   };
 
   useEffect(() => {
+    let disposed = false;
     // Window size is set once in Rust (setup) before first show — do not resize here
     // or the app will open at tauri.conf size then jump larger after React mounts.
     void invoke("ui_ready").catch((error) => setMessage(String(error), true));
-    void refreshLibrary().catch((error) => setMessage(String(error), true));
     void refreshSources().catch((error) => setMessage(String(error), true));
     void refreshCache().catch((error) => setMessage(String(error), true));
     void refreshHistory().catch(() => undefined);
     void invoke<string[]>("player_output_devices")
       .then(setOutputDevices)
       .catch((error) => setMessage(String(error), true));
-    void invoke<CatalogTrack[]>("metadata_chart", { limit: 12 })
-      .then(setChartTracks)
-      .catch(() => setChartTracks([]));
+
+    void (async () => {
+      let session = restoredPlaylistSession;
+      try {
+        const tracks = await refreshLibrary(true);
+        const availablePaths = new Set(
+          tracks.filter((track) => !track.missing).map((track) => track.path),
+        );
+        session = filterUnavailableLocalEntries(session, availablePaths);
+      } catch (error) {
+        console.warn("[GXPlayer] local queue validation failed", error);
+        session = filterUnavailableLocalEntries(session, new Set());
+      }
+      if (disposed) return;
+
+      setPlaylist(session.playlist);
+      setPlaylistIndex(session.currentIndex);
+      try {
+        await invoke("player_set_play_mode", { mode: session.playMode });
+        if (!disposed) setSnapshot((state) => ({ ...state, playMode: session.playMode }));
+      } catch (error) {
+        console.warn("[GXPlayer] play mode restore failed", error);
+      } finally {
+        if (!disposed) setPlaylistSessionReady(true);
+      }
+    })();
 
     // If the window somehow ended off-screen, recover after first paint.
     void (async () => {
@@ -690,7 +715,9 @@ function App() {
       }
     })();
 
-    return undefined;
+    return () => {
+      disposed = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -701,6 +728,32 @@ function App() {
         .catch(() => undefined);
     }
   }, [view]);
+
+  useEffect(() => {
+    if (!playlistSessionReady) return;
+    savePlaylistSession({
+      playlist,
+      currentIndex: playlistIndex,
+      playMode: snapshot.playMode,
+    });
+  }, [playlist, playlistIndex, playlistSessionReady, snapshot.playMode]);
+
+  useEffect(() => {
+    if (!playlistSessionReady) return;
+    const persistNow = () => {
+      savePlaylistSession({
+        playlist: playlistRef.current,
+        currentIndex: playlistIndexRef.current,
+        playMode: snapshotRef.current.playMode,
+      });
+    };
+    window.addEventListener("beforeunload", persistNow);
+    window.addEventListener("pagehide", persistNow);
+    return () => {
+      window.removeEventListener("beforeunload", persistNow);
+      window.removeEventListener("pagehide", persistNow);
+    };
+  }, [playlistSessionReady]);
 
   useEffect(() => {
     if (view !== "settings" && view !== "library") return;
@@ -764,23 +817,40 @@ function App() {
     setEngineErrorDismissed(false);
   }, [snapshot.error, snapshot.generation]);
 
+  const currentPlaylistEntry = playlistIndex === null ? null : playlist[playlistIndex] ?? null;
   const currentQueueItem = useMemo(
     () => (snapshot.queueIndex === null ? null : snapshot.queue[snapshot.queueIndex] ?? null),
     [snapshot.queue, snapshot.queueIndex],
   );
   const currentQueueKey = currentQueueItem ? `${snapshot.queueIndex}:${currentQueueItem.location}` : "";
+  const currentLocalPath = currentQueueItem?.location
+    ?? (currentPlaylistEntry?.kind === "local" ? currentPlaylistEntry.path : null);
   const currentLibraryTrack = useMemo(
-    () => library.find((track) => track.path === currentQueueItem?.location) ?? null,
-    [currentQueueItem?.location, library],
+    () => library.find((track) => track.path === currentLocalPath) ?? null,
+    [currentLocalPath, library],
   );
-  const currentTitle = selectedCatalogTrack?.title ?? currentLibraryTrack?.title ?? currentQueueItem?.title ?? "尚未播放";
-  const currentArtist = selectedCatalogTrack?.artist ?? currentLibraryTrack?.artist ?? "选择一首歌，让房间亮起来";
+  const queuedCatalogTrack = currentPlaylistEntry?.kind === "online" ? currentPlaylistEntry.track : null;
+  const displayedCatalogTrack = selectedCatalogTrack ?? queuedCatalogTrack;
+  const currentTitle = displayedCatalogTrack?.title
+    ?? currentLibraryTrack?.title
+    ?? (currentPlaylistEntry ? entryTitle(currentPlaylistEntry) : currentQueueItem?.title)
+    ?? "尚未播放";
+  const currentArtist = displayedCatalogTrack?.artist
+    ?? currentLibraryTrack?.artist
+    ?? (currentPlaylistEntry ? entryArtist(currentPlaylistEntry) : null)
+    ?? "选择一首歌，让房间亮起来";
   const localCover = currentLibraryTrack?.path ? coverCache[currentLibraryTrack.path] ?? null : null;
-  const currentArtwork = selectedCatalogTrack?.artworkUrl ?? localCover;
+  const currentArtwork = displayedCatalogTrack?.artworkUrl ?? localCover;
+  const queuedDurationSeconds = currentPlaylistEntry?.kind === "local"
+    ? currentPlaylistEntry.durationSeconds
+    : currentPlaylistEntry?.kind === "online" && currentPlaylistEntry.track.durationMs !== null
+      ? currentPlaylistEntry.track.durationMs / 1000
+      : null;
+  const currentDurationSeconds = snapshot.durationSeconds ?? queuedDurationSeconds;
 
   useEffect(() => {
     const path = currentLibraryTrack?.path;
-    if (!path || coverCache[path] || selectedCatalogTrack?.artworkUrl) return;
+    if (!path || coverCache[path] || displayedCatalogTrack?.artworkUrl) return;
     let cancelled = false;
     void invoke<{ dataUrl: string } | null>("library_embedded_cover", { path })
       .then((cover) => {
@@ -792,7 +862,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [currentLibraryTrack?.path, coverCache, selectedCatalogTrack?.artworkUrl]);
+  }, [currentLibraryTrack?.path, coverCache, displayedCatalogTrack?.artworkUrl]);
   useEffect(() => {
     const path = currentLibraryTrack?.path;
     if (!path) return;
@@ -2252,7 +2322,20 @@ function App() {
             <label className="playlist-card create-card"><span>＋</span><input aria-label="新歌单名称" placeholder="新歌单" value={newPlaylistName} onChange={(event) => setNewPlaylistName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createPlaylist(); }} /><button onClick={() => void createPlaylist()} disabled={!newPlaylistName.trim()}>创建</button></label>
           </div>
         </section>
-        {chartTracks.length > 0 && <section className="section-block panel-enter delay-2"><div className="section-heading"><div><p className="eyebrow">DISCOVER</p><h2>正在流行</h2></div><button onClick={() => { seedResults(chartTracks, "中国区热门"); setSearchQuery("中国区热门"); navigateTo("search"); }}>查看全部 →</button></div>{renderCatalogRows(chartTracks.slice(0, 6))}</section>}
+        <section className="section-block panel-enter delay-2">
+          <div className="section-heading">
+            <div><p className="eyebrow">DISCOVER</p><h2>正在流行</h2></div>
+            {chartTracks.length > 0 && <button onClick={() => { seedResults(chartTracks, "中国区热门"); setSearchQuery("中国区热门"); navigateTo("search"); }}>查看全部 →</button>}
+          </div>
+          {chartTracks.length > 0
+            ? renderCatalogRows(chartTracks.slice(0, 6))
+            : <EmptyState
+                title={chartLoading ? "正在加载在线推荐" : "在线推荐尚未加载"}
+                copy="为了保持启动安静，在线内容会在你明确需要时再联网获取。"
+                action={chartLoading ? undefined : "加载在线推荐"}
+                onAction={() => void loadChart()}
+              />}
+        </section>
       </div>
     );
 
@@ -2714,13 +2797,13 @@ function App() {
             type="range"
             className="seek-slider"
             min={0}
-            max={Math.max(snapshot.durationSeconds ?? 0, 0.01)}
+            max={Math.max(currentDurationSeconds ?? 0, 0.01)}
             step={0.05}
-            value={Math.min(shownPosition, Math.max(snapshot.durationSeconds ?? 0, 0.01))}
+            value={Math.min(shownPosition, Math.max(currentDurationSeconds ?? 0, 0.01))}
             disabled={!currentQueueItem || !snapshot.durationSeconds}
             style={
               {
-                "--fill": `${snapshot.durationSeconds ? (Math.min(shownPosition, snapshot.durationSeconds) / snapshot.durationSeconds) * 100 : 0}%`,
+                "--fill": `${currentDurationSeconds ? (Math.min(shownPosition, currentDurationSeconds) / currentDurationSeconds) * 100 : 0}%`,
               } as CSSProperties
             }
             onChange={(event) => setDragPosition(Number(event.target.value))}
@@ -2764,7 +2847,7 @@ function App() {
           <div className="timeline player-time-row">
             <time>{formatTime(shownPosition)}</time>
             <span aria-hidden="true" />
-            <time>{formatTime(snapshot.durationSeconds)}</time>
+            <time>{formatTime(currentDurationSeconds)}</time>
           </div>
         </div>
         <div className="player-tools">

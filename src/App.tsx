@@ -15,6 +15,7 @@ import { isRemoteArtworkUrl, useArtworkUrl } from "./hooks/useArtwork";
 import { useCatalogSearch } from "./hooks/useCatalogSearch";
 import { useEngineSnapshot } from "./hooks/useEngineSnapshot";
 import { useSystemProxySettings } from "./hooks/useSystemProxySettings";
+import { useWindowActivity } from "./hooks/useWindowActivity";
 import { useWindowPreferences } from "./hooks/useWindowPreferences";
 import {
   frontendNextIndex,
@@ -484,6 +485,7 @@ function ArtistLinks({ artist, onSelect, className = "", fallback = "未知歌�
 }
 
 function App() {
+  const windowActive = useWindowActivity();
   const [restoredPlaylistSession] = useState(loadPlaylistSession);
   const [view, setView] = useState<ViewId>(initialView);
   const [viewHistory, setViewHistory] = useState<ViewId[]>([]);
@@ -3059,7 +3061,7 @@ function App() {
   };
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${miniMode ? "mini-mode" : ""} ${isMaximized ? "is-maximized" : ""}`} data-theme={theme} style={{ "--accent": accent } as CSSProperties}>
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${miniMode ? "mini-mode" : ""} ${isMaximized ? "is-maximized" : ""} ${windowActive ? "" : "app-idle"}`} data-theme={theme} style={{ "--accent": accent } as CSSProperties}>
       <div className="ambient-light" aria-hidden="true" />
       <div className="ambient-light ambient-light-secondary" aria-hidden="true" />
       <div className="shell-noise" aria-hidden="true" />

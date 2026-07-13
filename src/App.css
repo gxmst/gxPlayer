@@ -285,6 +285,18 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   border-radius: 0;
 }
 
+.app-shell.app-idle,
+.app-shell.app-idle *,
+.app-shell.app-idle *::before,
+.app-shell.app-idle *::after {
+  animation-play-state: paused !important;
+}
+
+.app-shell.app-idle * {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
 .ambient-light {
   position: absolute;
   z-index: -1;

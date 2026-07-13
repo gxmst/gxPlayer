@@ -29,13 +29,38 @@
   --glass-border: rgba(255, 255, 255, 0.06);
   --glass-highlight: rgba(255, 255, 255, 0.1);
   --glass-inset: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --glass-sheen: rgba(255, 255, 255, 0.05);
+  --interactive-border: rgba(255, 255, 255, 0.12);
+  --field-border: var(--glass-border);
+  --button-border: var(--glass-border);
+  --scrollbar-thumb: rgba(255, 255, 255, 0.12);
+  --divider: rgba(255, 255, 255, 0.06);
+  --range-track: rgba(255, 255, 255, 0.12);
+  --range-thumb: #ffffff;
+  --row-hover: color-mix(in srgb, var(--accent) 7%, rgba(255, 255, 255, 0.03));
+  --listener-surface-start: rgba(40, 40, 55, 0.9);
+  --listener-surface-end: rgba(20, 20, 30, 0.95);
+  --tip-surface: rgba(18, 18, 26, 0.55);
+  --stage-panel-start: rgba(22, 22, 32, 0.55);
+  --stage-panel-end: rgba(12, 12, 18, 0.45);
   --text-hi: #f2f3f7;
   --text-mute: #a4a6b4;
   --text-dim: #61636f;
+  --text-disabled: var(--text-dim);
   --accent: #e85a71;
   --accent-fallback: #e85a71;
   --accent-readable: var(--accent);
+  --accent-contrast: var(--accent);
+  --accent-fill: var(--accent);
+  --accent-fill-highlight: color-mix(in srgb, var(--accent) 88%, white);
+  --range-fill-start: color-mix(in srgb, var(--accent) 88%, white);
+  --range-fill-end: var(--accent);
+  --eq-bar: color-mix(in srgb, var(--accent) 70%, white);
   --on-accent: #0e0e14;
+  --fixed-light-control-fg: #0e0e14;
+  --fixed-light-control-bg: #f2f2f6;
+  --fixed-light-control-hover-bg: #ffffff;
+  --fixed-light-control-disabled-bg: #e5e9f0;
   --success-fg: #69c89e;
   --success-solid: #39c979;
   --success-badge-fg: #0e1412;
@@ -96,12 +121,33 @@
   --glass-hover: rgba(15, 23, 42, 0.075);
   --glass-elevated: rgba(255, 255, 255, 0.92);
   --glass-border: rgba(15, 23, 42, 0.14);
-  --glass-highlight: rgba(255, 255, 255, 0.88);
+  --glass-highlight: #8793a4;
   --glass-inset: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  --glass-sheen: rgba(255, 255, 255, 0.72);
+  --interactive-border: #8793a4;
+  --field-border: var(--interactive-border);
+  --button-border: var(--interactive-border);
+  --scrollbar-thumb: #8793a4;
+  --divider: rgba(15, 23, 42, 0.18);
+  --range-track: #8793a4;
+  --row-hover: color-mix(in srgb, var(--accent-readable) 9%, var(--control-hover));
+  --listener-surface-start: var(--surface-2);
+  --listener-surface-end: var(--surface-solid);
+  --tip-surface: var(--panel-bg);
+  --stage-panel-start: var(--panel-strong);
+  --stage-panel-end: color-mix(in srgb, var(--panel-bg) 82%, var(--base));
   --text-hi: #18202c;
   --text-mute: #526071;
-  --text-dim: #748094;
-  --accent-readable: color-mix(in srgb, var(--accent) 52%, #111827);
+  --text-dim: #5f6c7e;
+  --text-disabled: #667085;
+  --accent-readable: color-mix(in srgb, var(--accent) 42%, #111827);
+  --accent-contrast: var(--accent-readable);
+  --accent-fill: var(--accent-readable);
+  --accent-fill-highlight: color-mix(in srgb, var(--accent-readable) 90%, #111827);
+  --range-fill-start: var(--accent-readable);
+  --range-fill-end: var(--accent-readable);
+  --eq-bar: var(--accent-readable);
+  --on-accent: #ffffff;
   --success-fg: #116b43;
   --success-solid: #168454;
   --success-badge-fg: #0b5534;
@@ -206,7 +252,7 @@ button:focus-visible,
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--accent-contrast);
   outline-offset: 2px;
 }
 button:disabled { cursor: not-allowed; opacity: 0.45; }
@@ -422,7 +468,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   min-width: 0;
   height: 40px;
   padding: 0 44px;
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--field-border);
   border-radius: 999px;
   color: var(--text-hi);
   background: var(--control-bg);
@@ -435,17 +481,17 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 }
 
 .global-search input:focus {
-  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  border-color: var(--accent-contrast);
   background: var(--control-hover);
   box-shadow:
     0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    inset 0 1px 0 var(--glass-sheen);
 }
 
 .search-spinner,
 .large-spinner {
   border: 2px solid var(--glass-highlight);
-  border-top-color: var(--accent);
+  border-top-color: var(--accent-contrast);
   border-radius: 50%;
   animation: spin 0.75s linear infinite;
 }
@@ -469,7 +515,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
   background: var(--panel-strong);
-  box-shadow: var(--shadow-lg), var(--glass-inset), 0 0 0 1px rgba(255, 255, 255, 0.03);
+  box-shadow: var(--shadow-lg), var(--glass-inset), 0 0 0 1px var(--soft-border);
   backdrop-filter: blur(32px) saturate(1.4);
   -webkit-backdrop-filter: blur(32px) saturate(1.4);
   animation: dropdown 0.18s var(--ease-out);
@@ -559,7 +605,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   min-width: 74px;
   height: 34px;
   padding: 0 11px;
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--button-border);
   border-radius: var(--radius-sm);
   color: var(--text-mute);
   background: var(--glass);
@@ -680,7 +726,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   gap: 7px;
   height: 34px;
   padding: 0 13px;
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--button-border);
   border-radius: 999px;
   background: var(--glass);
   color: var(--text-mute);
@@ -694,13 +740,13 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 }
 
 .mode-pill:hover {
-  border-color: color-mix(in srgb, var(--accent) 35%, rgba(255, 255, 255, 0.12));
+  border-color: color-mix(in srgb, var(--accent-contrast) 35%, var(--interactive-border));
   color: var(--text-hi);
 }
 
 .mode-pill.active {
   color: var(--text-hi);
-  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
+  border-color: color-mix(in srgb, var(--accent-contrast) 48%, var(--interactive-border));
   background: color-mix(in srgb, var(--accent) 12%, var(--glass));
   box-shadow:
     var(--glass-inset),
@@ -795,8 +841,8 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .sidebar nav button.active,
 .sidebar-playlists button.active {
   color: var(--text-hi);
-  background: color-mix(in srgb, var(--accent) 11%, rgba(255, 255, 255, 0.05));
-  box-shadow: inset 2px 0 0 var(--accent);
+  background: color-mix(in srgb, var(--accent-readable) 11%, var(--control-hover));
+  box-shadow: inset 2px 0 0 var(--accent-contrast);
 }
 
 .sidebar nav button span {
@@ -916,7 +962,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   background: var(--content-bg);
   box-shadow: var(--glass-inset);
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
 .page {
@@ -979,7 +1025,7 @@ h3 {
 
 /* Content buttons only — icon chrome is handled by tool/transport classes */
 button {
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--button-border);
   padding: 8px 13px;
   background: var(--control-bg);
   border-radius: var(--radius-sm);
@@ -992,8 +1038,8 @@ button {
     box-shadow 0.16s;
 }
 
-button:hover {
-  border-color: color-mix(in srgb, var(--accent) 28%, rgba(255, 255, 255, 0.12));
+button:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--accent-contrast) 28%, var(--interactive-border));
   background: var(--control-hover);
 }
 
@@ -1006,8 +1052,8 @@ button.primary {
   border-color: transparent;
   background: linear-gradient(
     165deg,
-    color-mix(in srgb, var(--accent) 88%, white),
-    var(--accent)
+    var(--accent-fill-highlight),
+    var(--accent-fill)
   );
   font-weight: 700;
   box-shadow:
@@ -1015,7 +1061,7 @@ button.primary {
     inset 0 1px 0 rgba(255, 255, 255, 0.32);
 }
 
-button.primary:hover {
+button.primary:not(:disabled):hover {
   border-color: transparent;
   box-shadow:
     0 4px 20px color-mix(in srgb, var(--accent) 30%, transparent),
@@ -1029,11 +1075,17 @@ button.danger {
 input,
 select,
 textarea {
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--field-border);
   border-radius: var(--radius-sm);
   color: var(--text-hi);
   background: var(--field-bg);
   box-shadow: var(--glass-inset);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-dim);
+  opacity: 1;
 }
 
 input,
@@ -1134,7 +1186,7 @@ select {
 .stage-orbit,
 .orbit {
   position: absolute;
-  border: 1px solid color-mix(in srgb, var(--accent) 32%, rgba(255, 255, 255, 0.08));
+  border: 1px solid color-mix(in srgb, var(--accent-contrast) 32%, var(--interactive-border));
   border-radius: 50%;
 }
 
@@ -1161,10 +1213,10 @@ select {
   background:
     linear-gradient(
       160deg,
-      color-mix(in srgb, var(--accent) 28%, rgba(40, 40, 55, 0.9)),
-      color-mix(in srgb, var(--accent) 10%, rgba(20, 20, 30, 0.95))
+      color-mix(in srgb, var(--accent) 28%, var(--listener-surface-start)),
+      color-mix(in srgb, var(--accent) 10%, var(--listener-surface-end))
     );
-  border: 1px solid color-mix(in srgb, var(--accent) 55%, rgba(255, 255, 255, 0.15));
+  border: 1px solid color-mix(in srgb, var(--accent-contrast) 55%, var(--interactive-border));
   color: var(--text-hi);
   font-size: 13px;
   font-weight: 650;
@@ -1179,7 +1231,7 @@ select {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  background: var(--accent);
+  background: var(--accent-contrast);
   box-shadow: 0 0 16px var(--accent);
   z-index: 2;
   transition: opacity 0.35s, filter 0.35s, box-shadow 0.35s;
@@ -1256,7 +1308,7 @@ select {
 .playlist-card:hover,
 .catalog-card:hover {
   transform: translateY(-2px);
-  border-color: color-mix(in srgb, var(--accent) 24%, rgba(255, 255, 255, 0.09));
+  border-color: color-mix(in srgb, var(--accent-contrast) 24%, var(--interactive-border));
   background: color-mix(in srgb, var(--panel-bg) 86%, var(--text-hi));
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.06),
@@ -1271,7 +1323,7 @@ select {
   margin-bottom: auto;
   border-radius: 14px;
   color: var(--accent-readable);
-  background: color-mix(in srgb, var(--accent) 14%, rgba(255, 255, 255, 0.03));
+  background: color-mix(in srgb, var(--accent) 14%, var(--control-bg));
   font-size: 22px;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
@@ -1339,8 +1391,8 @@ select {
   margin: 0 0 16px;
   padding: 12px 14px;
   border-radius: 14px;
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, rgba(255, 255, 255, 0.08));
-  background: color-mix(in srgb, var(--accent) 10%, rgba(18, 18, 26, 0.55));
+  border: 1px solid color-mix(in srgb, var(--accent-contrast) 28%, var(--interactive-border));
+  background: color-mix(in srgb, var(--accent) 10%, var(--tip-surface));
   color: var(--text-mute);
   font-size: 12px;
 }
@@ -1496,7 +1548,7 @@ select {
 }
 
 .track-row:hover {
-  background: color-mix(in srgb, var(--accent) 6%, rgba(255, 255, 255, 0.03));
+  background: var(--row-hover);
 }
 
 .track-main {
@@ -1595,7 +1647,7 @@ select {
   justify-self: start;
   padding: 4px 10px;
   border-radius: 999px;
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--button-border);
   background: var(--control-bg);
   color: var(--text-mute);
   font-size: 11px;
@@ -1604,7 +1656,7 @@ select {
 
 .catalog-enqueue:hover {
   color: var(--text-hi);
-  border-color: color-mix(in srgb, var(--accent) 35%, rgba(255, 255, 255, 0.1));
+  border-color: color-mix(in srgb, var(--accent-contrast) 35%, var(--interactive-border));
   background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
@@ -1686,8 +1738,8 @@ select {
   color: var(--on-accent);
   background: linear-gradient(
     165deg,
-    color-mix(in srgb, var(--accent) 90%, white),
-    var(--accent)
+    var(--accent-fill-highlight),
+    var(--accent-fill)
   );
   opacity: 0;
   transform: translateY(6px) scale(0.92);
@@ -1863,7 +1915,7 @@ select {
 }
 
 .source-card.active {
-  border-color: color-mix(in srgb, var(--accent) 44%, transparent);
+  border-color: color-mix(in srgb, var(--accent-contrast) 44%, var(--interactive-border));
   box-shadow:
     var(--glass-inset),
     0 0 28px color-mix(in srgb, var(--accent) 10%, transparent);
@@ -2000,7 +2052,7 @@ select {
   flex: 0 0 auto;
   width: 18px;
   height: 18px;
-  accent-color: var(--accent);
+  accent-color: var(--accent-contrast);
 }
 
 .proxy-status-line {
@@ -2196,7 +2248,7 @@ select {
   width: 4px;
   height: 8px;
   border-radius: 2px;
-  background: color-mix(in srgb, var(--accent) 70%, white);
+  background: var(--eq-bar);
   transform-origin: bottom center;
 }
 
@@ -2271,8 +2323,8 @@ select {
   background:
     linear-gradient(
       155deg,
-      rgba(22, 22, 32, 0.55),
-      rgba(12, 12, 18, 0.45)
+      var(--stage-panel-start),
+      var(--stage-panel-end)
     );
   box-shadow: var(--glass-inset), var(--shadow-md);
   backdrop-filter: blur(20px);
@@ -2309,7 +2361,7 @@ select {
 
 .stage-ring-outer {
   inset: 2%;
-  border: 1px solid color-mix(in srgb, var(--accent) 18%, rgba(255, 255, 255, 0.06));
+  border: 1px solid color-mix(in srgb, var(--accent-contrast) 18%, var(--soft-border));
   box-shadow:
     inset 0 0 50px color-mix(in srgb, var(--accent) 6%, transparent),
     0 0 40px color-mix(in srgb, var(--accent) 8%, transparent);
@@ -2322,7 +2374,7 @@ select {
 
 .stage-ring-core {
   inset: 38%;
-  border: 1px solid color-mix(in srgb, var(--accent) 25%, rgba(255, 255, 255, 0.08));
+  border: 1px solid color-mix(in srgb, var(--accent-contrast) 25%, var(--interactive-border));
   background: color-mix(in srgb, var(--accent) 4%, transparent);
 }
 
@@ -2346,8 +2398,8 @@ select {
   color: var(--on-accent);
   background: linear-gradient(
     160deg,
-    color-mix(in srgb, var(--accent) 88%, white),
-    var(--accent)
+    var(--accent-fill-highlight),
+    var(--accent-fill)
   );
   box-shadow:
     0 0 22px color-mix(in srgb, var(--accent) 45%, transparent),
@@ -2405,7 +2457,7 @@ select {
 
 .sound-stage.enabled .stage-mode-chip {
   color: var(--text-hi);
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  border-color: color-mix(in srgb, var(--accent-contrast) 40%, var(--interactive-border));
   box-shadow:
     var(--glass-inset),
     0 0 20px color-mix(in srgb, var(--accent) 14%, transparent);
@@ -2446,7 +2498,7 @@ select {
 }
 
 .mode-buttons button.active {
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  border-color: color-mix(in srgb, var(--accent-contrast) 55%, var(--interactive-border));
   background: color-mix(in srgb, var(--accent) 14%, var(--glass));
   box-shadow:
     var(--glass-inset),
@@ -2457,7 +2509,7 @@ select {
   max-width: 900px;
   margin: 36px auto 0;
   padding: 8px 0 0;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  border-top: 1px solid var(--divider);
 }
 
 .lyrics-scroll {
@@ -2691,8 +2743,8 @@ select {
   padding: 0;
   border: 0;
   border-radius: 50%;
-  color: var(--on-accent);
-  background: #f2f2f6;
+  color: var(--fixed-light-control-fg);
+  background: var(--fixed-light-control-bg);
   box-shadow:
     0 2px 10px rgba(0, 0, 0, 0.28),
     0 0 0 1px rgba(255, 255, 255, 0.08),
@@ -2700,9 +2752,9 @@ select {
   transition: transform 0.16s var(--ease-out), background 0.16s, box-shadow 0.16s;
 }
 
-.transport .play-button:hover {
+.transport .play-button:not(:disabled):hover {
   transform: scale(1.04);
-  background: #ffffff;
+  background: var(--fixed-light-control-hover-bg);
   border-color: transparent;
   box-shadow:
     0 4px 16px rgba(0, 0, 0, 0.32),
@@ -2805,9 +2857,9 @@ select {
 }
 
 .tool-btn.active .glyph-spatial {
-  border-color: var(--accent);
+  border-color: var(--accent-contrast);
   background:
-    radial-gradient(circle at 50% 50%, var(--accent) 0 1.5px, transparent 1.6px);
+    radial-gradient(circle at 50% 50%, var(--accent-contrast) 0 1.5px, transparent 1.6px);
   box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 35%, transparent);
   opacity: 1;
 }
@@ -2842,13 +2894,13 @@ input[type="range"],
   padding: 0;
   border: 0;
   border-radius: 99px;
-  accent-color: var(--accent);
+  accent-color: var(--accent-contrast);
   background: linear-gradient(
     to right,
-    color-mix(in srgb, var(--accent) 88%, white) 0%,
-    var(--accent) var(--fill, 0%),
-    rgba(255, 255, 255, 0.12) var(--fill, 0%),
-    rgba(255, 255, 255, 0.12) 100%
+    var(--range-fill-start) 0%,
+    var(--range-fill-end) var(--fill, 0%),
+    var(--range-track) var(--fill, 0%),
+    var(--range-track) 100%
   );
   box-shadow: none;
   cursor: pointer;
@@ -2871,7 +2923,7 @@ input[type="range"]::-webkit-slider-thumb,
   height: 12px;
   margin-top: -4px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--range-thumb);
   border: 0;
   box-shadow:
     0 0 0 1px rgba(0, 0, 0, 0.12),
@@ -2895,7 +2947,7 @@ input[type="range"]::-moz-range-thumb {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--range-thumb);
   border: 0;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
   opacity: 0;
@@ -2926,10 +2978,10 @@ input[type="range"]::-moz-range-thumb {
   border-radius: 0;
   background: linear-gradient(
     to right,
-    color-mix(in srgb, var(--accent) 88%, white) 0%,
-    var(--accent) var(--fill, 0%),
-    rgba(255, 255, 255, 0.12) var(--fill, 0%),
-    rgba(255, 255, 255, 0.12) 100%
+    var(--range-fill-start) 0%,
+    var(--range-fill-end) var(--fill, 0%),
+    var(--range-track) var(--fill, 0%),
+    var(--range-track) 100%
   );
   transition: height 180ms var(--ease-soft);
 }
@@ -2981,7 +3033,7 @@ input[type="range"]::-moz-range-thumb {
   border-radius: 999px;
   color: var(--text-mute);
   background: var(--glass-hover);
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--field-border);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.01em;
@@ -3045,7 +3097,7 @@ input[type="range"]::-moz-range-thumb {
 .quality-select:hover,
 .quality-select:focus-visible {
   color: var(--text-hi);
-  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  border-color: var(--accent-contrast);
 }
 
 /* Native option popup is system-rendered (defaults to white on WebView2) — force dark */
@@ -3236,7 +3288,7 @@ select option {
   gap: 10px;
   max-width: 420px;
   padding: 12px 14px;
-  border: 1px solid color-mix(in srgb, var(--accent) 40%, rgba(255, 255, 255, 0.08));
+  border: 1px solid color-mix(in srgb, var(--accent-contrast) 40%, var(--interactive-border));
   border-radius: 14px;
   background: var(--panel-strong);
   box-shadow: var(--shadow-lg), var(--glass-inset);
@@ -3399,7 +3451,7 @@ select {
 }
 
 .track-row:hover {
-  background: color-mix(in srgb, var(--accent) 7%, rgba(255, 255, 255, 0.03));
+  background: var(--row-hover);
 }
 
 .content {
@@ -3492,7 +3544,7 @@ select {
 
 @keyframes orbit-pulse {
   0%, 100% {
-    border-color: color-mix(in srgb, var(--accent) 28%, rgba(255, 255, 255, 0.08));
+    border-color: color-mix(in srgb, var(--accent-contrast) 28%, var(--interactive-border));
     box-shadow: 0 0 20px color-mix(in srgb, var(--accent) 6%, transparent);
   }
   50% {
@@ -3701,7 +3753,7 @@ select {
   border: 1px solid var(--glass-border);
   background: var(--panel-strong);
   backdrop-filter: blur(28px) saturate(1.2);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45), inset 0 1px 0 var(--glass-sheen);
   overflow: hidden;
 }
 
@@ -3733,7 +3785,7 @@ select {
   min-width: 32px;
   padding: 6px 10px;
   border-radius: 999px;
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--button-border);
   background: var(--control-bg);
   color: var(--text-mute);
   font-size: 12px;
@@ -3875,7 +3927,7 @@ select {
 }
 
 .up-next-list button:hover {
-  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  border-color: color-mix(in srgb, var(--accent-contrast) 30%, var(--interactive-border));
   background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
@@ -3888,7 +3940,7 @@ select {
 .suggestion-error button {
   justify-self: start;
   padding: 6px 12px;
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--button-border);
   border-radius: 999px;
   background: var(--glass-hover);
 }
@@ -3999,7 +4051,7 @@ select {
   min-width: 30px;
   min-height: 30px;
   padding: 0 9px;
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--button-border);
   border-radius: 8px;
   background: var(--glass);
 }
@@ -4061,7 +4113,7 @@ select {
   align-items: center;
   height: 26px;
   padding: 0 9px;
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--button-border);
   border-radius: 999px;
   color: var(--text-mute);
   background: var(--glass);
@@ -4165,4 +4217,81 @@ select {
   .record-stage.live .record-glow {
     animation: none !important;
   }
+}
+
+/* Light surfaces use explicit colors instead of opacity so labels stay readable. */
+.app-shell[data-theme="light"] button:disabled {
+  color: var(--text-disabled);
+  opacity: 1;
+}
+
+.app-shell[data-theme="light"] button:disabled:hover {
+  border-color: var(--soft-border);
+  background: var(--control-bg);
+}
+
+.app-shell[data-theme="light"] button.primary:disabled {
+  border-color: var(--soft-border);
+  color: var(--text-disabled);
+  background: var(--control-bg);
+  box-shadow: none;
+}
+
+.app-shell[data-theme="light"] input:disabled,
+.app-shell[data-theme="light"] select:disabled,
+.app-shell[data-theme="light"] textarea:disabled {
+  border-color: var(--soft-border);
+  color: var(--text-disabled);
+  background: var(--control-bg);
+  opacity: 1;
+  -webkit-text-fill-color: var(--text-disabled);
+}
+
+.app-shell[data-theme="light"] input:disabled::placeholder,
+.app-shell[data-theme="light"] textarea:disabled::placeholder {
+  color: var(--text-disabled);
+}
+
+.app-shell[data-theme="light"] .history-back:disabled,
+.app-shell[data-theme="light"] .queue-panel-actions button:disabled {
+  color: var(--text-disabled);
+  opacity: 1;
+}
+
+.app-shell[data-theme="light"] .transport .play-button:disabled {
+  color: var(--text-disabled);
+  background: var(--fixed-light-control-disabled-bg);
+  opacity: 1;
+}
+
+.app-shell[data-theme="light"] .transport .play-button:disabled:hover {
+  background: var(--fixed-light-control-disabled-bg);
+}
+
+.app-shell[data-theme="light"] .player-progress-rail .seek-slider:disabled {
+  opacity: 1;
+}
+
+.app-shell[data-theme="light"] .lyric {
+  color: var(--text-mute);
+  opacity: 0.92;
+}
+
+.app-shell[data-theme="light"] .timeline time,
+.app-shell[data-theme="light"] .volume-icon {
+  color: var(--text-dim);
+  opacity: 1;
+}
+
+.app-shell[data-theme="light"] .sound-stage.bypassed .stage-speaker {
+  opacity: 0.65;
+}
+
+.app-shell[data-theme="light"] * {
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+.app-shell[data-theme="light"] *::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: var(--scrollbar-thumb);
 }

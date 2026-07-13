@@ -10,9 +10,11 @@ import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
 import { QueuePanel } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
+import { isRemoteArtworkUrl, useArtworkUrl } from "./hooks/useArtwork";
 import { SourceGuide } from "./components/SourceGuide";
 import { useCatalogSearch } from "./hooks/useCatalogSearch";
 import { useEngineSnapshot } from "./hooks/useEngineSnapshot";
+import { useSystemProxySettings } from "./hooks/useSystemProxySettings";
 import { useWindowPreferences } from "./hooks/useWindowPreferences";
 import {
   frontendNextIndex,
@@ -395,20 +397,42 @@ async function accentFromArtwork(url: string | null, key: string): Promise<strin
   });
 }
 
-function Cover({ artwork, title, className = "" }: { artwork?: string | null; title: string; className?: string }) {
+function Cover({ artwork, title, className = "", eager = false }: { artwork?: string | null; title: string; className?: string; eager?: boolean }) {
+  const placeholderRef = useRef<HTMLDivElement | null>(null);
+  const remote = isRemoteArtworkUrl(artwork);
+  const [visibleArtwork, setVisibleArtwork] = useState<string | null>(() => remote && eager ? artwork : null);
+  const resolvedArtwork = useArtworkUrl(artwork, !remote || eager || visibleArtwork === artwork);
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
-  return artwork && failedUrl !== artwork ? (
+
+  useEffect(() => {
+    if (!remote || eager) return;
+    const target = placeholderRef.current;
+    if (!target || typeof IntersectionObserver === "undefined") {
+      setVisibleArtwork(artwork);
+      return;
+    }
+    setVisibleArtwork(null);
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        setVisibleArtwork(artwork);
+        observer.disconnect();
+      }
+    }, { rootMargin: "160px" });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [artwork, eager, remote]);
+
+  return resolvedArtwork && failedUrl !== resolvedArtwork ? (
     <img
       className={`cover ${className}`}
-      src={artwork}
+      src={resolvedArtwork}
       alt={`${title} 封面`}
-      crossOrigin="anonymous"
       loading="lazy"
       decoding="async"
-      onError={() => setFailedUrl(artwork)}
+      onError={() => setFailedUrl(resolvedArtwork)}
     />
   ) : (
-    <div className={`cover cover-placeholder ${className}`} aria-label={`${title} 暂无封面`}>
+    <div ref={placeholderRef} className={`cover cover-placeholder ${className}`} aria-label={`${title} 暂无封面`}>
       {initials(title)}
     </div>
   );
@@ -433,6 +457,15 @@ function App() {
     toggleAlwaysOnTop,
     toggleMiniMode,
   } = useWindowPreferences((error) => {
+    setMessageState(String(error));
+    setMessageIsError(true);
+  });
+  const {
+    status: proxyStatus,
+    busy: proxyBusy,
+    refresh: refreshProxyStatus,
+    setMode: setProxyMode,
+  } = useSystemProxySettings((error) => {
     setMessageState(String(error));
     setMessageIsError(true);
   });
@@ -775,6 +808,10 @@ function App() {
     return () => window.clearInterval(timer);
   }, [view]);
 
+  useEffect(() => {
+    if (view === "settings") void refreshProxyStatus();
+  }, [refreshProxyStatus, view]);
+
   // Auto-dismiss toasts: normal 3s, error/engine 10s.
   useEffect(() => {
     if (toastTimerRef.current) {
@@ -853,7 +890,8 @@ function App() {
     ?? (currentPlaylistEntry ? entryArtist(currentPlaylistEntry) : null)
     ?? "选择一首歌，让房间亮起来";
   const localCover = currentLibraryTrack?.path ? coverCache[currentLibraryTrack.path] ?? null : null;
-  const currentArtwork = displayedCatalogTrack?.artworkUrl ?? localCover;
+  const currentArtworkUrl = displayedCatalogTrack?.artworkUrl ?? localCover;
+  const currentArtwork = useArtworkUrl(currentArtworkUrl);
   const queuedDurationSeconds = currentPlaylistEntry?.kind === "local"
     ? currentPlaylistEntry.durationSeconds
     : currentPlaylistEntry?.kind === "online" && currentPlaylistEntry.track.durationMs !== null
@@ -2595,6 +2633,24 @@ function App() {
           <section className="settings-card"><h3>输出设备</h3><p>切换时会从当前位置继续播放。</p><select value={snapshot.outputDevice ?? ""} onChange={(event) => void run("player_set_output_device", { name: event.target.value || null })}><option value="">系统默认设备</option>{outputDevices.map((device) => <option key={device} value={device}>{device}</option>)}</select></section>
           <section className="settings-card"><h3>默认音质</h3><p>自动会按当前平台能力从高到低尝试，并在解析失败时逐档回退。</p><select value={qualityPreference} onChange={(event) => updateQualityPreference(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></section>
           <section className="settings-card"><h3>默认听感</h3><p>音乐模式保持 DSP 透明旁路；影院/游戏模式启用空间处理。</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></section>
+          <section className="settings-card proxy-settings">
+            <h3>网络代理</h3>
+            <p>使用你本机操作系统配置的第三方代理服务，非本应用提供，用于改善受限网络下的访问。</p>
+            <label className="settings-toggle">
+              <span><strong>使用系统代理</strong><small>对后续音源导入、在线搜索与解析、流媒体和封面连接生效。</small></span>
+              <input
+                type="checkbox"
+                checked={proxyStatus?.mode === "on" || (proxyStatus?.mode === "auto" && proxyStatus.effective) || false}
+                disabled={!proxyStatus || proxyBusy}
+                onChange={(event) => void setProxyMode(event.target.checked ? "on" : "off")}
+              />
+            </label>
+            <div className="proxy-status-line">
+              <span>{proxyStatus?.mode === "auto" ? "自动检测" : proxyStatus?.mode === "on" ? "手动开启" : proxyStatus?.mode === "off" ? "手动关闭" : "正在读取"}</span>
+              <span>{proxyStatus ? (proxyStatus.detected ? "已检测到系统代理" : "未检测到系统代理，当前直连") : "正在检测系统代理"}</span>
+              <button type="button" disabled={!proxyStatus || proxyBusy || proxyStatus.mode === "auto"} onClick={() => void setProxyMode("auto")}>恢复自动检测</button>
+            </div>
+          </section>
           <section className="settings-card">
             <h3>窗口</h3>
             <p>位置与尺寸会自动记忆；迷你模式适合边听边干活。</p>
@@ -2630,7 +2686,7 @@ function App() {
             <div className={`record-stage ${isPlaying ? "live" : ""}`}>
               <div className="record-glow" aria-hidden="true" />
               <div className={`record ${isPlaying ? "spinning" : ""}`}>
-                <Cover artwork={currentArtwork} title={currentTitle} className="record-cover" />
+                <Cover artwork={currentArtwork} title={currentTitle} className="record-cover" eager />
                 <span className="record-hole" />
               </div>
               <div className={`eq-bars ${isPlaying ? "active" : ""}`} aria-hidden="true">
@@ -2877,7 +2933,7 @@ function App() {
         </div>
         <button className={`player-track ${isPlaying ? "is-playing" : ""}`} onClick={() => navigateTo("now-playing")}>
           <span className={`player-cover-wrap ${isPlaying ? "live" : ""}`}>
-            <Cover artwork={currentArtwork} title={currentTitle} />
+            <Cover artwork={currentArtwork} title={currentTitle} eager />
             {isPlaying && <span className="player-eq" aria-hidden="true"><i /><i /><i /></span>}
           </span>
           <span>

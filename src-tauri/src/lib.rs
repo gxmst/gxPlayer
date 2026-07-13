@@ -14,9 +14,11 @@ use gx_dsp::DspSettings;
 use gx_library::{LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistSummary};
 use gx_source::{SourceStore, safe_http};
 
+mod artwork;
 mod cache_commands;
 mod media_session;
 mod metadata_commands;
+mod network_settings;
 mod product_commands;
 mod source_commands;
 mod source_runtime;
@@ -25,6 +27,7 @@ mod transport;
 mod window_state;
 mod windows_identity;
 
+use artwork::artwork_get;
 use cache_commands::{
     cache_clear, cache_list_entries, cache_online_favorites, cache_remove_by_quality,
     cache_remove_entries, cache_remove_entry, cache_reset_directory, cache_set_directory,
@@ -34,6 +37,7 @@ use metadata_commands::{
     maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
     metadata_play_preview, metadata_search,
 };
+use network_settings::{network_proxy_status, network_set_proxy_mode};
 use product_commands::{
     backup_read_file, backup_write_file, library_clear_history, library_embedded_cover,
     library_history, library_record_history, library_scan_missing, player_media_action,
@@ -929,6 +933,10 @@ pub fn run() {
         })
         .setup(|app| {
             let app_data = isolated_smoke_data_root().unwrap_or(app.path().app_data_dir()?);
+            app.manage(artwork::ArtworkCache::new(
+                app_data.join("artwork-cache"),
+            ));
+            app.manage(network_settings::NetworkSettingsState::open(&app_data));
             app.manage(window_state::WindowModeState::new(
                 window_state::load(&app_data).mini_mode,
             ));
@@ -991,6 +999,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             main_only_probe,
             ui_ready,
+            network_proxy_status,
+            network_set_proxy_mode,
+            artwork_get,
             player_load_local,
             player_enqueue_local,
             player_load_resolved,

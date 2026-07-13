@@ -1617,6 +1617,52 @@ select {
   margin-top: 18px;
 }
 
+.settings-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-top: 18px;
+  padding: 14px 0;
+  border-top: 1px solid var(--glass-border);
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.settings-toggle > span {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.settings-toggle strong {
+  font-size: 13px;
+}
+
+.settings-toggle small,
+.proxy-status-line {
+  color: var(--text-mute);
+  font-size: 11px;
+}
+
+.settings-toggle input {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.proxy-status-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-top: 12px;
+}
+
+.proxy-status-line button {
+  margin-left: auto;
+}
+
 .cache-settings {
   grid-column: 1 / -1;
 }

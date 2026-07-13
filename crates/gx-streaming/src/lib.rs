@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, bounded};
 use gx_cache::{CacheWritePlan, CacheWriter};
 use gx_contracts::{HttpHeader, ResolvedMediaRequest};
+use gx_source::network_policy::configure_client_builder;
 use gx_source::safe_http::validate_and_resolve;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -794,16 +795,15 @@ fn send_request(
         let host = url
             .host_str()
             .ok_or_else(|| "media URL has no host".to_owned())?;
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .connect_timeout(CONNECT_TIMEOUT)
-            // The blocking response applies this deadline independently to each body read. It
-            // therefore acts as an idle timeout without limiting the total duration of a song.
-            .timeout(STREAM_IDLE_TIMEOUT)
-            .resolve(host, resolved)
-            .build()
-            .map_err(|error| format!("failed to build pinned media client: {error}"))?;
+        let client =
+            configure_client_builder(Client::builder().redirect(reqwest::redirect::Policy::none()))
+                .connect_timeout(CONNECT_TIMEOUT)
+                // The blocking response applies this deadline independently to each body read. It
+                // therefore acts as an idle timeout without limiting the total duration of a song.
+                .timeout(STREAM_IDLE_TIMEOUT)
+                .resolve(host, resolved)
+                .build()
+                .map_err(|error| format!("failed to build pinned media client: {error}"))?;
         let mut builder = client.get(url.clone());
         for header in headers.iter().filter(|header| {
             !header.name.eq_ignore_ascii_case(RANGE.as_str())

@@ -59,11 +59,31 @@ pub struct MediaSessionState {
 }
 
 impl MediaSessionState {
-    fn set_override(&self, mut metadata: PlaybackMetadata) {
+    fn set_override(&self, mut metadata: PlaybackMetadata) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         inner.next_revision = inner.next_revision.wrapping_add(1).max(1);
         metadata.revision = inner.next_revision;
+        let revision = metadata.revision;
         inner.override_metadata = Some(metadata);
+        revision
+    }
+
+    fn set_cover_if_revision(&self, revision: u64, cover_url: String) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner
+            .override_metadata
+            .as_ref()
+            .map(|metadata| metadata.revision)
+            != Some(revision)
+        {
+            return false;
+        }
+        inner.next_revision = inner.next_revision.wrapping_add(1).max(1);
+        let next_revision = inner.next_revision;
+        let metadata = inner.override_metadata.as_mut().unwrap();
+        metadata.revision = next_revision;
+        metadata.cover_url = Some(cover_url);
+        true
     }
 
     fn matching_override(
@@ -94,7 +114,9 @@ pub fn set_online_metadata(
     minimum_generation: u64,
     location_hint: Option<String>,
 ) {
-    app.state::<MediaSessionState>()
+    let artwork_url = track.artwork_url.as_ref().map(ToString::to_string);
+    let revision = app
+        .state::<MediaSessionState>()
         .set_override(PlaybackMetadata {
             minimum_generation,
             location_hint,
@@ -103,9 +125,10 @@ pub fn set_online_metadata(
             artist: track.artist.clone(),
             album: track.album.clone(),
             duration_seconds: track.duration_ms.map(|value| value as f64 / 1000.0),
-            cover_url: track.artwork_url.as_ref().map(ToString::to_string),
+            cover_url: None,
             ..PlaybackMetadata::default()
         });
+    fetch_online_cover(app, artwork_url, revision);
 }
 
 pub fn set_cached_metadata(
@@ -117,7 +140,8 @@ pub fn set_cached_metadata(
     minimum_generation: u64,
     location: String,
 ) {
-    app.state::<MediaSessionState>()
+    let revision = app
+        .state::<MediaSessionState>()
         .set_override(PlaybackMetadata {
             minimum_generation,
             location_hint: Some(location),
@@ -126,9 +150,35 @@ pub fn set_cached_metadata(
             artist,
             album,
             duration_seconds: None,
-            cover_url,
+            cover_url: None,
             ..PlaybackMetadata::default()
         });
+    fetch_online_cover(app, cover_url, revision);
+}
+
+fn fetch_online_cover(app: &AppHandle, artwork_url: Option<String>, revision: u64) {
+    let Some(artwork_url) = artwork_url.filter(|url| is_remote_url(url)) else {
+        return;
+    };
+    let app = app.clone();
+    thread::Builder::new()
+        .name("gx-artwork".into())
+        .spawn(move || {
+            let result = app
+                .state::<crate::artwork::ArtworkCache>()
+                .ensure(&artwork_url);
+            let Ok(asset) = result else {
+                return;
+            };
+            let cover_url = file_url(&asset.path);
+            app.state::<MediaSessionState>()
+                .set_cover_if_revision(revision, cover_url);
+        })
+        .ok();
+}
+
+fn is_remote_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| url.scheme() == "http" || url.scheme() == "https")
 }
 
 pub fn spawn_media_session(app: AppHandle) {
@@ -324,7 +374,7 @@ fn set_metadata_best_effort(
     controls
         .set_metadata(text_metadata)
         .map_err(|error| format!("{context} text: {error:?}"))?;
-    if metadata.cover_url.is_some()
+    if metadata.cover_url.is_some_and(|url| !is_remote_url(url))
         && let Err(error) = controls.set_metadata(metadata)
     {
         eprintln!("GX_SMTC {context} cover skipped: {error:?}");
@@ -602,6 +652,31 @@ mod tests {
             state.matching_override(&snapshot, &item).unwrap().title,
             "new"
         );
+    }
+
+    #[test]
+    fn stale_artwork_cannot_replace_newer_metadata() {
+        let state = MediaSessionState::default();
+        let older = state.set_override(PlaybackMetadata {
+            title: "older".into(),
+            ..PlaybackMetadata::default()
+        });
+        let latest = state.set_override(PlaybackMetadata {
+            title: "latest".into(),
+            ..PlaybackMetadata::default()
+        });
+
+        assert!(!state.set_cover_if_revision(older, "file://older.jpg".into()));
+        assert!(state.set_cover_if_revision(latest, "file://latest.jpg".into()));
+        let metadata = state
+            .inner
+            .lock()
+            .unwrap()
+            .override_metadata
+            .clone()
+            .unwrap();
+        assert_eq!(metadata.title, "latest");
+        assert_eq!(metadata.cover_url.as_deref(), Some("file://latest.jpg"));
     }
 
     #[test]

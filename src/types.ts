@@ -84,6 +84,14 @@ export type SourceFallbackConfig = {
   explicitlyConfigured: boolean;
 };
 
+export type ProxyMode = "auto" | "on" | "off";
+
+export type ProxyStatus = {
+  mode: ProxyMode;
+  detected: boolean;
+  effective: boolean;
+};
+
 export type CacheStatus = {
   directory: string;
   customDirectory: string | null;

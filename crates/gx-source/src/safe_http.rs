@@ -9,6 +9,8 @@ use reqwest::header::{
 use reqwest::{Method, StatusCode, Url};
 use thiserror::Error;
 
+use crate::network_policy::configure_client_builder;
+
 const MAX_REDIRECTS: usize = 10;
 
 #[derive(Debug, Clone)]
@@ -57,17 +59,16 @@ pub fn execute(mut request: SafeHttpRequest) -> Result<SafeHttpResponse, SafeHtt
     for redirect_count in 0..=MAX_REDIRECTS {
         let resolved = validate_and_resolve(&request.url)?;
         let host = request.url.host_str().ok_or(SafeHttpError::MissingHost)?;
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            // Source scripts are untrusted input. Inheriting HTTP(S)_PROXY would let a local
-            // proxy bypass the DNS pinning performed above (and would disclose request data to
-            // an ambient process the user did not select for GXPlayer).
-            .no_proxy()
-            .connect_timeout(request.timeout.min(Duration::from_secs(10)))
-            .timeout(request.timeout)
-            .resolve(host, resolved)
-            .build()
-            .map_err(|error| SafeHttpError::Request(error.to_string()))?;
+        let client =
+            configure_client_builder(Client::builder().redirect(reqwest::redirect::Policy::none()))
+                // Private destinations are still rejected before every request and redirect. When
+                // the user enables an OS proxy, the proxy owns the final DNS resolution, so the
+                // direct-mode DNS pin below cannot constrain the proxy-side connection target.
+                .connect_timeout(request.timeout.min(Duration::from_secs(10)))
+                .timeout(request.timeout)
+                .resolve(host, resolved)
+                .build()
+                .map_err(|error| SafeHttpError::Request(error.to_string()))?;
         let mut builder = client.request(request.method.clone(), request.url.clone());
         for (name, value) in &request.headers {
             let name = HeaderName::from_bytes(name.as_bytes())

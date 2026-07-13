@@ -9,6 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub mod network_policy;
 pub mod safe_http;
 
 const MAX_SCRIPT_BYTES: usize = 5 * 1024 * 1024;

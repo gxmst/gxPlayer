@@ -36,6 +36,7 @@ mod imp {
     const BUTTON_PREVIOUS: u32 = 0x4751;
     const BUTTON_PLAY_PAUSE: u32 = 0x4752;
     const BUTTON_NEXT: u32 = 0x4753;
+    const GLYPH_COLOR: u32 = 0xff20_2020;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum PlaybackVisual {
@@ -614,7 +615,7 @@ mod imp {
         let height = pixels.len() / width;
         for y in top.min(height)..bottom.min(height) {
             for x in left.min(width)..right.min(width) {
-                pixels[y * width + x] = 0xffff_ffff;
+                pixels[y * width + x] = GLYPH_COLOR;
             }
         }
     }
@@ -678,11 +679,37 @@ mod imp {
         }
 
         #[test]
-        fn generated_glyph_pixels_have_transparent_backgrounds() {
-            let mut pixels = vec![0; 32 * 32];
-            paint_glyph(&mut pixels, 32, 32, Glyph::Play);
-            assert!(pixels.contains(&0xffff_ffff));
-            assert!(pixels.contains(&0));
+        fn generated_glyphs_use_opaque_dark_pixels_on_transparent_backgrounds() {
+            for glyph in [Glyph::Previous, Glyph::Play, Glyph::Pause, Glyph::Next] {
+                let mut pixels = vec![0; 32 * 32];
+                paint_glyph(&mut pixels, 32, 32, glyph);
+
+                assert!(pixels.contains(&GLYPH_COLOR));
+                assert!(pixels.contains(&0));
+                assert!(pixels.iter().all(|pixel| matches!(*pixel, 0 | GLYPH_COLOR)));
+                assert_eq!(GLYPH_COLOR >> 24, 0xff);
+                assert_eq!(GLYPH_COLOR & 0x00ff_ffff, 0x0020_2020);
+            }
+        }
+
+        #[test]
+        fn generated_toolbar_glyph_shapes_remain_distinct() {
+            fn render(glyph: Glyph) -> Vec<u32> {
+                let mut pixels = vec![0; 32 * 32];
+                paint_glyph(&mut pixels, 32, 32, glyph);
+                pixels
+            }
+
+            let previous = render(Glyph::Previous);
+            let play = render(Glyph::Play);
+            let pause = render(Glyph::Pause);
+            let next = render(Glyph::Next);
+
+            assert_ne!(previous, play);
+            assert_ne!(previous, next);
+            assert_ne!(play, pause);
+            assert_ne!(play, next);
+            assert_ne!(pause, next);
         }
     }
 }

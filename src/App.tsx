@@ -37,6 +37,12 @@ import {
   type PlaybackStartResult,
 } from "./lib/uiState";
 import {
+  loadThemePreference,
+  saveThemePreference,
+  THEME_OPTIONS,
+  type ThemeId,
+} from "./lib/themePreference";
+import {
   deriveTransportCapabilities,
   isTransportAction,
   type TransportAction,
@@ -472,6 +478,8 @@ function App() {
   /** User dismissed the engine error toast; reset when generation/error changes. */
   const [engineErrorDismissed, setEngineErrorDismissed] = useState(false);
   const [accent, setAccent] = useState(FALLBACK_ACCENT);
+  const [theme, setTheme] = useState<ThemeId>(() => loadThemePreference());
+  const [themePickerOpen, setThemePickerOpen] = useState(false);
   const [dragPosition, setDragPosition] = useState<number | null>(null);
   const [volumeDraft, setVolumeDraft] = useState<number | null>(null);
   const [pendingSeek, setPendingSeek] = useState<{ target: number; generation: number; queueKey: string } | null>(null);
@@ -523,6 +531,7 @@ function App() {
   const terminalAdvanceGuardTimerRef = useRef<number | null>(null);
   const searchShellRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const themePickerRef = useRef<HTMLDivElement | null>(null);
   const toastTimerRef = useRef<number | null>(null);
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -847,6 +856,32 @@ function App() {
     document.addEventListener("mousedown", onPointerDown);
     return () => document.removeEventListener("mousedown", onPointerDown);
   }, [suggestionOpen]);
+
+  useEffect(() => {
+    saveThemePreference(theme);
+  }, [theme]);
+
+  useEffect(() => {
+    if (!themePickerOpen) return;
+    const onPointerDown = (event: MouseEvent) => {
+      const root = themePickerRef.current;
+      if (!root) return;
+      if (event.target instanceof Node && !root.contains(event.target)) {
+        setThemePickerOpen(false);
+      }
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setThemePickerOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [themePickerOpen]);
 
   // Windows SMTC / taskbar controls share the same frontend-owned transport path.
   useEffect(() => {
@@ -2757,7 +2792,7 @@ function App() {
   };
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${miniMode ? "mini-mode" : ""} ${isMaximized ? "is-maximized" : ""}`} style={{ "--accent": accent } as CSSProperties}>
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${miniMode ? "mini-mode" : ""} ${isMaximized ? "is-maximized" : ""}`} data-theme={theme} style={{ "--accent": accent } as CSSProperties}>
       <div className="ambient-light" aria-hidden="true" />
       <div className="ambient-light ambient-light-secondary" aria-hidden="true" />
       <div className="shell-noise" aria-hidden="true" />
@@ -2883,6 +2918,44 @@ function App() {
         </div>
         <div className="top-bar-trail">
           <button className={`mode-pill ${snapshot.audioMode === "cinema_game" ? "active" : ""}`} onClick={() => navigateTo("now-playing")}><span>⊙</span>{snapshot.audioMode === "music" ? "原声" : "空间"}</button>
+          <div className="theme-picker" ref={themePickerRef}>
+            <button
+              type="button"
+              className={`theme-trigger ${themePickerOpen ? "active" : ""}`}
+              aria-label="切换皮肤"
+              aria-haspopup="menu"
+              aria-expanded={themePickerOpen}
+              title="切换皮肤"
+              onClick={() => setThemePickerOpen((open) => !open)}
+            >
+              <span aria-hidden="true">◐</span>
+              <span className="theme-trigger-label">换肤</span>
+            </button>
+            {themePickerOpen && (
+              <div className="theme-menu" role="menu" aria-label="选择皮肤">
+                {THEME_OPTIONS.map((option) => (
+                  <button
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={theme === option.id}
+                    className={`theme-option theme-option-${option.id} ${theme === option.id ? "selected" : ""}`}
+                    key={option.id}
+                    onClick={() => {
+                      setTheme(option.id);
+                      setThemePickerOpen(false);
+                    }}
+                  >
+                    <span className="theme-swatch" aria-hidden="true" />
+                    <span className="theme-option-copy">
+                      <strong>{option.label}</strong>
+                      <small>{option.description}</small>
+                    </span>
+                    <span className="theme-option-check" aria-hidden="true">{theme === option.id ? "✓" : ""}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
         <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button className="maximize-control" onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label="关闭">×</button></div>
       </header>

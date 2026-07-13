@@ -22,6 +22,7 @@ import {
   pickFailureSkipIndex,
 } from "./lib/playlistLogic";
 import { splitArtistNames } from "./lib/artistNames";
+import { groupConsecutiveHistory } from "./lib/historyGrouping";
 import {
   filterUnavailableLocalEntries,
   loadPlaylistSession,
@@ -682,7 +683,7 @@ function App() {
   };
 
   const refreshHistory = async () => {
-    const entries = await invoke<HistoryEntry[]>("library_history", { limit: 100 });
+    const entries = await invoke<HistoryEntry[]>("library_history", { limit: 500 });
     setHistoryEntries(entries);
   };
 
@@ -1031,6 +1032,7 @@ function App() {
   const selectedOnlineFavorite = selectedCatalogTrack
     ? onlineFavorites.some((track) => track.providerId === selectedCatalogTrack.providerId && track.providerTrackId === selectedCatalogTrack.providerTrackId)
     : false;
+  const groupedHistoryEntries = useMemo(() => groupConsecutiveHistory(historyEntries), [historyEntries]);
   const orderedSources = useMemo(
     () => [...sources].sort((left, right) => left.userPriority - right.userPriority),
     [sources],
@@ -2669,15 +2671,15 @@ function App() {
           <PageHeading
             eyebrow="HISTORY"
             title="播放历史"
-            copy={`${historyEntries.length} 条最近播放（最多保留 500）。`}
+            copy={`${historyEntries.length} 条原始播放记录，连续同曲合并显示为 ${groupedHistoryEntries.length} 行（读取最近 500 条）。`}
             action={<button type="button" className="danger" onClick={async () => { if (!window.confirm("确定清空全部播放历史吗？")) return; try { await invoke("library_clear_history"); await refreshHistory(); } catch (error) { setMessage(String(error), true); } }}>清空历史</button>}
           />
           {historyEntries.length === 0 ? (
             <EmptyState title="还没有播放记录" copy="听歌后会出现在这里，方便找回昨晚那首。" />
           ) : (
             <div className="track-list" role="list">
-              {historyEntries.map((entry) => (
-                <div className="track-row" role="listitem" key={entry.id}>
+              {groupedHistoryEntries.map(({ entry, count }) => (
+                <div className="track-row history-row" role="listitem" key={entry.id}>
                   <button
                     type="button"
                     className="track-main"
@@ -2708,6 +2710,7 @@ function App() {
                       <small>{entry.artist || "未知歌手"} · {new Date(entry.playedAtMs).toLocaleString()}</small>
                     </span>
                   </button>
+                  {count > 1 && <span className="history-count" aria-label={`连续播放 ${count} 次`}>×{count}</span>}
                 </div>
               ))}
             </div>

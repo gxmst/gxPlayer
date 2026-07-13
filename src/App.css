@@ -1380,6 +1380,21 @@ select {
   grid-template-columns: 28px minmax(0, 1fr) 72px 70px 36px 36px 36px;
 }
 
+.track-row.history-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.history-count {
+  min-width: 42px;
+  padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent-contrast) 30%, var(--glass-border));
+  border-radius: 999px;
+  color: var(--accent-readable);
+  background: color-mix(in srgb, var(--accent) 10%, var(--control-bg));
+  font: 700 11px/1 "Geist Mono Variable", monospace;
+  text-align: center;
+}
+
 .cache-select {
   display: grid;
   place-items: center;

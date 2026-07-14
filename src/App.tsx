@@ -1642,17 +1642,8 @@ function App() {
         return;
       }
 
-      const acceptedPaths = result.imported.map((track) => track.path);
-      await invoke("player_load_local", { paths: acceptedPaths, startIndex: 0 });
-      const entries = result.imported.map(localEntryFromLibrary);
-      shufflePlayedRef.current = new Set([0]);
-      setPlaylist(entries);
-      setPlaylistIndex(0);
-      setSelectedCatalogTrack(null);
-      setCurrentQuality(null);
-      clearLyrics();
       const failureNote = result.failures.length ? `，另有 ${result.failures.length} 个文件导入失败` : "";
-      setMessage(`已导入并播放 ${result.imported.length} 首${failureNote}`);
+      setMessage(`已导入 ${result.imported.length} 首到曲库，当前播放和队列未改变${failureNote}`);
     } catch (error) {
       setMessage(String(error), true);
     }

@@ -3674,6 +3674,16 @@ select option {
   margin-bottom: 16px;
 }
 
+.close-to-tray-modal {
+  width: min(520px, 92vw);
+}
+
+.close-to-tray-modal > p {
+  margin: 0;
+  color: var(--text-mute);
+  line-height: 1.7;
+}
+
 .config-toggles {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3774,6 +3784,49 @@ select option {
 }
 
 .toast button {
+  padding: 3px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.device-fallback-banner {
+  position: fixed;
+  z-index: 210;
+  top: 76px;
+  left: 50%;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 10px;
+  width: min(620px, calc(100vw - 32px));
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--warning-fg) 46%, var(--glass-border));
+  border-radius: 14px;
+  color: var(--text-main);
+  background: var(--panel-strong);
+  box-shadow: var(--shadow-lg), var(--glass-inset);
+  transform: translateX(-50%);
+}
+
+.device-fallback-banner > span {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  color: var(--warning-fg);
+  background: color-mix(in srgb, var(--warning-fg) 14%, transparent);
+  font-weight: 800;
+}
+
+.device-fallback-banner p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.device-fallback-banner button {
   padding: 3px;
   border: 0;
   background: transparent;

@@ -4,7 +4,8 @@ const TRAILING_FLUSH_MS = 180;
 
 export function useLiveVolume(
   actualVolume: number,
-  applyVolume: (volume: number) => Promise<unknown>,
+  previewActualVolume: (volume: number) => Promise<unknown>,
+  commitActualVolume: (volume: number) => Promise<unknown>,
   onError: (error: unknown) => void,
 ) {
   const [draftVolume, setDraftVolume] = useState<number | null>(null);
@@ -12,15 +13,17 @@ export function useLiveVolume(
   const draftRef = useRef<number | null>(null);
   const actualVolumeRef = useRef(actualVolume);
   const sawDifferentActualRef = useRef(false);
-  const pendingRef = useRef<number | null>(null);
+  const pendingRef = useRef<{ volume: number; commit: boolean } | null>(null);
   const frameRef = useRef<number | null>(null);
   const trailingFlushRef = useRef<number | null>(null);
   const inFlightRef = useRef(false);
   const disposedRef = useRef(false);
-  const applyVolumeRef = useRef(applyVolume);
+  const previewActualVolumeRef = useRef(previewActualVolume);
+  const commitActualVolumeRef = useRef(commitActualVolume);
   const errorHandlerRef = useRef(onError);
   actualVolumeRef.current = actualVolume;
-  applyVolumeRef.current = applyVolume;
+  previewActualVolumeRef.current = previewActualVolume;
+  commitActualVolumeRef.current = commitActualVolume;
   errorHandlerRef.current = onError;
 
   const updateDraft = useCallback((volume: number | null) => {
@@ -35,13 +38,13 @@ export function useLiveVolume(
     inFlightRef.current = true;
     try {
       while (!disposedRef.current && pendingRef.current !== null) {
-        const volume = pendingRef.current;
+        const pending = pendingRef.current;
         pendingRef.current = null;
         try {
-          await applyVolumeRef.current(volume);
+          await (pending.commit ? commitActualVolumeRef.current : previewActualVolumeRef.current)(pending.volume);
         } catch (error) {
           if (disposedRef.current) return;
-          if (pendingRef.current === null && draftRef.current === volume) {
+          if (pendingRef.current === null && draftRef.current === pending.volume) {
             updateDraft(null);
             setIsAdjustingVolume(false);
           }
@@ -69,7 +72,7 @@ export function useLiveVolume(
   const commitVolume = useCallback((volume: number) => {
     updateDraft(volume);
     setIsAdjustingVolume(false);
-    pendingRef.current = volume;
+    pendingRef.current = { volume, commit: true };
     cancelScheduledFlush();
     void drainPending();
   }, [cancelScheduledFlush, drainPending, updateDraft]);
@@ -77,7 +80,7 @@ export function useLiveVolume(
   const previewVolume = useCallback((volume: number) => {
     updateDraft(volume);
     setIsAdjustingVolume(true);
-    pendingRef.current = volume;
+    pendingRef.current = { volume, commit: false };
 
     if (frameRef.current === null) {
       frameRef.current = window.requestAnimationFrame(() => {

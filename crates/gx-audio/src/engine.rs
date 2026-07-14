@@ -35,6 +35,7 @@ const COMMAND_CAPACITY: usize = 64;
 const RING_SECONDS: f64 = 0.75;
 const PREBUFFER_SECONDS: f64 = 0.5;
 const DIAGNOSTIC_CAPACITY: usize = 128;
+const OUTPUT_DEVICE_EVENT_CAPACITY: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineDiagnostic {
@@ -67,6 +68,42 @@ impl EngineDiagnosticQueue {
     }
 
     fn drain(&self) -> Vec<EngineDiagnostic> {
+        self.inner.lock().unwrap().drain(..).collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputDeviceFallbackEvent {
+    pub unavailable_device: String,
+    pub fallback_device: Option<String>,
+}
+
+#[derive(Clone)]
+struct OutputDeviceEventQueue {
+    inner: Arc<Mutex<VecDeque<OutputDeviceFallbackEvent>>>,
+}
+
+impl Default for OutputDeviceEventQueue {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::with_capacity(
+                OUTPUT_DEVICE_EVENT_CAPACITY,
+            ))),
+        }
+    }
+}
+
+impl OutputDeviceEventQueue {
+    fn push(&self, event: OutputDeviceFallbackEvent) {
+        let mut events = self.inner.lock().unwrap();
+        if events.len() == OUTPUT_DEVICE_EVENT_CAPACITY {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    fn drain(&self) -> Vec<OutputDeviceFallbackEvent> {
         self.inner.lock().unwrap().drain(..).collect()
     }
 }
@@ -169,6 +206,15 @@ fn playback_error_code(error: &anyhow::Error) -> &'static str {
     } else {
         "failed"
     }
+}
+
+fn is_output_device_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("output device")
+        || message.contains("default audio output")
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<cpal::BuildStreamError>().is_some())
 }
 
 fn is_stream_interruption(error: &anyhow::Error) -> bool {
@@ -299,6 +345,7 @@ pub struct LocalAudioEngine {
     snapshot: Arc<Mutex<EngineSnapshot>>,
     diagnostics: EngineDiagnosticQueue,
     streaming_diagnostics: StreamingDiagnosticQueue,
+    output_device_events: OutputDeviceEventQueue,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -313,6 +360,8 @@ impl LocalAudioEngine {
         let streaming_diagnostics_for_worker = streaming_diagnostics.clone();
         let stream_interruption = StreamInterruption::default();
         let interruption_for_worker = stream_interruption.clone();
+        let output_device_events = OutputDeviceEventQueue::default();
+        let output_device_events_for_worker = output_device_events.clone();
         let worker = thread::Builder::new()
             .name("gx-local-audio-engine".into())
             .spawn(move || {
@@ -322,6 +371,7 @@ impl LocalAudioEngine {
                     diagnostics_for_worker,
                     streaming_diagnostics_for_worker,
                     interruption_for_worker,
+                    output_device_events_for_worker,
                 )
             })
             .context("failed to spawn local audio engine worker")?;
@@ -331,6 +381,7 @@ impl LocalAudioEngine {
             snapshot,
             diagnostics,
             streaming_diagnostics,
+            output_device_events,
             worker: Mutex::new(Some(worker)),
         })
     }
@@ -491,6 +542,10 @@ impl LocalAudioEngine {
         diagnostics
     }
 
+    pub fn drain_output_device_events(&self) -> Vec<OutputDeviceFallbackEvent> {
+        self.output_device_events.drain()
+    }
+
     pub fn output_devices(&self) -> Result<Vec<String>> {
         let host = cpal::default_host();
         let mut names = host
@@ -501,6 +556,17 @@ impl LocalAudioEngine {
         names.sort();
         names.dedup();
         Ok(names)
+    }
+
+    pub fn default_output_device_name(&self) -> Result<Option<String>> {
+        let host = cpal::default_host();
+        host.default_output_device()
+            .map(|device| {
+                device
+                    .name()
+                    .context("failed to read default output device name")
+            })
+            .transpose()
     }
 
     pub fn set_output_device(&self, name: Option<String>) -> Result<()> {
@@ -551,6 +617,7 @@ struct WorkerModel {
     generation: u64,
     error: Option<String>,
     output_device: Option<String>,
+    pending_output_device_fallback: Option<String>,
 }
 
 impl Default for WorkerModel {
@@ -572,6 +639,7 @@ impl Default for WorkerModel {
             generation: 0,
             error: None,
             output_device: None,
+            pending_output_device_fallback: None,
         }
     }
 }
@@ -756,6 +824,7 @@ fn run_worker(
     diagnostics: EngineDiagnosticQueue,
     streaming_diagnostics: StreamingDiagnosticQueue,
     stream_interruption: StreamInterruption,
+    output_device_events: OutputDeviceEventQueue,
 ) {
     let mut model = WorkerModel::default();
     let mut session: Option<PlaybackSession> = None;
@@ -812,22 +881,54 @@ fn run_worker(
                         }
                         session = Some(next_session);
                         model.error = None;
+                        if let Some(unavailable_device) =
+                            model.pending_output_device_fallback.take()
+                        {
+                            output_device_events.push(OutputDeviceFallbackEvent {
+                                unavailable_device,
+                                fallback_device: session
+                                    .as_ref()
+                                    .map(|active| active.output_device_name.clone()),
+                            });
+                        }
                     }
                     Err(error) => {
-                        if let PlaybackSource::Online {
-                            cache_plan: Some(plan),
-                            ..
-                        } = &item.source
-                        {
-                            plan.invalidate();
-                        }
                         if is_expected_stream_interruption(&error, &stream_interruption) {
+                            if let PlaybackSource::Online {
+                                cache_plan: Some(plan),
+                                ..
+                            } = &item.source
+                            {
+                                plan.invalidate();
+                            }
                             // The command carrying the interruption guard is still queued. Keep a
                             // retry armed so invalid/no-op commands can resume the same source;
                             // Pause and destructive commands explicitly clear or replace it.
                             model.reload_requested = true;
                             model.error = None;
+                        } else if let Some(unavailable_device) = model.output_device.take()
+                            && is_output_device_error(&error)
+                        {
+                            model.pending_output_device_fallback = Some(unavailable_device);
+                            model.reload_requested = true;
+                            model.status = PlaybackStatus::Loading;
+                            model.error = None;
                         } else {
+                            if let PlaybackSource::Online {
+                                cache_plan: Some(plan),
+                                ..
+                            } = &item.source
+                            {
+                                plan.invalidate();
+                            }
+                            if let Some(unavailable_device) =
+                                model.pending_output_device_fallback.take()
+                            {
+                                output_device_events.push(OutputDeviceFallbackEvent {
+                                    unavailable_device,
+                                    fallback_device: None,
+                                });
+                            }
                             diagnostics.push(EngineDiagnostic {
                                 category: "playback_start_failed",
                                 source: playback_source_label(&item.source, item.public.online),
@@ -847,6 +948,27 @@ fn run_worker(
         }
 
         if let Some(active) = session.as_mut() {
+            if active.output_device_failed.load(Ordering::Acquire) {
+                model.start_seconds = active.position_seconds();
+                if let Some(unavailable_device) = model.output_device.take() {
+                    model.pending_output_device_fallback = Some(unavailable_device);
+                    model.reload_requested = true;
+                    model.status = PlaybackStatus::Loading;
+                    model.error = None;
+                } else {
+                    if let Some(unavailable_device) = model.pending_output_device_fallback.take() {
+                        output_device_events.push(OutputDeviceFallbackEvent {
+                            unavailable_device,
+                            fallback_device: None,
+                        });
+                    }
+                    model.status = PlaybackStatus::Failed;
+                    model.error = Some("没有可用的音频输出设备".into());
+                }
+                session = None;
+                publish_snapshot(&model, None, &shared_snapshot);
+                continue;
+            }
             if model.intent_playing {
                 active.resume();
             } else {
@@ -883,6 +1005,28 @@ fn run_worker(
                     };
                     model.error = None;
                     active.invalidate_cache();
+                    session = None;
+                }
+                Err(_error) if active.output_device_failed.load(Ordering::Acquire) => {
+                    model.start_seconds = active.position_seconds();
+                    active.invalidate_cache();
+                    if let Some(unavailable_device) = model.output_device.take() {
+                        model.pending_output_device_fallback = Some(unavailable_device);
+                        model.reload_requested = true;
+                        model.status = PlaybackStatus::Loading;
+                        model.error = None;
+                    } else {
+                        if let Some(unavailable_device) =
+                            model.pending_output_device_fallback.take()
+                        {
+                            output_device_events.push(OutputDeviceFallbackEvent {
+                                unavailable_device,
+                                fallback_device: None,
+                            });
+                        }
+                        model.status = PlaybackStatus::Failed;
+                        model.error = Some("没有可用的音频输出设备".into());
+                    }
                     session = None;
                 }
                 Err(error) => {
@@ -1139,6 +1283,7 @@ fn handle_command(
         }
         EngineCommand::SetOutputDevice(name) => {
             model.output_device = name;
+            model.pending_output_device_fallback = None;
             if model.index.is_some() {
                 if let Some(active) = session.as_ref() {
                     model.start_seconds = active.position_seconds();
@@ -1280,6 +1425,8 @@ struct PlaybackSession {
     underrun_callbacks: Arc<AtomicU64>,
     callback_enabled: Arc<AtomicBool>,
     volume_bits: Arc<AtomicU32>,
+    output_device_failed: Arc<AtomicBool>,
+    output_device_name: String,
     source_channels: usize,
     output_channels: usize,
     source_sample_rate: u32,
@@ -1386,7 +1533,9 @@ impl PlaybackSession {
         } else {
             channels as u16
         };
-        let supported = choose_output_config(&device, sample_rate, preferred_channels)?;
+        let output_device_name = device.name().unwrap_or_else(|_| "系统默认设备".to_owned());
+        let supported = choose_output_config(&device, sample_rate, preferred_channels)
+            .context("failed to configure output device")?;
         let sample_format = supported.sample_format();
         let config: StreamConfig = supported.into();
         let output_sample_rate = config.sample_rate.0;
@@ -1400,6 +1549,7 @@ impl PlaybackSession {
         let underrun_callbacks = Arc::new(AtomicU64::new(0));
         let callback_enabled = Arc::new(AtomicBool::new(false));
         let volume_bits = Arc::new(AtomicU32::new(volume.to_bits()));
+        let output_device_failed = Arc::new(AtomicBool::new(false));
         let stream = build_engine_output_stream(
             &device,
             &config,
@@ -1411,7 +1561,9 @@ impl PlaybackSession {
                 enabled: Arc::clone(&callback_enabled),
                 volume_bits: Arc::clone(&volume_bits),
             },
-        )?;
+            Arc::clone(&output_device_failed),
+        )
+        .context("failed to build output device stream")?;
         let mut rate_adapter = RateAdapter::new(sample_rate, output_sample_rate, channels)?;
         let mut dsp_chain = DspChain::new(output_sample_rate, output_channels, dsp_settings)?;
         let prefetched = std::mem::take(&mut media.prefetched_samples);
@@ -1434,6 +1586,8 @@ impl PlaybackSession {
             underrun_callbacks,
             callback_enabled,
             volume_bits,
+            output_device_failed,
+            output_device_name,
             source_channels: channels,
             output_channels,
             source_sample_rate: sample_rate,
@@ -1543,7 +1697,10 @@ impl PlaybackSession {
         let enough = self.producer.occupied_len() >= self.prebuffer_samples;
         if self.intent_playing && !self.stream_playing && (enough || self.eof) {
             self.callback_enabled.store(true, Ordering::Release);
-            self.stream.play()?;
+            if let Err(error) = self.stream.play() {
+                self.output_device_failed.store(true, Ordering::Release);
+                return Err(error).context("failed to start output device stream");
+            }
             self.stream_playing = true;
         }
         Ok(())
@@ -1651,18 +1808,79 @@ fn build_engine_output_stream(
     sample_format: SampleFormat,
     consumer: HeapCons<f32>,
     counters: OutputCallbackCounters,
+    output_device_failed: Arc<AtomicBool>,
 ) -> Result<Stream> {
     match sample_format {
-        SampleFormat::I8 => build_typed_engine_stream::<i8>(device, config, consumer, counters),
-        SampleFormat::F32 => build_typed_engine_stream::<f32>(device, config, consumer, counters),
-        SampleFormat::I16 => build_typed_engine_stream::<i16>(device, config, consumer, counters),
-        SampleFormat::U16 => build_typed_engine_stream::<u16>(device, config, consumer, counters),
-        SampleFormat::I32 => build_typed_engine_stream::<i32>(device, config, consumer, counters),
-        SampleFormat::I64 => build_typed_engine_stream::<i64>(device, config, consumer, counters),
-        SampleFormat::U8 => build_typed_engine_stream::<u8>(device, config, consumer, counters),
-        SampleFormat::U32 => build_typed_engine_stream::<u32>(device, config, consumer, counters),
-        SampleFormat::U64 => build_typed_engine_stream::<u64>(device, config, consumer, counters),
-        SampleFormat::F64 => build_typed_engine_stream::<f64>(device, config, consumer, counters),
+        SampleFormat::I8 => build_typed_engine_stream::<i8>(
+            device,
+            config,
+            consumer,
+            counters,
+            output_device_failed,
+        ),
+        SampleFormat::F32 => build_typed_engine_stream::<f32>(
+            device,
+            config,
+            consumer,
+            counters,
+            output_device_failed,
+        ),
+        SampleFormat::I16 => build_typed_engine_stream::<i16>(
+            device,
+            config,
+            consumer,
+            counters,
+            output_device_failed,
+        ),
+        SampleFormat::U16 => build_typed_engine_stream::<u16>(
+            device,
+            config,
+            consumer,
+            counters,
+            output_device_failed,
+        ),
+        SampleFormat::I32 => build_typed_engine_stream::<i32>(
+            device,
+            config,
+            consumer,
+            counters,
+            output_device_failed,
+        ),
+        SampleFormat::I64 => build_typed_engine_stream::<i64>(
+            device,
+            config,
+            consumer,
+            counters,
+            output_device_failed,
+        ),
+        SampleFormat::U8 => build_typed_engine_stream::<u8>(
+            device,
+            config,
+            consumer,
+            counters,
+            output_device_failed,
+        ),
+        SampleFormat::U32 => build_typed_engine_stream::<u32>(
+            device,
+            config,
+            consumer,
+            counters,
+            output_device_failed,
+        ),
+        SampleFormat::U64 => build_typed_engine_stream::<u64>(
+            device,
+            config,
+            consumer,
+            counters,
+            output_device_failed,
+        ),
+        SampleFormat::F64 => build_typed_engine_stream::<f64>(
+            device,
+            config,
+            consumer,
+            counters,
+            output_device_failed,
+        ),
         other => bail!("unsupported output sample format: {other}"),
     }
 }
@@ -1672,6 +1890,7 @@ fn build_typed_engine_stream<T>(
     config: &StreamConfig,
     mut consumer: HeapCons<f32>,
     counters: OutputCallbackCounters,
+    output_device_failed: Arc<AtomicBool>,
 ) -> Result<Stream>
 where
     T: Sample + SizedSample + FromSample<f32>,
@@ -1683,7 +1902,10 @@ where
             callback_thread_priority.ensure_registered();
             render_output_callback(output, &mut consumer, &counters);
         },
-        |error| eprintln!("audio output stream error: {error}"),
+        move |error| {
+            output_device_failed.store(true, Ordering::Release);
+            eprintln!("audio output stream error: {error}");
+        },
         None,
     )?;
     Ok(stream)

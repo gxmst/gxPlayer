@@ -31,7 +31,8 @@ describe("useLiveVolume", () => {
 
   it("previews the latest slider value before pointer release", async () => {
     const applyVolume = vi.fn(async (_volume: number) => undefined);
-    const { result } = renderHook(() => useLiveVolume(1, applyVolume, vi.fn()));
+    const commitVolume = vi.fn(async (_volume: number) => undefined);
+    const { result } = renderHook(() => useLiveVolume(1, applyVolume, commitVolume, vi.fn()));
 
     act(() => {
       result.current.previewVolume(0.7);
@@ -50,7 +51,8 @@ describe("useLiveVolume", () => {
     const applyVolume = vi.fn<(volume: number) => Promise<void>>()
       .mockReturnValueOnce(first.promise)
       .mockResolvedValue(undefined);
-    const { result } = renderHook(() => useLiveVolume(1, applyVolume, vi.fn()));
+    const commitVolume = vi.fn(async (_volume: number) => undefined);
+    const { result } = renderHook(() => useLiveVolume(1, applyVolume, commitVolume, vi.fn()));
 
     act(() => {
       result.current.previewVolume(0.8);
@@ -73,8 +75,9 @@ describe("useLiveVolume", () => {
   });
 
   it("flushes the exact final value without waiting for the next frame", async () => {
-    const applyVolume = vi.fn(async (_volume: number) => undefined);
-    const { result } = renderHook(() => useLiveVolume(1, applyVolume, vi.fn()));
+    const previewVolume = vi.fn(async (_volume: number) => undefined);
+    const commitActualVolume = vi.fn(async (_volume: number) => undefined);
+    const { result } = renderHook(() => useLiveVolume(1, previewVolume, commitActualVolume, vi.fn()));
 
     act(() => {
       result.current.previewVolume(0.6);
@@ -82,14 +85,15 @@ describe("useLiveVolume", () => {
     });
     await act(async () => Promise.resolve());
 
-    expect(applyVolume.mock.calls.map(([volume]) => volume)).toEqual([0.35]);
+    expect(previewVolume).not.toHaveBeenCalled();
+    expect(commitActualVolume.mock.calls.map(([volume]) => volume)).toEqual([0.35]);
     expect(result.current.isAdjustingVolume).toBe(false);
   });
 
   it("does not mistake an old snapshot for acknowledgement after returning to the initial value", () => {
     const applyVolume = vi.fn(async (_volume: number) => undefined);
     const { result, rerender } = renderHook(
-      ({ actual }) => useLiveVolume(actual, applyVolume, vi.fn()),
+      ({ actual }) => useLiveVolume(actual, applyVolume, vi.fn(), vi.fn()),
       { initialProps: { actual: 1 } },
     );
 
@@ -112,7 +116,7 @@ describe("useLiveVolume", () => {
     const update = deferredFailure();
     const onError = vi.fn();
     const applyVolume = vi.fn((_volume: number) => update.promise);
-    const { result, unmount } = renderHook(() => useLiveVolume(1, applyVolume, onError));
+    const { result, unmount } = renderHook(() => useLiveVolume(1, applyVolume, vi.fn(), onError));
 
     act(() => {
       result.current.previewVolume(0.5);
@@ -125,5 +129,26 @@ describe("useLiveVolume", () => {
     });
 
     expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("persists only the final trailing value after live previews", async () => {
+    const previewVolume = vi.fn(async (_volume: number) => undefined);
+    const commitVolume = vi.fn(async (_volume: number) => undefined);
+    const { result } = renderHook(() => useLiveVolume(1, previewVolume, commitVolume, vi.fn()));
+
+    act(() => {
+      result.current.previewVolume(0.8);
+      result.current.previewVolume(0.6);
+      vi.advanceTimersByTime(16);
+    });
+    await act(async () => Promise.resolve());
+    act(() => {
+      result.current.previewVolume(0.4);
+      vi.advanceTimersByTime(180);
+    });
+    await act(async () => Promise.resolve());
+
+    expect(previewVolume.mock.calls.map(([volume]) => volume)).toEqual([0.6, 0.4]);
+    expect(commitVolume.mock.calls.map(([volume]) => volume)).toEqual([0.4]);
   });
 });

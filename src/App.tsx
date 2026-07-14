@@ -83,6 +83,23 @@ import {
 } from "./types";
 
 type AudioMode = EngineSnapshot["audioMode"];
+type CloseBehavior = "hide_to_tray" | "exit";
+type AppPreferences = {
+  version: number;
+  closeBehavior: CloseBehavior;
+  closeToTrayNoticeShown: boolean;
+  volume: number;
+  outputDevice: string | null;
+};
+type OutputDeviceStatus = {
+  devices: string[];
+  defaultDevice: string | null;
+  selectedDevice: string | null;
+};
+type OutputDeviceFallbackEvent = {
+  unavailableDevice: string;
+  fallbackDevice: string | null;
+};
 type SourceConfigDraft = {
   json: string;
   enabled: boolean;
@@ -538,6 +555,13 @@ function App() {
   const [dragPosition, setDragPosition] = useState<number | null>(null);
   const [pendingSeek, setPendingSeek] = useState<{ target: number; generation: number; queueKey: string } | null>(null);
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
+  const [outputDeviceStatus, setOutputDeviceStatus] = useState<OutputDeviceStatus | null>(null);
+  const [outputDeviceBusy, setOutputDeviceBusy] = useState(false);
+  const [appPreferences, setAppPreferences] = useState<AppPreferences | null>(null);
+  const [closeNoticeOpen, setCloseNoticeOpen] = useState(false);
+  const [closeNoticeBusy, setCloseNoticeBusy] = useState(false);
+  const [outputDeviceFallback, setOutputDeviceFallback] = useState<OutputDeviceFallbackEvent | null>(null);
+  const closeNoticeConfirmRef = useRef<HTMLButtonElement>(null);
   const [qualityPreference, setQualityPreference] = useState<QualityPreference>(() => {
     const stored = window.localStorage.getItem("gxplayer.defaultQuality");
     return QUALITY_OPTIONS.some((option) => option.value === stored) ? stored as QualityPreference : "auto";
@@ -750,6 +774,42 @@ function App() {
     setHistoryEntries(entries);
   };
 
+  const refreshOutputDevices = async () => {
+    setOutputDeviceBusy(true);
+    try {
+      const status = await invoke<OutputDeviceStatus>("player_refresh_output_devices");
+      setOutputDeviceStatus(status);
+      setOutputDevices(status.devices);
+    } finally {
+      setOutputDeviceBusy(false);
+    }
+  };
+
+  const selectOutputDevice = async (name: string | null) => {
+    if (outputDeviceBusy) return;
+    setOutputDeviceBusy(true);
+    try {
+      const status = await invoke<OutputDeviceStatus>("player_set_output_device", { name });
+      setOutputDeviceStatus(status);
+      setOutputDevices(status.devices);
+      setAppPreferences((preferences) => preferences ? { ...preferences, outputDevice: status.selectedDevice } : preferences);
+      setOutputDeviceFallback(null);
+    } catch (error) {
+      setMessage(String(error), true);
+      await refreshOutputDevices().catch(() => undefined);
+    } finally {
+      setOutputDeviceBusy(false);
+    }
+  };
+
+  const setCloseBehavior = async (behavior: CloseBehavior) => {
+    try {
+      setAppPreferences(await invoke<AppPreferences>("app_preferences_set_close_behavior", { behavior }));
+    } catch (error) {
+      setMessage(String(error), true);
+    }
+  };
+
   const beginDiagnosticLogOperation = () => {
     diagnosticLogGenerationRef.current += 1;
     return diagnosticLogGenerationRef.current;
@@ -825,8 +885,8 @@ function App() {
     void refreshSources().catch((error) => setMessage(String(error), true));
     void refreshCache().catch((error) => setMessage(String(error), true));
     void refreshHistory().catch(() => undefined);
-    void invoke<string[]>("player_output_devices")
-      .then(setOutputDevices)
+    void invoke<AppPreferences>("app_preferences_get")
+      .then(setAppPreferences)
       .catch((error) => setMessage(String(error), true));
 
     void refreshLibrary(true).catch((error) => {
@@ -873,6 +933,7 @@ function App() {
     if (view === "history") void refreshHistory().catch(() => undefined);
     if (view === "sources") void refreshSources().catch(() => undefined);
     if (view === "settings") {
+      void refreshOutputDevices().catch((error) => setMessage(String(error), true));
       const generation = beginDiagnosticLogOperation();
       setDiagnosticLogBusy("refresh");
       void refreshDiagnosticLog(generation)
@@ -916,6 +977,40 @@ function App() {
       void unlisten.then((stop) => stop());
     };
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const closeUnlisten = listen("gx-close-to-tray-notice-requested", () => {
+      if (!disposed) setCloseNoticeOpen(true);
+    });
+    const fallbackUnlisten = listen<OutputDeviceFallbackEvent>("gx-output-device-fallback", (event) => {
+      if (disposed) return;
+      setOutputDeviceFallback(event.payload);
+      setOutputDeviceStatus((status) => status ? { ...status, selectedDevice: null } : status);
+      setAppPreferences((preferences) => preferences ? { ...preferences, outputDevice: null } : preferences);
+    });
+    return () => {
+      disposed = true;
+      void closeUnlisten.then((stop) => stop());
+      void fallbackUnlisten.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!closeNoticeOpen) return;
+    const frame = window.requestAnimationFrame(() => closeNoticeConfirmRef.current?.focus());
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape" || closeNoticeBusy) return;
+      event.preventDefault();
+      setCloseNoticeOpen(false);
+      void invoke("app_close_notice_cancel").catch((error) => setMessage(String(error), true));
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeNoticeBusy, closeNoticeOpen]);
 
   useEffect(() => {
     if (!playlistSessionReady) return;
@@ -1125,6 +1220,7 @@ function App() {
   const { shownVolume, isAdjustingVolume, previewVolume, commitVolume } = useLiveVolume(
     snapshot.volume,
     (volume) => invoke("player_set_volume", { volume }),
+    (volume) => invoke<AppPreferences>("player_commit_volume", { volume }).then(setAppPreferences),
     (error) => setMessage(String(error), true),
   );
   const measuredSourceSpec = formatSourceSpec(snapshot);
@@ -3029,9 +3125,9 @@ function App() {
     if (view === "settings") return (
       <div className="page"><PageHeading eyebrow="SETTINGS" title="设置与备份" copy="输出设备、窗口和本地数据都在这里管理。" />
         <div className="settings-grid">
-          <section className="settings-card"><h3>输出设备</h3><p>切换时会从当前位置继续播放。</p><select value={snapshot.outputDevice ?? ""} onChange={(event) => void run("player_set_output_device", { name: event.target.value || null })}><option value="">系统默认设备</option>{outputDevices.map((device) => <option key={device} value={device}>{device}</option>)}</select></section>
+          <section className="settings-card"><h3>输出设备</h3><p>进入设置时会重新枚举；设备断开后自动回退到系统默认设备。</p><select value={outputDeviceStatus?.selectedDevice ?? appPreferences?.outputDevice ?? ""} disabled={outputDeviceBusy} onChange={(event) => void selectOutputDevice(event.target.value || null)}><option value="">系统默认设备{outputDeviceStatus?.defaultDevice ? ` · ${outputDeviceStatus.defaultDevice}` : ""}</option>{outputDevices.map((device) => <option key={device} value={device}>{device}</option>)}</select><button type="button" disabled={outputDeviceBusy} onClick={() => void refreshOutputDevices().catch((error) => setMessage(String(error), true))}>{outputDeviceBusy ? "正在刷新…" : "重新枚举设备"}</button></section>
           <section className="settings-card"><h3>默认音质</h3><p>自动会按当前平台能力从高到低尝试，并在解析失败时逐档回退。</p><select value={qualityPreference} onChange={(event) => updateQualityPreference(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></section>
-          <section className="settings-card"><h3>默认听感</h3><p>音乐模式保持 DSP 透明旁路；影院/游戏模式启用空间处理。</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></section>
+          <section className="settings-card"><h3>听感模式</h3><p>仅本次运行有效；重启后恢复原声直通，避免意外带入空间处理。</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></section>
           <section className="settings-card proxy-settings">
             <h3>网络代理</h3>
             <p>复用你本机操作系统配置的第三方代理服务，非本应用提供。音源连接优先直连，失败时才按需回退到代理。</p>
@@ -3052,7 +3148,9 @@ function App() {
           </section>
           <section className="settings-card">
             <h3>窗口</h3>
-            <p>位置与尺寸会自动记忆；迷你模式适合边听边干活。</p>
+            <p>位置与尺寸会自动记忆；关闭行为可随时修改。</p>
+            <label><span>关闭按钮（X）</span><select value={appPreferences?.closeBehavior ?? "hide_to_tray"} disabled={!appPreferences} onChange={(event) => void setCloseBehavior(event.target.value as CloseBehavior)}><option value="hide_to_tray">隐藏到系统托盘</option><option value="exit">退出应用</option></select></label>
+            <small>{appPreferences?.closeBehavior === "exit" ? "点击 X 会结束播放并退出。" : "点击 X 后继续后台播放；托盘右键菜单提供显式退出。"}</small>
             <div className="cache-actions">
               <button type="button" className={alwaysOnTop ? "primary" : ""} onClick={() => void toggleAlwaysOnTop()}>{alwaysOnTop ? "取消置顶" : "窗口置顶"}</button>
               <button type="button" className={miniMode ? "primary" : ""} onClick={() => void toggleMiniMode()}>{miniMode ? "退出迷你" : "迷你模式"}</button>
@@ -3407,7 +3505,7 @@ function App() {
             )}
           </div>
         </div>
-        <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button className="maximize-control" onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label="关闭">×</button></div>
+        <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button className="maximize-control" onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label={appPreferences?.closeBehavior === "exit" ? "退出应用" : "隐藏到系统托盘"} title={appPreferences?.closeBehavior === "exit" ? "退出应用" : "隐藏到系统托盘"}>×</button></div>
       </header>
 
       {narrowLayout && sidebarDrawerOpen && (
@@ -3463,6 +3561,36 @@ function App() {
         </div>
       )}
 
+      {closeNoticeOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="config-modal close-to-tray-modal" role="dialog" aria-modal="true" aria-labelledby="close-to-tray-title" aria-describedby="close-to-tray-copy">
+            <div className="section-heading">
+              <div><p className="eyebrow">BACKGROUND PLAYBACK</p><h3 id="close-to-tray-title">关闭后继续播放</h3></div>
+            </div>
+            <p id="close-to-tray-copy">GXPlayer 关闭后会隐藏到系统托盘，音乐继续播放。左键托盘图标恢复，右键菜单可退出；也可在设置中修改。</p>
+            <div className="modal-actions">
+              <button type="button" disabled={closeNoticeBusy} onClick={() => {
+                setCloseNoticeBusy(true);
+                void invoke("app_close_notice_cancel")
+                  .then(() => setCloseNoticeOpen(false))
+                  .catch((error) => setMessage(String(error), true))
+                  .finally(() => setCloseNoticeBusy(false));
+              }}>暂不关闭</button>
+              <button ref={closeNoticeConfirmRef} type="button" className="primary" disabled={closeNoticeBusy} onClick={() => {
+                setCloseNoticeBusy(true);
+                void invoke<AppPreferences>("app_close_notice_confirm")
+                  .then((preferences) => {
+                    setAppPreferences(preferences);
+                    setCloseNoticeOpen(false);
+                  })
+                  .catch((error) => setMessage(String(error), true))
+                  .finally(() => setCloseNoticeBusy(false));
+              }}>{closeNoticeBusy ? "正在处理…" : "知道了，隐藏到托盘"}</button>
+            </div>
+          </section>
+        </div>
+      )}
+
       <TextPlaylistImportDialog
         open={textPlaylistDialogOpen}
         onClose={() => setTextPlaylistDialogOpen(false)}
@@ -3478,6 +3606,16 @@ function App() {
           <span>{snapshot.error && !engineErrorDismissed || messageIsError ? "!" : "✓"}</span>
           <p>{(!engineErrorDismissed && snapshot.error) ? snapshot.error : message}</p>
           <button type="button" onClick={clearMessage} aria-label="关闭提示">×</button>
+        </div>
+      )}
+
+      {outputDeviceFallback && (
+        <div className="device-fallback-banner" role="alert">
+          <span>!</span>
+          <p>{outputDeviceFallback.fallbackDevice
+            ? `“${outputDeviceFallback.unavailableDevice}”已断开，已切换到系统默认设备“${outputDeviceFallback.fallbackDevice}”。`
+            : `“${outputDeviceFallback.unavailableDevice}”已断开，且没有可用的系统默认输出设备。`}</p>
+          <button type="button" onClick={() => setOutputDeviceFallback(null)} aria-label="关闭输出设备提示">×</button>
         </div>
       )}
 

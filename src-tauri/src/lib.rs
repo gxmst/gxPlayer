@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine, PlayMode};
 use gx_contracts::ResolvedMediaRequest;
@@ -14,6 +15,7 @@ use gx_dsp::DspSettings;
 use gx_library::{LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistSummary};
 use gx_source::{SourceStore, safe_http};
 
+mod app_preferences;
 mod artwork;
 mod backup_commands;
 mod cache_commands;
@@ -29,6 +31,7 @@ mod transport;
 mod window_state;
 mod windows_identity;
 
+use app_preferences::{AppPreferences, AppPreferencesState, CloseAction, CloseBehavior};
 use artwork::artwork_get;
 use backup_commands::{backup_preview_restore, backup_restore_atomic};
 use cache_commands::{
@@ -62,6 +65,19 @@ use source_commands::{
 use source_runtime::SourceRuntime;
 
 pub(crate) const SANDBOX_LABEL: &str = "lx-sandbox";
+
+#[derive(Default)]
+struct AppCloseRequestState {
+    notice_pending: AtomicBool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutputDeviceStatus {
+    devices: Vec<String>,
+    default_device: Option<String>,
+    selected_device: Option<String>,
+}
 
 pub(crate) fn isolated_smoke_data_root() -> Option<PathBuf> {
     (std::env::var_os("GX_PHASE1_LX_POC").is_some()
@@ -548,6 +564,27 @@ fn player_set_volume(
 }
 
 #[tauri::command]
+fn player_commit_volume(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    preferences: tauri::State<AppPreferencesState>,
+    volume: f32,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    let previous = preferences.get().volume;
+    engine
+        .set_volume(volume)
+        .map_err(|error| error.to_string())?;
+    match preferences.set_volume(volume) {
+        Ok(next) => Ok(next),
+        Err(error) => {
+            let _ = engine.set_volume(previous);
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
 fn player_set_dsp_settings(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
@@ -607,16 +644,93 @@ fn player_output_devices(
     engine.output_devices().map_err(|error| error.to_string())
 }
 
+fn output_device_status(
+    engine: &LocalAudioEngine,
+    preferences: &AppPreferencesState,
+) -> Result<OutputDeviceStatus, String> {
+    Ok(OutputDeviceStatus {
+        devices: engine.output_devices().map_err(|error| error.to_string())?,
+        default_device: engine
+            .default_output_device_name()
+            .map_err(|error| error.to_string())?,
+        selected_device: preferences.get().output_device,
+    })
+}
+
+#[tauri::command]
+fn player_refresh_output_devices(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    preferences: tauri::State<AppPreferencesState>,
+) -> Result<OutputDeviceStatus, String> {
+    require_window(&window, "main")?;
+    output_device_status(&engine, &preferences)
+}
+
 #[tauri::command]
 fn player_set_output_device(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
+    preferences: tauri::State<AppPreferencesState>,
     name: Option<String>,
+) -> Result<OutputDeviceStatus, String> {
+    require_window(&window, "main")?;
+    let devices = engine.output_devices().map_err(|error| error.to_string())?;
+    if let Some(name) = name.as_deref()
+        && !devices.iter().any(|device| device == name)
+    {
+        return Err(format!("输出设备“{name}”当前不可用，请刷新后重试"));
+    }
+    let previous = preferences.get().output_device;
+    preferences.set_output_device(name.clone())?;
+    if let Err(error) = engine.set_output_device(name) {
+        let _ = preferences.set_output_device(previous);
+        return Err(error.to_string());
+    }
+    output_device_status(&engine, &preferences)
+}
+
+#[tauri::command]
+fn app_preferences_get(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    Ok(preferences.get())
+}
+
+#[tauri::command]
+fn app_preferences_set_close_behavior(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    behavior: CloseBehavior,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    preferences.set_close_behavior(behavior)
+}
+
+#[tauri::command]
+fn app_close_notice_confirm(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    close_request: tauri::State<AppCloseRequestState>,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    let next = preferences.mark_close_notice_shown()?;
+    close_request.notice_pending.store(false, Ordering::Release);
+    save_main_window_state(window.app_handle());
+    window.hide().map_err(|error| error.to_string())?;
+    Ok(next)
+}
+
+#[tauri::command]
+fn app_close_notice_cancel(
+    window: WebviewWindow,
+    close_request: tauri::State<AppCloseRequestState>,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
-    engine
-        .set_output_device(name)
-        .map_err(|error| error.to_string())
+    close_request.notice_pending.store(false, Ordering::Release);
+    Ok(())
 }
 
 #[tauri::command]
@@ -858,6 +972,30 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn save_main_window_state(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(app_data) = app.path().app_data_dir() else {
+        return;
+    };
+    let mini_mode = app
+        .try_state::<window_state::WindowModeState>()
+        .is_some_and(|mode| mode.mini_mode());
+    if mini_mode {
+        let mut state = window_state::load(&app_data);
+        state.mini_mode = true;
+        let _ = window_state::save(&app_data, &state);
+    } else if let Some(state) = window_state::capture_from_window(&window, false) {
+        let _ = window_state::save(&app_data, &state);
+    }
+}
+
+fn request_app_exit(app: &AppHandle) {
+    save_main_window_state(app);
+    app.exit(0);
+}
+
 fn create_system_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "tray-show", "显示主界面", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "tray-quit", "退出", true, None::<&str>)?;
@@ -874,7 +1012,7 @@ fn create_system_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "tray-show" => show_main_window(app),
-            "tray-quit" => app.exit(0),
+            "tray-quit" => request_app_exit(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -954,6 +1092,7 @@ pub fn run() {
         .manage(ResolveCancellationRegistry::default())
         .manage(media_session::MediaSessionState::default())
         .manage(transport::TransportState::default())
+        .manage(AppCloseRequestState::default())
         .manage(LxPocState {
             script_path: phase1_script_path(),
             progress: Mutex::new(LxPocProgress::default()),
@@ -963,11 +1102,47 @@ pub fn run() {
                 && let tauri::WindowEvent::CloseRequested { api, .. } = event
             {
                 api.prevent_close();
-                let _ = window.hide();
+                let app = window.app_handle();
+                let preferences = app.state::<AppPreferencesState>();
+                match preferences.close_action() {
+                    CloseAction::Exit => request_app_exit(app),
+                    CloseAction::Hide => {
+                        save_main_window_state(app);
+                        let _ = window.hide();
+                    }
+                    CloseAction::Explain => {
+                        let close_request = app.state::<AppCloseRequestState>();
+                        if close_request
+                            .notice_pending
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                            && window.emit("gx-close-to-tray-notice-requested", ()).is_err()
+                        {
+                            close_request.notice_pending.store(false, Ordering::Release);
+                        }
+                    }
+                }
             }
         })
         .setup(|app| {
             let app_data = isolated_smoke_data_root().unwrap_or(app.path().app_data_dir()?);
+            let preferences = AppPreferencesState::open(&app_data);
+            let restored_preferences = preferences.get();
+            let engine = app.state::<LocalAudioEngine>();
+            engine
+                .set_volume(restored_preferences.volume)
+                .map_err(tauri::Error::Anyhow)?;
+            if let Some(device) = restored_preferences.output_device.as_ref() {
+                let available = engine.output_devices().unwrap_or_default();
+                if available.iter().any(|candidate| candidate == device) {
+                    engine
+                        .set_output_device(Some(device.clone()))
+                        .map_err(tauri::Error::Anyhow)?;
+                } else if let Err(error) = preferences.clear_output_device_if_matches(device) {
+                    eprintln!("failed to clear unavailable output device preference: {error}");
+                }
+            }
+            app.manage(preferences);
             app.manage(artwork::ArtworkCache::new(
                 app_data.join("artwork-cache"),
             ));
@@ -1061,6 +1236,7 @@ pub fn run() {
             player_pause,
             player_seek,
             player_set_volume,
+            player_commit_volume,
             player_set_audio_mode,
             player_set_play_mode,
             player_set_dsp_settings,
@@ -1073,7 +1249,12 @@ pub fn run() {
             player_snapshot,
             player_set_transport_capabilities,
             player_output_devices,
+            player_refresh_output_devices,
             player_set_output_device,
+            app_preferences_get,
+            app_preferences_set_close_behavior,
+            app_close_notice_confirm,
+            app_close_notice_cancel,
             player_media_action,
             library_import_files,
             library_relink_track,

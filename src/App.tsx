@@ -123,6 +123,7 @@ const PLAY_MODE_META: Record<PlayMode, { label: string; glyph: string }> = {
 };
 const TOAST_OK_MS = 3_000;
 const TOAST_ERROR_MS = 10_000;
+const MAX_CONSECUTIVE_FAILURE_SKIPS = 3;
 const COVER_CACHE_LIMIT = 96;
 
 function catalogKey(track: CatalogTrack): string {
@@ -604,7 +605,7 @@ function App() {
   const [selectedCacheKeys, setSelectedCacheKeys] = useState<string[]>([]);
   const [coverCache, setCoverCache] = useState<Record<string, string>>({});
   const [resolveBanner, setResolveBanner] = useState<{ title: string; detail: string } | null>(null);
-  const resolveGenerationRef = useRef(0);
+  const resolveGenerationRef = useRef(Date.now() * 1_000);
   const resolveAbortRef = useRef(false);
   const activeResolveRequestRef = useRef<string | null>(null);
   const cancelledResolveRequestsRef = useRef<Set<string>>(new Set());
@@ -879,6 +880,16 @@ function App() {
     setPlayingCatalogKey(null);
     setResolveBanner(null);
     pushMessage("已取消解析");
+  };
+
+  const supersedeActiveResolve = () => {
+    const requestId = activeResolveRequestRef.current;
+    if (!requestId) return;
+    cancelledResolveRequestsRef.current.add(requestId);
+    resolveAbortRef.current = true;
+    resolveGenerationRef.current += 1;
+    activeResolveRequestRef.current = null;
+    void invoke("player_cancel_resolve", { requestId }).catch(() => undefined);
   };
 
   useEffect(() => {
@@ -1424,12 +1435,14 @@ function App() {
   ): Promise<PlaybackStartResult> => {
     const key = catalogKey(wanted);
     const generation = ++resolveGenerationRef.current;
+    let failureKind: OnlinePlaybackResult["failureKind"] = null;
     const requestId = typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
       : `${Date.now()}-${generation}-${Math.random().toString(16).slice(2)}`;
     resolveAbortRef.current = false;
     activeResolveRequestRef.current = requestId;
     suppressNextTerminalAdvanceRef.current = false;
+    setPlayingCatalogKey(key);
     setResolveBanner({ title: `正在解析《${wanted.title}》`, detail: "可取消 · 仅解析当前这一首" });
     console.info("[GXPlayer] online resolve request", { key, requestId, title: wanted.title, quality });
 
@@ -1449,6 +1462,7 @@ function App() {
         quality: quality === "auto" ? null : quality,
         sourceId: null,
         requestId,
+        intentGeneration: generation,
       });
       const interrupted = interruptedOutcome();
       if (interrupted) return interrupted;
@@ -1456,6 +1470,7 @@ function App() {
         return { outcome: online.outcome };
       }
       if (online.outcome === "failed") {
+        failureKind = online.failureKind ?? "unknown";
         const diagnostics = formatResolveAttempts(online.attempts);
         throw new Error(`${online.error || "音源未能返回可播放地址"}${diagnostics}`);
       }
@@ -1488,13 +1503,14 @@ function App() {
       console.warn("[GXPlayer] online resolve failed", { key, error: String(onlineError) });
       if (!opts?.allowPreviewFallback) {
         setMessage(formatFailureMessage(onlineError, wanted.title), true);
-        return { outcome: "failed", error: onlineError };
+        return { outcome: "failed", error: onlineError, failureKind: failureKind ?? "unknown" };
       }
       try {
         const preview = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
           wanted,
           candidates: opts.candidates ?? [wanted],
           requestId,
+          intentGeneration: generation,
         });
         const previewInterrupted = interruptedOutcome();
         if (previewInterrupted) return previewInterrupted;
@@ -1517,13 +1533,14 @@ function App() {
         const previewInterrupted = interruptedOutcome();
         if (previewInterrupted) return previewInterrupted;
         setMessage(formatFailureMessage(`${String(onlineError)}; ${String(previewError)}`, wanted.title), true);
-        return { outcome: "failed", error: previewError };
+        return { outcome: "failed", error: previewError, failureKind: failureKind ?? "unknown" };
       }
     } finally {
       cancelledResolveRequestsRef.current.delete(requestId);
       if (activeResolveRequestRef.current === requestId) activeResolveRequestRef.current = null;
       if (generation === resolveGenerationRef.current) {
         setResolveBanner(null);
+        setPlayingCatalogKey(null);
       }
     }
   };
@@ -1558,6 +1575,7 @@ function App() {
   };
 
   const playHistoryEntry = async (entry: HistoryEntry) => {
+    supersedeActiveResolve();
     if (entry.kind === "local" && entry.path) {
       const track = { id: -1, path: entry.path, title: entry.title, artist: entry.artist, album: "", durationSeconds: null, favorite: false, addedAtMs: 0 };
       await playLocalInList([track], track);
@@ -1680,23 +1698,17 @@ function App() {
         return { outcome: "failed", error };
       }
     }
-    const key = catalogKey(entry.track);
-    setPlayingCatalogKey(key);
-    try {
-      return await resolveAndPlayOnline(entry.track, entry.quality, {
-        allowPreviewFallback: opts?.allowPreviewFallback,
-        candidates: entries
-          .filter((item): item is Extract<PlaylistEntry, { kind: "online" }> => item.kind === "online")
-          .map((item) => item.track),
-      });
-    } finally {
-      setPlayingCatalogKey(null);
-    }
+    return resolveAndPlayOnline(entry.track, entry.quality, {
+      allowPreviewFallback: opts?.allowPreviewFallback,
+      candidates: entries
+        .filter((item): item is Extract<PlaylistEntry, { kind: "online" }> => item.kind === "online")
+        .map((item) => item.track),
+    });
   };
 
   /**
-   * Advance the playhead. On hard failure, skip untried tracks at most once —
-   * never infinite-retry under repeat_one / wrap modes.
+   * Advance the playhead. Only a track-scoped "no playable URL" may be skipped,
+   * and a single chain can skip at most three tracks.
    * @returns true if a track started successfully.
    */
   const advanceFromIndex = async (
@@ -1709,12 +1721,18 @@ function App() {
     advancingRef.current = true;
     const tried = new Set<number>();
     if (opts?.fromFailure) tried.add(current);
+    let failureSkipCount = 0;
     try {
       const mode = snapshotRef.current.playMode ?? "sequential";
       let cursor = current;
       let pausedForExplicitAdvance = false;
       for (let attempt = 0; attempt < Math.max(entries.length, 1); attempt += 1) {
-        const next = opts?.fromFailure || attempt > 0
+        const isFailureSkip = Boolean(opts?.fromFailure) || attempt > 0;
+        if (isFailureSkip && failureSkipCount >= MAX_CONSECUTIVE_FAILURE_SKIPS) {
+          setMessage(`已连续跳过 ${MAX_CONSECUTIVE_FAILURE_SKIPS} 首无可用地址的歌曲，已停止自动尝试。`, true);
+          return { outcome: "failed", failureKind: "track_unavailable" };
+        }
+        const next = isFailureSkip
           ? pickFailureSkipIndex(
             mode,
             cursor,
@@ -1754,6 +1772,7 @@ function App() {
           }
         }
         tried.add(next);
+        if (isFailureSkip) failureSkipCount += 1;
         setPlaylistIndex(next);
         cursor = next;
         // Failure-skip never uses preview fallback (avoids cascading slow preview attempts).
@@ -1770,7 +1789,6 @@ function App() {
       return { outcome: "failed" };
     } finally {
       advancingRef.current = false;
-      setPlayingCatalogKey(null);
     }
   };
 
@@ -1795,13 +1813,7 @@ function App() {
     shufflePlayedRef.current = new Set([index]);
     setPlaylist(entries);
     setPlaylistIndex(index);
-    const startKey = entries[index]?.kind === "online" ? catalogKey(entries[index]!.track) : null;
-    if (startKey) setPlayingCatalogKey(startKey);
-    try {
-      return await playPlaylistEntry(entries, index, opts);
-    } finally {
-      setPlayingCatalogKey(null);
-    }
+    return playPlaylistEntry(entries, index, opts);
   };
 
   const chooseFiles = async () => {
@@ -1831,6 +1843,7 @@ function App() {
 
   /** Click a local track: load the entire current view as the queue, start at the clicked item. */
   const playLocalInList = async (tracks: LibraryTrack[], track: LibraryTrack) => {
+    supersedeActiveResolve();
     const startIndex = Math.max(0, tracks.findIndex((item) => item.id === track.id));
     const entries = tracks.map(localEntryFromLibrary);
     try {
@@ -1889,7 +1902,7 @@ function App() {
 
   /** Click a catalog track: queue the whole list as online placeholders; resolve only the clicked one. */
   const playCatalogInList = async (tracks: CatalogTrack[], wanted: CatalogTrack) => {
-    if (playingCatalogKey || advancingRef.current) return;
+    supersedeActiveResolve();
     const list = tracks.length ? tracks : [wanted];
     const startIndex = Math.max(0, list.findIndex((item) => catalogKey(item) === catalogKey(wanted)));
     const entries = list.map((track) => onlineEntryFromCatalog(track, qualityPreference));
@@ -1907,8 +1920,6 @@ function App() {
         navigateTo("now-playing");
       }
     } catch (error) {
-      setPlayingCatalogKey(null);
-      advancingRef.current = false;
       setMessage(`播放失败：${String(error)}`, true);
     }
   };
@@ -1924,7 +1935,6 @@ function App() {
             : onlineFavorites.some((track) => catalogKey(track) === catalogKey(wanted))
               ? onlineFavorites
               : [wanted];
-    if (playingCatalogKey || advancingRef.current) return;
     await playCatalogInList(context, wanted);
   };
 
@@ -1976,6 +1986,7 @@ function App() {
   };
 
   const jumpToPlaylistIndex = async (index: number) => {
+    supersedeActiveResolve();
     const entries = playlistRef.current;
     const target = entries[index];
     if (!target) return;
@@ -2004,17 +2015,11 @@ function App() {
       }
       return;
     }
-    const key = target.kind === "online" ? catalogKey(target.track) : null;
-    if (key) setPlayingCatalogKey(key);
-    try {
-      await playPlaylistEntry(entries, index);
-    } finally {
-      if (key) setPlayingCatalogKey(null);
-    }
+    await playPlaylistEntry(entries, index);
   };
 
   const playCacheInList = async (entries: CacheEntryView[], wanted: CacheEntryView) => {
-    if (playingCatalogKey || advancingRef.current) return;
+    supersedeActiveResolve();
     const startIndex = Math.max(0, entries.findIndex(
       (item) => item.providerId === wanted.providerId
         && item.providerTrackId === wanted.providerTrackId
@@ -2025,8 +2030,6 @@ function App() {
       const result = await replacePlaylist(playlistEntries, startIndex === -1 ? 0 : startIndex);
       if (result.outcome === "started") navigateTo("now-playing");
     } catch (error) {
-      setPlayingCatalogKey(null);
-      advancingRef.current = false;
       setMessage(String(error), true);
     }
   };
@@ -2330,7 +2333,9 @@ function App() {
         suppressNextTerminalAdvanceRef.current = false;
         return;
       }
-      void advanceFromIndex(entries, current, "ended", { fromFailure: true });
+      // Engine failures are not proven to be track-scoped. Stop here instead of sweeping the
+      // online queue on a network/output/system fault; the engine error toast remains visible.
+      setPlaylistIndex(current);
     }
   }, [snapshot.status]);
 
@@ -2352,6 +2357,7 @@ function App() {
         quality: preference === "auto" ? null : preference,
         sourceId: null,
         requestId,
+        intentGeneration: generation,
         preserveTransport: true,
       });
       if (interrupted()) return;

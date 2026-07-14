@@ -73,6 +73,7 @@ export type CatalogTrack = {
 
 export type OnlinePlaybackResult = {
   outcome: "started" | "failed" | "cancelled" | "stale";
+  failureKind: ResolveFailureKind | null;
   attempts: ResolveAttemptDiagnostic[];
   error?: string | null;
   track: CatalogTrack;
@@ -81,6 +82,14 @@ export type OnlinePlaybackResult = {
   quality: string | null;
   cacheHit: boolean;
 };
+
+export type ResolveFailureKind =
+  | "track_unavailable"
+  | "no_source"
+  | "network"
+  | "authentication"
+  | "rate_limited"
+  | "unknown";
 
 export type ResolveAttemptDiagnostic = {
   sourceId: string | null;

@@ -45,6 +45,7 @@ pub struct ImportResult {
 #[serde(rename_all = "camelCase")]
 pub struct OnlinePlaybackResult {
     pub outcome: ResolveOutcome,
+    pub failure_kind: Option<ResolveFailureKind>,
     pub track: CatalogTrack,
     pub source_id: Option<String>,
     pub source_name: Option<String>,
@@ -61,6 +62,17 @@ pub enum ResolveOutcome {
     Failed,
     Cancelled,
     Stale,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolveFailureKind {
+    TrackUnavailable,
+    NoSource,
+    Network,
+    Authentication,
+    RateLimited,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -98,6 +110,7 @@ impl ResolveToken {
 
 #[derive(Default)]
 struct ResolveRegistryInner {
+    latest_intent_generation: u64,
     current_request_id: Option<String>,
     requests: HashMap<String, Arc<AtomicU8>>,
 }
@@ -108,12 +121,31 @@ pub struct ResolveCancellationRegistry {
 }
 
 impl ResolveCancellationRegistry {
-    pub(crate) fn begin(&self, request_id: String) -> Result<ResolveToken, String> {
+    pub(crate) fn begin(
+        &self,
+        request_id: String,
+        intent_generation: Option<u64>,
+    ) -> Result<ResolveToken, String> {
         let request_id = request_id.trim().to_owned();
         if request_id.is_empty() || request_id.len() > 160 {
             return Err("resolve requestId must contain 1 to 160 characters".into());
         }
         let mut inner = self.inner.lock().unwrap();
+        let intent_generation =
+            intent_generation.unwrap_or_else(|| inner.latest_intent_generation.saturating_add(1));
+        if intent_generation < inner.latest_intent_generation
+            || (intent_generation == inner.latest_intent_generation
+                && inner
+                    .current_request_id
+                    .as_deref()
+                    .is_some_and(|current| current != request_id))
+        {
+            return Ok(ResolveToken {
+                request_id,
+                state: Arc::new(AtomicU8::new(RESOLVE_STALE)),
+            });
+        }
+        inner.latest_intent_generation = intent_generation;
         if let Some(previous_id) = inner.current_request_id.take()
             && previous_id != request_id
             && let Some(previous) = inner.requests.get(&previous_id)
@@ -694,14 +726,22 @@ fn safe_http_error_code(error: &SafeHttpError) -> &'static str {
 
 fn diagnostic_error_code(error: &str) -> &'static str {
     let error = error.to_ascii_lowercase();
-    if error.contains("all lx source fallbacks failed") || error.contains("所有音源均无法返回结果")
+    if error.contains("track_unavailable")
+        || error.contains("no matching lx-platform song was found")
+    {
+        "track_unavailable"
+    } else if error.contains("all lx source fallbacks failed")
+        || error.contains("所有音源均无法返回结果")
     {
         "all_sources_failed"
     } else if error.contains("no lx source") || error.contains("没有已导入且可用") {
         "no_source"
     } else if error.contains("timed out") || error.contains("timeout") {
         "timeout"
-    } else if error.contains("http 401") || error.contains("http 403") {
+    } else if error.contains("http 401")
+        || error.contains("http 403")
+        || error.contains("upstream_auth_rejected")
+    {
         "upstream_auth_rejected"
     } else if error.contains("http 408") {
         "upstream_timeout"
@@ -709,11 +749,12 @@ fn diagnostic_error_code(error: &str) -> &'static str {
         "upstream_rate_limited"
     } else if error.contains("upstream_not_found") || error.contains("http 404") {
         "upstream_not_found"
-    } else if error.contains("http 5") {
+    } else if error.contains("http 5") || error.contains("upstream_server_error") {
         "upstream_server_error"
     } else if error.contains("private destination")
         || error.contains("loopback")
         || error.contains("link-local")
+        || error.contains("blocked_destination")
     {
         "blocked_destination"
     } else if error.contains("dns") || error.contains("resolve destination") {
@@ -745,6 +786,8 @@ fn diagnostic_error_code(error: &str) -> &'static str {
         "active_source_restore_failed"
     } else if error.contains("source_resolution_failed") {
         "source_resolution_failed"
+    } else if error.contains("redirect_failed") {
+        "redirect_failed"
     } else if error.contains("sandbox") || error.contains("worker") {
         "worker_failed"
     } else if error.contains("read")
@@ -819,12 +862,16 @@ pub async fn player_play_online_track(
     quality: Option<String>,
     source_id: Option<String>,
     request_id: Option<String>,
+    intent_generation: Option<u64>,
     preserve_transport: Option<bool>,
 ) -> Result<OnlinePlaybackResult, String> {
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
     let token = request_id
-        .map(|request_id| app.state::<ResolveCancellationRegistry>().begin(request_id))
+        .map(|request_id| {
+            app.state::<ResolveCancellationRegistry>()
+                .begin(request_id, intent_generation)
+        })
         .transpose()?;
     let diagnostic_source_id = source_id.clone();
     let token_for_worker = token.clone();
@@ -1100,6 +1147,7 @@ fn play_online_track(
             }
             return Ok(OnlinePlaybackResult {
                 outcome: ResolveOutcome::Started,
+                failure_kind: None,
                 track: resolved.track,
                 source_id: Some(resolved.source_id),
                 source_name: resolved.source_name,
@@ -1180,6 +1228,7 @@ fn play_cache_hit(
     });
     Ok(Some(OnlinePlaybackResult {
         outcome: ResolveOutcome::Started,
+        failure_kind: None,
         track: track.clone(),
         source_id: None,
         source_name: None,
@@ -1247,8 +1296,11 @@ fn terminal_playback_result(
     attempts: Vec<ResolveAttemptDiagnostic>,
     error: Option<String>,
 ) -> OnlinePlaybackResult {
+    let failure_kind = (outcome == ResolveOutcome::Failed)
+        .then(|| classify_resolve_failure(error.as_deref(), &attempts));
     OnlinePlaybackResult {
         outcome,
+        failure_kind,
         track,
         source_id: None,
         source_name: None,
@@ -1257,6 +1309,63 @@ fn terminal_playback_result(
         attempts,
         error,
     }
+}
+
+fn classify_resolve_failure(
+    terminal_error: Option<&str>,
+    attempts: &[ResolveAttemptDiagnostic],
+) -> ResolveFailureKind {
+    let terminal_code = terminal_error.map(diagnostic_error_code);
+    let attempt_codes = attempts
+        .iter()
+        .filter(|attempt| !attempt.success)
+        .filter_map(|attempt| attempt.error.as_deref())
+        .map(diagnostic_error_code)
+        .collect::<Vec<_>>();
+    let contains = |wanted: &[&str]| {
+        terminal_code.is_some_and(|code| wanted.contains(&code))
+            || attempt_codes.iter().any(|code| wanted.contains(code))
+    };
+
+    if contains(&["no_source"]) {
+        return ResolveFailureKind::NoSource;
+    }
+    if contains(&["upstream_rate_limited"]) {
+        return ResolveFailureKind::RateLimited;
+    }
+    if contains(&["upstream_auth_rejected"]) {
+        return ResolveFailureKind::Authentication;
+    }
+    if contains(&[
+        "timeout",
+        "upstream_timeout",
+        "dns_failed",
+        "blocked_destination",
+        "redirect_failed",
+        "upstream_server_error",
+        "source_initialization_failed",
+        "active_source_restore_failed",
+        "worker_failed",
+        "channel_disconnected",
+    ]) {
+        return ResolveFailureKind::Network;
+    }
+
+    const TRACK_SCOPED_CODES: &[&str] = &[
+        "track_unavailable",
+        "upstream_not_found",
+        "preview_or_truncated_media",
+    ];
+    if (attempt_codes.is_empty()
+        && terminal_code.is_some_and(|code| TRACK_SCOPED_CODES.contains(&code)))
+        || (!attempt_codes.is_empty()
+            && attempt_codes
+                .iter()
+                .all(|code| TRACK_SCOPED_CODES.contains(code)))
+    {
+        return ResolveFailureKind::TrackUnavailable;
+    }
+    ResolveFailureKind::Unknown
 }
 
 fn run_playback_commit<T>(
@@ -1298,6 +1407,12 @@ fn format_attempt_failure(attempts: &[ResolveAttemptDiagnostic]) -> String {
 
 fn public_attempt_error(stage: &str, error: &str) -> String {
     let error = error.to_ascii_lowercase();
+    if error.contains("returned no result")
+        || error.contains("no playable url")
+        || error.contains("must contain a string url")
+    {
+        return "track_unavailable".into();
+    }
     if error.contains("timed out") || error.contains("timeout") {
         return "timeout".into();
     }
@@ -2895,12 +3010,12 @@ mod tests {
     #[test]
     fn replaced_request_finish_cannot_detach_the_new_owner() {
         let registry = ResolveCancellationRegistry::default();
-        let old = registry.begin("same".into()).unwrap();
-        let replacement = registry.begin("same".into()).unwrap();
+        let old = registry.begin("same".into(), Some(1)).unwrap();
+        let replacement = registry.begin("same".into(), Some(1)).unwrap();
         assert_eq!(old.outcome(), Some(ResolveOutcome::Stale));
 
         registry.finish(&old);
-        let next = registry.begin("next".into()).unwrap();
+        let next = registry.begin("next".into(), Some(2)).unwrap();
 
         assert_eq!(replacement.outcome(), Some(ResolveOutcome::Stale));
         assert_eq!(next.outcome(), None);
@@ -2909,7 +3024,7 @@ mod tests {
     #[test]
     fn cancelled_request_cannot_commit_playback() {
         let registry = ResolveCancellationRegistry::default();
-        let token = registry.begin("cancelled".into()).unwrap();
+        let token = registry.begin("cancelled".into(), Some(1)).unwrap();
         assert!(registry.cancel("cancelled"));
         let mut committed = false;
 
@@ -2917,6 +3032,26 @@ mod tests {
 
         assert_eq!(result, Err(ResolveOutcome::Cancelled));
         assert!(!committed);
+    }
+
+    #[test]
+    fn late_fallback_cannot_supersede_a_newer_playback_intent() {
+        let registry = ResolveCancellationRegistry::default();
+        let old = registry.begin("old".into(), Some(10)).unwrap();
+        registry.finish(&old);
+        let current = registry.begin("current".into(), Some(11)).unwrap();
+
+        let late_old_fallback = registry.begin("old".into(), Some(10)).unwrap();
+
+        assert_eq!(late_old_fallback.outcome(), Some(ResolveOutcome::Stale));
+        assert_eq!(current.outcome(), None);
+        let mut committed = false;
+        assert!(
+            registry
+                .run_if_active(&current, || committed = true)
+                .is_ok()
+        );
+        assert!(committed);
     }
 
     #[test]
@@ -2959,6 +3094,66 @@ mod tests {
             error: Some("timeout".into()),
         }]);
         assert!(message.starts_with("所有音源均无法返回结果"));
+    }
+
+    fn failed_attempt(error: &str) -> ResolveAttemptDiagnostic {
+        ResolveAttemptDiagnostic {
+            source_id: Some("source-a".into()),
+            source_name: Some("测试音源".into()),
+            provider_id: "wy".into(),
+            provider_track_id: "1".into(),
+            quality: Some("320k".into()),
+            stage: "resolve".into(),
+            success: false,
+            error: Some(error.into()),
+        }
+    }
+
+    #[test]
+    fn resolve_failures_are_classified_conservatively_for_queue_skips() {
+        assert_eq!(
+            classify_resolve_failure(Some("没有已导入且可用的 LX 音源"), &[]),
+            ResolveFailureKind::NoSource
+        );
+        assert_eq!(
+            classify_resolve_failure(None, &[failed_attempt("upstream_rate_limited")]),
+            ResolveFailureKind::RateLimited
+        );
+        assert_eq!(
+            classify_resolve_failure(None, &[failed_attempt("upstream_auth_rejected")]),
+            ResolveFailureKind::Authentication
+        );
+        assert_eq!(
+            classify_resolve_failure(None, &[failed_attempt("timeout")]),
+            ResolveFailureKind::Network
+        );
+        assert_eq!(
+            classify_resolve_failure(
+                None,
+                &[
+                    failed_attempt("track_unavailable"),
+                    failed_attempt("upstream_not_found"),
+                ],
+            ),
+            ResolveFailureKind::TrackUnavailable
+        );
+        assert_eq!(
+            classify_resolve_failure(
+                None,
+                &[
+                    failed_attempt("track_unavailable"),
+                    failed_attempt("source_resolution_failed"),
+                ],
+            ),
+            ResolveFailureKind::Unknown
+        );
+        assert_eq!(
+            classify_resolve_failure(
+                Some("no matching LX-platform song was found for this catalog result"),
+                &[],
+            ),
+            ResolveFailureKind::TrackUnavailable
+        );
     }
 
     #[test]
@@ -3100,6 +3295,7 @@ mod tests {
 
         let playback = OnlinePlaybackResult {
             outcome: ResolveOutcome::Failed,
+            failure_kind: Some(ResolveFailureKind::Unknown),
             track: CatalogTrack {
                 provider_id: "wy".into(),
                 provider_track_id: "track".into(),

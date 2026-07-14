@@ -102,11 +102,15 @@ pub async fn metadata_play_preview(
     wanted: CatalogTrack,
     candidates: Vec<CatalogTrack>,
     request_id: Option<String>,
+    intent_generation: Option<u64>,
 ) -> Result<SelectedPlayback, String> {
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
     let token = request_id
-        .map(|request_id| app.state::<ResolveCancellationRegistry>().begin(request_id))
+        .map(|request_id| {
+            app.state::<ResolveCancellationRegistry>()
+                .begin(request_id, intent_generation)
+        })
         .transpose()?;
     let result = async {
         let (selected, replaced_provider_id) = tauri::async_runtime::spawn_blocking(move || {

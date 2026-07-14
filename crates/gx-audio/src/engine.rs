@@ -297,6 +297,7 @@ enum EngineCommand {
         start_index: usize,
     },
     Enqueue(Vec<EngineQueueItem>),
+    ReplaceCurrent(EngineQueueItem),
     Jump(usize),
     Remove(usize),
     Reorder {
@@ -322,6 +323,7 @@ impl EngineCommand {
         matches!(
             self,
             Self::Load { .. }
+                | Self::ReplaceCurrent(_)
                 | Self::Jump(_)
                 | Self::ClearQueue
                 | Self::Pause
@@ -459,6 +461,48 @@ impl LocalAudioEngine {
             }],
             start_index: 0,
         })
+    }
+
+    pub fn replace_current_resolved_cached(
+        &self,
+        request: ResolvedMediaRequest,
+        title: String,
+        cache_plan: Option<CacheWritePlan>,
+    ) -> Result<()> {
+        if request.media_type == MediaType::Hls {
+            bail!("HLS playback is not supported in v1");
+        }
+        if self.snapshot().queue_index.is_none() {
+            bail!("there is no current track to replace");
+        }
+        let location = request.redacted_for_log();
+        self.send(EngineCommand::ReplaceCurrent(EngineQueueItem {
+            public: QueueItem {
+                location,
+                title,
+                duration_seconds: None,
+                online: true,
+            },
+            source: PlaybackSource::Online {
+                request,
+                cache_plan,
+            },
+        }))
+    }
+
+    pub fn replace_current_cached_online(&self, path: PathBuf, title: String) -> Result<()> {
+        if self.snapshot().queue_index.is_none() {
+            bail!("there is no current track to replace");
+        }
+        self.send(EngineCommand::ReplaceCurrent(EngineQueueItem {
+            public: QueueItem {
+                location: path.display().to_string(),
+                title,
+                duration_seconds: None,
+                online: true,
+            },
+            source: PlaybackSource::Local(path),
+        }))
     }
 
     pub fn jump(&self, index: usize) -> Result<()> {
@@ -1150,6 +1194,20 @@ fn handle_command(
             } else {
                 let _ = old_len;
             }
+        }
+        EngineCommand::ReplaceCurrent(item) => {
+            let Some(index) = model.index else {
+                return false;
+            };
+            if let Some(active) = session.as_ref() {
+                model.start_seconds = active.position_seconds();
+            }
+            model.queue[index] = item;
+            model.reload_requested = true;
+            model.status = PlaybackStatus::Loading;
+            model.error = None;
+            model.generation = model.generation.wrapping_add(1);
+            *session = None;
         }
         EngineCommand::Jump(index) => {
             if index < model.queue.len() {
@@ -2554,6 +2612,29 @@ mod tests {
         assert_eq!(model.index, Some(2));
         assert!(!model.reload_requested);
         assert_eq!(model.generation, generation);
+    }
+
+    #[test]
+    fn replace_current_preserves_position_and_play_intent() {
+        let mut model = model_with_queue(2, 1, PlayMode::Sequential);
+        model.start_seconds = 42.5;
+        model.intent_playing = false;
+        model.status = PlaybackStatus::Paused;
+        let generation = model.generation;
+        let mut session = None;
+
+        assert!(!handle_command(
+            EngineCommand::ReplaceCurrent(dummy_item("replacement")),
+            &mut model,
+            &mut session,
+        ));
+        assert_eq!(model.index, Some(1));
+        assert_eq!(model.queue[1].public.title, "replacement");
+        assert_eq!(model.start_seconds, 42.5);
+        assert!(!model.intent_playing);
+        assert!(model.reload_requested);
+        assert_eq!(model.status, PlaybackStatus::Loading);
+        assert_eq!(model.generation, generation.wrapping_add(1));
     }
 
     #[test]

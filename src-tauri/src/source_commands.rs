@@ -819,6 +819,7 @@ pub async fn player_play_online_track(
     quality: Option<String>,
     source_id: Option<String>,
     request_id: Option<String>,
+    preserve_transport: Option<bool>,
 ) -> Result<OnlinePlaybackResult, String> {
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
@@ -835,6 +836,7 @@ pub async fn player_play_online_track(
             quality,
             source_id,
             token_for_worker.as_ref(),
+            preserve_transport.unwrap_or(false),
         )
     })
     .await;
@@ -887,6 +889,7 @@ fn play_online_track(
     quality: Option<String>,
     source_id: Option<String>,
     cancellation: Option<&ResolveToken>,
+    preserve_transport: bool,
 ) -> Result<OnlinePlaybackResult, String> {
     // Constraint 2 audit trail: each call is one on-demand resolve (never batch at enqueue).
     println!(
@@ -921,9 +924,14 @@ fn play_online_track(
                     None,
                 ));
             }
-            if let Some(result) =
-                play_cache_hit(app, &track, &attempt, cancellation, &mut diagnostics)?
-            {
+            if let Some(result) = play_cache_hit(
+                app,
+                &track,
+                &attempt,
+                cancellation,
+                &mut diagnostics,
+                preserve_transport,
+            )? {
                 return Ok(result);
             }
         }
@@ -964,9 +972,14 @@ fn play_online_track(
                     None,
                 ));
             }
-            if let Some(result) =
-                play_cache_hit(app, candidate, &attempt, cancellation, &mut diagnostics)?
-            {
+            if let Some(result) = play_cache_hit(
+                app,
+                candidate,
+                &attempt,
+                cancellation,
+                &mut diagnostics,
+                preserve_transport,
+            )? {
                 return Ok(result);
             }
         }
@@ -1051,12 +1064,20 @@ fn play_online_track(
             let minimum_generation = crate::media_session::next_engine_generation(&engine);
             let location = resolved.request.redacted_for_log();
             let commit = run_playback_commit(app, cancellation, || {
-                engine
-                    .load_resolved_cached(
+                let submit = if preserve_transport {
+                    engine.replace_current_resolved_cached(
                         resolved.request,
                         resolved.track.title.clone(),
                         Some(cache_plan),
                     )
+                } else {
+                    engine.load_resolved_cached(
+                        resolved.request,
+                        resolved.track.title.clone(),
+                        Some(cache_plan),
+                    )
+                };
+                submit
                     .map_err(|error| format!("Rust streaming engine rejected LX media: {error}"))?;
                 crate::media_session::set_online_metadata(
                     app,
@@ -1113,6 +1134,7 @@ fn play_cache_hit(
     quality: &str,
     cancellation: Option<&ResolveToken>,
     diagnostics: &mut Vec<ResolveAttemptDiagnostic>,
+    preserve_transport: bool,
 ) -> Result<Option<OnlinePlaybackResult>, String> {
     let key = CacheKey {
         provider_id: track.provider_id.clone(),
@@ -1126,9 +1148,12 @@ fn play_cache_hit(
     let minimum_generation = crate::media_session::next_engine_generation(&engine);
     let location = hit.audio_path.display().to_string();
     let commit = run_playback_commit(app, cancellation, || {
-        engine
-            .load_cached_online(hit.audio_path, track.title.clone())
-            .map_err(|error| format!("Rust audio engine rejected cached media: {error}"))?;
+        let submit = if preserve_transport {
+            engine.replace_current_cached_online(hit.audio_path, track.title.clone())
+        } else {
+            engine.load_cached_online(hit.audio_path, track.title.clone())
+        };
+        submit.map_err(|error| format!("Rust audio engine rejected cached media: {error}"))?;
         crate::media_session::set_online_metadata(app, track, minimum_generation, Some(location));
         Ok::<_, String>(())
     });
@@ -2043,7 +2068,8 @@ fn start_online_e2e(app: &AppHandle) -> Result<(), String> {
                 .into_iter()
                 .find(|track| lx_identity(track).is_some())
                 .ok_or_else(|| "online E2E search returned no LX-compatible track".to_owned())?;
-            let result = play_online_track(&app_for_play, track, Some("320k".into()), None, None)?;
+            let result =
+                play_online_track(&app_for_play, track, Some("320k".into()), None, None, false)?;
             if result.outcome != ResolveOutcome::Started {
                 return Err(result
                     .error
@@ -2162,6 +2188,7 @@ fn monitor_cache_completion(app: &AppHandle, first: OnlinePlaybackResult) -> Res
                 first.quality.clone(),
                 first.source_id.clone(),
                 None,
+                false,
             )?;
             if !replay.cache_hit {
                 return Err("second playback did not hit the completed cache".into());

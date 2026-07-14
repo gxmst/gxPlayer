@@ -2282,6 +2282,7 @@ function App() {
         quality: preference === "auto" ? null : preference,
         sourceId: null,
         requestId,
+        preserveTransport: true,
       });
       if (interrupted()) return;
       if (online.outcome !== "started") {
@@ -2292,7 +2293,7 @@ function App() {
       }
       setSelectedCatalogTrack(online.track);
       setCurrentQuality(online.quality);
-      setMessage(online.cacheHit ? `已切换到本地缓存 ${online.quality ?? "自动"}。` : `已切换到 ${online.quality ?? "自动"}，并重新开始流式播放。`);
+      setMessage(online.cacheHit ? `已切换到本地缓存 ${online.quality ?? "自动"}，播放位置已保留。` : `已切换到 ${online.quality ?? "自动"}，播放位置已保留。`);
     } catch (error) {
       if (!interrupted()) setMessage(`切换音质失败，已保留当前播放：${String(error)}`, true);
     } finally {

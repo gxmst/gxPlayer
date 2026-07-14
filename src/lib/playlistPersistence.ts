@@ -256,32 +256,3 @@ export function clearPlaylistSession(storage: StorageLike | null = defaultStorag
     return false;
   }
 }
-
-/** Remove local entries that no longer exist while keeping the selected song stable. */
-export function filterUnavailableLocalEntries(
-  state: PlaylistSessionState,
-  availableLocalPaths: ReadonlySet<string>,
-): PlaylistSessionState {
-  const playlist: PersistablePlaylistEntry[] = [];
-  let currentIndex: number | null = null;
-  let keptBeforeCurrent = 0;
-
-  state.playlist.forEach((entry, index) => {
-    const keep = entry.kind !== "local" || availableLocalPaths.has(entry.path);
-    if (!keep) return;
-
-    if (state.currentIndex !== null && index < state.currentIndex) keptBeforeCurrent += 1;
-    if (index === state.currentIndex) currentIndex = playlist.length;
-    playlist.push(entry);
-  });
-
-  if (state.currentIndex !== null && currentIndex === null && playlist.length > 0) {
-    currentIndex = Math.min(keptBeforeCurrent, playlist.length - 1);
-  }
-
-  return {
-    playlist,
-    currentIndex,
-    playMode: state.playMode,
-  };
-}

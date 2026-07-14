@@ -46,10 +46,10 @@ use metadata_commands::{
 };
 use network_settings::{network_proxy_status, network_set_proxy_mode};
 use product_commands::{
-    backup_read_file, backup_write_file, library_clear_history, library_embedded_cover,
-    library_history, library_record_history, library_scan_missing, player_media_action,
-    window_force_show, window_get_state, window_save_state, window_set_always_on_top,
-    window_set_mini_mode,
+    backup_read_file, backup_write_file, library_check_local_paths, library_clear_history,
+    library_embedded_cover, library_history, library_record_history, library_scan_missing,
+    player_media_action, window_force_show, window_get_state, window_save_state,
+    window_set_always_on_top, window_set_mini_mode,
 };
 use source_commands::{
     ResolveCancellationRegistry, lx_http_request, lx_runtime_failure, lx_runtime_result, lx_send,
@@ -214,6 +214,33 @@ async fn library_import_files(
     })
     .await
     .map_err(|error| format!("本地音乐导入任务失败: {error}"))?
+}
+
+#[tauri::command]
+async fn library_relink_track(
+    window: WebviewWindow,
+    old_path: String,
+    new_path: String,
+) -> Result<LibraryTrack, String> {
+    require_window(&window, "main")?;
+    if old_path.trim().is_empty() || new_path.trim().is_empty() {
+        return Err("原路径和新路径不能为空".into());
+    }
+    if old_path.len() > 32 * 1024 || new_path.len() > 32 * 1024 {
+        return Err("本地音频路径过长".into());
+    }
+
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&new_path);
+        let info = gx_audio::probe_local_file(&path).map_err(|error| error.to_string())?;
+        let replacement = new_library_track(&path, info);
+        app.state::<LibraryStore>()
+            .relink_track(&old_path, &replacement)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("本地音乐重新定位任务失败: {error}"))?
 }
 
 fn import_local_files(
@@ -1049,6 +1076,7 @@ pub fn run() {
             player_set_output_device,
             player_media_action,
             library_import_files,
+            library_relink_track,
             library_tracks,
             library_favorites,
             library_set_favorite,
@@ -1061,6 +1089,7 @@ pub fn run() {
             library_export_backup,
             library_restore_backup,
             library_scan_missing,
+            library_check_local_paths,
             library_history,
             library_clear_history,
             library_record_history,

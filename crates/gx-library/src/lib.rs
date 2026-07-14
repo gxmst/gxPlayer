@@ -337,6 +337,84 @@ impl LibraryStore {
         Ok(tracks)
     }
 
+    /// Move a library record to a replacement path without losing its identity or relationships.
+    ///
+    /// If the replacement path is already present, its favorite and playlist memberships are
+    /// merged into the old record before the duplicate is removed. When the old path was only
+    /// present in a restored playback queue (and not in the library), the replacement is upserted
+    /// as a normal library track instead.
+    pub fn relink_track(&self, old_path: &str, replacement: &NewTrack) -> Result<LibraryTrack> {
+        if old_path.trim().is_empty()
+            || replacement.path.trim().is_empty()
+            || replacement.title.trim().is_empty()
+        {
+            bail!("old path, replacement path, and title are required");
+        }
+
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        let old_id = transaction
+            .query_row("SELECT id FROM tracks WHERE path=?1", [old_path], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?;
+
+        if let Some(old_id) = old_id {
+            let replacement_id = transaction
+                .query_row(
+                    "SELECT id FROM tracks WHERE path=?1",
+                    [&replacement.path],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+
+            if let Some(replacement_id) = replacement_id.filter(|id| *id != old_id) {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO favorites(track_id)
+                     SELECT ?1 WHERE EXISTS(SELECT 1 FROM favorites WHERE track_id=?2)",
+                    params![old_id, replacement_id],
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO playlist_tracks(playlist_id, track_id, position)
+                     SELECT playlist_id, ?1, position
+                     FROM playlist_tracks WHERE track_id=?2",
+                    params![old_id, replacement_id],
+                )?;
+                transaction.execute("DELETE FROM tracks WHERE id=?1", [replacement_id])?;
+            }
+
+            // Only the path changes: the old row remains the canonical identity, preserving its
+            // metadata, favorite, playlist memberships, and original added_at timestamp.
+            transaction.execute(
+                "UPDATE tracks SET path=?1 WHERE id=?2",
+                params![replacement.path, old_id],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO tracks(path, title, artist, album, duration_seconds, added_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(path) DO UPDATE SET
+                   title=excluded.title,
+                   artist=excluded.artist,
+                   album=excluded.album,
+                   duration_seconds=excluded.duration_seconds",
+                params![
+                    replacement.path,
+                    replacement.title,
+                    replacement.artist,
+                    replacement.album,
+                    replacement.duration_seconds,
+                    now_ms()
+                ],
+            )?;
+        }
+
+        transaction.commit()?;
+        drop(connection);
+        self.track_by_path(&replacement.path)?
+            .context("replacement track disappeared after relink")
+    }
+
     pub fn record_history(&self, entry: NewHistoryEntry<'_>) -> Result<()> {
         let connection = self.connection.lock().unwrap();
         connection.execute(
@@ -612,5 +690,128 @@ mod tests {
         assert_eq!(restored.list_tracks(100).unwrap().len(), 2);
         assert_eq!(restored.list_favorites().unwrap().len(), 1);
         assert_eq!(restored.list_playlists().unwrap()[0].name, "夜间");
+    }
+
+    #[test]
+    fn relink_preserves_old_identity_metadata_and_memberships() {
+        let store = LibraryStore::open(":memory:").unwrap();
+        let old = store
+            .add_tracks(&[NewTrack {
+                path: "D:/Offline/old.flac".into(),
+                title: "Original title".into(),
+                artist: "Original artist".into(),
+                album: "Original album".into(),
+                duration_seconds: Some(180.0),
+            }])
+            .unwrap()
+            .pop()
+            .unwrap();
+        store.set_favorite(old.id, true).unwrap();
+        let playlist = store.create_playlist("Moved songs").unwrap();
+        store.add_to_playlist(playlist.id, old.id).unwrap();
+
+        let relinked = store
+            .relink_track(
+                &old.path,
+                &NewTrack {
+                    path: "E:/Music/new.flac".into(),
+                    title: "Probed title".into(),
+                    artist: "Probed artist".into(),
+                    album: "Probed album".into(),
+                    duration_seconds: Some(181.0),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(relinked.id, old.id);
+        assert_eq!(relinked.added_at_ms, old.added_at_ms);
+        assert_eq!(relinked.title, "Original title");
+        assert_eq!(relinked.path, "E:/Music/new.flac");
+        assert!(relinked.favorite);
+        assert!(store.track_by_path(&old.path).unwrap().is_none());
+        assert_eq!(store.playlist_tracks(playlist.id).unwrap(), vec![relinked]);
+    }
+
+    #[test]
+    fn relink_merges_an_existing_target_into_the_old_record() {
+        let store = LibraryStore::open(":memory:").unwrap();
+        let tracks = store
+            .add_tracks(&[
+                NewTrack {
+                    path: "D:/Offline/old.flac".into(),
+                    title: "Old".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                },
+                NewTrack {
+                    path: "E:/Music/existing.flac".into(),
+                    title: "Existing".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                },
+            ])
+            .unwrap();
+        let old = tracks.iter().find(|track| track.title == "Old").unwrap();
+        let existing = tracks
+            .iter()
+            .find(|track| track.title == "Existing")
+            .unwrap();
+        store.set_favorite(existing.id, true).unwrap();
+        let old_playlist = store.create_playlist("Old membership").unwrap();
+        let target_playlist = store.create_playlist("Target membership").unwrap();
+        store.add_to_playlist(old_playlist.id, old.id).unwrap();
+        store
+            .add_to_playlist(target_playlist.id, existing.id)
+            .unwrap();
+
+        let relinked = store
+            .relink_track(
+                &old.path,
+                &NewTrack {
+                    path: existing.path.clone(),
+                    title: "Ignored probe metadata".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(relinked.id, old.id);
+        assert_eq!(relinked.added_at_ms, old.added_at_ms);
+        assert_eq!(relinked.title, "Old");
+        assert!(relinked.favorite);
+        assert_eq!(store.list_tracks(10).unwrap().len(), 1);
+        assert_eq!(
+            store.playlist_tracks(old_playlist.id).unwrap()[0].id,
+            old.id
+        );
+        assert_eq!(
+            store.playlist_tracks(target_playlist.id).unwrap()[0].id,
+            old.id
+        );
+    }
+
+    #[test]
+    fn relink_upserts_when_the_old_path_is_not_in_the_library() {
+        let store = LibraryStore::open(":memory:").unwrap();
+        let relinked = store
+            .relink_track(
+                "D:/Restored/missing.flac",
+                &NewTrack {
+                    path: "E:/Music/found.flac".into(),
+                    title: "Found".into(),
+                    artist: "Artist".into(),
+                    album: String::new(),
+                    duration_seconds: Some(99.0),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(relinked.path, "E:/Music/found.flac");
+        assert_eq!(relinked.title, "Found");
+        assert_eq!(store.list_tracks(10).unwrap(), vec![relinked]);
     }
 }

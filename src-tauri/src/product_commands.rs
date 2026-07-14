@@ -12,6 +12,10 @@ use crate::require_window;
 use crate::transport::{TransportAction, dispatch};
 use crate::window_state::{self, WindowState};
 
+const MAX_LOCAL_PATH_CHECKS: usize = 10_000;
+const MAX_LOCAL_PATH_BYTES: usize = 32 * 1024;
+const MAX_LOCAL_PATH_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoverPayload {
@@ -31,6 +35,55 @@ pub struct HistoryRecordRequest {
     pub quality: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalPathAvailability {
+    pub path: String,
+    pub available: bool,
+}
+
+fn validate_local_path_batch(paths: &[String]) -> Result<(), String> {
+    if paths.len() > MAX_LOCAL_PATH_CHECKS {
+        return Err(format!("单次最多检查 {MAX_LOCAL_PATH_CHECKS} 个本地路径"));
+    }
+    let mut total_bytes = 0usize;
+    for path in paths {
+        if path.trim().is_empty() {
+            return Err("本地路径不能为空".into());
+        }
+        if path.len() > MAX_LOCAL_PATH_BYTES {
+            return Err("本地路径过长".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(path.len())
+            .ok_or_else(|| "本地路径总长度超出限制".to_owned())?;
+        if total_bytes > MAX_LOCAL_PATH_BATCH_BYTES {
+            return Err("本地路径总长度超出限制".into());
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn library_check_local_paths(
+    window: WebviewWindow,
+    paths: Vec<String>,
+) -> Result<Vec<LocalPathAvailability>, String> {
+    require_window(&window, "main")?;
+    validate_local_path_batch(&paths)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|path| LocalPathAvailability {
+                available: PathBuf::from(&path).is_file(),
+                path,
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| format!("本地路径检查任务失败: {error}"))
+}
+
 #[tauri::command]
 pub fn library_scan_missing(
     window: WebviewWindow,
@@ -38,6 +91,26 @@ pub fn library_scan_missing(
 ) -> Result<Vec<LibraryTrack>, String> {
     require_window(&window, "main")?;
     library.scan_missing().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_path_batch_limits_count_individual_and_total_size() {
+        assert!(validate_local_path_batch(&["C:/Music/song.flac".into()]).is_ok());
+        assert!(validate_local_path_batch(&[String::new()]).is_err());
+        assert!(validate_local_path_batch(&vec!["x".into(); MAX_LOCAL_PATH_CHECKS + 1]).is_err());
+        assert!(validate_local_path_batch(&["x".repeat(MAX_LOCAL_PATH_BYTES + 1)]).is_err());
+        assert!(
+            validate_local_path_batch(&vec![
+                "x".repeat(MAX_LOCAL_PATH_BYTES);
+                MAX_LOCAL_PATH_BATCH_BYTES / MAX_LOCAL_PATH_BYTES + 1
+            ])
+            .is_err()
+        );
+    }
 }
 
 #[tauri::command]

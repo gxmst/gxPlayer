@@ -8,7 +8,7 @@ import "@fontsource-variable/geist-mono";
 import "@fontsource-variable/noto-sans-sc";
 import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
-import { QueuePanel } from "./components/QueuePanel";
+import { QueuePanel, type QueueAvailabilityStatus } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
 import { TextPlaylistImportDialog } from "./components/TextPlaylistImportDialog";
 import { isRemoteArtworkUrl, useArtworkUrl } from "./hooks/useArtwork";
@@ -28,7 +28,13 @@ import { splitArtistNames } from "./lib/artistNames";
 import { diagnosticEntryDisplay } from "./lib/diagnosticDisplay";
 import { groupConsecutiveHistory } from "./lib/historyGrouping";
 import {
-  filterUnavailableLocalEntries,
+  engineMatchesLocalQueue,
+  localQueuePaths,
+  relinkLocalQueuePath,
+  unavailablePathsFromChecks,
+  type LocalPathAvailability,
+} from "./lib/localQueueAvailability";
+import {
   loadPlaylistSession,
   savePlaylistSession,
   type PersistablePlaylistEntry,
@@ -154,7 +160,7 @@ function cacheEntryToCatalog(entry: CacheEntryView): CatalogTrack {
   };
 }
 
-function localEntryFromLibrary(track: LibraryTrack): PlaylistEntry {
+function localEntryFromLibrary(track: LibraryTrack): Extract<PlaylistEntry, { kind: "local" }> {
   return {
     kind: "local",
     path: track.path,
@@ -608,6 +614,14 @@ function App() {
   const [playlistIndex, setPlaylistIndex] = useState<number | null>(restoredPlaylistSession.currentIndex);
   const [playlistSessionReady, setPlaylistSessionReady] = useState(false);
   const [queuePanelOpen, setQueuePanelOpen] = useState(false);
+  const [localQueueAvailability, setLocalQueueAvailability] = useState<{
+    status: QueueAvailabilityStatus;
+    unavailablePaths: Set<string>;
+  }>(() => ({
+    status: localQueuePaths(restoredPlaylistSession.playlist).length ? "checking" : "ready",
+    unavailablePaths: new Set<string>(),
+  }));
+  const [relinkingQueueIndex, setRelinkingQueueIndex] = useState<number | null>(null);
   const shufflePlayedRef = useRef<Set<number>>(new Set());
   const shuffleRngRef = useRef({ state: (Date.now() ^ 0x9e3779b9) >>> 0 || 1 });
   const advancingRef = useRef(false);
@@ -616,6 +630,7 @@ function App() {
   const snapshotRef = useRef(snapshot);
   const mediaActionHandlerRef = useRef<(action: TransportAction) => void>(() => undefined);
   const transportCapabilitiesRef = useRef({ signature: "", revision: 0 });
+  const localQueueAvailabilityGenerationRef = useRef(0);
   playlistRef.current = playlist;
   playlistIndexRef.current = playlistIndex;
   snapshotRef.current = snapshot;
@@ -642,6 +657,37 @@ function App() {
     } catch (error) {
       pushMessage(String(error), true);
       return undefined;
+    }
+  };
+
+  const checkLocalQueueAvailability = async (
+    entries: PlaylistEntry[] = playlistRef.current,
+    announce = false,
+  ): Promise<void> => {
+    const generation = ++localQueueAvailabilityGenerationRef.current;
+    const paths = localQueuePaths(entries);
+    if (!paths.length) {
+      setLocalQueueAvailability({ status: "ready", unavailablePaths: new Set() });
+      if (announce) setMessage("队列中没有需要检查的本地歌曲。");
+      return;
+    }
+
+    setLocalQueueAvailability((state) => ({ ...state, status: "checking" }));
+    try {
+      const checks = await invoke<LocalPathAvailability[]>("library_check_local_paths", { paths });
+      if (generation !== localQueueAvailabilityGenerationRef.current) return;
+      const unavailablePaths = unavailablePathsFromChecks(entries, checks);
+      setLocalQueueAvailability({ status: "ready", unavailablePaths });
+      if (announce) {
+        setMessage(unavailablePaths.size
+          ? `检查完成：仍有 ${unavailablePaths.size} 首本地歌曲暂不可用。`
+          : "本地歌曲路径已全部恢复可用。");
+      }
+    } catch (error) {
+      if (generation !== localQueueAvailabilityGenerationRef.current) return;
+      setLocalQueueAvailability((state) => ({ ...state, status: "failed" }));
+      console.warn("[GXPlayer] local queue availability check failed", error);
+      if (announce) setMessage(`本地歌曲检查失败，队列已保持不变：${String(error)}`, true);
     }
   };
 
@@ -777,18 +823,13 @@ function App() {
       .then(setOutputDevices)
       .catch((error) => setMessage(String(error), true));
 
+    void refreshLibrary(true).catch((error) => {
+      console.warn("[GXPlayer] initial library scan failed", error);
+    });
+    void checkLocalQueueAvailability(restoredPlaylistSession.playlist);
+
     void (async () => {
-      let session = restoredPlaylistSession;
-      try {
-        const tracks = await refreshLibrary(true);
-        const availablePaths = new Set(
-          tracks.filter((track) => !track.missing).map((track) => track.path),
-        );
-        session = filterUnavailableLocalEntries(session, availablePaths);
-      } catch (error) {
-        console.warn("[GXPlayer] local queue validation failed", error);
-        session = filterUnavailableLocalEntries(session, new Set());
-      }
+      const session = restoredPlaylistSession;
       if (disposed) return;
 
       setPlaylist(session.playlist);
@@ -818,6 +859,7 @@ function App() {
 
     return () => {
       disposed = true;
+      localQueueAvailabilityGenerationRef.current += 1;
     };
   }, []);
 
@@ -1385,6 +1427,11 @@ function App() {
       terminalAdvanceGuardTimerRef.current = null;
     }
     if (entry.kind === "local") {
+      if (localQueueAvailability.unavailablePaths.has(entry.path)) {
+        const error = new Error(`《${entry.title}》的本地文件暂不可用`);
+        setMessage("本地文件暂不可用；接回磁盘后请在播放队列中重试，或重新定位文件。", true);
+        return { outcome: "failed", error };
+      }
       try {
         if (playlistIsLocalOnly(entries)) {
           const paths = entries.map((item) => (item as Extract<PlaylistEntry, { kind: "local" }>).path);
@@ -1591,6 +1638,38 @@ function App() {
     }
   };
 
+  const relinkLocalQueueEntry = async (index: number) => {
+    if (relinkingQueueIndex !== null) return;
+    const entry = playlistRef.current[index];
+    if (!entry || entry.kind !== "local") return;
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "音频", extensions: ["mp3", "flac", "wav", "m4a", "aac", "ogg"] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+
+    setRelinkingQueueIndex(index);
+    try {
+      const relinked = await invoke<LibraryTrack>("library_relink_track", {
+        oldPath: entry.path,
+        newPath: selected,
+      });
+      const replacement = localEntryFromLibrary(relinked);
+      const nextEntries = relinkLocalQueuePath(playlistRef.current, entry.path, replacement);
+      setPlaylist(nextEntries);
+      await checkLocalQueueAvailability(nextEntries);
+      void refreshLibrary(true).catch((error) => {
+        console.warn("[GXPlayer] library refresh after relink failed", error);
+      });
+      setMessage(`已重新定位《${entry.title}》`);
+    } catch (error) {
+      setMessage(`重新定位失败：${String(error)}`, true);
+    } finally {
+      setRelinkingQueueIndex(null);
+    }
+  };
+
   /** Click a catalog track: queue the whole list as online placeholders; resolve only the clicked one. */
   const playCatalogInList = async (tracks: CatalogTrack[], wanted: CatalogTrack) => {
     if (playingCatalogKey || advancingRef.current) return;
@@ -1683,12 +1762,29 @@ function App() {
     const entries = playlistRef.current;
     const target = entries[index];
     if (!target) return;
+    if (target.kind === "local" && localQueueAvailability.unavailablePaths.has(target.path)) {
+      setMessage("这首歌的本地文件暂不可用；请先重试检查或重新定位。", true);
+      return;
+    }
     shufflePlayedRef.current.add(index);
     setPlaylistIndex(index);
     if (playlistIsLocalOnly(entries) && target.kind === "local") {
-      await run("player_jump", { index });
-      setSelectedCatalogTrack(null);
-      setCurrentQuality(null);
+      try {
+        if (engineMatchesLocalQueue(entries, snapshotRef.current.queue)) {
+          await invoke("player_jump", { index });
+        } else {
+          await invoke("player_load_local", {
+            paths: entries.map((entry) => (entry as Extract<PlaylistEntry, { kind: "local" }>).path),
+            startIndex: index,
+          });
+        }
+        setSelectedCatalogTrack(null);
+        setCurrentQuality(null);
+        clearLyrics();
+        void recordHistory({ kind: "local", title: target.title, artist: target.artist, path: target.path });
+      } catch (error) {
+        setMessage(formatFailureMessage(error, target.title), true);
+      }
       return;
     }
     const key = target.kind === "online" ? catalogKey(target.track) : null;
@@ -1761,6 +1857,7 @@ function App() {
     const previous = playlistRef.current;
     const entries = [...previous];
     if (index < 0 || index >= entries.length) return;
+    const removedEntry = entries[index];
     const current = playlistIndexRef.current;
     const removedCurrent = current === index;
     const wasLocalOnly = playlistIsLocalOnly(previous);
@@ -1794,6 +1891,9 @@ function App() {
     }
 
     setPlaylist(entries);
+    if (removedEntry?.kind === "local") {
+      void checkLocalQueueAvailability(entries);
+    }
     if (!entries.length) {
       setPlaylistIndex(null);
       setSelectedCatalogTrack(null);
@@ -1824,6 +1924,8 @@ function App() {
     }
     setPlaylist([]);
     setPlaylistIndex(null);
+    localQueueAvailabilityGenerationRef.current += 1;
+    setLocalQueueAvailability({ status: "ready", unavailablePaths: new Set() });
     shufflePlayedRef.current.clear();
     setSelectedCatalogTrack(null);
     setCurrentQuality(null);
@@ -2449,7 +2551,13 @@ function App() {
             </span>
           </button>
           <time>{formatTime(track.durationSeconds)}</time>
-          <button className="icon-button" onClick={() => void enqueueLocalTracks([track])} aria-label="添加到队列" title="添加到队列">＋</button>
+          <button
+            className="icon-button"
+            onClick={() => void enqueueLocalTracks([track])}
+            aria-label={track.missing ? `${track.title} 的文件缺失，无法添加到队列` : `将 ${track.title} 添加到队列`}
+            title={track.missing ? "文件缺失，无法添加" : "添加到队列"}
+            disabled={Boolean(track.missing)}
+          >＋</button>
           <button className={`icon-button ${track.favorite ? "active" : ""}`} onClick={() => void toggleFavorite(track)} aria-label={track.favorite ? "取消收藏" : "收藏"}>
             {track.favorite ? "♥" : "♡"}
           </button>
@@ -3433,15 +3541,20 @@ function App() {
       <QueuePanel
         open={queuePanelOpen}
         playMode={snapshot.playMode ?? "sequential"}
+        availabilityStatus={localQueueAvailability.status}
         rows={displayPlaylist.map((entry, index) => ({
           key: entryKey(entry, index),
           title: entryTitle(entry),
-          subtitle: `${entryArtist(entry)} · ${entrySourceLabel(entry)}${entry.kind === "online" && index !== displayIndex ? " · 待解析" : ""}`,
+          subtitle: `${entryArtist(entry)} · ${entrySourceLabel(entry)}${entry.kind === "online" && index !== displayIndex ? " · 待解析" : ""}${entry.kind === "local" && localQueueAvailability.unavailablePaths.has(entry.path) ? " · 暂不可用" : ""}`,
           active: index === displayIndex,
+          unavailable: entry.kind === "local" && localQueueAvailability.unavailablePaths.has(entry.path),
+          relinking: index === relinkingQueueIndex,
         }))}
         onClose={() => setQueuePanelOpen(false)}
         onClear={() => void clearPlaylist()}
         onJump={(index) => void jumpToPlaylistIndex(index)}
+        onRelink={(index) => void relinkLocalQueueEntry(index)}
+        onRetryAvailability={() => void checkLocalQueueAvailability(playlistRef.current, true)}
         onRemove={(index) => void removePlaylistIndex(index)}
         onReorder={(from, to) => void reorderPlaylist(from, to)}
       />

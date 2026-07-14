@@ -4248,6 +4248,36 @@ select {
   opacity: 0.35;
 }
 
+.queue-availability {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--warning-solid) 28%, var(--soft-border));
+  color: var(--warning-fg);
+  background: color-mix(in srgb, var(--warning-solid) 8%, var(--control-bg));
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.queue-availability.failed {
+  color: var(--danger-fg);
+  border-bottom-color: color-mix(in srgb, var(--danger-solid) 28%, var(--soft-border));
+  background: color-mix(in srgb, var(--danger-solid) 8%, var(--control-bg));
+}
+
+.queue-availability button,
+.queue-relink {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border: 1px solid var(--button-border);
+  border-radius: 999px;
+  color: inherit;
+  background: var(--control-bg);
+  font-size: 10px;
+}
+
 .queue-empty {
   padding: 28px 18px;
   text-align: center;
@@ -4271,7 +4301,7 @@ select {
 
 .queue-list li {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 32px;
+  grid-template-columns: minmax(0, 1fr) max-content;
   align-items: center;
   gap: 4px;
   border-radius: 12px;
@@ -4280,6 +4310,10 @@ select {
 
 .queue-list li.active {
   background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.queue-list li.unavailable {
+  background: color-mix(in srgb, var(--warning-solid) 7%, transparent);
 }
 
 .queue-main {
@@ -4296,8 +4330,13 @@ select {
   min-width: 0;
 }
 
-.queue-main:hover {
+.queue-main:hover:not(:disabled) {
   background: var(--control-hover);
+}
+
+.queue-main:disabled {
+  cursor: not-allowed;
+  opacity: 0.68;
 }
 
 .queue-index {
@@ -4308,6 +4347,22 @@ select {
 
 .queue-list li.active .queue-index {
   color: var(--accent-readable);
+}
+
+.queue-list li.unavailable .queue-index,
+.queue-list li.unavailable .queue-main small {
+  color: var(--warning-fg);
+}
+
+.queue-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.queue-relink:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 .queue-main strong,

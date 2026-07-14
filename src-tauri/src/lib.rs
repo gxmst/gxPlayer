@@ -1164,7 +1164,16 @@ pub fn run() {
                     error.to_string(),
                 );
             })?;
+            let cache_store_for_validation = cache_store.clone();
             app.manage(cache_store);
+            std::thread::Builder::new()
+                .name("gx-cache-validation".into())
+                .spawn(move || {
+                    if let Err(error) = cache_store_for_validation.deep_validate() {
+                        eprintln!("background cache validation failed: {error}");
+                    }
+                })
+                .ok();
             let source_root = app_data.join("sources");
             let drop_in_root = source_root.join("drop-in");
             let mut source_store = SourceStore::open(&source_root)?;

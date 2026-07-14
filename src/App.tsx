@@ -1041,8 +1041,14 @@ function App() {
   useEffect(() => {
     if (view !== "settings" && view !== "library") return;
     void refreshCache().catch((error) => pushMessage(String(error), true));
-    const timer = window.setInterval(() => void refreshCache().catch(() => undefined), 2000);
-    return () => window.clearInterval(timer);
+    let disposed = false;
+    const unlisten = listen<number>("gx-cache-changed", () => {
+      if (!disposed) void refreshCache().catch(() => undefined);
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((stop) => stop());
+    };
   }, [view]);
 
   useEffect(() => {

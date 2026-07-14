@@ -81,6 +81,7 @@ pub struct CacheEntryView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheStatus {
+    pub revision: u64,
     pub directory: PathBuf,
     pub custom_directory: Option<PathBuf>,
     pub limit_bytes: u64,
@@ -131,6 +132,7 @@ struct CacheState {
 pub struct CacheStore {
     inner: Arc<Mutex<CacheState>>,
     diagnostics: Arc<Mutex<VecDeque<CacheDiagnostic>>>,
+    revision: Arc<AtomicU64>,
 }
 
 impl CacheStore {
@@ -156,7 +158,6 @@ impl CacheStore {
                 default_root.clone()
             });
         ensure_writable_directory(&root)?;
-        cleanup_part_files(&root);
         let (manifest, initial_diagnostics) = load_manifest(&root);
         let diagnostics = initial_diagnostics
             .into_iter()
@@ -175,6 +176,7 @@ impl CacheStore {
                 active_writers: BTreeMap::new(),
             })),
             diagnostics: Arc::new(Mutex::new(diagnostics.into_iter().rev().collect())),
+            revision: Arc::new(AtomicU64::new(1)),
         };
         store.persist_all()?;
         Ok(store)
@@ -189,6 +191,7 @@ impl CacheStore {
             .map(|entry| entry.byte_len)
             .sum();
         CacheStatus {
+            revision: self.revision(),
             directory: state.root.clone(),
             custom_directory: state.settings.custom_directory.clone(),
             limit_bytes: state.settings.limit_bytes,
@@ -221,6 +224,7 @@ impl CacheStore {
                     "stage=lookup_cleanup code=manifest_persist_failed".into(),
                 );
             }
+            self.mark_changed();
             return None;
         }
         entry.last_accessed_at_ms = now_ms();
@@ -232,11 +236,20 @@ impl CacheStore {
                 "stage=touch code=manifest_persist_failed".into(),
             );
         }
+        self.mark_changed();
         Some(result)
     }
 
     pub fn drain_diagnostics(&self) -> Vec<CacheDiagnostic> {
         self.diagnostics.lock().unwrap().drain(..).collect()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    fn mark_changed(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     fn push_diagnostic(&self, category: &'static str, source: &'static str, summary: String) {
@@ -314,33 +327,11 @@ impl CacheStore {
     /// List all completed cache entries for the offline/cache UI.
     /// Absolute paths are never included — only `file_name` basenames.
     pub fn list_entries(&self) -> Vec<CacheEntryView> {
-        let mut state = self.inner.lock().unwrap();
-        let invalid = state
-            .manifest
-            .entries
-            .iter()
-            .filter_map(|(id, entry)| entry_file_error_code(entry).map(|code| (id.clone(), code)))
-            .collect::<Vec<_>>();
-        for (id, code) in &invalid {
-            state.manifest.entries.remove(id);
-            self.push_diagnostic(
-                "cache_read_failed",
-                "cache",
-                format!("stage=list code={code}"),
-            );
-        }
-        if !invalid.is_empty() && persist_manifest(&state).is_err() {
-            self.push_diagnostic(
-                "cache_write_failed",
-                "cache",
-                "stage=list_cleanup code=manifest_persist_failed".into(),
-            );
-        }
+        let state = self.inner.lock().unwrap();
         let mut views = state
             .manifest
             .entries
             .values()
-            .filter(|entry| entry.audio_path.is_file())
             .map(|entry| entry_to_view(entry, &state.settings.online_favorites))
             .collect::<Vec<_>>();
         views.sort_by_key(|entry| std::cmp::Reverse(entry.last_accessed_at_ms));
@@ -367,6 +358,7 @@ impl CacheStore {
                 }
             }
         }
+        self.mark_changed();
         Ok(self.status())
     }
 
@@ -385,6 +377,7 @@ impl CacheStore {
             }
             persist_manifest(&state)?;
         }
+        self.mark_changed();
         Ok(self.status())
     }
 
@@ -417,6 +410,7 @@ impl CacheStore {
             }
             persist_manifest(&state)?;
         }
+        self.mark_changed();
         Ok(self.status())
     }
 
@@ -430,6 +424,7 @@ impl CacheStore {
             persist_settings(&state)?;
         }
         self.evict()?;
+        self.mark_changed();
         Ok(self.status())
     }
 
@@ -454,6 +449,7 @@ impl CacheStore {
             persist_manifest(&state)?;
         }
         self.evict()?;
+        self.mark_changed();
         Ok(self.status())
     }
 
@@ -477,6 +473,7 @@ impl CacheStore {
             persist_settings(&state)?;
             persist_manifest(&state)?;
         }
+        self.mark_changed();
         Ok(self.status())
     }
 
@@ -505,6 +502,7 @@ impl CacheStore {
         }
         persist_manifest(&state)?;
         drop(state);
+        self.mark_changed();
         Ok(self.status())
     }
 
@@ -542,6 +540,8 @@ impl CacheStore {
         }
         persist_settings(&state)?;
         persist_manifest(&state)?;
+        drop(state);
+        self.mark_changed();
         Ok(())
     }
 
@@ -671,6 +671,9 @@ impl CacheStore {
                 "stage=evict code=persist_failed".into(),
             );
         }
+        if result.is_ok() {
+            self.mark_changed();
+        }
         result
     }
 
@@ -705,6 +708,60 @@ impl CacheStore {
             }
         }
         persist_manifest(&state)
+    }
+
+    /// Expensive filesystem reconciliation runs after startup so a GB-scale cache never blocks
+    /// the first window. The manifest remains the fast-path source of truth until this completes.
+    pub fn deep_validate(&self) -> Result<()> {
+        let (root, epoch) = {
+            let state = self.inner.lock().unwrap();
+            (state.root.clone(), state.epoch)
+        };
+        let recovered = recover_manifest_from_sidecars(&root);
+        let mut state = self.inner.lock().unwrap();
+        if state.epoch != epoch || state.root != root {
+            return Ok(());
+        }
+
+        let mut changed = false;
+        for (id, entry) in recovered.entries {
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                state.manifest.entries.entry(id)
+            {
+                slot.insert(entry);
+                changed = true;
+            }
+        }
+        let invalid = state
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                let in_root =
+                    entry.audio_path.starts_with(&root) && entry.sidecar_path.starts_with(&root);
+                let code = if in_root {
+                    entry_file_error_code(entry)
+                } else {
+                    Some("outside_root")
+                };
+                code.map(|code| (id.clone(), code))
+            })
+            .collect::<Vec<_>>();
+        for (id, code) in invalid {
+            state.manifest.entries.remove(&id);
+            self.push_diagnostic(
+                "cache_read_failed",
+                "cache",
+                format!("stage=manifest_reconcile code={code}"),
+            );
+            changed = true;
+        }
+        if changed {
+            persist_manifest(&state)?;
+            drop(state);
+            self.mark_changed();
+        }
+        Ok(())
     }
 
     fn persist_all(&self) -> Result<()> {
@@ -796,6 +853,21 @@ impl CacheWritePlan {
             self.invalidate();
         }
         result
+    }
+
+    /// Final manifest/sidecar publication can include slow filesystem syncs. Audio workers use
+    /// this best-effort path so EOF processing and transport commands never wait on storage.
+    pub fn commit_in_background(&self) {
+        let plan = self.clone();
+        if std::thread::Builder::new()
+            .name("gx-cache-commit".into())
+            .spawn(move || {
+                let _ = plan.commit();
+            })
+            .is_err()
+        {
+            self.invalidate();
+        }
     }
 
     fn is_current(&self) -> bool {
@@ -1033,40 +1105,43 @@ fn load_manifest(root: &Path) -> (Manifest, Vec<CacheDiagnostic>) {
     let path = root.join(MANIFEST_FILE_NAME);
     let backup = json_backup_path(&path);
     let legacy = root.join("manifest.json");
-    let mut manifest: Manifest = match read_json(&path) {
-        Ok(manifest) => manifest,
+    let (mut manifest, primary_valid): (Manifest, bool) = match read_json(&path) {
+        Ok(manifest) => (manifest, true),
         Err(error) => {
             if error.kind() != io::ErrorKind::NotFound {
                 quarantine_corrupt_json(&path);
             }
-            read_json(&backup)
-                .or_else(|_| read_json(&legacy))
-                .unwrap_or_else(|_| recover_manifest_from_sidecars(root))
+            (
+                read_json(&backup)
+                    .or_else(|_| read_json(&legacy))
+                    .unwrap_or_default(),
+                false,
+            )
         }
     };
-    for (id, entry) in recover_manifest_from_sidecars(root).entries {
-        manifest.entries.entry(id).or_insert(entry);
+    if !primary_valid {
+        for (id, entry) in recover_manifest_from_sidecars(root).entries {
+            manifest.entries.entry(id).or_insert(entry);
+        }
     }
     let mut diagnostics = Vec::new();
-    manifest.entries.retain(|_, entry| {
-        let in_root = entry.audio_path.starts_with(root) && entry.sidecar_path.starts_with(root);
-        let file_error = in_root.then(|| entry_file_error_code(entry)).flatten();
-        let valid = in_root && file_error.is_none();
-        if !valid {
-            let code = if !in_root {
-                "outside_root"
-            } else {
-                file_error.unwrap_or("unreadable")
-            };
-            diagnostics.push(CacheDiagnostic {
-                category: "cache_read_failed",
-                source: "cache",
-                summary: format!("stage=manifest_reconcile code={code}"),
-            });
-        }
-        valid
-    });
-    (manifest, diagnostics)
+    let entries = manifest
+        .entries
+        .into_iter()
+        .filter(|(_, entry)| {
+            let in_root =
+                entry.audio_path.starts_with(root) && entry.sidecar_path.starts_with(root);
+            if !in_root {
+                diagnostics.push(CacheDiagnostic {
+                    category: "cache_read_failed",
+                    source: "cache",
+                    summary: "stage=manifest_reconcile code=outside_root".into(),
+                });
+            }
+            in_root
+        })
+        .collect();
+    (Manifest { entries }, diagnostics)
 }
 
 fn persist_settings(state: &CacheState) -> Result<()> {
@@ -1280,6 +1355,51 @@ mod tests {
         writer.append(b"short");
         writer.finish(Some(99));
         assert!(store.lookup(&mismatched_key).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_uses_manifest_before_background_file_validation() {
+        let root = temporary_root();
+        let cache_key = key("fast-manifest", "320k");
+        let store = CacheStore::open(&root, None).unwrap();
+        let plan = store.prepare(cache_key.clone(), MediaType::Mp3);
+        let mut writer = plan.begin().unwrap();
+        writer.append(b"cached audio");
+        writer.finish(Some(12));
+        plan.commit().unwrap();
+        let audio_path = store.lookup(&cache_key).unwrap().audio_path;
+        drop(store);
+        fs::remove_file(audio_path).unwrap();
+
+        let reopened = CacheStore::open(&root, None).unwrap();
+        assert_eq!(reopened.status().entry_count, 1);
+        assert_eq!(reopened.list_entries().len(), 1);
+        let revision = reopened.revision();
+        reopened.deep_validate().unwrap();
+        assert_eq!(reopened.status().entry_count, 0);
+        assert!(reopened.revision() > revision);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn background_commit_eventually_publishes_without_caller_disk_work() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        let cache_key = key("background-commit", "320k");
+        let plan = store.prepare(cache_key.clone(), MediaType::Mp3);
+        let mut writer = plan.begin().unwrap();
+        writer.append(b"audio");
+        writer.finish(Some(5));
+        let revision = store.revision();
+        plan.commit_in_background();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while store.lookup(&cache_key).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(store.lookup(&cache_key).is_some());
+        assert!(store.revision() > revision);
         fs::remove_dir_all(root).unwrap();
     }
 

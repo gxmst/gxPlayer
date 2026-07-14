@@ -13,8 +13,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, bounded};
-use gx_cache::{CacheWritePlan, CacheWriter};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
+};
+use gx_cache::CacheWritePlan;
 use gx_contracts::{HttpHeader, NetworkRoute, ResolvedMediaRequest};
 use gx_source::network_policy::{
     configure_client_builder, configure_client_builder_for_route, source_route_attempts,
@@ -43,6 +45,8 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(12);
 const INTERRUPTION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DIAGNOSTIC_CAPACITY: usize = 128;
+const CACHE_WRITE_QUEUE_CAPACITY: usize = 8;
+const CACHE_FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Shared cancellation edge for decoder-side blocking waits.
 ///
@@ -313,8 +317,9 @@ impl HttpMediaSource {
         let effective_for_worker = Arc::clone(&effective_request);
         let diagnostics = self.diagnostics.clone();
         let cache_writer = (offset == 0)
-            .then(|| self.cache_plan.as_ref().and_then(CacheWritePlan::begin))
-            .flatten();
+            .then(|| self.cache_plan.clone())
+            .flatten()
+            .and_then(AsyncCacheWriter::new);
         let handle = thread::Builder::new()
             .name("gx-http-stream".into())
             .spawn(move || {
@@ -671,9 +676,85 @@ struct NetworkWorkerArgs {
     ready_sender: crossbeam_channel::Sender<Result<ReadyInfo, String>>,
     cancel: Arc<AtomicBool>,
     metrics: Arc<StreamMetrics>,
-    cache_writer: Option<CacheWriter>,
+    cache_writer: Option<AsyncCacheWriter>,
     effective_request: Arc<Mutex<EffectiveRequest>>,
     diagnostics: StreamingDiagnosticQueue,
+}
+
+enum CacheWriteMessage {
+    Data(Vec<u8>),
+    Finish {
+        total_len: Option<u64>,
+        completed: Sender<()>,
+    },
+}
+
+struct AsyncCacheWriter {
+    sender: Option<Sender<CacheWriteMessage>>,
+}
+
+impl AsyncCacheWriter {
+    fn new(plan: CacheWritePlan) -> Option<Self> {
+        let (sender, receiver) = bounded(CACHE_WRITE_QUEUE_CAPACITY);
+        thread::Builder::new()
+            .name("gx-cache-writer".into())
+            .spawn(move || {
+                let Some(mut writer) = plan.begin() else {
+                    return;
+                };
+                while let Ok(message) = receiver.recv() {
+                    match message {
+                        CacheWriteMessage::Data(bytes) => writer.append(&bytes),
+                        CacheWriteMessage::Finish {
+                            total_len,
+                            completed,
+                        } => {
+                            writer.finish(total_len);
+                            let _ = completed.send(());
+                            return;
+                        }
+                    }
+                }
+                writer.invalidate();
+            })
+            .ok()?;
+        Some(Self {
+            sender: Some(sender),
+        })
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        if matches!(
+            sender.try_send(CacheWriteMessage::Data(bytes.to_vec())),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+        ) {
+            // Cache is best-effort. Slow storage must never backpressure network/decode supply.
+            self.sender = None;
+        }
+    }
+
+    fn finish(mut self, total_len: Option<u64>) {
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        let (completed, receiver) = bounded(1);
+        if sender
+            .send_timeout(
+                CacheWriteMessage::Finish {
+                    total_len,
+                    completed,
+                },
+                Duration::from_millis(25),
+            )
+            .is_err()
+        {
+            return;
+        }
+        let _ = receiver.recv_timeout(CACHE_FINISH_TIMEOUT);
+    }
 }
 
 fn network_worker(args: NetworkWorkerArgs) {
@@ -1368,7 +1449,20 @@ fn unix_time_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use gx_cache::{CacheKey, CacheStore};
+
     use super::*;
+
+    fn temporary_cache_root() -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "gx-streaming-cache-writer-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     fn idle_media_source(route: Option<NetworkRoute>) -> HttpMediaSource {
         let url = reqwest::Url::parse("https://media.example/song.mp3").unwrap();
@@ -1394,6 +1488,26 @@ mod tests {
             interruption: StreamInterruption::default(),
             reached_end: false,
         }
+    }
+
+    #[test]
+    fn async_cache_writer_stages_complete_data_without_blocking_append_contract() {
+        let root = temporary_cache_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        let key = CacheKey {
+            provider_id: "provider".into(),
+            provider_track_id: "track".into(),
+            quality: "320k".into(),
+        };
+        let plan = store.prepare(key.clone(), gx_contracts::MediaType::Mp3);
+        let mut writer = AsyncCacheWriter::new(plan.clone()).unwrap();
+        writer.append(b"first ");
+        writer.append(b"second");
+        writer.finish(Some(12));
+        plan.commit().unwrap();
+        let entry = store.lookup(&key).unwrap();
+        assert_eq!(fs::read(entry.audio_path).unwrap(), b"first second");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

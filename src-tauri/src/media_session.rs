@@ -204,6 +204,7 @@ fn spawn_diagnostic_drain(app: AppHandle) {
         .name("gx-diagnostic-drain".into())
         .spawn(move || {
             let mut logged_failed_generation = None;
+            let mut cache_revision = 0;
             loop {
                 if let Some(cache) = app.try_state::<gx_cache::CacheStore>() {
                     for diagnostic in cache.drain_diagnostics() {
@@ -213,6 +214,13 @@ fn spawn_diagnostic_drain(app: AppHandle) {
                             Some(diagnostic.source),
                             diagnostic.summary,
                         );
+                    }
+                    let next_revision = cache.revision();
+                    if next_revision != cache_revision {
+                        cache_revision = next_revision;
+                        if let Err(error) = app.emit("gx-cache-changed", next_revision) {
+                            eprintln!("cache change event failed: {error}");
+                        }
                     }
                 }
                 if let Some(engine) = app.try_state::<LocalAudioEngine>() {

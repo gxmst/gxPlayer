@@ -76,6 +76,7 @@ pub async fn cache_set_directory(
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
     let cache = cache.inner().clone();
+    let cache_for_validation = cache.clone();
     let result = match tauri::async_runtime::spawn_blocking(move || cache.set_directory(path)).await
     {
         Ok(result) => result.map_err(|error| error.to_string()),
@@ -83,6 +84,10 @@ pub async fn cache_set_directory(
     };
     if let Err(error) = &result {
         record_cache_operation_failure(&app, "set_directory", error);
+    } else {
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = cache_for_validation.deep_validate();
+        });
     }
     result
 }
@@ -95,12 +100,17 @@ pub async fn cache_reset_directory(
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
     let cache = cache.inner().clone();
+    let cache_for_validation = cache.clone();
     let result = match tauri::async_runtime::spawn_blocking(move || cache.reset_directory()).await {
         Ok(result) => result.map_err(|error| error.to_string()),
         Err(error) => Err(error.to_string()),
     };
     if let Err(error) = &result {
         record_cache_operation_failure(&app, "reset_directory", error);
+    } else {
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = cache_for_validation.deep_validate();
+        });
     }
     result
 }

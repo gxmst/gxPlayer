@@ -118,6 +118,7 @@ export type DiagnosticLogExportResult = {
 };
 
 export type CacheStatus = {
+  revision: number;
   directory: string;
   customDirectory: string | null;
   limitBytes: number;

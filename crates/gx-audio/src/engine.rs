@@ -1748,7 +1748,7 @@ impl PlaybackSession {
             return;
         }
         if let Some(plan) = &self.cache_plan {
-            let _ = plan.commit();
+            plan.commit_in_background();
         }
         self.cache_committed = true;
     }

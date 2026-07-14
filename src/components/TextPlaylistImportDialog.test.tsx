@@ -44,7 +44,7 @@ describe("TextPlaylistImportDialog", () => {
     expect(onEnqueue).not.toHaveBeenCalled();
     expect(screen.getByText("已匹配 2 首")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "加入队列（2 首）" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认加入队列（2 首）" }));
     await waitFor(() => expect(onEnqueue).toHaveBeenCalledWith([track("第一首"), track("第二首")]));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
@@ -91,5 +91,47 @@ describe("TextPlaylistImportDialog", () => {
 
     await waitFor(() => expect(screen.getByText("匹配已取消")).toBeInTheDocument());
     expect(search).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires confirmation for weak matches, switches candidates, and exports unresolved input", async () => {
+    const top = { ...track("目标歌"), artist: "其他歌手" };
+    const alternate = { ...track("另一个版本"), artist: "目标歌手", album: "特别版" };
+    const onEnqueue = vi.fn();
+    const onExportUnmatched = vi.fn();
+    const search = vi.fn(async (query: string) => query === "未找到" ? [] : [alternate, top]);
+    render(
+      <TextPlaylistImportDialog
+        open
+        onClose={() => undefined}
+        onEnqueue={onEnqueue}
+        onExportUnmatched={onExportUnmatched}
+        search={search}
+        delayMs={0}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("歌曲列表"), {
+      target: { value: "目标歌 - 目标歌手\n未找到" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "开始匹配" }));
+    await waitFor(() => expect(screen.getByText("匹配完成")).toBeInTheDocument());
+
+    const checkbox = screen.getByRole("checkbox", { name: "第 1 行加入队列" });
+    expect(checkbox).not.toBeChecked();
+    expect(screen.getByText("准备加入 0 首")).toBeInTheDocument();
+    expect(screen.getByText("待确认 1 首")).toBeInTheDocument();
+    expect(screen.getByText("未匹配 1 首")).toBeInTheDocument();
+    expect(screen.getByText("已取消选择 0 首")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "导出未匹配（2 行）" }));
+    await waitFor(() => expect(onExportUnmatched).toHaveBeenCalledWith("目标歌 - 目标歌手\n未找到"));
+
+    fireEvent.change(screen.getByRole("combobox", { name: "第 1 行候选版本" }), { target: { value: "1" } });
+    fireEvent.click(checkbox);
+    expect(screen.getByText("准备加入 1 首")).toBeInTheDocument();
+    expect(screen.getByText("待确认 0 首")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认加入队列（1 首）" }));
+    await waitFor(() => expect(onEnqueue).toHaveBeenCalledWith([alternate]));
   });
 });

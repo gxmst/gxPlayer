@@ -3,9 +3,11 @@ import type { CatalogTrack } from "../types";
 import {
   DEFAULT_TEXT_PLAYLIST_MAX_LINE_LENGTH,
   DEFAULT_TEXT_PLAYLIST_MAX_LINES,
-  chooseCatalogMatch,
   parseTextPlaylist,
+  rankCatalogCandidates,
+  TEXT_PLAYLIST_CONFIDENCE_THRESHOLD,
   type ParsedTextPlaylistLine,
+  type RankedCatalogCandidate,
   type TextPlaylistParseOptions,
 } from "../lib/textPlaylistImport";
 
@@ -43,6 +45,10 @@ export type TextPlaylistRowStatus =
 export type TextPlaylistImportRow = ParsedTextPlaylistLine & {
   status: TextPlaylistRowStatus;
   track: CatalogTrack | null;
+  candidates: RankedCatalogCandidate[];
+  selectedCandidateIndex: number | null;
+  confidence: number | null;
+  included: boolean;
   error: string | null;
 };
 
@@ -54,6 +60,10 @@ export type TextPlaylistImportState = {
   total: number;
   processed: number;
   matched: number;
+  included: number;
+  needsConfirmation: number;
+  excluded: number;
+  unmatched: number;
   unresolved: number;
   warnings: string[];
 };
@@ -66,6 +76,11 @@ export type TextPlaylistImportOptions = TextPlaylistParseOptions & {
 export type TextPlaylistImportSummary = {
   rows: TextPlaylistImportRow[];
   matchedTracks: CatalogTrack[];
+  included: number;
+  needsConfirmation: number;
+  excluded: number;
+  unmatched: number;
+  unmatchedText: string;
   warnings: string[];
 };
 
@@ -75,6 +90,10 @@ const EMPTY_STATE: TextPlaylistImportState = {
   total: 0,
   processed: 0,
   matched: 0,
+  included: 0,
+  needsConfirmation: 0,
+  excluded: 0,
+  unmatched: 0,
   unresolved: 0,
   warnings: [],
 };
@@ -89,6 +108,10 @@ function invalidRow(lineNumber: number, raw: string, reason: string): TextPlayli
     key: "",
     status: "invalid",
     track: null,
+    candidates: [],
+    selectedCandidateIndex: null,
+    confidence: null,
+    included: false,
     error: reason,
   };
 }
@@ -100,6 +123,10 @@ function initialRows(
     ...line,
     status: "pending" as const,
     track: null,
+    candidates: [],
+    selectedCandidateIndex: null,
+    confidence: null,
+    included: false,
     error: null,
   }));
   const invalidRows = parsed.rejected.map((line) => invalidRow(line.lineNumber, line.raw, line.reason));
@@ -116,7 +143,49 @@ function summarizeRows(rows: readonly TextPlaylistImportRow[]) {
   ]);
   const processed = rows.filter((row) => terminal.has(row.status)).length;
   const matched = rows.filter((row) => row.status === "matched" && row.track).length;
-  return { processed, matched, unresolved: processed - matched };
+  const included = rows.filter((row) => row.status === "matched" && row.track && row.included).length;
+  const needsConfirmation = rows.filter((row) => (
+    row.status === "matched"
+    && row.track
+    && !row.included
+    && (row.confidence ?? 0) < TEXT_PLAYLIST_CONFIDENCE_THRESHOLD
+  )).length;
+  const excluded = rows.filter((row) => (
+    row.status === "matched"
+    && row.track
+    && !row.included
+    && (row.confidence ?? 0) >= TEXT_PLAYLIST_CONFIDENCE_THRESHOLD
+  )).length;
+  const unmatched = rows.filter(shouldExportAsUnmatched).length;
+  return { processed, matched, included, needsConfirmation, excluded, unmatched, unresolved: processed - matched };
+}
+
+/**
+ * Export unresolved input verbatim. A high-confidence result that the user
+ * deliberately unchecked is an exclusion, not a failed match.
+ */
+export function shouldExportAsUnmatched(row: TextPlaylistImportRow): boolean {
+  if (["not_found", "error", "invalid", "cancelled"].includes(row.status)) return true;
+  return row.status === "matched"
+    && Boolean(row.track)
+    && !row.included
+    && (row.confidence ?? 0) < TEXT_PLAYLIST_CONFIDENCE_THRESHOLD;
+}
+
+export function buildTextPlaylistUnmatchedText(rows: readonly TextPlaylistImportRow[]): string {
+  return rows
+    .filter(shouldExportAsUnmatched)
+    .sort((left, right) => left.lineNumber - right.lineNumber)
+    .map((row) => row.raw)
+    .join("\n");
+}
+
+export function collectIncludedTextPlaylistTracks(
+  rows: readonly TextPlaylistImportRow[],
+): CatalogTrack[] {
+  return rows.flatMap((row) => (
+    row.status === "matched" && row.track && row.included ? [row.track] : []
+  ));
 }
 
 function errorText(error: unknown): string {
@@ -167,6 +236,12 @@ export function useTextPlaylistImport(
   const maxLines = options.maxLines ?? DEFAULT_TEXT_PLAYLIST_MAX_LINES;
   const maxLineLength = options.maxLineLength ?? DEFAULT_TEXT_PLAYLIST_MAX_LINE_LENGTH;
 
+  const replaceRows = useCallback((rows: TextPlaylistImportRow[]) => {
+    rowsRef.current = rows;
+    const summary = summarizeRows(rows);
+    setState((previous) => ({ ...previous, rows, ...summary }));
+  }, []);
+
   const cancel = useCallback(() => {
     generationRef.current += 1;
     controllerRef.current?.abort();
@@ -192,13 +267,38 @@ export function useTextPlaylistImport(
     setState(EMPTY_STATE);
   }, []);
 
+  const setRowIncluded = useCallback((lineNumber: number, included: boolean) => {
+    const rows = rowsRef.current.map((row) => (
+      row.lineNumber === lineNumber && row.status === "matched" && row.track
+        ? { ...row, included }
+        : row
+    ));
+    replaceRows(rows);
+  }, [replaceRows]);
+
+  const selectCandidate = useCallback((lineNumber: number, candidateIndex: number) => {
+    if (!Number.isInteger(candidateIndex) || candidateIndex < 0) return;
+    const rows = rowsRef.current.map((row) => {
+      if (row.lineNumber !== lineNumber || row.status !== "matched") return row;
+      const candidate = row.candidates[candidateIndex];
+      if (!candidate) return row;
+      return {
+        ...row,
+        selectedCandidateIndex: candidateIndex,
+        track: candidate.track,
+        confidence: candidate.score,
+      };
+    });
+    replaceRows(rows);
+  }, [replaceRows]);
+
   const start = useCallback(async (text: string): Promise<TextPlaylistImportSummary | null> => {
     controllerRef.current?.abort();
     const generation = ++generationRef.current;
     const controller = new AbortController();
     controllerRef.current = controller;
     const parsed = parseTextPlaylist(text, { maxLines, maxLineLength });
-    let workingRows = initialRows(parsed);
+    const workingRows = initialRows(parsed);
     rowsRef.current = workingRows;
     setState({
       phase: "running",
@@ -211,11 +311,11 @@ export function useTextPlaylistImport(
     const active = () => generation === generationRef.current && !controller.signal.aborted;
     const updateRow = (lineNumber: number, patch: Partial<TextPlaylistImportRow>) => {
       if (!active()) return;
-      workingRows = workingRows.map((row) => row.lineNumber === lineNumber ? { ...row, ...patch } : row);
-      rowsRef.current = workingRows;
-      const summary = summarizeRows(workingRows);
+      const rows = rowsRef.current.map((row) => row.lineNumber === lineNumber ? { ...row, ...patch } : row);
+      rowsRef.current = rows;
+      const summary = summarizeRows(rows);
       setState((previous) => generation === generationRef.current
-        ? { ...previous, rows: workingRows, ...summary }
+        ? { ...previous, rows, ...summary }
         : previous);
     };
 
@@ -235,10 +335,21 @@ export function useTextPlaylistImport(
             request = Promise.resolve(searchRef.current(line.query, controller.signal));
             cache.set(line.key, request);
           }
-          const candidates = await request;
+          const searchResults = await request;
           if (!active()) return null;
-          const track = chooseCatalogMatch(line, candidates ?? []);
-          if (track) updateRow(line.lineNumber, { status: "matched", track, error: null });
+          const candidates = rankCatalogCandidates(line, searchResults ?? []);
+          const selected = candidates[0];
+          if (selected) {
+            updateRow(line.lineNumber, {
+              status: "matched",
+              track: selected.track,
+              candidates,
+              selectedCandidateIndex: 0,
+              confidence: selected.score,
+              included: selected.score >= TEXT_PLAYLIST_CONFIDENCE_THRESHOLD,
+              error: null,
+            });
+          }
           else updateRow(line.lineNumber, { status: "not_found", track: null, error: "未找到匹配歌曲" });
         } catch (error) {
           if (!active() || isAbortError(error)) return null;
@@ -247,14 +358,20 @@ export function useTextPlaylistImport(
       }
 
       if (!active()) return null;
-      const summary = summarizeRows(workingRows);
+      const rows = rowsRef.current;
+      const summary = summarizeRows(rows);
       const result: TextPlaylistImportSummary = {
-        rows: workingRows,
-        matchedTracks: workingRows.flatMap((row) => row.status === "matched" && row.track ? [row.track] : []),
+        rows,
+        matchedTracks: collectIncludedTextPlaylistTracks(rows),
+        included: summary.included,
+        needsConfirmation: summary.needsConfirmation,
+        excluded: summary.excluded,
+        unmatched: summary.unmatched,
+        unmatchedText: buildTextPlaylistUnmatchedText(rows),
         warnings: parsed.warnings,
       };
       setState((previous) => generation === generationRef.current
-        ? { ...previous, phase: "complete", rows: workingRows, ...summary }
+        ? { ...previous, phase: "complete", rows, ...summary }
         : previous);
       return result;
     } finally {
@@ -267,5 +384,5 @@ export function useTextPlaylistImport(
     controllerRef.current?.abort();
   }, []);
 
-  return { state, start, cancel, reset };
+  return { state, start, cancel, reset, setRowIncluded, selectCandidate };
 }

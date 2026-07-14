@@ -3,6 +3,8 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CatalogTrack } from "../types";
 import {
+  buildTextPlaylistUnmatchedText,
+  collectIncludedTextPlaylistTracks,
   createTextPlaylistSearch,
   useTextPlaylistImport,
   type TextPlaylistSearch,
@@ -118,6 +120,7 @@ describe("useTextPlaylistImport", () => {
     expect(search).toHaveBeenCalledTimes(1);
     expect(result.current.state.phase).toBe("cancelled");
     expect(result.current.state.rows.map((row) => row.status)).toEqual(["cancelled", "cancelled"]);
+    expect(buildTextPlaylistUnmatchedText(result.current.state.rows)).toBe("当前\n下一首");
   });
 
   it("does not search rejected URL lines", async () => {
@@ -129,6 +132,57 @@ describe("useTextPlaylistImport", () => {
     expect(search).toHaveBeenCalledTimes(1);
     expect(result.current.state.rows[0]).toMatchObject({ status: "invalid", error: "不支持链接格式，请输入歌曲文本" });
     expect(result.current.state.rows[1]?.status).toBe("matched");
+  });
+
+  it("keeps duplicate-query choices independent and leaves low-confidence candidates unchecked", async () => {
+    const top = track("目标歌", "其他歌手");
+    const alternate = track("另一个版本", "目标歌手");
+    const search: TextPlaylistSearch = vi.fn(async () => [alternate, top]);
+    const { result } = renderHook(() => useTextPlaylistImport(search, { delayMs: 0 }));
+
+    await act(async () => {
+      await result.current.start("目标歌 - 目标歌手\n目标歌 - 目标歌手");
+    });
+
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(result.current.state.rows).toEqual([
+      expect.objectContaining({ track: top, included: false, selectedCandidateIndex: 0 }),
+      expect.objectContaining({ track: top, included: false, selectedCandidateIndex: 0 }),
+    ]);
+    expect(result.current.state.needsConfirmation).toBe(2);
+
+    act(() => {
+      result.current.setRowIncluded(1, true);
+      result.current.selectCandidate(2, 1);
+    });
+
+    expect(result.current.state.rows[0]).toMatchObject({ track: top, included: true, selectedCandidateIndex: 0 });
+    expect(result.current.state.rows[1]).toMatchObject({ track: alternate, included: false, selectedCandidateIndex: 1 });
+    expect(collectIncludedTextPlaylistTracks(result.current.state.rows)).toEqual([top]);
+  });
+
+  it("exports failures and unconfirmed weak matches but not an unchecked strong match", async () => {
+    const search: TextPlaylistSearch = vi.fn(async (query) => {
+      if (query === "未找到") return [];
+      if (query === "失败") throw new Error("网络错误");
+      if (query === "低信 原歌手") return [track("低信", "其他歌手")];
+      return [track(query)];
+    });
+    const { result } = renderHook(() => useTextPlaylistImport(search, { delayMs: 0 }));
+
+    await act(async () => {
+      await result.current.start("高信\n低信 - 原歌手\n未找到\n失败\nhttps://invalid.example/list");
+    });
+    act(() => result.current.setRowIncluded(1, false));
+
+    expect(result.current.state.excluded).toBe(1);
+    expect(result.current.state.needsConfirmation).toBe(1);
+    expect(buildTextPlaylistUnmatchedText(result.current.state.rows)).toBe([
+      "低信 - 原歌手",
+      "未找到",
+      "失败",
+      "https://invalid.example/list",
+    ].join("\n"));
   });
 });
 

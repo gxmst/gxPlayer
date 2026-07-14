@@ -2,6 +2,7 @@ import type { CatalogTrack } from "../types";
 
 export const DEFAULT_TEXT_PLAYLIST_MAX_LINES = 200;
 export const DEFAULT_TEXT_PLAYLIST_MAX_LINE_LENGTH = 200;
+export const TEXT_PLAYLIST_CONFIDENCE_THRESHOLD = 0.72;
 
 export type ParsedTextPlaylistLine = {
   lineNumber: number;
@@ -29,6 +30,13 @@ export type TextPlaylistParseResult = {
   blankLines: number;
   truncatedLines: number;
   warnings: string[];
+};
+
+export type RankedCatalogCandidate = {
+  track: CatalogTrack;
+  score: number;
+  /** The provider result position, used as the deterministic tie breaker. */
+  sourceIndex: number;
 };
 
 /** Normalize only for matching/deduplication; the original text remains visible to the user. */
@@ -138,19 +146,24 @@ export function scoreCatalogCandidate(
   return titleScore * 0.8 + queryScore * 0.2;
 }
 
+/** Rank by textual confidence while preserving provider order for exact ties. */
+export function rankCatalogCandidates(
+  line: ParsedTextPlaylistLine,
+  candidates: readonly CatalogTrack[],
+): RankedCatalogCandidate[] {
+  return candidates
+    .map((track, sourceIndex) => ({
+      track,
+      score: scoreCatalogCandidate(line, track),
+      sourceIndex,
+    }))
+    .sort((left, right) => right.score - left.score || left.sourceIndex - right.sourceIndex);
+}
+
 /** Pick the strongest textual match while preserving input order for ties. */
 export function chooseCatalogMatch(
   line: ParsedTextPlaylistLine,
   candidates: readonly CatalogTrack[],
 ): CatalogTrack | null {
-  let best: CatalogTrack | null = null;
-  let bestScore = -1;
-  candidates.forEach((candidate) => {
-    const score = scoreCatalogCandidate(line, candidate);
-    if (score > bestScore) {
-      best = candidate;
-      bestScore = score;
-    }
-  });
-  return best;
+  return rankCatalogCandidates(line, candidates)[0]?.track ?? null;
 }

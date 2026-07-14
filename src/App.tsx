@@ -2221,6 +2221,16 @@ function App() {
     setMessage(`备份已写入 ${path}`);
   };
 
+  const exportUnmatchedTextPlaylist = async (content: string) => {
+    const path = await save({
+      defaultPath: "gxplayer-text-import-unmatched.txt",
+      filters: [{ name: "文本列表", extensions: ["txt"] }],
+    });
+    if (!path || Array.isArray(path)) return;
+    await invoke("backup_write_file", { path, content });
+    setMessage(`未匹配条目已导出到 ${path}`);
+  };
+
   const refreshDiagnosticLogNow = async () => {
     if (diagnosticLogBusy) return;
     const generation = beginDiagnosticLogOperation();
@@ -3808,6 +3818,7 @@ function App() {
         open={textPlaylistDialogOpen}
         onClose={() => setTextPlaylistDialogOpen(false)}
         onEnqueue={enqueueCatalogTracks}
+        onExportUnmatched={exportUnmatchedTextPlaylist}
         invoke={invoke}
       />
 

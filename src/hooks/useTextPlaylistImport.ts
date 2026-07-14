@@ -21,15 +21,55 @@ export type TextPlaylistInvoke = (
   args?: Record<string, unknown>,
 ) => Promise<unknown>;
 
+let textPlaylistRequestSequence = 0;
+
+function nextTextPlaylistRequestId(): string {
+  textPlaylistRequestSequence += 1;
+  return `import-${Date.now()}-${textPlaylistRequestSequence}`;
+}
+
+function abortError(): DOMException {
+  return new DOMException("搜索已取消", "AbortError");
+}
+
 /** Adapt the existing Tauri search command without coupling this hook to Tauri. */
 export function createTextPlaylistSearch(
   invoke: TextPlaylistInvoke,
   limit = 5,
 ): TextPlaylistSearch {
   return async (query, signal) => {
-    if (signal.aborted) throw new DOMException("搜索已取消", "AbortError");
-    const result = await invoke("metadata_search", { query, limit });
-    return Array.isArray(result) ? result as CatalogTrack[] : null;
+    if (signal.aborted) throw abortError();
+    const requestId = nextTextPlaylistRequestId();
+    let onAbort: (() => void) | null = null;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => {
+        void invoke("metadata_cancel_request", {
+          lane: "searchImport",
+          requestId,
+        }).catch(() => undefined);
+        reject(abortError());
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+
+    try {
+      const result = await Promise.race([
+        invoke("metadata_search", {
+          query,
+          limit,
+          requestId,
+          lane: "searchImport",
+        }),
+        aborted,
+      ]);
+      if (signal.aborted) throw abortError();
+      return Array.isArray(result) ? result as CatalogTrack[] : null;
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw abortError();
+      throw error;
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
   };
 }
 

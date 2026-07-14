@@ -16,6 +16,7 @@ use gx_library::{
     CachedPlaylistTrack, LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistItem,
     PlaylistSummary,
 };
+use gx_metadata::MetadataClient;
 use gx_source::{SourceStore, safe_http};
 
 mod app_preferences;
@@ -49,8 +50,9 @@ use diagnostic_log::{
     diagnostic_log_set_enabled, diagnostic_log_status,
 };
 use metadata_commands::{
-    maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
-    metadata_play_preview, metadata_search,
+    MetadataCancellationRegistry, maybe_start_phase3_smoke, metadata_cancel_request,
+    metadata_chart, metadata_find_replacements, metadata_lyrics, metadata_play_preview,
+    metadata_search,
 };
 use network_settings::{network_proxy_status, network_set_proxy_mode};
 use product_commands::{
@@ -1151,6 +1153,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(audio_engine)
         .manage(ResolveCancellationRegistry::default())
+        .manage(MetadataClient::default())
+        .manage(MetadataCancellationRegistry::default())
         .manage(media_session::MediaSessionState::default())
         .manage(transport::TransportState::default())
         .manage(AppCloseRequestState::default())
@@ -1381,6 +1385,7 @@ pub fn run() {
             source_restore_backup,
             source_resolve,
             metadata_search,
+            metadata_cancel_request,
             metadata_chart,
             metadata_lyrics,
             metadata_find_replacements,

@@ -719,6 +719,7 @@ fn safe_http_error_code(error: &SafeHttpError) -> &'static str {
         SafeHttpError::PrivateDestination => "blocked_destination",
         SafeHttpError::Dns(_) => "dns_failed",
         SafeHttpError::Request(message) => diagnostic_error_code(message),
+        SafeHttpError::Cancelled => "cancelled",
         SafeHttpError::InvalidRedirect | SafeHttpError::TooManyRedirects => "redirect_failed",
         SafeHttpError::ResponseTooLarge { .. } => "response_too_large",
     }

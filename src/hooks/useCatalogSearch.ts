@@ -17,12 +17,18 @@ type CatalogSearchBatch = {
   error: string | null;
 };
 
+type SearchLane = "searchSuggestions" | "searchResults";
+
 const IDLE_BUCKET: SearchBucket = { state: "idle", error: null };
 let requestSequence = 0;
 
 function nextRequestId(kind: "suggestion" | "results"): string {
   requestSequence += 1;
   return `${kind}-${Date.now()}-${requestSequence}`;
+}
+
+function cancelMetadataRequest(lane: SearchLane, requestId: string): void {
+  void invoke("metadata_cancel_request", { lane, requestId }).catch(() => undefined);
 }
 
 function catalogKey(track: CatalogTrack): string {
@@ -45,11 +51,13 @@ export function useCatalogSearch(query: string) {
   const [suggestionBucket, setSuggestionBucket] = useState<SearchBucket>(IDLE_BUCKET);
   const [suggestionRetry, setSuggestionRetry] = useState(0);
   const suggestionGeneration = useRef(0);
+  const activeSuggestionRequest = useRef<string | null>(null);
 
   const [results, setResults] = useState<CatalogTrack[]>([]);
   const [resultsQuery, setResultsQuery] = useState("");
   const [resultsBucket, setResultsBucket] = useState<SearchBucket>(IDLE_BUCKET);
   const resultsGeneration = useRef(0);
+  const activeResultsRequest = useRef<string | null>(null);
   const resultsUnlisten = useRef<UnlistenFn | null>(null);
 
   useEffect(() => {
@@ -64,6 +72,7 @@ export function useCatalogSearch(query: string) {
     setSuggestions([]);
     setSuggestionBucket({ state: "loading", error: null });
     const requestId = nextRequestId("suggestion");
+    activeSuggestionRequest.current = requestId;
     let disposed = false;
     let unlisten: UnlistenFn | null = null;
     const timer = window.setTimeout(() => {
@@ -86,6 +95,7 @@ export function useCatalogSearch(query: string) {
             query: normalized,
             limit: 9,
             requestId,
+            lane: "searchSuggestions",
           });
           if (disposed || generation !== suggestionGeneration.current) return;
           setSuggestions(tracks);
@@ -97,6 +107,9 @@ export function useCatalogSearch(query: string) {
         } finally {
           unlisten?.();
           unlisten = null;
+          if (activeSuggestionRequest.current === requestId) {
+            activeSuggestionRequest.current = null;
+          }
         }
       })();
     }, 200);
@@ -106,6 +119,10 @@ export function useCatalogSearch(query: string) {
       window.clearTimeout(timer);
       unlisten?.();
       unlisten = null;
+      if (activeSuggestionRequest.current === requestId) {
+        activeSuggestionRequest.current = null;
+        cancelMetadataRequest("searchSuggestions", requestId);
+      }
     };
   }, [query, suggestionRetry]);
 
@@ -113,7 +130,11 @@ export function useCatalogSearch(query: string) {
     const normalized = rawQuery.trim();
     if (!normalized) return null;
     const generation = ++resultsGeneration.current;
+    const previousRequestId = activeResultsRequest.current;
+    activeResultsRequest.current = null;
+    if (previousRequestId) cancelMetadataRequest("searchResults", previousRequestId);
     const requestId = nextRequestId("results");
+    activeResultsRequest.current = requestId;
     resultsUnlisten.current?.();
     resultsUnlisten.current = null;
     setResultsQuery(normalized);
@@ -138,6 +159,7 @@ export function useCatalogSearch(query: string) {
         query: normalized,
         limit: 40,
         requestId,
+        lane: "searchResults",
       });
       if (generation !== resultsGeneration.current) return null;
       setResults(tracks);
@@ -151,12 +173,21 @@ export function useCatalogSearch(query: string) {
     } finally {
       stopListener?.();
       if (resultsUnlisten.current === stopListener) resultsUnlisten.current = null;
+      if (activeResultsRequest.current === requestId) {
+        activeResultsRequest.current = null;
+      }
     }
   }, []);
 
   useEffect(() => () => {
     suggestionGeneration.current += 1;
     resultsGeneration.current += 1;
+    const suggestionRequestId = activeSuggestionRequest.current;
+    activeSuggestionRequest.current = null;
+    if (suggestionRequestId) cancelMetadataRequest("searchSuggestions", suggestionRequestId);
+    const resultsRequestId = activeResultsRequest.current;
+    activeResultsRequest.current = null;
+    if (resultsRequestId) cancelMetadataRequest("searchResults", resultsRequestId);
     resultsUnlisten.current?.();
     resultsUnlisten.current = null;
   }, []);
@@ -167,6 +198,9 @@ export function useCatalogSearch(query: string) {
   }, [resultsQuery, search]);
   const seedResults = useCallback((tracks: CatalogTrack[], label: string) => {
     resultsGeneration.current += 1;
+    const requestId = activeResultsRequest.current;
+    activeResultsRequest.current = null;
+    if (requestId) cancelMetadataRequest("searchResults", requestId);
     resultsUnlisten.current?.();
     resultsUnlisten.current = null;
     setResultsQuery(label);

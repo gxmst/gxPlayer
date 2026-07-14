@@ -190,13 +190,46 @@ describe("createTextPlaylistSearch", () => {
   it("injects the existing metadata command and bounds the candidate count", async () => {
     const invoke = vi.fn(async <T,>(command: string, args?: Record<string, unknown>) => {
       expect(command).toBe("metadata_search");
-      expect(args).toEqual({ query: "歌曲", limit: 7 });
+      expect(args).toMatchObject({
+        query: "歌曲",
+        limit: 7,
+        lane: "searchImport",
+        requestId: expect.any(String),
+      });
       return [track("歌曲")] as T;
     });
     const search = createTextPlaylistSearch(invoke, 7);
+    const controller = new AbortController();
 
-    await expect(search("歌曲", new AbortController().signal)).resolves.toEqual([track("歌曲")]);
+    await expect(search("歌曲", controller.signal)).resolves.toEqual([track("歌曲")]);
+    controller.abort();
     expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels an in-flight backend import search and rejects promptly with AbortError", async () => {
+    const pending = deferred<unknown>();
+    const invoke = vi.fn((command: string, _args?: Record<string, unknown>) => (
+      command === "metadata_cancel_request" ? Promise.resolve(undefined) : pending.promise
+    ));
+    const search = createTextPlaylistSearch(invoke);
+    const controller = new AbortController();
+    const request = search("歌曲", controller.signal);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+      "metadata_search",
+      expect.objectContaining({ lane: "searchImport", requestId: expect.any(String) }),
+    ));
+    const searchArgs = invoke.mock.calls.find(([command]) => command === "metadata_search")?.[1] as {
+      requestId: string;
+    };
+
+    controller.abort();
+
+    await expect(request).rejects.toMatchObject({ name: "AbortError" });
+    expect(invoke).toHaveBeenCalledWith("metadata_cancel_request", {
+      lane: "searchImport",
+      requestId: searchArgs.requestId,
+    });
+    pending.resolve([]);
   });
 
   it("does not invoke after cancellation is already requested", async () => {

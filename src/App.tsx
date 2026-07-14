@@ -126,6 +126,17 @@ const TOAST_OK_MS = 3_000;
 const TOAST_ERROR_MS = 10_000;
 const MAX_CONSECUTIVE_FAILURE_SKIPS = 3;
 const COVER_CACHE_LIMIT = 96;
+let lyricsRequestSequence = 0;
+
+function nextLyricsRequestId(): string {
+  lyricsRequestSequence += 1;
+  return `lyrics-${Date.now()}-${lyricsRequestSequence}`;
+}
+
+function isMetadataCancellation(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return message.includes("cancel") || message.includes("取消");
+}
 
 function catalogKey(track: CatalogTrack): string {
   return `${track.providerId}:${track.providerTrackId}`;
@@ -663,6 +674,7 @@ function App() {
   const [selectedCatalogTrack, setSelectedCatalogTrack] = useState<CatalogTrack | null>(null);
   const [lyrics, setLyrics] = useState<LyricDocument | null>(null);
   const lyricsGenerationRef = useRef(0);
+  const activeLyricsRequestRef = useRef<string | null>(null);
   const lyricRefs = useRef<Array<HTMLParagraphElement | null>>([]);
 
   /** Logical playlist (local paths + online CatalogTrack metadata). Online never pre-resolved. */
@@ -1425,25 +1437,61 @@ function App() {
 
   const clearLyrics = () => {
     lyricsGenerationRef.current += 1;
+    const requestId = activeLyricsRequestRef.current;
+    activeLyricsRequestRef.current = null;
+    if (requestId) {
+      void invoke("metadata_cancel_request", { lane: "lyrics", requestId }).catch(() => undefined);
+    }
     setLyrics(null);
   };
 
   const loadLyricsFor = async (title: string, artist: string, durationMs: number | null, baseMessage: string) => {
     const generation = ++lyricsGenerationRef.current;
+    const previousRequestId = activeLyricsRequestRef.current;
+    activeLyricsRequestRef.current = null;
+    if (previousRequestId) {
+      void invoke("metadata_cancel_request", {
+        lane: "lyrics",
+        requestId: previousRequestId,
+      }).catch(() => undefined);
+    }
+    const requestId = nextLyricsRequestId();
+    activeLyricsRequestRef.current = requestId;
     setLyrics(null);
     try {
       const lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
         title,
         artist,
         durationMs,
+        requestId,
       });
-      if (generation === lyricsGenerationRef.current) setLyrics(lyricDocument);
+      if (
+        generation === lyricsGenerationRef.current
+        && activeLyricsRequestRef.current === requestId
+      ) setLyrics(lyricDocument);
     } catch (lyricError) {
-      if (generation === lyricsGenerationRef.current) {
+      if (
+        generation === lyricsGenerationRef.current
+        && activeLyricsRequestRef.current === requestId
+        && !isMetadataCancellation(lyricError)
+      ) {
         setMessage(`${baseMessage} 歌曲已播放，但歌词加载失败：${String(lyricError)}`);
+      }
+    } finally {
+      if (activeLyricsRequestRef.current === requestId) {
+        activeLyricsRequestRef.current = null;
       }
     }
   };
+
+  useEffect(() => () => {
+    lyricsGenerationRef.current += 1;
+    const requestId = activeLyricsRequestRef.current;
+    activeLyricsRequestRef.current = null;
+    if (requestId) {
+      void invoke("metadata_cancel_request", { lane: "lyrics", requestId }).catch(() => undefined);
+    }
+  }, []);
 
   /**
    * Resolve and play a single online CatalogTrack into the engine.

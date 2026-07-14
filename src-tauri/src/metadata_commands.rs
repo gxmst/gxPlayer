@@ -1,18 +1,155 @@
 use gx_audio::engine::LocalAudioEngine;
 use gx_metadata::{
-    CatalogTrack, LyricDocument, ReplacementMatch, SearchBatch, apple_chart, fetch_lyrics,
-    fetch_preview_bytes, find_replacements, preview_is_available, search_all,
-    search_all_progressive, select_playable_with,
+    CatalogTrack, LyricDocument, MetadataClient, ReplacementMatch, SearchBatch, apple_chart,
+    fetch_lyrics, fetch_preview_bytes, find_replacements, preview_is_available, search_all,
+    select_playable_with,
 };
-use serde::Serialize;
+use gx_source::safe_http::RequestCancellation;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::require_window;
 use crate::source_commands::{ResolveCancellationRegistry, ResolveToken};
 
 static PHASE3_SMOKE_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, Deserialize, Hash, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MetadataLane {
+    SearchSuggestions,
+    SearchResults,
+    SearchImport,
+    Lyrics,
+}
+
+impl MetadataLane {
+    fn accepts_search(self) -> bool {
+        matches!(
+            self,
+            Self::SearchSuggestions | Self::SearchResults | Self::SearchImport
+        )
+    }
+}
+
+#[derive(Clone)]
+struct MetadataToken {
+    lane: MetadataLane,
+    request_id: String,
+    cancellation: Arc<RequestCancellation>,
+}
+
+impl MetadataToken {
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+}
+
+struct ActiveMetadataRequest {
+    request_id: String,
+    cancellation: Arc<RequestCancellation>,
+}
+
+#[derive(Default)]
+struct MetadataCancellationState {
+    active: HashMap<MetadataLane, ActiveMetadataRequest>,
+    cancelled_before_begin: HashMap<MetadataLane, VecDeque<String>>,
+}
+
+#[derive(Default)]
+pub struct MetadataCancellationRegistry {
+    state: Mutex<MetadataCancellationState>,
+}
+
+impl MetadataCancellationRegistry {
+    fn begin(&self, lane: MetadataLane, request_id: String) -> Result<MetadataToken, String> {
+        let request_id = request_id.trim().to_owned();
+        if !valid_request_id(&request_id) {
+            return Err("metadata requestId must contain 1 to 160 characters".into());
+        }
+        let cancellation = Arc::new(RequestCancellation::new());
+        let active = ActiveMetadataRequest {
+            request_id: request_id.clone(),
+            cancellation: Arc::clone(&cancellation),
+        };
+        let mut state = self.state.lock().unwrap();
+        let cancelled_before_begin = state
+            .cancelled_before_begin
+            .get_mut(&lane)
+            .and_then(|request_ids| {
+                let position = request_ids
+                    .iter()
+                    .position(|pending| pending == &request_id)?;
+                request_ids.remove(position)
+            })
+            .is_some();
+        if state
+            .cancelled_before_begin
+            .get(&lane)
+            .is_some_and(VecDeque::is_empty)
+        {
+            state.cancelled_before_begin.remove(&lane);
+        }
+        if let Some(previous) = state.active.insert(lane, active) {
+            previous.cancellation.cancel();
+        }
+        if cancelled_before_begin {
+            cancellation.cancel();
+        }
+        drop(state);
+        Ok(MetadataToken {
+            lane,
+            request_id,
+            cancellation,
+        })
+    }
+
+    fn cancel(&self, lane: MetadataLane, request_id: &str) -> bool {
+        const MAX_EARLY_CANCELLATIONS_PER_LANE: usize = 32;
+
+        let request_id = request_id.trim();
+        if !valid_request_id(request_id) {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        let matches = state
+            .active
+            .get(&lane)
+            .is_some_and(|request| request.request_id == request_id);
+        if !matches {
+            let pending = state.cancelled_before_begin.entry(lane).or_default();
+            if !pending.iter().any(|candidate| candidate == request_id) {
+                if pending.len() == MAX_EARLY_CANCELLATIONS_PER_LANE {
+                    pending.pop_front();
+                }
+                pending.push_back(request_id.to_owned());
+            }
+            return false;
+        }
+        if let Some(request) = state.active.remove(&lane) {
+            request.cancellation.cancel();
+        }
+        true
+    }
+
+    fn finish(&self, token: &MetadataToken) {
+        let mut state = self.state.lock().unwrap();
+        let owns_request = state.active.get(&token.lane).is_some_and(|request| {
+            request.request_id == token.request_id
+                && Arc::ptr_eq(&request.cancellation, &token.cancellation)
+        });
+        if owns_request {
+            state.active.remove(&token.lane);
+        }
+    }
+}
+
+fn valid_request_id(request_id: &str) -> bool {
+    !request_id.is_empty() && request_id.len() <= 160
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,31 +170,54 @@ struct CatalogSearchBatchEvent {
 #[tauri::command]
 pub async fn metadata_search(
     window: WebviewWindow,
+    client: State<'_, MetadataClient>,
+    registry: State<'_, MetadataCancellationRegistry>,
     query: String,
     limit: Option<usize>,
-    request_id: Option<String>,
+    request_id: String,
+    lane: MetadataLane,
 ) -> Result<Vec<CatalogTrack>, String> {
     require_window(&window, "main")?;
+    if !lane.accepts_search() {
+        return Err("lyrics lane cannot run a metadata search".into());
+    }
+    let token = registry.begin(lane, request_id.clone())?;
     let event_window = window.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        search_all_progressive(&query, limit.unwrap_or(15), |batch: SearchBatch| {
-            let Some(request_id) = request_id.as_ref() else {
-                return;
-            };
-            let payload = CatalogSearchBatchEvent {
-                request_id: request_id.clone(),
-                provider_id: batch.provider_id,
-                tracks: batch.tracks,
-                error: batch.error,
-            };
-            if let Err(error) = event_window.emit("gx-catalog-search-batch", payload) {
-                eprintln!("catalog search batch emit failed: {error}");
-            }
-        })
-    })
-    .await
-    .map_err(|error| format!("metadata search task failed: {error}"))?
-    .map_err(|error| error.to_string())
+    let event_token = token.clone();
+    let result = client
+        .search_all_progressive(
+            &query,
+            limit.unwrap_or(15),
+            token.cancellation.as_ref(),
+            move |batch: SearchBatch| {
+                if event_token.is_cancelled() {
+                    return;
+                }
+                let payload = CatalogSearchBatchEvent {
+                    request_id: request_id.clone(),
+                    provider_id: batch.provider_id,
+                    tracks: batch.tracks,
+                    error: batch.error,
+                };
+                if let Err(error) = event_window.emit("gx-catalog-search-batch", payload) {
+                    eprintln!("catalog search batch emit failed: {error}");
+                }
+            },
+        )
+        .await;
+    registry.finish(&token);
+    result.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn metadata_cancel_request(
+    window: WebviewWindow,
+    registry: State<'_, MetadataCancellationRegistry>,
+    lane: MetadataLane,
+    request_id: String,
+) -> Result<bool, String> {
+    require_window(&window, "main")?;
+    Ok(registry.cancel(lane, &request_id))
 }
 
 #[tauri::command]
@@ -75,15 +235,20 @@ pub async fn metadata_chart(
 #[tauri::command]
 pub async fn metadata_lyrics(
     window: WebviewWindow,
+    client: State<'_, MetadataClient>,
+    registry: State<'_, MetadataCancellationRegistry>,
     title: String,
     artist: String,
     duration_ms: Option<u64>,
+    request_id: String,
 ) -> Result<Option<LyricDocument>, String> {
     require_window(&window, "main")?;
-    tauri::async_runtime::spawn_blocking(move || fetch_lyrics(&title, &artist, duration_ms))
-        .await
-        .map_err(|error| format!("lyrics task failed: {error}"))?
-        .map_err(|error| error.to_string())
+    let token = registry.begin(MetadataLane::Lyrics, request_id)?;
+    let result = client
+        .fetch_lyrics(&title, &artist, duration_ms, token.cancellation.as_ref())
+        .await;
+    registry.finish(&token);
+    result.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -310,4 +475,94 @@ async fn cache_preview(
             .status(),
     );
     Ok(destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MetadataCancellationRegistry, MetadataLane};
+
+    #[test]
+    fn newer_request_cancels_the_previous_request_in_the_same_lane() {
+        let registry = MetadataCancellationRegistry::default();
+        let first = registry
+            .begin(MetadataLane::SearchResults, "first".into())
+            .unwrap();
+        let second = registry
+            .begin(MetadataLane::SearchResults, "second".into())
+            .unwrap();
+
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+    }
+
+    #[test]
+    fn requests_in_different_lanes_do_not_cancel_each_other() {
+        let registry = MetadataCancellationRegistry::default();
+        let suggestions = registry
+            .begin(MetadataLane::SearchSuggestions, "suggestions".into())
+            .unwrap();
+        let lyrics = registry
+            .begin(MetadataLane::Lyrics, "lyrics".into())
+            .unwrap();
+
+        assert!(!suggestions.is_cancelled());
+        assert!(!lyrics.is_cancelled());
+    }
+
+    #[test]
+    fn finishing_an_old_token_does_not_remove_the_new_owner() {
+        let registry = MetadataCancellationRegistry::default();
+        let old = registry
+            .begin(MetadataLane::SearchImport, "shared-id".into())
+            .unwrap();
+        let current = registry
+            .begin(MetadataLane::SearchImport, "shared-id".into())
+            .unwrap();
+
+        registry.finish(&old);
+
+        assert!(registry.cancel(MetadataLane::SearchImport, "shared-id"));
+        assert!(current.is_cancelled());
+    }
+
+    #[test]
+    fn a_mismatched_request_id_cannot_cancel_the_current_owner() {
+        let registry = MetadataCancellationRegistry::default();
+        let current = registry
+            .begin(MetadataLane::SearchResults, "current".into())
+            .unwrap();
+
+        assert!(!registry.cancel(MetadataLane::SearchResults, "stale"));
+        assert!(!current.is_cancelled());
+        assert!(registry.cancel(MetadataLane::SearchResults, "current"));
+    }
+
+    #[test]
+    fn cancellation_that_arrives_before_begin_is_not_lost() {
+        let registry = MetadataCancellationRegistry::default();
+
+        assert!(!registry.cancel(MetadataLane::SearchSuggestions, "late-begin"));
+        let request = registry
+            .begin(MetadataLane::SearchSuggestions, "late-begin".into())
+            .unwrap();
+
+        assert!(request.is_cancelled());
+    }
+
+    #[test]
+    fn invalid_request_ids_are_rejected_without_replacing_the_current_owner() {
+        let registry = MetadataCancellationRegistry::default();
+        let current = registry
+            .begin(MetadataLane::Lyrics, "current".into())
+            .unwrap();
+
+        assert!(registry.begin(MetadataLane::Lyrics, "   ".into()).is_err());
+        assert!(
+            registry
+                .begin(MetadataLane::Lyrics, "x".repeat(161))
+                .is_err()
+        );
+        assert!(!current.is_cancelled());
+        assert!(registry.cancel(MetadataLane::Lyrics, "current"));
+    }
 }

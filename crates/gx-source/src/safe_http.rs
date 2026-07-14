@@ -9,8 +9,12 @@ use reqwest::header::{
 };
 use reqwest::{Method, StatusCode, Url};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
-use crate::network_policy::{configure_client_builder, configure_client_builder_for_route};
+use crate::network_policy::{
+    configure_async_client_builder, configure_async_client_builder_for_route,
+    configure_client_builder, configure_client_builder_for_route,
+};
 
 const MAX_REDIRECTS: usize = 10;
 
@@ -32,6 +36,27 @@ pub struct SafeHttpResponse {
     pub body: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RequestCancellation(CancellationToken);
+
+impl RequestCancellation {
+    pub fn new() -> Self {
+        Self(CancellationToken::new())
+    }
+
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    pub async fn cancelled(&self) {
+        self.0.cancelled().await;
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SafeHttpError {
     #[error("only HTTP(S) URLs are allowed")]
@@ -48,6 +73,8 @@ pub enum SafeHttpError {
     InvalidHeader(String),
     #[error("HTTP request failed: {0}")]
     Request(String),
+    #[error("HTTP request was cancelled")]
+    Cancelled,
     #[error("redirect response has no valid Location header")]
     InvalidRedirect,
     #[error("redirect limit exceeded")]
@@ -65,6 +92,21 @@ pub fn execute_on_route(
     route: NetworkRoute,
 ) -> Result<SafeHttpResponse, SafeHttpError> {
     execute_with_route(request, Some(route))
+}
+
+pub async fn execute_async(
+    request: SafeHttpRequest,
+    cancellation: &RequestCancellation,
+) -> Result<SafeHttpResponse, SafeHttpError> {
+    execute_with_route_async(request, None, cancellation).await
+}
+
+pub async fn execute_on_route_async(
+    request: SafeHttpRequest,
+    route: NetworkRoute,
+    cancellation: &RequestCancellation,
+) -> Result<SafeHttpResponse, SafeHttpError> {
+    execute_with_route_async(request, Some(route), cancellation).await
 }
 
 fn execute_with_route(
@@ -106,7 +148,7 @@ fn execute_with_route(
             if redirect_count == MAX_REDIRECTS {
                 return Err(SafeHttpError::TooManyRedirects);
             }
-            let next_url = redirect_target(&request.url, &response)?;
+            let next_url = redirect_target(&request.url, response.headers())?;
             if !same_origin(&request.url, &next_url) {
                 strip_sensitive_headers(&mut request.headers);
             }
@@ -124,6 +166,83 @@ fn execute_with_route(
         return read_response(response, request.max_response_bytes);
     }
     Err(SafeHttpError::TooManyRedirects)
+}
+
+async fn execute_with_route_async(
+    mut request: SafeHttpRequest,
+    route: Option<NetworkRoute>,
+    cancellation: &RequestCancellation,
+) -> Result<SafeHttpResponse, SafeHttpError> {
+    for redirect_count in 0..=MAX_REDIRECTS {
+        let resolved = validate_and_resolve_async(request.url.clone(), cancellation).await?;
+        let host = request.url.host_str().ok_or(SafeHttpError::MissingHost)?;
+        let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        let builder = match route {
+            Some(route) => configure_async_client_builder_for_route(builder, route),
+            None => configure_async_client_builder(builder),
+        };
+        let client = builder
+            // This mirrors the blocking path: validation happens before every request and the
+            // resolved address is pinned for direct connections. A system proxy still owns its
+            // final target-side DNS resolution.
+            .connect_timeout(request.timeout.min(Duration::from_secs(10)))
+            .timeout(request.timeout)
+            .resolve(host, resolved)
+            .build()
+            .map_err(|error| SafeHttpError::Request(error.to_string()))?;
+        let mut builder = client.request(request.method.clone(), request.url.clone());
+        for (name, value) in &request.headers {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|error| SafeHttpError::InvalidHeader(error.to_string()))?;
+            let value = HeaderValue::from_str(value)
+                .map_err(|error| SafeHttpError::InvalidHeader(error.to_string()))?;
+            builder = builder.header(name, value);
+        }
+        if let Some(body) = &request.body {
+            builder = builder.body(body.clone());
+        }
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(SafeHttpError::Cancelled),
+            result = builder.send() => {
+                result.map_err(|error| SafeHttpError::Request(error.to_string()))?
+            }
+        };
+        if response.status().is_redirection() {
+            if redirect_count == MAX_REDIRECTS {
+                return Err(SafeHttpError::TooManyRedirects);
+            }
+            let next_url = redirect_target(&request.url, response.headers())?;
+            if !same_origin(&request.url, &next_url) {
+                strip_sensitive_headers(&mut request.headers);
+            }
+            request.url = next_url;
+            if response.status() == StatusCode::SEE_OTHER
+                || ((response.status() == StatusCode::MOVED_PERMANENTLY
+                    || response.status() == StatusCode::FOUND)
+                    && request.method == Method::POST)
+            {
+                request.method = Method::GET;
+                request.body = None;
+            }
+            continue;
+        }
+        return read_response_async(response, request.max_response_bytes, cancellation).await;
+    }
+    Err(SafeHttpError::TooManyRedirects)
+}
+
+async fn validate_and_resolve_async(
+    url: Url,
+    cancellation: &RequestCancellation,
+) -> Result<SocketAddr, SafeHttpError> {
+    let resolution = tokio::task::spawn_blocking(move || validate_and_resolve(&url));
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(SafeHttpError::Cancelled),
+        result = resolution => result
+            .map_err(|error| SafeHttpError::Dns(format!("resolution task failed: {error}")))?,
+    }
 }
 
 fn same_origin(left: &Url, right: &Url) -> bool {
@@ -168,14 +287,49 @@ pub fn validate_and_resolve(url: &Url) -> Result<SocketAddr, SafeHttpError> {
     Ok(addresses[0])
 }
 
-fn redirect_target(base: &Url, response: &Response) -> Result<Url, SafeHttpError> {
-    let location = response
-        .headers()
+fn redirect_target(base: &Url, headers: &HeaderMap) -> Result<Url, SafeHttpError> {
+    let location = headers
         .get(LOCATION)
         .and_then(|value| value.to_str().ok())
         .ok_or(SafeHttpError::InvalidRedirect)?;
     base.join(location)
         .map_err(|_| SafeHttpError::InvalidRedirect)
+}
+
+async fn read_response_async(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    cancellation: &RequestCancellation,
+) -> Result<SafeHttpResponse, SafeHttpError> {
+    let final_url = response.url().clone();
+    let status = response.status().as_u16();
+    let headers = flatten_headers(response.headers());
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(SafeHttpError::Cancelled),
+            result = response.chunk() => {
+                result.map_err(|error| SafeHttpError::Request(error.to_string()))?
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if chunk.len() > max_bytes.saturating_sub(body.len()) {
+            return Err(SafeHttpError::ResponseTooLarge {
+                limit: max_bytes,
+                status,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(SafeHttpResponse {
+        final_url,
+        status,
+        headers,
+        body,
+    })
 }
 
 fn read_response(
@@ -330,6 +484,97 @@ mod tests {
             .unwrap();
         assert!(matches!(
             read_response(response, 4),
+            Err(SafeHttpError::ResponseTooLarge {
+                limit: 4,
+                status: 200
+            })
+        ));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_execution_rejects_private_destinations() {
+        let cancellation = RequestCancellation::new();
+        let result = execute_async(
+            SafeHttpRequest {
+                url: Url::parse("http://127.0.0.1/private").unwrap(),
+                method: Method::GET,
+                headers: Vec::new(),
+                body: None,
+                timeout: Duration::from_secs(1),
+                max_response_bytes: 1024,
+            },
+            &cancellation,
+        )
+        .await;
+
+        assert!(matches!(result, Err(SafeHttpError::PrivateDestination)));
+    }
+
+    #[tokio::test]
+    async fn async_reader_cancels_a_stalled_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let cancellation = RequestCancellation::new();
+        let cancellation_for_task = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancellation_for_task.cancel();
+        });
+
+        let result = read_response_async(response, 16, &cancellation).await;
+
+        assert!(matches!(result, Err(SafeHttpError::Cancelled)));
+        let _ = release_tx.send(());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_reader_rejects_oversized_responses_before_extending() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678",
+                )
+                .unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let cancellation = RequestCancellation::new();
+
+        let result = read_response_async(response, 4, &cancellation).await;
+
+        assert!(matches!(
+            result,
             Err(SafeHttpError::ResponseTooLarge {
                 limit: 4,
                 status: 200

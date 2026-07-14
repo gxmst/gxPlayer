@@ -5,7 +5,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
-import "@fontsource-variable/noto-sans-sc";
 import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
 import { useActionDialog, type ActionErrorClassifier } from "./components/ActionDialog";

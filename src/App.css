@@ -1,5 +1,5 @@
 :root {
-  font-family: "Geist Variable", "Noto Sans SC Variable", "Microsoft YaHei UI", sans-serif;
+  font-family: "Geist Variable", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
   color: var(--text-hi);
   background: transparent;
   font-synthesis: none;
@@ -995,7 +995,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 }
 
 h1, h2, h3 {
-  font-family: "Geist Variable", "Noto Sans SC Variable", sans-serif;
+  font-family: "Geist Variable", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
 }
 
 h1 {

@@ -1498,6 +1498,7 @@ function App() {
     try {
       const mode = snapshotRef.current.playMode ?? "sequential";
       let cursor = current;
+      let pausedForExplicitAdvance = false;
       for (let attempt = 0; attempt < Math.max(entries.length, 1); attempt += 1) {
         const next = opts?.fromFailure || attempt > 0
           ? pickFailureSkipIndex(
@@ -1526,6 +1527,17 @@ function App() {
         if (tried.has(next)) {
           setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。", true);
           return { outcome: "failed" };
+        }
+        if (!pausedForExplicitAdvance && (intent === "next" || intent === "previous")) {
+          try {
+            // Stop feeding the old online stream before resolving the explicitly requested item.
+            // Natural end never enters this branch.
+            await invoke("player_pause");
+            pausedForExplicitAdvance = true;
+          } catch (error) {
+            setMessage(`切歌前暂停当前播放失败：${String(error)}`, true);
+            return { outcome: "failed", error };
+          }
         }
         tried.add(next);
         setPlaylistIndex(next);

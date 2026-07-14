@@ -7,10 +7,10 @@ use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 #[cfg(feature = "test-private-network")]
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, bounded};
@@ -41,7 +41,62 @@ const MAX_MEDIA_REDIRECTS: usize = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKER_MESSAGE_TIMEOUT: Duration = Duration::from_secs(12);
+const INTERRUPTION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DIAGNOSTIC_CAPACITY: usize = 128;
+
+/// Shared cancellation edge for decoder-side blocking waits.
+///
+/// A counter is used instead of a bool so consuming one queued command cannot clear another
+/// command's wake-up. The non-clone guard keeps its request registered until the audio worker has
+/// consumed that exact command.
+#[derive(Clone, Default)]
+pub struct StreamInterruption {
+    pending: Arc<AtomicUsize>,
+}
+
+impl StreamInterruption {
+    pub fn register(&self) -> StreamInterruptionGuard {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        StreamInterruptionGuard {
+            pending: Arc::clone(&self.pending),
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire) > 0
+    }
+}
+
+/// One pending interruption request. Intentionally not `Clone`.
+pub struct StreamInterruptionGuard {
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for StreamInterruptionGuard {
+    fn drop(&mut self) {
+        let previous = self.pending.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "stream interruption counter underflow");
+    }
+}
+
+fn interruption_error() -> io::Error {
+    io::Error::new(
+        ErrorKind::ConnectionAborted,
+        "HTTP media wait was cancelled by a playback command",
+    )
+}
+
+fn map_restart_error(error: anyhow::Error) -> io::Error {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == ErrorKind::ConnectionAborted)
+    }) {
+        interruption_error()
+    } else {
+        io::Error::other(error.to_string())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamingDiagnostic {
@@ -161,6 +216,7 @@ pub struct HttpMediaSource {
     metrics: Arc<StreamMetrics>,
     cache_plan: Option<CacheWritePlan>,
     diagnostics: StreamingDiagnosticQueue,
+    interruption: StreamInterruption,
     reached_end: bool,
 }
 
@@ -185,6 +241,20 @@ impl HttpMediaSource {
         cache_plan: Option<CacheWritePlan>,
         diagnostics: StreamingDiagnosticQueue,
     ) -> Result<Self> {
+        Self::new_with_cache_diagnostics_and_interruption(
+            request,
+            cache_plan,
+            diagnostics,
+            StreamInterruption::default(),
+        )
+    }
+
+    pub fn new_with_cache_diagnostics_and_interruption(
+        request: ResolvedMediaRequest,
+        cache_plan: Option<CacheWritePlan>,
+        diagnostics: StreamingDiagnosticQueue,
+        interruption: StreamInterruption,
+    ) -> Result<Self> {
         if request.is_expired_at(unix_time_ms()) {
             bail!("resolved media request has expired and must be resolved again");
         }
@@ -202,6 +272,7 @@ impl HttpMediaSource {
             metrics,
             cache_plan,
             diagnostics,
+            interruption,
             reached_end: false,
         };
         source.restart(0)?;
@@ -261,18 +332,49 @@ impl HttpMediaSource {
             })
             .context("failed to spawn HTTP streaming worker")?;
 
-        let ready = match ready_receiver.recv_timeout(WORKER_MESSAGE_TIMEOUT) {
-            Ok(Ok(ready)) => ready,
-            Ok(Err(error)) => {
+        let deadline = Instant::now() + WORKER_MESSAGE_TIMEOUT;
+        let ready = loop {
+            if self.interruption.is_pending() {
                 cancel.store(true, Ordering::Release);
                 self.apply_effective_request(&effective_request);
                 reclaim_worker(handle);
-                return Err(anyhow::Error::msg(error));
+                return Err(interruption_error().into());
             }
-            Err(error) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 cancel.store(true, Ordering::Release);
+                self.apply_effective_request(&effective_request);
                 reclaim_worker(handle);
-                return Err(error).context("HTTP streaming worker did not become ready");
+                bail!("HTTP streaming worker did not become ready before the timeout");
+            }
+            match ready_receiver.recv_timeout(remaining.min(INTERRUPTION_POLL_INTERVAL)) {
+                Ok(result) => {
+                    if self.interruption.is_pending() {
+                        cancel.store(true, Ordering::Release);
+                        self.apply_effective_request(&effective_request);
+                        reclaim_worker(handle);
+                        return Err(interruption_error().into());
+                    }
+                    match result {
+                        Ok(ready) => break ready,
+                        Err(error) => {
+                            cancel.store(true, Ordering::Release);
+                            self.apply_effective_request(&effective_request);
+                            reclaim_worker(handle);
+                            return Err(anyhow::Error::msg(error));
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    cancel.store(true, Ordering::Release);
+                    self.apply_effective_request(&effective_request);
+                    reclaim_worker(handle);
+                    if self.interruption.is_pending() {
+                        return Err(interruption_error().into());
+                    }
+                    bail!("HTTP streaming worker disconnected before becoming ready");
+                }
             }
         };
         self.apply_effective_request(&effective_request);
@@ -334,7 +436,14 @@ impl Read for HttpMediaSource {
             return Ok(0);
         }
 
+        let deadline = Instant::now() + WORKER_MESSAGE_TIMEOUT;
         loop {
+            if self.interruption.is_pending() {
+                if let Some(worker) = self.worker.as_ref() {
+                    worker.cancel.store(true, Ordering::Release);
+                }
+                return Err(interruption_error());
+            }
             if self.chunk_offset < self.current_chunk.len() {
                 let available = &self.current_chunk[self.chunk_offset..];
                 let count = available.len().min(target.len());
@@ -348,7 +457,23 @@ impl Read for HttpMediaSource {
                 .worker
                 .as_ref()
                 .ok_or_else(|| io::Error::new(ErrorKind::BrokenPipe, "HTTP worker is stopped"))?;
-            match worker.receiver.recv_timeout(WORKER_MESSAGE_TIMEOUT) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                worker.cancel.store(true, Ordering::Release);
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "HTTP worker produced no data before the idle deadline",
+                ));
+            }
+            match worker
+                .receiver
+                .recv_timeout(remaining.min(INTERRUPTION_POLL_INTERVAL))
+            {
+                Ok(message) if self.interruption.is_pending() => {
+                    worker.cancel.store(true, Ordering::Release);
+                    drop(message);
+                    return Err(interruption_error());
+                }
                 Ok(StreamMessage::Data(chunk)) => {
                     self.current_chunk = chunk;
                     self.chunk_offset = 0;
@@ -361,13 +486,13 @@ impl Read for HttpMediaSource {
                     return Err(io::Error::other(message));
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    worker.cancel.store(true, Ordering::Release);
-                    return Err(io::Error::new(
-                        ErrorKind::TimedOut,
-                        "HTTP worker produced no data before the idle deadline",
-                    ));
+                    continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    if self.interruption.is_pending() {
+                        worker.cancel.store(true, Ordering::Release);
+                        return Err(interruption_error());
+                    }
                     return Err(io::Error::new(
                         ErrorKind::UnexpectedEof,
                         "HTTP worker disconnected",
@@ -399,8 +524,7 @@ impl Seek for HttpMediaSource {
                 "HTTP server does not advertise byte-range support",
             ));
         }
-        self.restart(target)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.restart(target).map_err(map_restart_error)?;
         Ok(target)
     }
 }
@@ -582,17 +706,21 @@ fn network_worker(args: NetworkWorkerArgs) {
             metrics.range_requests.fetch_add(1, Ordering::Relaxed);
         }
 
-        let (response, actual_route) = match send_request(
-            &mut active_headers,
-            active_url.clone(),
+        let (response, actual_route) = match send_request(SendRequestArgs {
+            headers: &mut active_headers,
+            url: active_url.clone(),
             offset,
-            identity.as_ref().and_then(EntityIdentity::if_range),
-            &effective_request,
+            if_range: identity.as_ref().and_then(EntityIdentity::if_range),
+            effective_request: &effective_request,
             active_route,
-            &diagnostics,
-        ) {
+            diagnostics: &diagnostics,
+            cancel: &cancel,
+        }) {
             Ok(response) => response,
             Err(error) => {
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
                 diagnostics.push(
                     "stream_request_failed",
                     "stream",
@@ -621,6 +749,9 @@ fn network_worker(args: NetworkWorkerArgs) {
         {
             Ok(info) => info,
             Err(message) => {
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
                 diagnostics.push(
                     "stream_response_failed",
                     "stream",
@@ -643,6 +774,9 @@ fn network_worker(args: NetworkWorkerArgs) {
         }
         total_len = response_info.total_len.or(total_len);
         if !ready_sent {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
             let _ = ready_sender.send(Ok(ReadyInfo {
                 final_url: active_url.clone(),
                 total_len,
@@ -659,6 +793,9 @@ fn network_worker(args: NetworkWorkerArgs) {
             }
             match response.read(&mut buffer) {
                 Ok(0) => {
+                    if cancel.load(Ordering::Acquire) {
+                        return;
+                    }
                     if response_info
                         .expected_end_exclusive
                         .is_some_and(|end| offset < end)
@@ -677,6 +814,9 @@ fn network_worker(args: NetworkWorkerArgs) {
                     break Ok(());
                 }
                 Ok(count) => {
+                    if cancel.load(Ordering::Acquire) {
+                        return;
+                    }
                     let next_offset = offset.saturating_add(count as u64);
                     if response_info
                         .expected_end_exclusive
@@ -710,6 +850,9 @@ fn network_worker(args: NetworkWorkerArgs) {
                     }
                 }
                 Err(error) => {
+                    if cancel.load(Ordering::Acquire) {
+                        return;
+                    }
                     break Err(format!("HTTP body read failed at byte {offset}: {error}"));
                 }
             }
@@ -717,6 +860,9 @@ fn network_worker(args: NetworkWorkerArgs) {
 
         match outcome {
             Ok(()) => {
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(writer) = cache_writer.take() {
                     // This only stages the transfer. The decoder commits it after clean EOF.
                     writer.finish(total_len);
@@ -725,11 +871,17 @@ fn network_worker(args: NetworkWorkerArgs) {
                 return;
             }
             Err(_message) if reconnects < MAX_RECONNECTS => {
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
                 reconnects += 1;
                 metrics.reconnects.fetch_add(1, Ordering::Relaxed);
                 thread::sleep(Duration::from_millis(100 * reconnects));
             }
             Err(message) => {
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
                 diagnostics.push(
                     "stream_runtime_failed",
                     "stream",
@@ -877,16 +1029,32 @@ fn header_text(response: &Response, name: reqwest::header::HeaderName) -> Option
         .map(str::to_owned)
 }
 
-fn send_request(
-    headers: &mut Vec<HttpHeader>,
-    mut url: reqwest::Url,
+struct SendRequestArgs<'a> {
+    headers: &'a mut Vec<HttpHeader>,
+    url: reqwest::Url,
     offset: u64,
-    if_range: Option<&str>,
-    effective_request: &Mutex<EffectiveRequest>,
-    mut active_route: Option<NetworkRoute>,
-    diagnostics: &StreamingDiagnosticQueue,
-) -> Result<(Response, Option<NetworkRoute>), String> {
+    if_range: Option<&'a str>,
+    effective_request: &'a Mutex<EffectiveRequest>,
+    active_route: Option<NetworkRoute>,
+    diagnostics: &'a StreamingDiagnosticQueue,
+    cancel: &'a AtomicBool,
+}
+
+fn send_request(args: SendRequestArgs<'_>) -> Result<(Response, Option<NetworkRoute>), String> {
+    let SendRequestArgs {
+        headers,
+        mut url,
+        offset,
+        if_range,
+        effective_request,
+        mut active_route,
+        diagnostics,
+        cancel,
+    } = args;
     for redirect_count in 0..=MAX_MEDIA_REDIRECTS {
+        if cancel.load(Ordering::Acquire) {
+            return Err("media request cancelled".into());
+        }
         let resolved = resolve_media_destination(&url)
             .map_err(|error| format!("media destination denied: {error}"))?;
         let host = url
@@ -901,6 +1069,7 @@ fn send_request(
             if_range,
             preferred_route: active_route,
             diagnostics,
+            cancel,
         })?;
         active_route = actual_route;
         if !response.status().is_redirection() {
@@ -938,6 +1107,7 @@ struct MediaRequestArgs<'a> {
     if_range: Option<&'a str>,
     preferred_route: Option<NetworkRoute>,
     diagnostics: &'a StreamingDiagnosticQueue,
+    cancel: &'a AtomicBool,
 }
 
 fn send_media_request(
@@ -952,7 +1122,11 @@ fn send_media_request(
         if_range,
         preferred_route,
         diagnostics,
+        cancel,
     } = args;
+    if cancel.load(Ordering::Acquire) {
+        return Err("media request cancelled".into());
+    }
     let Some(preferred_route) = preferred_route else {
         let client = build_media_client(host, resolved, None)?;
         let response = build_media_get(&client, url, headers, offset, if_range)?
@@ -970,11 +1144,17 @@ fn send_media_request(
         .take(2)
         .collect::<Vec<_>>();
     for (index, route) in routes.iter().copied().enumerate() {
+        if cancel.load(Ordering::Acquire) {
+            return Err("media request cancelled".into());
+        }
         let client = build_media_client(host, resolved, Some(route))?;
         let builder = build_media_get(&client, url, headers, offset, if_range)?;
         match builder.send() {
             Ok(response) => return Ok((response, Some(route))),
             Err(error) => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err("media request cancelled".into());
+                }
                 if let Some(next_route) = routes.get(index + 1).copied() {
                     diagnostics.push(
                         "stream_route_fallback",
@@ -1211,6 +1391,7 @@ mod tests {
             metrics: Arc::new(StreamMetrics::default()),
             cache_plan: None,
             diagnostics: StreamingDiagnosticQueue::default(),
+            interruption: StreamInterruption::default(),
             reached_end: false,
         }
     }
@@ -1362,5 +1543,69 @@ mod tests {
             "http_429"
         );
         assert_eq!(stream_error_code("opaque secret value"), "failed");
+    }
+
+    #[test]
+    fn interruption_guards_do_not_lose_overlapping_wakeups() {
+        let interruption = StreamInterruption::default();
+        let first = interruption.register();
+        let second = interruption.register();
+        assert!(interruption.is_pending());
+
+        drop(first);
+        assert!(interruption.is_pending());
+
+        drop(second);
+        assert!(!interruption.is_pending());
+    }
+
+    #[test]
+    fn range_restart_preserves_connection_aborted_error_kind() {
+        let mapped = map_restart_error(interruption_error().into());
+        assert_eq!(mapped.kind(), ErrorKind::ConnectionAborted);
+
+        let ordinary = map_restart_error(anyhow::anyhow!("ordinary restart failure"));
+        assert_eq!(ordinary.kind(), ErrorKind::Other);
+    }
+
+    #[test]
+    fn blocked_read_returns_connection_aborted_within_control_budget() {
+        let interruption = StreamInterruption::default();
+        let mut source = idle_media_source(None);
+        source.interruption = interruption.clone();
+        let (sender, receiver) = bounded(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_worker = Arc::clone(&cancel);
+        let effective_request = Arc::new(Mutex::new(EffectiveRequest {
+            url: source.request.url.clone(),
+            headers: Vec::new(),
+            network_route: None,
+        }));
+        let handle = thread::spawn(move || {
+            while !cancel_for_worker.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            drop(sender);
+        });
+        source.worker = Some(WorkerState {
+            receiver,
+            cancel: Arc::clone(&cancel),
+            handle,
+            effective_request,
+        });
+
+        let reader = thread::spawn(move || {
+            let started = Instant::now();
+            let error = source.read(&mut [0u8; 1]).unwrap_err();
+            (started.elapsed(), error.kind())
+        });
+        thread::sleep(Duration::from_millis(30));
+        let guard = interruption.register();
+        let (elapsed, kind) = reader.join().unwrap();
+
+        assert_eq!(kind, ErrorKind::ConnectionAborted);
+        assert!(elapsed < Duration::from_millis(200), "elapsed={elapsed:?}");
+        assert!(cancel.load(Ordering::Acquire));
+        drop(guard);
     }
 }

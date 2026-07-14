@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,9 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use gx_cache::CacheWritePlan;
 use gx_contracts::{MediaType, PlaybackStatus, ResolvedMediaRequest};
 use gx_dsp::{CrossfeedSettings, DspChain, DspSettings, HrtfSettings, LimiterSettings};
-use gx_streaming::{HttpMediaSource, StreamingDiagnosticQueue};
+use gx_streaming::{
+    HttpMediaSource, StreamInterruption, StreamInterruptionGuard, StreamingDiagnosticQueue,
+};
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use serde::{Deserialize, Serialize};
 use symphonia::core::audio::SampleBuffer;
@@ -169,6 +171,28 @@ fn playback_error_code(error: &anyhow::Error) -> &'static str {
     }
 }
 
+fn is_stream_interruption(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == ErrorKind::ConnectionAborted)
+            || cause.downcast_ref::<SymphoniaError>().is_some_and(|error| {
+                matches!(
+                    error,
+                    SymphoniaError::IoError(error)
+                        if error.kind() == ErrorKind::ConnectionAborted
+                )
+            })
+    })
+}
+
+fn is_expected_stream_interruption(
+    error: &anyhow::Error,
+    interruption: &StreamInterruption,
+) -> bool {
+    interruption.is_pending() && is_stream_interruption(error)
+}
+
 #[derive(Clone)]
 struct EngineQueueItem {
     public: QueueItem,
@@ -247,8 +271,31 @@ enum EngineCommand {
     Shutdown,
 }
 
+impl EngineCommand {
+    fn interrupts_stream(&self) -> bool {
+        matches!(
+            self,
+            Self::Load { .. }
+                | Self::Jump(_)
+                | Self::ClearQueue
+                | Self::Pause
+                | Self::Seek(_)
+                | Self::SetOutputDevice(_)
+                | Self::Next
+                | Self::Previous
+                | Self::Shutdown
+        )
+    }
+}
+
+struct QueuedEngineCommand {
+    command: EngineCommand,
+    interruption: Option<StreamInterruptionGuard>,
+}
+
 pub struct LocalAudioEngine {
-    commands: Sender<EngineCommand>,
+    commands: Sender<QueuedEngineCommand>,
+    stream_interruption: StreamInterruption,
     snapshot: Arc<Mutex<EngineSnapshot>>,
     diagnostics: EngineDiagnosticQueue,
     streaming_diagnostics: StreamingDiagnosticQueue,
@@ -264,6 +311,8 @@ impl LocalAudioEngine {
         let diagnostics_for_worker = diagnostics.clone();
         let streaming_diagnostics = StreamingDiagnosticQueue::default();
         let streaming_diagnostics_for_worker = streaming_diagnostics.clone();
+        let stream_interruption = StreamInterruption::default();
+        let interruption_for_worker = stream_interruption.clone();
         let worker = thread::Builder::new()
             .name("gx-local-audio-engine".into())
             .spawn(move || {
@@ -272,11 +321,13 @@ impl LocalAudioEngine {
                     snapshot_for_worker,
                     diagnostics_for_worker,
                     streaming_diagnostics_for_worker,
+                    interruption_for_worker,
                 )
             })
             .context("failed to spawn local audio engine worker")?;
         Ok(Self {
             commands,
+            stream_interruption,
             snapshot,
             diagnostics,
             streaming_diagnostics,
@@ -460,15 +511,21 @@ impl LocalAudioEngine {
     }
 
     fn send(&self, command: EngineCommand) -> Result<()> {
+        let interruption = command
+            .interrupts_stream()
+            .then(|| self.stream_interruption.register());
         self.commands
-            .send(command)
+            .send(QueuedEngineCommand {
+                command,
+                interruption,
+            })
             .map_err(|_| anyhow!("local audio engine is not running"))
     }
 }
 
 impl Drop for LocalAudioEngine {
     fn drop(&mut self) {
-        let _ = self.commands.send(EngineCommand::Shutdown);
+        let _ = self.send(EngineCommand::Shutdown);
         if let Some(worker) = self.worker.lock().unwrap().take() {
             let _ = worker.join();
         }
@@ -694,10 +751,11 @@ fn request_track_change(
 }
 
 fn run_worker(
-    commands: Receiver<EngineCommand>,
+    commands: Receiver<QueuedEngineCommand>,
     shared_snapshot: Arc<Mutex<EngineSnapshot>>,
     diagnostics: EngineDiagnosticQueue,
     streaming_diagnostics: StreamingDiagnosticQueue,
+    stream_interruption: StreamInterruption,
 ) {
     let mut model = WorkerModel::default();
     let mut session: Option<PlaybackSession> = None;
@@ -708,7 +766,7 @@ fn run_worker(
         loop {
             match commands.try_recv() {
                 Ok(command) => {
-                    if handle_command(command, &mut model, &mut session) {
+                    if handle_queued_command(command, &mut model, &mut session) {
                         shutdown = true;
                         break;
                     }
@@ -737,6 +795,7 @@ fn run_worker(
                     model.dsp_settings.clone(),
                     model.output_device.as_deref(),
                     streaming_diagnostics.clone(),
+                    stream_interruption.clone(),
                 ) {
                     Ok(mut next_session) => {
                         if let Some(index) = model.index
@@ -755,16 +814,6 @@ fn run_worker(
                         model.error = None;
                     }
                     Err(error) => {
-                        diagnostics.push(EngineDiagnostic {
-                            category: "playback_start_failed",
-                            source: playback_source_label(&item.source, item.public.online),
-                            summary: format!(
-                                "stage=session_new code={} generation={}",
-                                playback_error_code(&error),
-                                model.generation
-                            ),
-                            generation: Some(model.generation),
-                        });
                         if let PlaybackSource::Online {
                             cache_plan: Some(plan),
                             ..
@@ -772,8 +821,26 @@ fn run_worker(
                         {
                             plan.invalidate();
                         }
-                        model.status = PlaybackStatus::Failed;
-                        model.error = Some(error.to_string());
+                        if is_expected_stream_interruption(&error, &stream_interruption) {
+                            // The command carrying the interruption guard is still queued. Keep a
+                            // retry armed so invalid/no-op commands can resume the same source;
+                            // Pause and destructive commands explicitly clear or replace it.
+                            model.reload_requested = true;
+                            model.error = None;
+                        } else {
+                            diagnostics.push(EngineDiagnostic {
+                                category: "playback_start_failed",
+                                source: playback_source_label(&item.source, item.public.online),
+                                summary: format!(
+                                    "stage=session_new code={} generation={}",
+                                    playback_error_code(&error),
+                                    model.generation
+                                ),
+                                generation: Some(model.generation),
+                            });
+                            model.status = PlaybackStatus::Failed;
+                            model.error = Some(error.to_string());
+                        }
                     }
                 }
             }
@@ -806,6 +873,18 @@ fn run_worker(
                     model.start_seconds = active.position_seconds();
                     session = None;
                 }
+                Err(error) if is_expected_stream_interruption(&error, &stream_interruption) => {
+                    model.start_seconds = active.position_seconds();
+                    model.reload_requested = true;
+                    model.status = if model.intent_playing {
+                        PlaybackStatus::Loading
+                    } else {
+                        PlaybackStatus::Paused
+                    };
+                    model.error = None;
+                    active.invalidate_cache();
+                    session = None;
+                }
                 Err(error) => {
                     let source = model
                         .index
@@ -836,19 +915,19 @@ fn run_worker(
         if session.is_some() {
             if backpressured {
                 if let Ok(command) = commands.recv_timeout(Duration::from_millis(4))
-                    && handle_command(command, &mut model, &mut session)
+                    && handle_queued_command(command, &mut model, &mut session)
                 {
                     break;
                 }
             } else if let Ok(command) = commands.try_recv()
-                && handle_command(command, &mut model, &mut session)
+                && handle_queued_command(command, &mut model, &mut session)
             {
                 break;
             }
         } else {
             match commands.recv_timeout(Duration::from_millis(50)) {
                 Ok(command) => {
-                    if handle_command(command, &mut model, &mut session) {
+                    if handle_queued_command(command, &mut model, &mut session) {
                         break;
                     }
                 }
@@ -857,6 +936,20 @@ fn run_worker(
             }
         }
     }
+}
+
+fn handle_queued_command(
+    queued: QueuedEngineCommand,
+    model: &mut WorkerModel,
+    session: &mut Option<PlaybackSession>,
+) -> bool {
+    let QueuedEngineCommand {
+        command,
+        interruption,
+    } = queued;
+    let shutdown = handle_command(command, model, session);
+    drop(interruption);
+    shutdown
 }
 
 fn handle_command(
@@ -996,6 +1089,9 @@ fn handle_command(
         }
         EngineCommand::Pause => {
             model.intent_playing = false;
+            // If a blocked online read was cancelled, keep the saved position but do not rebuild
+            // until the user explicitly resumes. Otherwise Pause would immediately block again.
+            model.reload_requested = false;
             if let Some(active) = session.as_mut() {
                 active.pause();
             }
@@ -1212,6 +1308,7 @@ impl PlaybackSession {
         dsp_settings: DspSettings,
         output_device_name: Option<&str>,
         streaming_diagnostics: StreamingDiagnosticQueue,
+        stream_interruption: StreamInterruption,
     ) -> Result<Self> {
         let cache_plan = match source {
             PlaybackSource::Online { cache_plan, .. } => cache_plan.clone(),
@@ -1229,10 +1326,11 @@ impl PlaybackSession {
             } => {
                 let extension = media_extension(&request.media_type);
                 let description = request.redacted_for_log();
-                let http = HttpMediaSource::new_with_cache_and_diagnostics(
+                let http = HttpMediaSource::new_with_cache_diagnostics_and_interruption(
                     request.clone(),
                     cache_plan.clone(),
                     streaming_diagnostics,
+                    stream_interruption,
                 )?;
                 let mut media = open_media_source(Box::new(http), extension, &description)?;
                 let discard = seek_media_coarse(&mut media, start_seconds)?;
@@ -1628,6 +1726,13 @@ fn render_output_callback<T>(
 mod tests {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
+    use std::fs;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    use crossbeam_channel::{Receiver as TestReceiver, Sender as TestSender};
+    use gx_cache::{CacheKey, CacheStore};
+    use gx_contracts::NetworkRoute;
 
     use super::*;
 
@@ -1664,6 +1769,130 @@ mod tests {
 
     #[global_allocator]
     static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    struct BlackholeServer {
+        url: String,
+        accepted: TestReceiver<usize>,
+        release: TestSender<()>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl BlackholeServer {
+        fn start(expected_connections: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (accepted_sender, accepted) = bounded(expected_connections.max(1));
+            let (release, release_receiver) = bounded(1);
+            let handle = thread::spawn(move || {
+                let mut streams: Vec<TcpStream> = Vec::with_capacity(expected_connections);
+                while streams.len() < expected_connections {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            streams.push(stream);
+                            let _ = accepted_sender.send(streams.len());
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let _ = release_receiver.recv_timeout(Duration::from_secs(3));
+                drop(streams);
+            });
+            Self {
+                url: format!("http://{address}/blackhole.mp3"),
+                accepted,
+                release,
+                handle: Some(handle),
+            }
+        }
+
+        fn wait_for_connection(&self, count: usize) -> Duration {
+            let started = Instant::now();
+            loop {
+                let accepted = self
+                    .accepted
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("blackhole server did not receive a connection");
+                if accepted == count {
+                    return started.elapsed();
+                }
+            }
+        }
+
+        fn unblock(&mut self) {
+            let _ = self.release.try_send(());
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Drop for BlackholeServer {
+        fn drop(&mut self) {
+            let _ = self.release.try_send(());
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn blackhole_request(url: &str) -> ResolvedMediaRequest {
+        ResolvedMediaRequest {
+            url: url.parse().unwrap(),
+            headers: Vec::new(),
+            media_type: MediaType::Mp3,
+            quality: Some("test".into()),
+            expires_at_ms: None,
+            network_route: Some(NetworkRoute::Direct),
+        }
+    }
+
+    fn online_item(request: ResolvedMediaRequest, title: &str) -> EngineQueueItem {
+        EngineQueueItem {
+            public: QueueItem {
+                location: request.redacted_for_log(),
+                title: title.into(),
+                duration_seconds: None,
+                online: true,
+            },
+            source: PlaybackSource::Online {
+                request,
+                cache_plan: None,
+            },
+        }
+    }
+
+    fn wait_for_engine(
+        engine: &LocalAudioEngine,
+        predicate: impl Fn(&EngineSnapshot) -> bool,
+    ) -> Duration {
+        let started = Instant::now();
+        loop {
+            if predicate(&engine.snapshot()) {
+                return started.elapsed();
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "engine state did not converge: {:?}",
+                engine.snapshot()
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn temporary_cache_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "gx-audio-interruption-test-{}-{nonce}",
+            std::process::id()
+        ))
+    }
 
     fn dummy_item(name: &str) -> EngineQueueItem {
         EngineQueueItem {
@@ -1718,6 +1947,189 @@ mod tests {
         assert_eq!(item.public.title, "queued-song");
         assert_eq!(item.public.duration_seconds, None);
         assert!(!item.public.online);
+    }
+
+    #[test]
+    fn connection_aborted_requires_a_pending_command_to_be_expected() {
+        let error = anyhow!(io::Error::new(
+            ErrorKind::ConnectionAborted,
+            "transport aborted without a player command",
+        ));
+        let interruption = StreamInterruption::default();
+        assert!(!is_expected_stream_interruption(&error, &interruption));
+
+        let guard = interruption.register();
+        assert!(is_expected_stream_interruption(&error, &interruption));
+        drop(guard);
+        assert!(!is_expected_stream_interruption(&error, &interruption));
+    }
+
+    #[test]
+    fn interrupted_pause_defers_range_reload_until_play_and_keeps_position() {
+        let mut model = model_with_queue(1, 0, PlayMode::Sequential);
+        model.start_seconds = 42.25;
+        model.reload_requested = true;
+        model.status = PlaybackStatus::Loading;
+        let mut session = None;
+
+        assert!(!handle_command(
+            EngineCommand::Pause,
+            &mut model,
+            &mut session,
+        ));
+        assert_eq!(model.start_seconds, 42.25);
+        assert_eq!(model.status, PlaybackStatus::Paused);
+        assert!(!model.reload_requested);
+        assert!(!model.intent_playing);
+
+        assert!(!handle_command(
+            EngineCommand::Play,
+            &mut model,
+            &mut session,
+        ));
+        assert_eq!(model.start_seconds, 42.25);
+        assert!(model.reload_requested);
+        assert!(model.intent_playing);
+    }
+
+    #[test]
+    fn pause_interrupts_blackhole_ready_wait_without_publishing_cache_or_diagnostics() {
+        let mut server = BlackholeServer::start(1);
+        let cache_root = temporary_cache_root();
+        let store = CacheStore::open(&cache_root, None).unwrap();
+        let key = CacheKey {
+            provider_id: "test".into(),
+            provider_track_id: "pause-blackhole".into(),
+            quality: "320k".into(),
+        };
+        let plan = store.prepare(key.clone(), MediaType::Mp3);
+        let engine = LocalAudioEngine::new().unwrap();
+        engine
+            .load_resolved_cached(
+                blackhole_request(&server.url),
+                "Pause blackhole".into(),
+                Some(plan),
+            )
+            .unwrap();
+        server.wait_for_connection(1);
+
+        let started = Instant::now();
+        engine.pause().unwrap();
+        wait_for_engine(&engine, |snapshot| {
+            snapshot.status == PlaybackStatus::Paused
+        });
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_millis(200), "elapsed={elapsed:?}");
+        assert!(store.lookup(&key).is_none());
+        let cache_directory = store.status().directory;
+
+        server.unblock();
+        thread::sleep(Duration::from_millis(30));
+        assert!(engine.drain_diagnostics().is_empty());
+        drop(engine);
+        drop(server);
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let has_incomplete = fs::read_dir(&cache_directory)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    matches!(
+                        entry.path().extension().and_then(|value| value.to_str()),
+                        Some("part" | "ready")
+                    )
+                });
+            if !has_incomplete || Instant::now() >= cleanup_deadline {
+                assert!(
+                    !has_incomplete,
+                    "cancelled stream left an incomplete cache file"
+                );
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn next_and_clear_queue_interrupt_blackhole_ready_waits_within_budget() {
+        let mut server = BlackholeServer::start(2);
+        let request = blackhole_request(&server.url);
+        let engine = LocalAudioEngine::new().unwrap();
+        engine
+            .send(EngineCommand::Load {
+                items: vec![
+                    online_item(request.clone(), "First"),
+                    online_item(request, "Second"),
+                ],
+                start_index: 0,
+            })
+            .unwrap();
+        server.wait_for_connection(1);
+
+        let next_started = Instant::now();
+        engine.next().unwrap();
+        wait_for_engine(&engine, |snapshot| snapshot.queue_index == Some(1));
+        assert!(
+            next_started.elapsed() < Duration::from_millis(200),
+            "next elapsed={:?}",
+            next_started.elapsed()
+        );
+        server.wait_for_connection(2);
+
+        let clear_started = Instant::now();
+        engine.clear_queue().unwrap();
+        wait_for_engine(&engine, |snapshot| {
+            snapshot.status == PlaybackStatus::Idle && snapshot.queue.is_empty()
+        });
+        assert!(
+            clear_started.elapsed() < Duration::from_millis(200),
+            "clear elapsed={:?}",
+            clear_started.elapsed()
+        );
+        server.unblock();
+        thread::sleep(Duration::from_millis(30));
+        assert!(engine.drain_diagnostics().is_empty());
+        drop(engine);
+        drop(server);
+    }
+
+    #[test]
+    fn invalid_jump_and_end_of_queue_next_resume_the_interrupted_source() {
+        let mut server = BlackholeServer::start(3);
+        let engine = LocalAudioEngine::new().unwrap();
+        engine
+            .load_resolved(blackhole_request(&server.url), "Only item".into())
+            .unwrap();
+        server.wait_for_connection(1);
+
+        let jump_started = Instant::now();
+        engine.jump(99).unwrap();
+        server.wait_for_connection(2);
+        assert!(
+            jump_started.elapsed() < Duration::from_millis(200),
+            "invalid jump recovery elapsed={:?}",
+            jump_started.elapsed()
+        );
+
+        let next_started = Instant::now();
+        engine.next().unwrap();
+        server.wait_for_connection(3);
+        assert!(
+            next_started.elapsed() < Duration::from_millis(200),
+            "end-of-queue next recovery elapsed={:?}",
+            next_started.elapsed()
+        );
+        assert_eq!(engine.snapshot().queue_index, Some(0));
+        engine.clear_queue().unwrap();
+        wait_for_engine(&engine, |snapshot| snapshot.queue.is_empty());
+        server.unblock();
+        thread::sleep(Duration::from_millis(30));
+        assert!(engine.drain_diagnostics().is_empty());
+        drop(engine);
+        drop(server);
     }
 
     #[test]

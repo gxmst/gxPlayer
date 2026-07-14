@@ -18,5 +18,8 @@ rubato.workspace = true
 serde.workspace = true
 symphonia.workspace = true
 
+[dev-dependencies]
+gx-streaming = { path = "../gx-streaming", features = ["test-private-network"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_System_Threading"] }

@@ -13,8 +13,12 @@ use tauri::{
     WebviewWindow,
 };
 
-const MIN_WIDTH: f64 = 720.0;
-const MIN_HEIGHT: f64 = 560.0;
+pub const NORMAL_MIN_WIDTH: f64 = 320.0;
+pub const NORMAL_MIN_HEIGHT: f64 = 560.0;
+pub const MINI_MIN_WIDTH: f64 = 320.0;
+pub const MINI_MIN_HEIGHT: f64 = 120.0;
+pub const MINI_DEFAULT_WIDTH: f64 = 380.0;
+pub const MINI_DEFAULT_HEIGHT: f64 = 140.0;
 const DEFAULT_WIDTH: f64 = 1100.0;
 const DEFAULT_HEIGHT: f64 = 688.0;
 
@@ -138,17 +142,34 @@ fn geometry_is_visible(
 
 fn clamp_size(width: f64, height: f64, mini_mode: bool) -> (f64, f64) {
     if mini_mode {
-        // Mini bar: keep a usable strip, still respect a soft floor.
-        (width.clamp(320.0, 520.0), height.clamp(100.0, 200.0))
+        (
+            width.clamp(MINI_MIN_WIDTH, 520.0),
+            height.clamp(MINI_MIN_HEIGHT, 200.0),
+        )
     } else {
         (
-            width.clamp(MIN_WIDTH, 4096.0),
-            height.clamp(MIN_HEIGHT, 2160.0),
+            width.clamp(NORMAL_MIN_WIDTH, 4096.0),
+            height.clamp(NORMAL_MIN_HEIGHT, 2160.0),
         )
     }
 }
 
+fn minimum_size(mini_mode: bool) -> LogicalSize<f64> {
+    if mini_mode {
+        LogicalSize::new(MINI_MIN_WIDTH, MINI_MIN_HEIGHT)
+    } else {
+        LogicalSize::new(NORMAL_MIN_WIDTH, NORMAL_MIN_HEIGHT)
+    }
+}
+
+pub fn apply_minimum_size(window: &WebviewWindow, mini_mode: bool) -> Result<(), String> {
+    window
+        .set_min_size(Some(minimum_size(mini_mode)))
+        .map_err(|error| error.to_string())
+}
+
 pub fn apply_default_placement(window: &WebviewWindow) {
+    let _ = apply_minimum_size(window, false);
     if let Ok(Some(monitor)) = window
         .current_monitor()
         .or_else(|_| window.primary_monitor())
@@ -165,8 +186,8 @@ pub fn apply_default_placement(window: &WebviewWindow) {
             height = maximum_height;
             width = height * 1.6;
         }
-        width = width.max(MIN_WIDTH);
-        height = height.max(MIN_HEIGHT);
+        width = width.max(NORMAL_MIN_WIDTH);
+        height = height.max(NORMAL_MIN_HEIGHT);
         let _ = window.set_size(LogicalSize::new(width.floor(), height.floor()));
     } else {
         let _ = window.set_size(LogicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT));
@@ -178,6 +199,7 @@ pub fn apply_default_placement(window: &WebviewWindow) {
 pub fn apply_to_window(window: &WebviewWindow, state: &WindowState) {
     let monitors = monitors_for(window);
     let mini = state.mini_mode;
+    let _ = apply_minimum_size(window, mini);
     let (width, height) = clamp_size(
         state.width.unwrap_or(DEFAULT_WIDTH),
         state.height.unwrap_or(DEFAULT_HEIGHT),
@@ -191,18 +213,19 @@ pub fn apply_to_window(window: &WebviewWindow, state: &WindowState) {
 
     if !position_ok && !state.maximized {
         // Bad / missing coordinates — safe centered default (still apply always-on-top flag).
-        apply_default_placement(window);
-        let _ = window.set_always_on_top(state.always_on_top || mini);
         if mini {
-            let _ = window.set_size(LogicalSize::new(380.0, 140.0));
+            let _ = window.set_size(LogicalSize::new(MINI_DEFAULT_WIDTH, MINI_DEFAULT_HEIGHT));
             let _ = window.set_always_on_top(true);
             let _ = window.center();
+        } else {
+            apply_default_placement(window);
+            let _ = window.set_always_on_top(state.always_on_top);
         }
         return;
     }
 
     if mini {
-        let _ = window.set_size(LogicalSize::new(380.0, 140.0));
+        let _ = window.set_size(LogicalSize::new(MINI_DEFAULT_WIDTH, MINI_DEFAULT_HEIGHT));
         let _ = window.set_always_on_top(true);
     } else {
         let _ = window.set_size(LogicalSize::new(width, height));
@@ -272,8 +295,41 @@ pub fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// Force the main window onto the primary work area (recovery command).
 pub fn force_show_main(window: &WebviewWindow, app_data: &Path) {
     let _ = window.unminimize();
+    let _ = apply_minimum_size(window, false);
     apply_default_placement(window);
     let _ = clear_geometry(app_data);
     let _ = window.show();
     let _ = window.set_focus();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_and_mini_sizes_use_distinct_constraints() {
+        assert_eq!(clamp_size(100.0, 100.0, false), (320.0, 560.0));
+        assert_eq!(clamp_size(100.0, 100.0, true), (320.0, 120.0));
+        assert_eq!(
+            clamp_size(MINI_DEFAULT_WIDTH, MINI_DEFAULT_HEIGHT, true),
+            (MINI_DEFAULT_WIDTH, MINI_DEFAULT_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn a_saved_320px_normal_window_is_not_expanded_back_to_720px() {
+        assert_eq!(clamp_size(320.0, 560.0, false), (320.0, 560.0));
+    }
+
+    #[test]
+    fn minimum_size_matches_the_active_window_mode() {
+        assert_eq!(
+            minimum_size(false),
+            LogicalSize::new(NORMAL_MIN_WIDTH, NORMAL_MIN_HEIGHT)
+        );
+        assert_eq!(
+            minimum_size(true),
+            LogicalSize::new(MINI_MIN_WIDTH, MINI_MIN_HEIGHT)
+        );
+    }
 }

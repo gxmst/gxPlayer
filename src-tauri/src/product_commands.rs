@@ -208,9 +208,14 @@ pub fn window_save_state(
 
 /// Recover a missing window: center on primary display and clear bad geometry.
 #[tauri::command]
-pub fn window_force_show(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
+pub fn window_force_show(
+    window: WebviewWindow,
+    app: AppHandle,
+    mode: State<'_, window_state::WindowModeState>,
+) -> Result<(), String> {
     require_window(&window, "main")?;
     let app_data = window_state::app_data_dir(&app)?;
+    mode.set_mini_mode(false);
     window_state::force_show_main(&window, &app_data);
     Ok(())
 }
@@ -253,19 +258,41 @@ pub fn window_set_mini_mode(
                 state.height = captured.height.or(state.height);
             }
         }
-        window
-            .set_size(tauri::LogicalSize::new(380.0, 140.0))
-            .map_err(|e| e.to_string())?;
-        window.set_always_on_top(true).map_err(|e| e.to_string())?;
+        let previous_runtime_mode = mode.mini_mode();
+        let _ = window.unmaximize();
+        window_state::apply_minimum_size(&window, true)?;
+        // Resize events can fire before this command returns. Mark mini mode first so those events
+        // never overwrite the remembered normal geometry with the compact dimensions.
+        mode.set_mini_mode(true);
+        if let Err(error) = window.set_size(tauri::LogicalSize::new(
+            window_state::MINI_DEFAULT_WIDTH,
+            window_state::MINI_DEFAULT_HEIGHT,
+        )) {
+            mode.set_mini_mode(previous_runtime_mode);
+            let _ = window_state::apply_minimum_size(&window, previous_runtime_mode);
+            return Err(error.to_string());
+        }
+        if let Err(error) = window.set_always_on_top(true) {
+            mode.set_mini_mode(previous_runtime_mode);
+            let _ = window_state::apply_minimum_size(&window, previous_runtime_mode);
+            return Err(error.to_string());
+        }
         let _ = window.center();
         state.mini_mode = true;
     } else {
         state.mini_mode = false;
-        let width = state.width.unwrap_or(1100.0).max(720.0);
-        let height = state.height.unwrap_or(688.0).max(560.0);
+        let width = state
+            .width
+            .unwrap_or(1100.0)
+            .max(window_state::NORMAL_MIN_WIDTH);
+        let height = state
+            .height
+            .unwrap_or(688.0)
+            .max(window_state::NORMAL_MIN_HEIGHT);
         window
             .set_size(tauri::LogicalSize::new(width, height))
             .map_err(|e| e.to_string())?;
+        window_state::apply_minimum_size(&window, false)?;
         window
             .set_always_on_top(state.always_on_top)
             .map_err(|e| e.to_string())?;
@@ -274,8 +301,13 @@ pub fn window_set_mini_mode(
         } else {
             let _ = window.center();
         }
+        if state.maximized {
+            window.maximize().map_err(|e| e.to_string())?;
+        }
+        // Keep mini authoritative throughout the resize above so its event cannot persist the
+        // compact/transition geometry as the normal window size.
+        mode.set_mini_mode(false);
     }
-    mode.set_mini_mode(enabled);
     window_state::save(&app_data, &state)?;
     Ok(())
 }

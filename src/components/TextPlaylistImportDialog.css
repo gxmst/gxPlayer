@@ -175,9 +175,13 @@
 
 @media (max-width: 560px) {
   .text-playlist-dialog {
-    width: 96vw;
-    max-height: 92vh;
+    width: 100%;
+    max-height: calc(100vh - 16px);
     padding: 16px;
+  }
+
+  .text-playlist-dialog-header {
+    gap: 10px;
   }
 
   .text-playlist-progress {

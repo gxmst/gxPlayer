@@ -16,6 +16,7 @@ import { useBackupRestore } from "./hooks/useBackupRestore";
 import { useCatalogSearch } from "./hooks/useCatalogSearch";
 import { useEngineSnapshot } from "./hooks/useEngineSnapshot";
 import { useLiveVolume } from "./hooks/useLiveVolume";
+import { useNarrowLayout } from "./hooks/useNarrowLayout";
 import { useSystemProxySettings } from "./hooks/useSystemProxySettings";
 import { useWindowActivity } from "./hooks/useWindowActivity";
 import { useWindowPreferences } from "./hooks/useWindowPreferences";
@@ -494,6 +495,7 @@ function ArtistLinks({ artist, onSelect, className = "", fallback = "未知歌�
 
 function App() {
   const windowActive = useWindowActivity();
+  const isNarrow = useNarrowLayout();
   const [restoredPlaylistSession] = useState(loadPlaylistSession);
   const [view, setView] = useState<ViewId>(initialView);
   const [viewHistory, setViewHistory] = useState<ViewId[]>([]);
@@ -515,6 +517,10 @@ function App() {
     setMessageState(String(error));
     setMessageIsError(true);
   });
+  const narrowLayout = isNarrow && !miniMode;
+  const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
   const {
     status: proxyStatus,
     busy: proxyBusy,
@@ -1150,13 +1156,41 @@ function App() {
     }
   })();
 
+  useEffect(() => {
+    if (!narrowLayout) setSidebarDrawerOpen(false);
+  }, [narrowLayout]);
+
+  useEffect(() => {
+    if (!sidebarDrawerOpen) return;
+    const frame = window.requestAnimationFrame(() => {
+      sidebarRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    });
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setSidebarDrawerOpen(false);
+      window.requestAnimationFrame(() => menuButtonRef.current?.focus());
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [sidebarDrawerOpen]);
+
+  useEffect(() => {
+    if (queuePanelOpen && sidebarDrawerOpen) setSidebarDrawerOpen(false);
+  }, [queuePanelOpen, sidebarDrawerOpen]);
+
   const navigateTo = (next: ViewId) => {
+    setSidebarDrawerOpen(false);
     if (next === view) return;
     setViewHistory((history) => [...history, view].slice(-32));
     setView(next);
   };
 
   const navigateBack = () => {
+    setSidebarDrawerOpen(false);
     setViewHistory((history) => {
       const previous = history[history.length - 1];
       if (!previous) return history;
@@ -3200,13 +3234,30 @@ function App() {
   };
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${miniMode ? "mini-mode" : ""} ${isMaximized ? "is-maximized" : ""} ${windowActive ? "" : "app-idle"}`} data-theme={theme} style={{ "--accent": accent } as CSSProperties}>
+    <div className={`app-shell ${!narrowLayout && sidebarCollapsed ? "sidebar-collapsed" : ""} ${narrowLayout ? "narrow-layout" : ""} ${miniMode ? "mini-mode" : ""} ${isMaximized ? "is-maximized" : ""} ${windowActive ? "" : "app-idle"}`} data-theme={theme} style={{ "--accent": accent } as CSSProperties}>
       <div className="ambient-light" aria-hidden="true" />
       <div className="ambient-light ambient-light-secondary" aria-hidden="true" />
       <div className="shell-noise" aria-hidden="true" />
       <header className="top-bar" data-tauri-drag-region>
         <div className="brand-cluster">
-          <button className="menu-button" onClick={() => setSidebarCollapsed((value) => !value)} aria-pressed={!sidebarCollapsed} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>☰</button>
+          <button
+            ref={menuButtonRef}
+            className="menu-button"
+            onClick={() => {
+              if (narrowLayout) {
+                setQueuePanelOpen(false);
+                setSidebarDrawerOpen((open) => !open);
+              } else {
+                setSidebarCollapsed((value) => !value);
+              }
+            }}
+            aria-controls="app-sidebar"
+            aria-expanded={narrowLayout ? sidebarDrawerOpen : undefined}
+            aria-pressed={narrowLayout ? undefined : !sidebarCollapsed}
+            aria-label={narrowLayout
+              ? sidebarDrawerOpen ? "关闭导航抽屉" : "打开导航抽屉"
+              : sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+          >☰</button>
           <button className="logo" onClick={() => navigateTo("discovery")} aria-label="返回探索页"><img src={gxplayerIcon} alt="" /></button>
           <button className="history-back" onClick={navigateBack} disabled={!viewHistory.length} aria-label="返回上一页" title="返回上一页">‹</button>
           <button className="mini-mode-exit" type="button" onClick={() => void toggleMiniMode()}>退出迷你</button>
@@ -3368,11 +3419,30 @@ function App() {
         <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button className="maximize-control" onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label="关闭">×</button></div>
       </header>
 
-      <aside className="sidebar">
-        <nav>{NAV_ITEMS.map((item) => <button className={view === item.id ? "active" : ""} onClick={() => navigateTo(item.id)} key={item.id} title={item.label}><span>{item.icon}</span><strong>{item.label}</strong></button>)}</nav>
-        <div className="sidebar-playlists"><p><span>创建的歌单</span><small>{playlists.length}</small></p>{playlists.slice(0, 8).map((playlist) => <button key={playlist.id} className={activePlaylist?.id === playlist.id && view === "playlist" ? "active" : ""} onClick={() => void openPlaylist(playlist)} title={playlist.name}><span>♬</span><strong>{playlist.name}</strong></button>)}</div>
-        <div className="engine-health"><i className={snapshot.status === "failed" ? "bad" : ""} /><span><strong>Rust Engine</strong><small>{snapshot.status === "failed" ? "需要处理" : `${snapshot.underrunCallbacks} underrun`}</small></span></div>
-      </aside>
+      {narrowLayout && sidebarDrawerOpen && (
+        <button
+          type="button"
+          className="sidebar-drawer-backdrop"
+          tabIndex={-1}
+          aria-label="关闭导航抽屉"
+          onClick={() => {
+            setSidebarDrawerOpen(false);
+            window.requestAnimationFrame(() => menuButtonRef.current?.focus());
+          }}
+        />
+      )}
+      {(!narrowLayout || sidebarDrawerOpen) && (
+        <aside
+          ref={sidebarRef}
+          id="app-sidebar"
+          className={`sidebar ${narrowLayout ? "sidebar-drawer" : ""}`}
+          aria-label="主导航"
+        >
+          <nav>{NAV_ITEMS.map((item) => <button className={view === item.id ? "active" : ""} onClick={() => navigateTo(item.id)} key={item.id} title={item.label}><span>{item.icon}</span><strong>{item.label}</strong></button>)}</nav>
+          <div className="sidebar-playlists"><p><span>创建的歌单</span><small>{playlists.length}</small></p>{playlists.slice(0, 8).map((playlist) => <button key={playlist.id} className={activePlaylist?.id === playlist.id && view === "playlist" ? "active" : ""} onClick={() => void openPlaylist(playlist)} title={playlist.name}><span>♬</span><strong>{playlist.name}</strong></button>)}</div>
+          <div className="engine-health"><i className={snapshot.status === "failed" ? "bad" : ""} /><span><strong>Rust Engine</strong><small>{snapshot.status === "failed" ? "需要处理" : `${snapshot.underrunCallbacks} underrun`}</small></span></div>
+        </aside>
+      )}
 
       <main className="content">{renderView()}</main>
 

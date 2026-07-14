@@ -127,6 +127,13 @@ export type CacheStatus = {
   pinnedCount: number;
 };
 
+export type PreviewCacheStatus = {
+  directory: string;
+  limitBytes: number;
+  totalBytes: number;
+  entryCount: number;
+};
+
 /** Offline/cache list row — never includes absolute disk paths. */
 export type CacheEntryView = {
   providerId: string;

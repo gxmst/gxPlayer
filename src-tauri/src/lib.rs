@@ -23,6 +23,7 @@ mod diagnostic_log;
 mod media_session;
 mod metadata_commands;
 mod network_settings;
+mod preview_cache;
 mod product_commands;
 mod source_commands;
 mod source_runtime;
@@ -38,6 +39,7 @@ use cache_commands::{
     cache_clear, cache_list_entries, cache_online_favorites, cache_remove_by_quality,
     cache_remove_entries, cache_remove_entry, cache_reset_directory, cache_set_directory,
     cache_set_limit, cache_set_online_favorite, cache_status, player_play_cache_entry,
+    preview_cache_clear, preview_cache_status,
 };
 use diagnostic_log::{
     DiagnosticLogState, diagnostic_log_clear, diagnostic_log_export, diagnostic_log_recent,
@@ -1148,6 +1150,10 @@ pub fn run() {
             ));
             app.manage(network_settings::NetworkSettingsState::open(&app_data));
             app.manage(DiagnosticLogState::open(&app_data));
+            app.manage(
+                preview_cache::PreviewCacheStore::open(app_data.join("preview-cache"))
+                    .map_err(std::io::Error::other)?,
+            );
             app.manage(window_state::WindowModeState::new(
                 window_state::load(&app_data).mini_mode,
             ));
@@ -1326,6 +1332,8 @@ pub fn run() {
             lx_security_result,
             lx_poc_failure,
             cache_status,
+            preview_cache_status,
+            preview_cache_clear,
             cache_set_limit,
             cache_set_directory,
             cache_reset_directory,

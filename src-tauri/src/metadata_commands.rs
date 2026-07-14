@@ -283,37 +283,27 @@ async fn cache_preview(
         gx_contracts::MediaType::Wav => "wav",
         _ => "media",
     };
-    let safe_id = track
-        .provider_track_id
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(80)
-        .collect::<String>();
-    let root = crate::isolated_smoke_data_root()
-        .map(|root| root.join("preview-cache"))
-        .unwrap_or(
-            app.path()
-                .app_cache_dir()
-                .map_err(|error| error.to_string())?
-                .join("preview-cache"),
-        );
-    let destination = root.join(format!("{}-{safe_id}.{extension}", track.provider_id));
-    if destination
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() > 0)
+    if let Some(cached) = app
+        .state::<crate::preview_cache::PreviewCacheStore>()
+        .lookup(&track.provider_id, &track.provider_track_id)?
     {
-        return Ok(destination);
+        return Ok(cached);
     }
-    let destination_for_task = destination.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    let app_for_task = app.clone();
+    let provider_id = track.provider_id.clone();
+    let provider_track_id = track.provider_track_id.clone();
+    let destination = tauri::async_runtime::spawn_blocking(move || {
         let bytes = fetch_preview_bytes(&request).map_err(|error| error.to_string())?;
-        let temporary = destination_for_task.with_extension(format!("{extension}.tmp"));
-        std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-        std::fs::rename(&temporary, &destination_for_task).map_err(|error| error.to_string())?;
-        Ok::<_, String>(())
+        app_for_task
+            .state::<crate::preview_cache::PreviewCacheStore>()
+            .insert(&provider_id, &provider_track_id, extension, &bytes)
     })
     .await
     .map_err(|error| format!("preview cache task failed: {error}"))??;
+    let _ = app.emit(
+        "gx-preview-cache-changed",
+        app.state::<crate::preview_cache::PreviewCacheStore>()
+            .status(),
+    );
     Ok(destination)
 }

@@ -77,6 +77,7 @@ import {
   type OnlinePlaybackResult,
   type PlayMode,
   type PlaylistSummary,
+  type PreviewCacheStatus,
   type ResolveAttemptDiagnostic,
   type RuntimeStatus,
   type ViewId,
@@ -594,6 +595,7 @@ function App() {
   const [diagnosticLogBusy, setDiagnosticLogBusy] = useState<"refresh" | "toggle" | "export" | "clear" | null>(null);
   const diagnosticLogGenerationRef = useRef(0);
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
+  const [previewCacheStatus, setPreviewCacheStatus] = useState<PreviewCacheStatus | null>(null);
   const [cacheLimitGiB, setCacheLimitGiB] = useState("5");
   const cacheLimitDirtyRef = useRef(false);
   const [onlineFavorites, setOnlineFavorites] = useState<CatalogTrack[]>([]);
@@ -756,10 +758,11 @@ function App() {
   };
 
   const refreshCache = async () => {
-    const [status, favoriteTracks, entries] = await Promise.all([
+    const [status, favoriteTracks, entries, previewStatus] = await Promise.all([
       invoke<CacheStatus>("cache_status"),
       invoke<CatalogTrack[]>("cache_online_favorites"),
       invoke<CacheEntryView[]>("cache_list_entries"),
+      invoke<PreviewCacheStatus>("preview_cache_status"),
     ]);
     setCacheStatus(status);
     if (!cacheLimitDirtyRef.current) {
@@ -767,6 +770,7 @@ function App() {
     }
     setOnlineFavorites(favoriteTracks);
     setCacheEntries(entries);
+    setPreviewCacheStatus(previewStatus);
   };
 
   const refreshHistory = async () => {
@@ -1045,9 +1049,13 @@ function App() {
     const unlisten = listen<number>("gx-cache-changed", () => {
       if (!disposed) void refreshCache().catch(() => undefined);
     });
+    const previewUnlisten = listen<PreviewCacheStatus>("gx-preview-cache-changed", (event) => {
+      if (!disposed) setPreviewCacheStatus(event.payload);
+    });
     return () => {
       disposed = true;
       void unlisten.then((stop) => stop());
+      void previewUnlisten.then((stop) => stop());
     };
   }, [view]);
 
@@ -3162,7 +3170,7 @@ function App() {
               <button type="button" className={miniMode ? "primary" : ""} onClick={() => void toggleMiniMode()}>{miniMode ? "退出迷你" : "迷你模式"}</button>
             </div>
           </section>
-          <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。批量管理请到「曲库」页的在线缓存分区。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => { cacheLimitDirtyRef.current = true; setCacheLimitGiB(event.target.value); }} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={async () => { if (!window.confirm("确定清理所有未收藏缓存吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: false }); setCacheStatus(status); }}>清未收藏</button><button className="danger" onClick={async () => { if (!window.confirm("确定清空全部缓存（包括收藏钉住项）吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: true }); setCacheStatus(status); }}>清空全部</button></div></section>
+          <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。试听缓存独立限制为 256 MiB，并按最近使用自动淘汰。</p><dl><div><dt>完整歌曲</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>试听缓存</dt><dd>{previewCacheStatus ? `${formatBytes(previewCacheStatus.totalBytes)} · ${previewCacheStatus.entryCount} 项 / ${formatBytes(previewCacheStatus.limitBytes)}` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>完整歌曲上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => { cacheLimitDirtyRef.current = true; setCacheLimitGiB(event.target.value); }} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={async () => { const status = await invoke<PreviewCacheStatus>("preview_cache_clear"); setPreviewCacheStatus(status); setMessage("试听缓存已清理。"); }}>清理试听</button><button onClick={async () => { if (!window.confirm("确定清理所有未收藏缓存吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: false }); setCacheStatus(status); }}>清未收藏</button><button className="danger" onClick={async () => { if (!window.confirm("确定清空全部缓存（包括收藏钉住项）吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: true }); setCacheStatus(status); }}>清空全部</button></div></section>
           <section className="settings-card diagnostic-log-settings">
             <div className="diagnostic-log-heading">
               <div>

@@ -4,6 +4,7 @@ use gx_metadata::CatalogTrack;
 use tauri::{AppHandle, Manager, WebviewWindow};
 
 use crate::diagnostic_log::record_diagnostic;
+use crate::preview_cache::{PreviewCacheStatus, PreviewCacheStore};
 use crate::require_window;
 use crate::source_runtime::{MAX_RUNTIME_PAYLOAD_BYTES, ensure_json_size};
 
@@ -42,6 +43,24 @@ pub fn cache_status(
 ) -> Result<CacheStatus, String> {
     require_window(&window, "main")?;
     Ok(cache.status())
+}
+
+#[tauri::command]
+pub fn preview_cache_status(
+    window: WebviewWindow,
+    cache: tauri::State<'_, PreviewCacheStore>,
+) -> Result<PreviewCacheStatus, String> {
+    require_window(&window, "main")?;
+    Ok(cache.status())
+}
+
+#[tauri::command]
+pub fn preview_cache_clear(
+    window: WebviewWindow,
+    cache: tauri::State<'_, PreviewCacheStore>,
+) -> Result<PreviewCacheStatus, String> {
+    require_window(&window, "main")?;
+    cache.clear()
 }
 
 #[tauri::command]

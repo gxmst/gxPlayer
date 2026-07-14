@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CatalogTrack } from "../types";
 import { TextPlaylistImportDialog } from "./TextPlaylistImportDialog";
@@ -21,6 +21,23 @@ function track(title: string): CatalogTrack {
 
 describe("TextPlaylistImportDialog", () => {
   afterEach(() => cleanup());
+
+  it("focuses the text input and closes through the shared dialog", async () => {
+    const onClose = vi.fn();
+    render(
+      <TextPlaylistImportDialog
+        open
+        onClose={onClose}
+        onEnqueue={() => undefined}
+        search={async () => []}
+        delayMs={0}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByLabelText("歌曲列表")).toHaveFocus());
+    fireEvent.click(screen.getByRole("button", { name: "关闭对话框" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
 
   it("matches rows and only enqueues after explicit confirmation", async () => {
     const onEnqueue = vi.fn();
@@ -133,5 +150,74 @@ describe("TextPlaylistImportDialog", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "确认加入队列（1 首）" }));
     await waitFor(() => expect(onEnqueue).toHaveBeenCalledWith([alternate]));
+  });
+
+  it("locks an enqueue submission against closing and same-tick double activation", async () => {
+    let resolveEnqueue!: () => void;
+    const onEnqueue = vi.fn(() => new Promise<void>((resolve) => { resolveEnqueue = resolve; }));
+    const onClose = vi.fn();
+    render(
+      <TextPlaylistImportDialog
+        open
+        onClose={onClose}
+        onEnqueue={onEnqueue}
+        search={async (query) => [track(query)]}
+        delayMs={0}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("歌曲列表"), { target: { value: "待加入歌曲" } });
+    fireEvent.click(screen.getByRole("button", { name: "开始匹配" }));
+    await waitFor(() => expect(screen.getByText("匹配完成")).toBeInTheDocument());
+
+    const enqueueButton = screen.getByRole("button", { name: "确认加入队列（1 首）" });
+    act(() => {
+      enqueueButton.click();
+      enqueueButton.click();
+    });
+
+    expect(onEnqueue).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "关闭对话框" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "关闭" })).toBeDisabled();
+    fireEvent.keyDown(document, { key: "Escape" });
+    const backdrop = document.querySelector<HTMLElement>(".modal-backdrop");
+    expect(backdrop).not.toBeNull();
+    fireEvent.mouseDown(backdrop!);
+    expect(onClose).not.toHaveBeenCalled();
+
+    await act(async () => { resolveEnqueue(); });
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it("locks unmatched export against same-tick double activation and keeps errors in the dialog", async () => {
+    let rejectExport!: (reason: unknown) => void;
+    const onExportUnmatched = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectExport = reject; }));
+    render(
+      <TextPlaylistImportDialog
+        open
+        onClose={() => undefined}
+        onEnqueue={() => undefined}
+        onExportUnmatched={onExportUnmatched}
+        search={async () => []}
+        delayMs={0}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("歌曲列表"), { target: { value: "没有匹配" } });
+    fireEvent.click(screen.getByRole("button", { name: "开始匹配" }));
+    await waitFor(() => expect(screen.getByText("匹配完成")).toBeInTheDocument());
+
+    const exportButton = screen.getByRole("button", { name: "导出未匹配（1 行）" });
+    act(() => {
+      exportButton.click();
+      exportButton.click();
+    });
+    expect(onExportUnmatched).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "关闭对话框" })).toBeDisabled();
+
+    await act(async () => { rejectExport(new Error("导出目标不可写")); });
+    expect(await screen.findByRole("alert")).toHaveTextContent("导出目标不可写");
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "关闭对话框" })).toBeEnabled();
   });
 });

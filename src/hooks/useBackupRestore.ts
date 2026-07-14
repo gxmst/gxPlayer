@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import {
-  formatRestoreConfirmation,
   parseBackupText,
   type ApplicationBackupPayload,
   type BackupRestorePreview,
@@ -17,18 +16,14 @@ const defaultBackupInvoke: BackupInvoke = (command, args) => invoke<BackupRestor
 
 type UseBackupRestoreOptions = {
   backupText: string;
-  onRestored: () => Promise<void>;
   onMessage: (message: string, isError?: boolean) => void;
   invokeCommand?: BackupInvoke;
-  confirmRestore?: (message: string) => boolean;
 };
 
 export function useBackupRestore({
   backupText,
-  onRestored,
   onMessage,
   invokeCommand = defaultBackupInvoke,
-  confirmRestore = (message) => window.confirm(message),
 }: UseBackupRestoreOptions) {
   const [preview, setPreview] = useState<BackupRestorePreview | null>(null);
   const [busy, setBusy] = useState<BackupRestoreBusy>(null);
@@ -71,29 +66,23 @@ export function useBackupRestore({
   const restore = useCallback(async () => {
     if (
       operationLockedRef.current
-      || !preview
-      || previewedTextRef.current !== backupText
-    ) return;
-    operationLockedRef.current = true;
-    if (!confirmRestore(formatRestoreConfirmation(preview))) {
-      operationLockedRef.current = false;
-      return;
+    ) return null;
+    if (!preview || previewedTextRef.current !== backupText) {
+      throw new Error("备份内容尚未通过当前版本校验，请先重新检查备份。");
     }
+    operationLockedRef.current = true;
     setBusy("restore");
     try {
       const backup = parseBackupText(backupText);
       const restoredPreview = await invokeCommand("backup_restore_atomic", { backup });
       previewedTextRef.current = backupText;
       setPreview(restoredPreview);
-      await onRestored();
-      onMessage("备份已完整恢复。");
-    } catch (error) {
-      onMessage(String(error), true);
+      return restoredPreview;
     } finally {
       operationLockedRef.current = false;
       setBusy(null);
     }
-  }, [backupText, confirmRestore, invokeCommand, onMessage, onRestored, preview]);
+  }, [backupText, invokeCommand, preview]);
 
   return { preview, busy, inspect, restore, resetPreview };
 }

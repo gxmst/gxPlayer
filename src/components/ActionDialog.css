@@ -1,0 +1,30 @@
+.action-dialog__message {
+  display: grid;
+  gap: 5px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--error-solid) 38%, var(--soft-border));
+  border-radius: var(--radius-sm);
+  color: var(--error-fg);
+  background: color-mix(in srgb, var(--error-solid) 8%, var(--control-bg));
+}
+
+.action-dialog__message p,
+.action-dialog__success {
+  margin: 0;
+  line-height: 1.55;
+}
+
+.action-dialog__message p {
+  color: var(--text-mute);
+}
+
+.action-dialog__message--validation,
+.action-dialog__message--transient {
+  border-color: color-mix(in srgb, var(--warning-solid) 38%, var(--soft-border));
+  color: var(--warning-fg);
+  background: color-mix(in srgb, var(--warning-solid) 8%, var(--control-bg));
+}
+
+.action-dialog__success {
+  color: var(--text-hi);
+}

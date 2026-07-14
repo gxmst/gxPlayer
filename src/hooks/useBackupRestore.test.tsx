@@ -26,8 +26,6 @@ describe("useBackupRestore", () => {
     const { result } = renderHook(() => useBackupRestore({
       backupText: BACKUP_TEXT,
       invokeCommand,
-      confirmRestore: vi.fn(() => true),
-      onRestored: vi.fn(async () => undefined),
       onMessage,
     }));
 
@@ -43,18 +41,14 @@ describe("useBackupRestore", () => {
     expect(result.current.preview).toEqual({ trackCount: 8, playlistCount: 2, sourceCount: 1 });
   });
 
-  it("requires confirmation and locks duplicate atomic restores", async () => {
+  it("locks duplicate atomic restores and returns the restored preview", async () => {
     const pendingRestore = deferred<BackupRestorePreview>();
     const invokeCommand = vi.fn((command: string) => command === "backup_preview_restore"
       ? Promise.resolve({ trackCount: 8, playlistCount: 2, sourceCount: 1 })
       : pendingRestore.promise);
-    const confirmRestore = vi.fn(() => true);
-    const onRestored = vi.fn(async () => undefined);
     const { result } = renderHook(() => useBackupRestore({
       backupText: BACKUP_TEXT,
       invokeCommand,
-      confirmRestore,
-      onRestored,
       onMessage: vi.fn(),
     }));
 
@@ -65,11 +59,28 @@ describe("useBackupRestore", () => {
     });
 
     expect(result.current.busy).toBe("restore");
-    expect(confirmRestore).toHaveBeenCalledTimes(1);
     expect(invokeCommand.mock.calls.filter(([command]) => command === "backup_restore_atomic")).toHaveLength(1);
 
     await act(async () => pendingRestore.resolve({ trackCount: 8, playlistCount: 2, sourceCount: 1 }));
     expect(result.current.busy).toBeNull();
-    expect(onRestored).toHaveBeenCalledTimes(1);
+    expect(result.current.preview).toEqual({ trackCount: 8, playlistCount: 2, sourceCount: 1 });
+  });
+
+  it("propagates atomic restore failures so the action dialog can classify and retry", async () => {
+    const invokeCommand = vi.fn((command: string) => command === "backup_preview_restore"
+      ? Promise.resolve({ trackCount: 1, playlistCount: 0, sourceCount: 0 })
+      : Promise.reject(new Error("source backup is corrupt")));
+    const onMessage = vi.fn();
+    const { result } = renderHook(() => useBackupRestore({
+      backupText: BACKUP_TEXT,
+      invokeCommand,
+      onMessage,
+    }));
+
+    await act(async () => result.current.inspect());
+    await expect(act(async () => result.current.restore())).rejects.toThrow("source backup is corrupt");
+
+    expect(result.current.busy).toBeNull();
+    expect(onMessage).not.toHaveBeenCalledWith(expect.stringContaining("corrupt"), true);
   });
 });

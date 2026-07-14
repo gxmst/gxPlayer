@@ -8,6 +8,8 @@ import "@fontsource-variable/geist-mono";
 import "@fontsource-variable/noto-sans-sc";
 import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
+import { useActionDialog, type ActionErrorClassifier } from "./components/ActionDialog";
+import { Dialog } from "./components/Dialog";
 import { QueuePanel, type QueueAvailabilityStatus } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
 import { TextPlaylistImportDialog } from "./components/TextPlaylistImportDialog";
@@ -42,6 +44,7 @@ import {
   type QualityPreference,
 } from "./lib/playlistPersistence";
 import { formatFailureMessage } from "./lib/resolveErrors";
+import { formatRestoreConfirmation } from "./lib/backupRestore";
 import {
   STARTED,
   nextOptionIndex,
@@ -137,6 +140,25 @@ function isMetadataCancellation(error: unknown): boolean {
   const message = String(error).toLowerCase();
   return message.includes("cancel") || message.includes("取消");
 }
+
+const classifyUiActionError: ActionErrorClassifier = (error) => {
+  const message = (error instanceof Error ? error.message : String(error)).trim() || "操作未能完成。";
+  const normalized = message.toLowerCase();
+  if ((error instanceof DOMException && error.name === "AbortError")
+    || normalized === "cancelled"
+    || normalized === "canceled"
+    || normalized === "已取消") {
+    return { kind: "cancelled", message };
+  }
+  if (error instanceof SyntaxError
+    || /invalid|validation|必须|不能为空|格式|校验|尚未通过/.test(normalized)) {
+    return { kind: "validation", message };
+  }
+  if (/timeout|timed out|temporar|network|connection|429|502|503|504|超时|网络|稍后|暂时/.test(normalized)) {
+    return { kind: "transient", message };
+  }
+  return { kind: "permanent", message };
+};
 
 function catalogKey(track: CatalogTrack): string {
   return `${track.providerId}:${track.providerTrackId}`;
@@ -541,6 +563,7 @@ function ArtistLinks({ artist, onSelect, className = "", fallback = "未知歌�
 }
 
 function App() {
+  const actionDialog = useActionDialog();
   const windowActive = useWindowActivity();
   const isNarrow = useNarrowLayout();
   const [restoredPlaylistSession] = useState(loadPlaylistSession);
@@ -590,8 +613,10 @@ function App() {
   const [appPreferences, setAppPreferences] = useState<AppPreferences | null>(null);
   const [closeNoticeOpen, setCloseNoticeOpen] = useState(false);
   const [closeNoticeBusy, setCloseNoticeBusy] = useState(false);
+  const [closeNoticeError, setCloseNoticeError] = useState<string | null>(null);
   const [outputDeviceFallback, setOutputDeviceFallback] = useState<OutputDeviceFallbackEvent | null>(null);
   const closeNoticeConfirmRef = useRef<HTMLButtonElement>(null);
+  const closeNoticeBusyRef = useRef(false);
   const [qualityPreference, setQualityPreference] = useState<QualityPreference>(() => {
     const stored = window.localStorage.getItem("gxplayer.defaultQuality");
     return QUALITY_OPTIONS.some((option) => option.value === stored) ? stored as QualityPreference : "auto";
@@ -618,6 +643,9 @@ function App() {
   const [sourceConfigDraft, setSourceConfigDraft] = useState<SourceConfigDraft | null>(null);
   const [sourceConfigRevealed, setSourceConfigRevealed] = useState(false);
   const [sourceConfigBusy, setSourceConfigBusy] = useState(false);
+  const [sourceConfigError, setSourceConfigError] = useState<string | null>(null);
+  const sourceConfigBusyRef = useRef(false);
+  const sourceConfigInitialFocusRef = useRef<HTMLInputElement>(null);
   const [backupText, setBackupText] = useState("");
   const [diagnosticLogStatus, setDiagnosticLogStatus] = useState<DiagnosticLogStatus | null>(null);
   const [diagnosticLogEntries, setDiagnosticLogEntries] = useState<DiagnosticLogEntry[]>([]);
@@ -625,6 +653,8 @@ function App() {
   const diagnosticLogGenerationRef = useRef(0);
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
   const [previewCacheStatus, setPreviewCacheStatus] = useState<PreviewCacheStatus | null>(null);
+  const [cacheMaintenanceBusy, setCacheMaintenanceBusy] = useState<"choose" | "limit" | "reset" | "preview" | null>(null);
+  const cacheMaintenanceBusyRef = useRef(false);
   const [cacheLimitGiB, setCacheLimitGiB] = useState("5");
   const cacheLimitDirtyRef = useRef(false);
   const [onlineFavorites, setOnlineFavorites] = useState<CatalogTrack[]>([]);
@@ -850,6 +880,26 @@ function App() {
     }
   };
 
+  const resolveCloseNotice = async (action: "cancel" | "confirm") => {
+    if (closeNoticeBusyRef.current) return;
+    closeNoticeBusyRef.current = true;
+    setCloseNoticeBusy(true);
+    setCloseNoticeError(null);
+    try {
+      if (action === "cancel") {
+        await invoke("app_close_notice_cancel");
+      } else {
+        setAppPreferences(await invoke<AppPreferences>("app_close_notice_confirm"));
+      }
+      setCloseNoticeOpen(false);
+    } catch (error) {
+      setCloseNoticeError(String(error).slice(0, 240) || "关闭行为设置失败");
+    } finally {
+      closeNoticeBusyRef.current = false;
+      setCloseNoticeBusy(false);
+    }
+  };
+
   const beginDiagnosticLogOperation = () => {
     diagnosticLogGenerationRef.current += 1;
     return diagnosticLogGenerationRef.current;
@@ -1031,7 +1081,10 @@ function App() {
   useEffect(() => {
     let disposed = false;
     const closeUnlisten = listen("gx-close-to-tray-notice-requested", () => {
-      if (!disposed) setCloseNoticeOpen(true);
+      if (!disposed) {
+        setCloseNoticeError(null);
+        setCloseNoticeOpen(true);
+      }
     });
     const fallbackUnlisten = listen<OutputDeviceFallbackEvent>("gx-output-device-fallback", (event) => {
       if (disposed) return;
@@ -1045,22 +1098,6 @@ function App() {
       void fallbackUnlisten.then((stop) => stop());
     };
   }, []);
-
-  useEffect(() => {
-    if (!closeNoticeOpen) return;
-    const frame = window.requestAnimationFrame(() => closeNoticeConfirmRef.current?.focus());
-    const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key !== "Escape" || closeNoticeBusy) return;
-      event.preventDefault();
-      setCloseNoticeOpen(false);
-      void invoke("app_close_notice_cancel").catch((error) => setMessage(String(error), true));
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.cancelAnimationFrame(frame);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [closeNoticeBusy, closeNoticeOpen]);
 
   useEffect(() => {
     if (!playlistSessionReady) return;
@@ -2113,20 +2150,26 @@ function App() {
     setMessage(`已添加 ${entries.length} 首缓存歌曲到队列`);
   };
 
-  const removeCacheEntry = async (entry: CacheEntryView) => {
-    if (!window.confirm(`确定删除《${entry.title}》的 ${entry.quality} 缓存吗？`)) return;
-    try {
-      const status = await invoke<CacheStatus>("cache_remove_entry", {
+  const removeCacheEntry = (entry: CacheEntryView) => {
+    actionDialog.openAction({
+      title: "删除缓存",
+      description: `确定删除《${entry.title}》的 ${entry.quality} 缓存吗？`,
+      confirmLabel: "删除缓存",
+      busyLabel: "正在删除…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke<CacheStatus>("cache_remove_entry", {
         providerId: entry.providerId,
         providerTrackId: entry.providerTrackId,
         quality: entry.quality,
-      });
-      setCacheStatus(status);
-      await refreshCache();
-      setMessage(`已删除缓存《${entry.title}》· ${entry.quality}`);
-    } catch (error) {
-      setMessage(String(error), true);
-    }
+      }),
+      afterSuccess: async (status) => {
+        setCacheStatus(status);
+        await refreshCache();
+        setMessage(`已删除缓存《${entry.title}》· ${entry.quality}`);
+      },
+    });
   };
 
   const toggleCachePinned = async (entry: CacheEntryView) => {
@@ -2204,15 +2247,7 @@ function App() {
     }
   };
 
-  const clearPlaylist = async () => {
-    if (playlistRef.current.length && !window.confirm("确定清空整个播放队列吗？")) return;
-    if (activeResolveRequestRef.current) cancelResolve();
-    try {
-      await invoke("player_clear_queue");
-    } catch (error) {
-      setMessage(String(error), true);
-      return;
-    }
+  const finishClearingPlaylist = () => {
     setPlaylist([]);
     setPlaylistIndex(null);
     localQueueAvailabilityGenerationRef.current += 1;
@@ -2222,6 +2257,28 @@ function App() {
     setCurrentQuality(null);
     clearLyrics();
     setMessage("队列已清空");
+  };
+
+  const clearPlaylist = () => {
+    const runClear = async () => {
+      if (activeResolveRequestRef.current) cancelResolve();
+      await invoke("player_clear_queue");
+    };
+    if (!playlistRef.current.length) {
+      void runClear().then(finishClearingPlaylist).catch((error) => setMessage(String(error), true));
+      return;
+    }
+    actionDialog.openAction({
+      title: "清空播放队列",
+      description: `队列中的 ${playlistRef.current.length} 首歌曲都会移除，当前播放也会停止。`,
+      confirmLabel: "清空队列",
+      busyLabel: "正在清空…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: runClear,
+      afterSuccess: finishClearingPlaylist,
+    });
   };
 
   const reorderPlaylist = async (from: number, to: number) => {
@@ -2334,21 +2391,24 @@ function App() {
     }
   };
 
-  const clearDiagnosticLog = async () => {
-    if (diagnosticLogBusy || !window.confirm("确定清空全部诊断日志吗？此操作无法撤销。")) return;
-    const generation = beginDiagnosticLogOperation();
-    setDiagnosticLogBusy("clear");
-    try {
-      await invoke("diagnostic_log_clear");
-      if (!isCurrentDiagnosticLogOperation(generation)) return;
-      setDiagnosticLogEntries([]);
-      await refreshDiagnosticLog(generation);
-      if (isCurrentDiagnosticLogOperation(generation)) setMessage("诊断日志已清空。");
-    } catch (error) {
-      if (isCurrentDiagnosticLogOperation(generation)) setMessage(String(error), true);
-    } finally {
-      if (isCurrentDiagnosticLogOperation(generation)) setDiagnosticLogBusy(null);
-    }
+  const clearDiagnosticLog = () => {
+    if (diagnosticLogBusy) return;
+    actionDialog.openAction({
+      title: "清空诊断日志",
+      description: "确定清空全部诊断日志吗？此操作无法撤销。",
+      confirmLabel: "清空日志",
+      busyLabel: "正在清空…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke("diagnostic_log_clear"),
+      afterSuccess: async () => {
+        const generation = beginDiagnosticLogOperation();
+        setDiagnosticLogEntries([]);
+        await refreshDiagnosticLog(generation);
+        if (isCurrentDiagnosticLogOperation(generation)) setMessage("诊断日志已清空。");
+      },
+    });
   };
 
   const importBackupFile = async () => {
@@ -2363,29 +2423,49 @@ function App() {
     setMessage("已读入备份文件，确认无误后点击「恢复备份」。");
   };
 
-  const removeSelectedCache = async () => {
+  const removeSelectedCache = () => {
     if (!selectedCacheKeys.length) return;
-    if (!window.confirm(`确定删除选中的 ${selectedCacheKeys.length} 条缓存吗？`)) return;
     const keys = selectedCacheKeys.map((key) => {
       const [providerId, providerTrackId, quality] = key.split("\u0000");
       return { providerId, providerTrackId, quality };
     });
-    const status = await invoke<CacheStatus>("cache_remove_entries", { keys });
-    setCacheStatus(status);
-    setSelectedCacheKeys([]);
-    await refreshCache();
-    setMessage(`已删除 ${keys.length} 条缓存`);
+    actionDialog.openAction({
+      title: "删除所选缓存",
+      description: `确定删除选中的 ${keys.length} 条缓存吗？`,
+      confirmLabel: `删除 ${keys.length} 条`,
+      busyLabel: "正在删除…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke<CacheStatus>("cache_remove_entries", { keys }),
+      afterSuccess: async (status) => {
+        setCacheStatus(status);
+        setSelectedCacheKeys([]);
+        await refreshCache();
+        setMessage(`已删除 ${keys.length} 条缓存`);
+      },
+    });
   };
 
-  const removeCacheByQuality = async (quality: string) => {
-    if (!window.confirm(`确定清理所有未钉住的 ${quality} 缓存吗？`)) return;
-    const status = await invoke<CacheStatus>("cache_remove_by_quality", {
-      quality,
-      includePinned: false,
+  const removeCacheByQuality = (quality: string) => {
+    actionDialog.openAction({
+      title: `清理 ${quality} 缓存`,
+      description: `确定清理所有未钉住的 ${quality} 缓存吗？收藏钉住项会保留。`,
+      confirmLabel: "确认清理",
+      busyLabel: "正在清理…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke<CacheStatus>("cache_remove_by_quality", {
+        quality,
+        includePinned: false,
+      }),
+      afterSuccess: async (status) => {
+        setCacheStatus(status);
+        await refreshCache();
+        setMessage(`已清理未钉住的 ${quality} 缓存`);
+      },
     });
-    setCacheStatus(status);
-    await refreshCache();
-    setMessage(`已清理未钉住的 ${quality} 缓存`);
   };
 
   // Engine always stops on natural end (no auto-advance). Frontend picks the next index
@@ -2571,19 +2651,30 @@ function App() {
     }
   };
 
-  const removeSource = async (source: ListedSource) => {
+  const removeSource = (source: ListedSource) => {
     if (sourceActionBusy || sourceOrderBusy) return;
-    if (!window.confirm(`确定删除音源“${source.metadata.name || source.id}”吗？`)) return;
-    setSourceActionBusy({ id: source.id, kind: "remove" });
-    try {
-      await invoke("source_remove", { id: source.id });
-      await refreshSources();
-      setMessage(`已删除音源“${source.metadata.name || source.id}”。`);
-    } catch (error) {
-      setMessage(String(error), true);
-    } finally {
-      setSourceActionBusy(null);
-    }
+    const name = source.metadata.name || source.id;
+    actionDialog.openAction({
+      title: "删除音源",
+      description: `确定删除音源“${name}”吗？脚本及其本地配置会一并移除。`,
+      confirmLabel: "删除音源",
+      busyLabel: "正在删除…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: async () => {
+        setSourceActionBusy({ id: source.id, kind: "remove" });
+        try {
+          await invoke("source_remove", { id: source.id });
+        } finally {
+          setSourceActionBusy(null);
+        }
+      },
+      afterSuccess: async () => {
+        await refreshSources();
+        setMessage(`已删除音源“${name}”。`);
+      },
+    });
   };
 
   const openSourceConfig = async (source: ListedSource) => {
@@ -2598,6 +2689,7 @@ function App() {
         updatesEnabled: source.updatesEnabled,
       });
       setSourceConfigRevealed(false);
+      setSourceConfigError(null);
     } catch (error) {
       setMessage(String(error), true);
     } finally {
@@ -2606,14 +2698,18 @@ function App() {
   };
 
   const closeSourceConfig = () => {
+    if (sourceConfigBusyRef.current) return;
     setConfigSource(null);
     setSourceConfigDraft(null);
     setSourceConfigRevealed(false);
+    setSourceConfigError(null);
   };
 
   const saveSourceConfig = async () => {
-    if (!configSource || !sourceConfigDraft) return;
+    if (!configSource || !sourceConfigDraft || sourceConfigBusyRef.current) return;
+    sourceConfigBusyRef.current = true;
     setSourceConfigBusy(true);
+    setSourceConfigError(null);
     try {
       const config: unknown = JSON.parse(sourceConfigDraft.json);
       if (!config || typeof config !== "object" || Array.isArray(config)) {
@@ -2626,13 +2722,16 @@ function App() {
       if (sourceConfigDraft.updatesEnabled !== configSource.updatesEnabled) {
         await invoke("source_set_updates_enabled", { id: configSource.id, enabled: sourceConfigDraft.updatesEnabled });
       }
-      closeSourceConfig();
       await refreshSources();
       setMessage(sourceConfigDraft.enabled ? "音源设置已保存并应用。" : "音源设置已保存；该音源当前不参与音源调用。");
+      setConfigSource(null);
+      setSourceConfigDraft(null);
+      setSourceConfigRevealed(false);
     } catch (error) {
       const detail = error instanceof SyntaxError ? `配置 JSON 格式有误：${error.message}` : String(error);
-      setMessage(detail, true);
+      setSourceConfigError(detail.slice(0, 240) || "音源设置保存失败");
     } finally {
+      sourceConfigBusyRef.current = false;
       setSourceConfigBusy(false);
     }
   };
@@ -2718,25 +2817,44 @@ function App() {
     setMessage(favorite ? "已收藏；现有缓存已钉住，未缓存时会在自然播放完成后自动钉住。" : "已取消收藏；对应缓存恢复为可淘汰状态。");
   };
 
-  const chooseCacheDirectory = async () => {
+  const runCacheMaintenance = async (
+    kind: "choose" | "limit" | "reset" | "preview",
+    operation: () => Promise<void>,
+  ) => {
+    if (cacheMaintenanceBusyRef.current) return;
+    cacheMaintenanceBusyRef.current = true;
+    setCacheMaintenanceBusy(kind);
+    try {
+      await operation();
+    } catch (error) {
+      setMessage(String(error), true);
+    } finally {
+      cacheMaintenanceBusyRef.current = false;
+      setCacheMaintenanceBusy(null);
+    }
+  };
+
+  const chooseCacheDirectory = () => runCacheMaintenance("choose", async () => {
     const selected = await open({ multiple: false, directory: true });
     if (!selected || Array.isArray(selected)) return;
     const status = await invoke<CacheStatus>("cache_set_directory", { path: selected });
     setCacheStatus(status);
     setMessage("缓存目录已切换；已有缓存不会自动迁移。");
-  };
+  });
 
-  const saveCacheLimit = async () => {
+  const saveCacheLimit = () => {
     const gib = Number(cacheLimitGiB);
     if (!Number.isFinite(gib) || gib <= 0) {
       setMessage("缓存上限必须是正数。", true);
       return;
     }
-    const status = await invoke<CacheStatus>("cache_set_limit", { limitBytes: Math.round(gib * 1024 * 1024 * 1024) });
-    setCacheStatus(status);
-    cacheLimitDirtyRef.current = false;
-    setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
-    setMessage("缓存上限已保存，超限未收藏条目已按 LRU 清理。");
+    return runCacheMaintenance("limit", async () => {
+      const status = await invoke<CacheStatus>("cache_set_limit", { limitBytes: Math.round(gib * 1024 * 1024 * 1024) });
+      setCacheStatus(status);
+      cacheLimitDirtyRef.current = false;
+      setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
+      setMessage("缓存上限已保存，超限未收藏条目已按 LRU 清理。");
+    });
   };
 
   const createPlaylist = async () => {
@@ -2816,11 +2934,26 @@ function App() {
     resetPreview: resetBackupRestorePreview,
   } = useBackupRestore({
     backupText,
-    onRestored: async () => {
-      await Promise.all([refreshLibrary(), refreshSources()]);
-    },
     onMessage: setMessage,
   });
+
+  const requestBackupRestore = () => {
+    if (!backupRestorePreview || backupRestoreBusy) return;
+    actionDialog.openAction({
+      title: "覆盖并恢复备份",
+      description: formatRestoreConfirmation(backupRestorePreview),
+      confirmLabel: "确认恢复",
+      busyLabel: "正在原子恢复…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: restoreBackup,
+      afterSuccess: async () => {
+        await Promise.all([refreshLibrary(), refreshSources()]);
+        setMessage("备份已完整恢复。");
+      },
+    });
+  };
 
   const commitSeek = async (seconds: number) => {
     if (!currentQueueItem) return;
@@ -3113,6 +3246,78 @@ function App() {
     </div>
   );
 
+  const requestClearHistory = () => {
+    actionDialog.openAction({
+      title: "清空播放历史",
+      description: `确定清空全部 ${historyEntries.length} 条播放记录吗？`,
+      confirmLabel: "清空历史",
+      busyLabel: "正在清空…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke("library_clear_history"),
+      afterSuccess: async () => {
+        await refreshHistory();
+        setMessage("播放历史已清空。");
+      },
+    });
+  };
+
+  const requestDeleteActivePlaylist = () => {
+    const playlistToDelete = activePlaylist;
+    if (!playlistToDelete) return;
+    actionDialog.openAction({
+      title: "删除歌单",
+      description: `确定删除歌单“${playlistToDelete.name}”吗？歌曲文件和缓存不会被删除。`,
+      confirmLabel: "删除歌单",
+      busyLabel: "正在删除…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke("library_delete_playlist", { playlistId: playlistToDelete.id }),
+      afterSuccess: async () => {
+        navigateTo("discovery");
+        setActivePlaylist(null);
+        setPlaylistItems([]);
+        await refreshLibrary();
+        setMessage(`已删除歌单“${playlistToDelete.name}”。`);
+      },
+    });
+  };
+
+  const requestClearCache = (includePinned: boolean) => {
+    actionDialog.openAction({
+      title: includePinned ? "清空全部缓存" : "清理未收藏缓存",
+      description: includePinned
+        ? "确定清空全部在线播放缓存吗？收藏钉住项也会被删除，此操作无法撤销。"
+        : "确定清理所有未收藏缓存吗？收藏钉住项会保留。",
+      confirmLabel: includePinned ? "清空全部" : "确认清理",
+      busyLabel: "正在清理…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke<CacheStatus>("cache_clear", { includePinned }),
+      afterSuccess: async (status) => {
+        setCacheStatus(status);
+        await refreshCache();
+        setMessage(includePinned ? "全部在线播放缓存已清空。" : "未收藏缓存已清理。");
+      },
+    });
+  };
+
+  const resetCacheDirectory = () => runCacheMaintenance("reset", async () => {
+    const status = await invoke<CacheStatus>("cache_reset_directory");
+    setCacheStatus(status);
+    await refreshCache();
+    setMessage("已恢复默认缓存目录；旧目录内容未迁移。");
+  });
+
+  const clearPreviewCache = () => runCacheMaintenance("preview", async () => {
+    const status = await invoke<PreviewCacheStatus>("preview_cache_clear");
+    setPreviewCacheStatus(status);
+    setMessage("试听缓存已清理。");
+  });
+
   const displayPlaylist = playlist;
   const displayIndex = playlistIndex;
   const upNext = displayPlaylist.length && displayIndex !== null
@@ -3316,7 +3521,7 @@ function App() {
             eyebrow="HISTORY"
             title="播放历史"
             copy={`${historyEntries.length} 条原始播放记录，连续同曲合并显示为 ${groupedHistoryEntries.length} 行（读取最近 500 条）。`}
-            action={<button type="button" className="danger" onClick={async () => { if (!window.confirm("确定清空全部播放历史吗？")) return; try { await invoke("library_clear_history"); await refreshHistory(); } catch (error) { setMessage(String(error), true); } }}>清空历史</button>}
+            action={<button type="button" className="danger" disabled={!historyEntries.length} onClick={requestClearHistory}>清空历史</button>}
           />
           {historyEntries.length === 0 ? (
             <EmptyState title="还没有播放记录" copy="听歌后会出现在这里，方便找回昨晚那首。" />
@@ -3345,7 +3550,7 @@ function App() {
     }
 
     if (view === "playlist") return (
-      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistItems.length} 首音乐 · 支持本地与已缓存歌曲`} action={activePlaylist ? <button className="danger" onClick={async () => { if (!window.confirm(`确定删除歌单“${activePlaylist.name}”吗？`)) return; try { await invoke("library_delete_playlist", { playlistId: activePlaylist.id }); navigateTo("discovery"); setActivePlaylist(null); setPlaylistItems([]); await refreshLibrary(); } catch (error) { setMessage(String(error), true); } }}>删除歌单</button> : undefined} />{playlistItems.length && activePlaylist ? renderLibraryPlaylistItems(playlistItems, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把本地音乐或已缓存歌曲加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
+      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistItems.length} 首音乐 · 支持本地与已缓存歌曲`} action={activePlaylist ? <button className="danger" onClick={requestDeleteActivePlaylist}>删除歌单</button> : undefined} />{playlistItems.length && activePlaylist ? renderLibraryPlaylistItems(playlistItems, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把本地音乐或已缓存歌曲加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
     );
 
     if (view === "sources") return (
@@ -3427,7 +3632,7 @@ function App() {
               <button type="button" className={miniMode ? "primary" : ""} onClick={() => void toggleMiniMode()}>{miniMode ? "退出迷你" : "迷你模式"}</button>
             </div>
           </section>
-          <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。试听缓存独立限制为 256 MiB，并按最近使用自动淘汰。</p><dl><div><dt>完整歌曲</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>试听缓存</dt><dd>{previewCacheStatus ? `${formatBytes(previewCacheStatus.totalBytes)} · ${previewCacheStatus.entryCount} 项 / ${formatBytes(previewCacheStatus.limitBytes)}` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>完整歌曲上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => { cacheLimitDirtyRef.current = true; setCacheLimitGiB(event.target.value); }} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={async () => { const status = await invoke<PreviewCacheStatus>("preview_cache_clear"); setPreviewCacheStatus(status); setMessage("试听缓存已清理。"); }}>清理试听</button><button onClick={async () => { if (!window.confirm("确定清理所有未收藏缓存吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: false }); setCacheStatus(status); }}>清未收藏</button><button className="danger" onClick={async () => { if (!window.confirm("确定清空全部缓存（包括收藏钉住项）吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: true }); setCacheStatus(status); }}>清空全部</button></div></section>
+          <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。试听缓存独立限制为 256 MiB，并按最近使用自动淘汰。</p><dl><div><dt>完整歌曲</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>试听缓存</dt><dd>{previewCacheStatus ? `${formatBytes(previewCacheStatus.totalBytes)} · ${previewCacheStatus.entryCount} 项 / ${formatBytes(previewCacheStatus.limitBytes)}` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>完整歌曲上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} disabled={Boolean(cacheMaintenanceBusy)} onChange={(event) => { cacheLimitDirtyRef.current = true; setCacheLimitGiB(event.target.value); }} /><button disabled={Boolean(cacheMaintenanceBusy)} onClick={() => void saveCacheLimit()}>{cacheMaintenanceBusy === "limit" ? "正在保存…" : "保存"}</button></div></label><div className="cache-actions"><button disabled={Boolean(cacheMaintenanceBusy)} onClick={() => void chooseCacheDirectory()}>{cacheMaintenanceBusy === "choose" ? "正在选择…" : "选择目录"}</button><button disabled={Boolean(cacheMaintenanceBusy)} onClick={() => void resetCacheDirectory()}>{cacheMaintenanceBusy === "reset" ? "正在恢复…" : "恢复默认"}</button><button disabled={Boolean(cacheMaintenanceBusy)} onClick={() => void clearPreviewCache()}>{cacheMaintenanceBusy === "preview" ? "正在清理…" : "清理试听"}</button><button disabled={Boolean(cacheMaintenanceBusy)} onClick={() => requestClearCache(false)}>清未收藏</button><button className="danger" disabled={Boolean(cacheMaintenanceBusy)} onClick={() => requestClearCache(true)}>清空全部</button></div></section>
           <section className="settings-card diagnostic-log-settings">
             <div className="diagnostic-log-heading">
               <div>
@@ -3483,7 +3688,7 @@ function App() {
               <button type="button" disabled={Boolean(backupRestoreBusy)} onClick={() => void exportBackupFile()}>存为文件…</button>
               <button type="button" disabled={Boolean(backupRestoreBusy)} onClick={() => void importBackupFile()}>从文件读入…</button>
               {backupRestorePreview ? (
-                <button type="button" className="primary" disabled={Boolean(backupRestoreBusy)} onClick={() => void restoreBackup()}>
+                <button type="button" className="primary" disabled={Boolean(backupRestoreBusy)} onClick={requestBackupRestore}>
                   {backupRestoreBusy === "restore" ? "正在恢复…" : "确认覆盖并恢复"}
                 </button>
               ) : (
@@ -3807,60 +4012,55 @@ function App() {
       <main className="content">{renderView()}</main>
 
       {configSource && sourceConfigDraft && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSourceConfig(); }}>
-          <section className="config-modal" role="dialog" aria-modal="true" aria-label={`${configSource.metadata.name} 音源配置`}>
-            <div className="section-heading">
-              <div><p className="eyebrow">SOURCE SETTINGS</p><h3>{configSource.metadata.name || "音源设置"}</h3><p>配置结构由音源脚本定义；应用不会猜测或改写其中字段。</p></div>
-              <button onClick={closeSourceConfig} aria-label="关闭配置">×</button>
-            </div>
+        <Dialog
+          open
+          eyebrow="SOURCE SETTINGS"
+          title={configSource.metadata.name || "音源设置"}
+          description="配置结构由音源脚本定义；应用不会猜测或改写其中字段。"
+          busy={sourceConfigBusy}
+          initialFocusRef={sourceConfigInitialFocusRef}
+          onRequestClose={closeSourceConfig}
+          actions={<>
+            <button type="button" disabled={sourceConfigBusy} onClick={closeSourceConfig}>取消</button>
+            <button type="button" className="primary" disabled={sourceConfigBusy} onClick={() => void saveSourceConfig()}>{sourceConfigBusy ? "正在保存…" : "保存并应用"}</button>
+          </>}
+        >
             <div className="config-toggles">
-              <label><span><strong>启用音源</strong><small>禁用后不参与音源调用和自动降级。</small></span><input type="checkbox" checked={sourceConfigDraft.enabled} onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, enabled: event.target.checked })} /></label>
-              <label><span><strong>更新提醒</strong><small>保留现有音源更新提示设置。</small></span><input type="checkbox" checked={sourceConfigDraft.updatesEnabled} onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, updatesEnabled: event.target.checked })} /></label>
+              <label><span><strong>启用音源</strong><small>禁用后不参与音源调用和自动降级。</small></span><input ref={sourceConfigInitialFocusRef} type="checkbox" checked={sourceConfigDraft.enabled} disabled={sourceConfigBusy} onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, enabled: event.target.checked })} /></label>
+              <label><span><strong>更新提醒</strong><small>保留现有音源更新提示设置。</small></span><input type="checkbox" checked={sourceConfigDraft.updatesEnabled} disabled={sourceConfigBusy} onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, updatesEnabled: event.target.checked })} /></label>
             </div>
             <div className="config-json-section">
               <div><strong>完整配置 JSON</strong><p>可能包含密钥等敏感内容，默认隐藏；显示后请勿截图或分享。</p></div>
-              <button type="button" aria-expanded={sourceConfigRevealed} onClick={() => setSourceConfigRevealed((revealed) => !revealed)}>{sourceConfigRevealed ? "隐藏配置" : "显示配置"}</button>
+              <button type="button" disabled={sourceConfigBusy} aria-expanded={sourceConfigRevealed} onClick={() => setSourceConfigRevealed((revealed) => !revealed)}>{sourceConfigRevealed ? "隐藏配置" : "显示配置"}</button>
             </div>
             {sourceConfigRevealed && (
               <label className="config-json-editor">
                 <span>按 JSON 对象原样保存</span>
-                <textarea className="config-editor" value={sourceConfigDraft.json} autoComplete="off" spellCheck={false} onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, json: event.target.value })} />
+                <textarea className="config-editor" value={sourceConfigDraft.json} disabled={sourceConfigBusy} autoComplete="off" spellCheck={false} onChange={(event) => setSourceConfigDraft({ ...sourceConfigDraft, json: event.target.value })} />
               </label>
             )}
-            <div className="modal-actions"><button onClick={closeSourceConfig}>取消</button><button className="primary" disabled={sourceConfigBusy} onClick={() => void saveSourceConfig()}>{sourceConfigBusy ? "正在保存…" : "保存并应用"}</button></div>
-          </section>
-        </div>
+            {sourceConfigError && <p className="dialog-error" role="alert">{sourceConfigError}</p>}
+        </Dialog>
       )}
 
-      {closeNoticeOpen && (
-        <div className="modal-backdrop" role="presentation">
-          <section className="config-modal close-to-tray-modal" role="dialog" aria-modal="true" aria-labelledby="close-to-tray-title" aria-describedby="close-to-tray-copy">
-            <div className="section-heading">
-              <div><p className="eyebrow">BACKGROUND PLAYBACK</p><h3 id="close-to-tray-title">关闭后继续播放</h3></div>
-            </div>
-            <p id="close-to-tray-copy">GXPlayer 关闭后会隐藏到系统托盘，音乐继续播放。左键托盘图标恢复，右键菜单可退出；也可在设置中修改。</p>
-            <div className="modal-actions">
-              <button type="button" disabled={closeNoticeBusy} onClick={() => {
-                setCloseNoticeBusy(true);
-                void invoke("app_close_notice_cancel")
-                  .then(() => setCloseNoticeOpen(false))
-                  .catch((error) => setMessage(String(error), true))
-                  .finally(() => setCloseNoticeBusy(false));
-              }}>暂不关闭</button>
-              <button ref={closeNoticeConfirmRef} type="button" className="primary" disabled={closeNoticeBusy} onClick={() => {
-                setCloseNoticeBusy(true);
-                void invoke<AppPreferences>("app_close_notice_confirm")
-                  .then((preferences) => {
-                    setAppPreferences(preferences);
-                    setCloseNoticeOpen(false);
-                  })
-                  .catch((error) => setMessage(String(error), true))
-                  .finally(() => setCloseNoticeBusy(false));
-              }}>{closeNoticeBusy ? "正在处理…" : "知道了，隐藏到托盘"}</button>
-            </div>
-          </section>
-        </div>
-      )}
+      <Dialog
+        open={closeNoticeOpen}
+        eyebrow="BACKGROUND PLAYBACK"
+        title="关闭后继续播放"
+        description="GXPlayer 关闭后会隐藏到系统托盘，音乐继续播放。左键托盘图标恢复，右键菜单可退出；也可在设置中修改。"
+        size="small"
+        busy={closeNoticeBusy}
+        showClose={false}
+        closeOnBackdrop={false}
+        initialFocusRef={closeNoticeConfirmRef}
+        onRequestClose={() => { void resolveCloseNotice("cancel"); }}
+        actions={<>
+          <button type="button" disabled={closeNoticeBusy} onClick={() => { void resolveCloseNotice("cancel"); }}>暂不关闭</button>
+          <button ref={closeNoticeConfirmRef} type="button" className="primary" disabled={closeNoticeBusy} onClick={() => { void resolveCloseNotice("confirm"); }}>{closeNoticeBusy ? "正在处理…" : "知道了，隐藏到托盘"}</button>
+        </>}
+      >
+        {closeNoticeError && <p className="dialog-error" role="alert">{closeNoticeError}</p>}
+      </Dialog>
 
       <TextPlaylistImportDialog
         open={textPlaylistDialogOpen}
@@ -3869,6 +4069,8 @@ function App() {
         onExportUnmatched={exportUnmatchedTextPlaylist}
         invoke={invoke}
       />
+
+      {actionDialog.dialog}
 
       {(message || (snapshot.error && !engineErrorDismissed)) && (
         <div

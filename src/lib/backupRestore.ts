@@ -1,5 +1,5 @@
 export type ApplicationBackupPayload = {
-  version: 1;
+  version: 1 | 2;
   library: Record<string, unknown>;
   sources: Record<string, unknown>;
 };
@@ -22,11 +22,15 @@ export function parseBackupText(text: string): ApplicationBackupPayload {
     throw new Error("备份内容不是有效的 JSON。");
   }
   if (!isObject(value)) throw new Error("备份内容必须是一个 JSON 对象。");
-  if (value.version !== 1) throw new Error("不支持的备份版本。");
+  if (value.version !== 1 && value.version !== 2) throw new Error("不支持的备份版本。");
   if (!isObject(value.library)) throw new Error("备份中缺少有效的曲库数据。");
   if (!isObject(value.sources)) throw new Error("备份中缺少有效的音源数据。");
+  const expectedLibraryVersion = value.version;
+  if (value.library.version !== expectedLibraryVersion) {
+    throw new Error(`备份容器版本 ${value.version} 与曲库版本不匹配。`);
+  }
   return {
-    version: 1,
+    version: value.version,
     library: value.library,
     sources: value.sources,
   };

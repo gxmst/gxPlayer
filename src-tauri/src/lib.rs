@@ -12,7 +12,10 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindo
 use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine, PlayMode};
 use gx_contracts::ResolvedMediaRequest;
 use gx_dsp::DspSettings;
-use gx_library::{LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistSummary};
+use gx_library::{
+    CachedPlaylistTrack, LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistItem,
+    PlaylistSummary,
+};
 use gx_source::{SourceStore, safe_http};
 
 mod app_preferences;
@@ -468,6 +471,18 @@ fn library_playlist_tracks(
 }
 
 #[tauri::command]
+fn library_playlist_items(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    playlist_id: i64,
+) -> Result<Vec<PlaylistItem>, String> {
+    require_window(&window, "main")?;
+    library
+        .playlist_items(playlist_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn library_add_to_playlist(
     window: WebviewWindow,
     library: tauri::State<LibraryStore>,
@@ -490,6 +505,50 @@ fn library_remove_from_playlist(
     require_window(&window, "main")?;
     library
         .remove_from_playlist(playlist_id, track_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn library_add_cached_to_playlist(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    playlist_id: i64,
+    provider_id: String,
+    provider_track_id: String,
+    quality: String,
+    title: String,
+    artist: String,
+    album: String,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .add_cached_to_playlist(
+            playlist_id,
+            &CachedPlaylistTrack {
+                provider_id,
+                provider_track_id,
+                quality,
+                title,
+                artist,
+                album,
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_remove_cached_from_playlist(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    playlist_id: i64,
+    provider_id: String,
+    provider_track_id: String,
+    quality: String,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .remove_cached_from_playlist(playlist_id, &provider_id, &provider_track_id, &quality)
         .map_err(|error| error.to_string())
 }
 
@@ -1280,8 +1339,11 @@ pub fn run() {
             library_create_playlist,
             library_delete_playlist,
             library_playlist_tracks,
+            library_playlist_items,
             library_add_to_playlist,
             library_remove_from_playlist,
+            library_add_cached_to_playlist,
+            library_remove_cached_from_playlist,
             library_export_backup,
             library_restore_backup,
             library_scan_missing,

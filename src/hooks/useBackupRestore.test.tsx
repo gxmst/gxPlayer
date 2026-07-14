@@ -7,8 +7,8 @@ import type { BackupRestorePreview } from "../lib/backupRestore";
 import { useBackupRestore } from "./useBackupRestore";
 
 const BACKUP_TEXT = JSON.stringify({
-  version: 1,
-  library: { version: 1, tracks: [], playlists: [] },
+  version: 2,
+  library: { version: 2, tracks: [], playlists: [] },
   sources: { version: 1, sources: [] },
 });
 

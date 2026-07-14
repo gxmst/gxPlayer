@@ -71,6 +71,7 @@ import {
   type EngineSnapshot,
   type HistoryEntry,
   type LibraryImportResult,
+  type LibraryPlaylistItem,
   type LibraryTrack,
   type ListedSource,
   type LyricDocument,
@@ -163,6 +164,22 @@ function cacheEntryToPlaylist(entry: CacheEntryView): PlaylistEntry {
     quality: entry.quality,
     title: entry.title,
     artist: entry.artist,
+  };
+}
+
+function cachedIdentityKey(providerId: string, providerTrackId: string, quality: string): string {
+  return `${providerId}\u0000${providerTrackId}\u0000${quality}`;
+}
+
+function libraryPlaylistItemToQueueEntry(item: LibraryPlaylistItem): PlaylistEntry {
+  if (item.kind === "local") return localEntryFromLibrary(item.track);
+  return {
+    kind: "cached",
+    providerId: item.providerId,
+    providerTrackId: item.providerTrackId,
+    quality: item.quality,
+    title: item.title,
+    artist: item.artist,
   };
 }
 
@@ -576,7 +593,7 @@ function App() {
   const [favorites, setFavorites] = useState<LibraryTrack[]>([]);
   const [playlists, setPlaylists] = useState<PlaylistSummary[]>([]);
   const [activePlaylist, setActivePlaylist] = useState<PlaylistSummary | null>(null);
-  const [playlistTracks, setPlaylistTracks] = useState<LibraryTrack[]>([]);
+  const [playlistItems, setPlaylistItems] = useState<LibraryPlaylistItem[]>([]);
   const [newPlaylistName, setNewPlaylistName] = useState("");
 
   const [sources, setSources] = useState<ListedSource[]>([]);
@@ -601,6 +618,12 @@ function App() {
   const cacheLimitDirtyRef = useRef(false);
   const [onlineFavorites, setOnlineFavorites] = useState<CatalogTrack[]>([]);
   const [cacheEntries, setCacheEntries] = useState<CacheEntryView[]>([]);
+  const availableCacheKeys = useMemo(
+    () => new Set(cacheEntries.map((entry) => (
+      cachedIdentityKey(entry.providerId, entry.providerTrackId, entry.quality)
+    ))),
+    [cacheEntries],
+  );
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
   const [selectedCacheKeys, setSelectedCacheKeys] = useState<string[]>([]);
   const [coverCache, setCoverCache] = useState<Record<string, string>>({});
@@ -2186,7 +2209,7 @@ function App() {
       invoke("library_export_backup"),
       invoke("source_export_backup"),
     ]);
-    const text = JSON.stringify({ version: 1, library: libraryBackup, sources: sourceBackup }, null, 2);
+    const text = JSON.stringify({ version: 2, library: libraryBackup, sources: sourceBackup }, null, 2);
     resetBackupRestorePreview();
     setBackupText(text);
     const path = await save({
@@ -2665,16 +2688,16 @@ function App() {
       setNewPlaylistName("");
       await refreshLibrary();
       setActivePlaylist(playlist);
-      setPlaylistTracks([]);
+      setPlaylistItems([]);
       navigateTo("playlist");
     }
   };
 
   const openPlaylist = async (playlist: PlaylistSummary) => {
-    const tracks = await run<LibraryTrack[]>("library_playlist_tracks", { playlistId: playlist.id });
-    if (tracks) {
+    const items = await run<LibraryPlaylistItem[]>("library_playlist_items", { playlistId: playlist.id });
+    if (items) {
       setActivePlaylist(playlist);
-      setPlaylistTracks(tracks);
+      setPlaylistItems(items);
       navigateTo("playlist");
     }
   };
@@ -2684,13 +2707,47 @@ function App() {
     await refreshLibrary();
   };
 
+  const addCachedToPlaylist = async (entry: CacheEntryView, playlistId: number) => {
+    await run("library_add_cached_to_playlist", {
+      playlistId,
+      providerId: entry.providerId,
+      providerTrackId: entry.providerTrackId,
+      quality: entry.quality,
+      title: entry.title,
+      artist: entry.artist,
+      album: entry.album,
+    });
+    await refreshLibrary();
+  };
+
+  const playLibraryPlaylistItem = async (items: LibraryPlaylistItem[], index: number) => {
+    const target = items[index];
+    if (!target) return;
+    if (target.kind === "local" && (
+      target.track.missing
+      || library.some((track) => track.path === target.track.path && track.missing)
+    )) {
+      setMessage("这首歌的本地文件暂不可用，请重新导入或重新定位后再试。", true);
+      return;
+    }
+    if (target.kind === "cached" && !availableCacheKeys.has(
+      cachedIdentityKey(target.providerId, target.providerTrackId, target.quality),
+    )) {
+      setMessage("这首歌的缓存已被清理；歌单记录仍保留，未发起联网请求。", true);
+      return;
+    }
+    supersedeActiveResolve();
+    const result = await replacePlaylist(items.map(libraryPlaylistItemToQueueEntry), index);
+    if (result.outcome === "started") navigateTo("now-playing");
+  };
+
   const exportBackup = async () => {
     const [libraryBackup, sourceBackup] = await Promise.all([
       invoke("library_export_backup"),
       invoke("source_export_backup"),
     ]);
     resetBackupRestorePreview();
-    setBackupText(JSON.stringify({ version: 1, library: libraryBackup, sources: sourceBackup }, null, 2));
+    setBackupText(JSON.stringify({ version: 2, library: libraryBackup, sources: sourceBackup }, null, 2));
   };
 
   const {
@@ -2883,7 +2940,7 @@ function App() {
           <time title="缓存大小">{formatBytes(entry.byteLen)}</time>
           <button
             type="button"
-            className="icon-button"
+            className="icon-button cache-enqueue"
             onClick={() => enqueueCacheEntries([entry])}
             aria-label="添加到队列"
             title="添加到队列"
@@ -2892,16 +2949,24 @@ function App() {
           </button>
           <button
             type="button"
-            className={`icon-button ${entry.pinned ? "active" : ""}`}
+            className={`icon-button cache-pin ${entry.pinned ? "active" : ""}`}
             onClick={() => void toggleCachePinned(entry)}
             aria-label={entry.pinned ? "取消钉住" : "收藏钉住"}
             title={entry.pinned ? "取消钉住" : "收藏并钉住"}
           >
             {entry.pinned ? "♥" : "♡"}
           </button>
+          <select className="cache-playlist-select" aria-label={`将 ${entry.title} 添加到歌单`} defaultValue="" onChange={(event) => {
+            const playlistId = Number(event.target.value);
+            if (playlistId) void addCachedToPlaylist(entry, playlistId);
+            event.target.value = "";
+          }}>
+            <option value="">＋ 歌单</option>
+            {playlists.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
+          </select>
           <button
             type="button"
-            className="icon-button"
+            className="icon-button cache-remove"
             onClick={() => void removeCacheEntry(entry)}
             aria-label="删除缓存"
             title="删除此缓存"
@@ -2909,6 +2974,82 @@ function App() {
             ×
           </button>
         </div>
+        );
+      })}
+    </div>
+  );
+
+  const renderLibraryPlaylistItems = (items: LibraryPlaylistItem[], playlistId: number) => (
+    <div className="track-list" role="list">
+      {items.map((item, index) => {
+        const isLocal = item.kind === "local";
+        const title = isLocal ? item.track.title : item.title;
+        const artist = (isLocal ? item.track.artist : item.artist) || "未知歌手";
+        const album = isLocal ? item.track.album : item.album;
+        const cacheAvailable = isLocal || availableCacheKeys.has(
+          cachedIdentityKey(item.providerId, item.providerTrackId, item.quality),
+        );
+        const unavailable = isLocal
+          ? Boolean(item.track.missing || library.some((track) => track.path === item.track.path && track.missing))
+          : !cacheAvailable;
+        const key = isLocal
+          ? `local:${item.track.id}`
+          : `cached:${cachedIdentityKey(item.providerId, item.providerTrackId, item.quality)}`;
+        return (
+          <div className="track-row playlist-item-row" role="listitem" key={key}>
+            <button
+              type="button"
+              className="track-main"
+              disabled={unavailable}
+              onClick={() => void playLibraryPlaylistItem(items, index)}
+            >
+              <span className="track-index">{String(index + 1).padStart(2, "0")}</span>
+              <span>
+                <strong>{title}{unavailable ? isLocal ? " · 文件缺失" : " · 缓存不可用" : ""}</strong>
+                <small>
+                  {artist}{album ? ` · ${album}` : ""}
+                  {isLocal ? " · 本地" : ` · 缓存 ${item.quality}`}
+                  {unavailable ? " · 记录已保留，不会自动联网" : ""}
+                </small>
+              </span>
+            </button>
+            {isLocal
+              ? <time>{formatTime(item.track.durationSeconds)}</time>
+              : <span className="cache-quality-badge">{item.quality}</span>}
+            <button
+              type="button"
+              className="icon-button"
+              disabled={unavailable}
+              aria-label={`将 ${title} 添加到队列`}
+              title={unavailable ? "当前不可用" : "添加到队列"}
+              onClick={() => {
+                const entry = libraryPlaylistItemToQueueEntry(item);
+                const wasEmpty = playlistRef.current.length === 0;
+                setPlaylist((current) => [...current, entry]);
+                if (wasEmpty) setPlaylistIndex(0);
+                setMessage(`已将《${title}》添加到队列`);
+              }}
+            >＋</button>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={`从歌单移除 ${title}`}
+              onClick={async () => {
+                if (isLocal) {
+                  await run("library_remove_from_playlist", { playlistId, trackId: item.track.id });
+                } else {
+                  await run("library_remove_cached_from_playlist", {
+                    playlistId,
+                    providerId: item.providerId,
+                    providerTrackId: item.providerTrackId,
+                    quality: item.quality,
+                  });
+                }
+                if (activePlaylist) await openPlaylist(activePlaylist);
+                await refreshLibrary();
+              }}
+            >×</button>
+          </div>
         );
       })}
     </div>
@@ -3146,7 +3287,7 @@ function App() {
     }
 
     if (view === "playlist") return (
-      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistTracks.length} 首音乐`} action={activePlaylist ? <button className="danger" onClick={async () => { if (!window.confirm(`确定删除歌单“${activePlaylist.name}”吗？`)) return; try { await invoke("library_delete_playlist", { playlistId: activePlaylist.id }); navigateTo("discovery"); setActivePlaylist(null); await refreshLibrary(); } catch (error) { setMessage(String(error), true); } }}>删除歌单</button> : undefined} />{playlistTracks.length && activePlaylist ? renderTrackRows(playlistTracks, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把想听的歌加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
+      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistItems.length} 首音乐 · 支持本地与已缓存歌曲`} action={activePlaylist ? <button className="danger" onClick={async () => { if (!window.confirm(`确定删除歌单“${activePlaylist.name}”吗？`)) return; try { await invoke("library_delete_playlist", { playlistId: activePlaylist.id }); navigateTo("discovery"); setActivePlaylist(null); setPlaylistItems([]); await refreshLibrary(); } catch (error) { setMessage(String(error), true); } }}>删除歌单</button> : undefined} />{playlistItems.length && activePlaylist ? renderLibraryPlaylistItems(playlistItems, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把本地音乐或已缓存歌曲加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
     );
 
     if (view === "sources") return (

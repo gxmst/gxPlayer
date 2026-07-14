@@ -1391,7 +1391,15 @@ select {
 }
 
 .track-row.cache-row {
-  grid-template-columns: 28px minmax(0, 1fr) 72px 70px 36px 36px 36px;
+  grid-template-columns: 28px minmax(0, 1fr) 72px 70px 36px 36px minmax(88px, auto) 36px;
+}
+
+.track-row.playlist-item-row {
+  grid-template-columns: minmax(0, 1fr) 80px 36px 36px;
+}
+
+.cache-playlist-select {
+  min-width: 88px;
 }
 
 .track-row.history-row {
@@ -4336,7 +4344,7 @@ select {
 
   .app-shell:not(.mini-mode) .track-row.cache-row {
     grid-template-columns: 28px minmax(0, 1fr) repeat(3, 34px);
-    grid-template-rows: minmax(46px, auto) 36px;
+    grid-template-rows: minmax(46px, auto) 36px 36px;
     gap: 2px 4px;
     min-height: 92px;
     padding: 7px 8px;
@@ -4362,16 +4370,27 @@ select {
     grid-row: 2;
   }
 
-  .app-shell:not(.mini-mode) .cache-row > .icon-button:nth-last-child(3) {
+  .app-shell:not(.mini-mode) .cache-row > .cache-enqueue {
     grid-column: 3;
   }
 
-  .app-shell:not(.mini-mode) .cache-row > .icon-button:nth-last-child(2) {
+  .app-shell:not(.mini-mode) .cache-row > .cache-pin {
     grid-column: 4;
   }
 
-  .app-shell:not(.mini-mode) .cache-row > .icon-button:last-child {
+  .app-shell:not(.mini-mode) .cache-row > .cache-remove {
     grid-column: 5;
+  }
+
+  .app-shell:not(.mini-mode) .cache-row > .cache-playlist-select {
+    grid-column: 2 / -1;
+    grid-row: 3;
+    width: 100%;
+    max-width: none;
+  }
+
+  .app-shell:not(.mini-mode) .track-row.playlist-item-row {
+    grid-template-columns: minmax(0, 1fr) 70px 34px 34px;
   }
 
   .app-shell:not(.mini-mode) .now-grid {

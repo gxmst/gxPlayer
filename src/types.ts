@@ -203,6 +203,18 @@ export type PlaylistSummary = {
   createdAtMs: number;
 };
 
+export type LibraryPlaylistItem =
+  | { kind: "local"; track: LibraryTrack }
+  | {
+      kind: "cached";
+      providerId: string;
+      providerTrackId: string;
+      quality: string;
+      title: string;
+      artist: string;
+      album: string;
+    };
+
 export type EqBand = {
   enabled: boolean;
   kind: "peak" | "low_shelf" | "high_shelf" | "low_pass" | "high_pass";

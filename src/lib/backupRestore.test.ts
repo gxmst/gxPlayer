@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { formatRestoreConfirmation, parseBackupText } from "./backupRestore";
 
 describe("backup restore helpers", () => {
-  it("accepts only a complete version-one envelope", () => {
+  it("accepts compatible v1 and v2 envelopes and rejects mismatches", () => {
     expect(parseBackupText(JSON.stringify({
       version: 1,
       library: { version: 1, tracks: [], playlists: [] },
@@ -15,7 +15,13 @@ describe("backup restore helpers", () => {
     });
 
     expect(() => parseBackupText("not json")).toThrow("不是有效的 JSON");
-    expect(() => parseBackupText('{"version":2,"library":{},"sources":{}}')).toThrow("不支持的备份版本");
+    expect(parseBackupText(JSON.stringify({
+      version: 2,
+      library: { version: 2, tracks: [], playlists: [] },
+      sources: { version: 1, sources: [] },
+    })).version).toBe(2);
+    expect(() => parseBackupText('{"version":3,"library":{},"sources":{}}')).toThrow("不支持的备份版本");
+    expect(() => parseBackupText('{"version":2,"library":{"version":1},"sources":{}}')).toThrow("版本不匹配");
     expect(() => parseBackupText('{"version":1,"library":{}}')).toThrow("缺少有效的音源数据");
   });
 

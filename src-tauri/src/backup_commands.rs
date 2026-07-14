@@ -24,8 +24,14 @@ pub struct BackupRestorePreview {
 }
 
 fn validate_backup(backup: &ApplicationBackup) -> Result<BackupRestorePreview, String> {
-    if backup.version != 1 {
+    if !matches!(backup.version, 1 | 2) {
         return Err(format!("不支持的 GXPlayer 备份版本 {}", backup.version));
+    }
+    if backup.library.version != backup.version {
+        return Err(format!(
+            "GXPlayer 备份版本 {} 与曲库备份版本 {} 不匹配",
+            backup.version, backup.library.version
+        ));
     }
     LibraryStore::validate_backup(&backup.library)
         .map_err(|error| format!("曲库备份校验失败：{error}"))?;
@@ -123,7 +129,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use gx_library::{LibraryTrack, NewTrack, PlaylistBackup};
+    use gx_library::{LibraryTrack, NewTrack, PlaylistBackup, PlaylistBackupItem};
     use gx_source::BackupSource;
     use serde_json::Value;
 
@@ -154,6 +160,7 @@ mod tests {
             playlists: vec![PlaylistBackup {
                 name: "列表".into(),
                 track_paths: vec![path.into()],
+                items: Vec::new(),
             }],
         }
     }
@@ -174,6 +181,16 @@ mod tests {
                 config: Value::Object(Default::default()),
             }],
         }
+    }
+
+    fn version_two_library_backup(path: &str, title: &str) -> LibraryBackup {
+        let mut backup = library_backup(path, title);
+        backup.version = 2;
+        backup.playlists[0].track_paths.clear();
+        backup.playlists[0].items = vec![PlaylistBackupItem::Local {
+            track_path: path.into(),
+        }];
+        backup
     }
 
     fn stores() -> (LibraryStore, SourceRuntime, std::path::PathBuf) {
@@ -215,6 +232,34 @@ mod tests {
         drop(runtime);
         drop(library);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepts_matching_legacy_and_current_envelopes_but_rejects_mixed_versions() {
+        let legacy = ApplicationBackup {
+            version: 1,
+            library: library_backup("C:/Music/legacy.flac", "Legacy"),
+            sources: source_backup("lx.on('request', () => 'legacy')", "Legacy"),
+        };
+        assert!(validate_backup(&legacy).is_ok());
+
+        let current = ApplicationBackup {
+            version: 2,
+            library: version_two_library_backup("C:/Music/current.flac", "Current"),
+            sources: source_backup("lx.on('request', () => 'current')", "Current"),
+        };
+        assert!(validate_backup(&current).is_ok());
+
+        let mismatched = ApplicationBackup {
+            version: 2,
+            library: library_backup("C:/Music/mixed.flac", "Mixed"),
+            sources: source_backup("lx.on('request', () => 'mixed')", "Mixed"),
+        };
+        assert!(
+            validate_backup(&mismatched)
+                .unwrap_err()
+                .contains("版本 2 与曲库备份版本 1 不匹配")
+        );
     }
 
     #[test]

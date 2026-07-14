@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+const MAX_BACKUP_PLAYLIST_ITEMS: usize = 100_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryTrack {
@@ -66,6 +68,37 @@ pub struct PlaylistSummary {
     pub created_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedPlaylistTrack {
+    pub provider_id: String,
+    pub provider_track_id: String,
+    pub quality: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PlaylistItem {
+    Local {
+        track: LibraryTrack,
+    },
+    Cached {
+        provider_id: String,
+        provider_track_id: String,
+        quality: String,
+        title: String,
+        artist: String,
+        album: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryBackup {
@@ -78,7 +111,30 @@ pub struct LibraryBackup {
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistBackup {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub track_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<PlaylistBackupItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PlaylistBackupItem {
+    Local {
+        track_path: String,
+    },
+    Cached {
+        provider_id: String,
+        provider_track_id: String,
+        quality: String,
+        title: String,
+        artist: String,
+        album: String,
+    },
 }
 
 pub struct LibraryStore {
@@ -123,6 +179,17 @@ impl LibraryStore {
                track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                position INTEGER NOT NULL,
                PRIMARY KEY (playlist_id, track_id)
+             );
+             CREATE TABLE IF NOT EXISTS playlist_cached_tracks (
+               playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+               provider_id TEXT NOT NULL,
+               provider_track_id TEXT NOT NULL,
+               quality TEXT NOT NULL,
+               title TEXT NOT NULL,
+               artist TEXT NOT NULL DEFAULT '',
+               album TEXT NOT NULL DEFAULT '',
+               position INTEGER NOT NULL,
+               PRIMARY KEY (playlist_id, provider_id, provider_track_id, quality)
              );
              CREATE TABLE IF NOT EXISTS play_history (
                id INTEGER PRIMARY KEY,
@@ -263,9 +330,11 @@ impl LibraryStore {
     pub fn list_playlists(&self) -> Result<Vec<PlaylistSummary>> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
-            "SELECT p.id, p.name, COUNT(pt.track_id), p.created_at_ms
-             FROM playlists p LEFT JOIN playlist_tracks pt ON pt.playlist_id=p.id
-             GROUP BY p.id ORDER BY p.created_at_ms DESC",
+            "SELECT p.id, p.name,
+                    (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id=p.id) +
+                    (SELECT COUNT(*) FROM playlist_cached_tracks pc WHERE pc.playlist_id=p.id),
+                    p.created_at_ms
+             FROM playlists p ORDER BY p.created_at_ms DESC",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(PlaylistSummary {
@@ -290,19 +359,12 @@ impl LibraryStore {
     pub fn add_to_playlist(&self, playlist_id: i64, track_id: i64) -> Result<()> {
         let connection = self.connection.lock().unwrap();
         ensure_track(&connection, track_id)?;
-        let exists = connection
-            .query_row("SELECT 1 FROM playlists WHERE id=?1", [playlist_id], |_| {
-                Ok(())
-            })
-            .optional()?
-            .is_some();
-        if !exists {
-            bail!("playlist does not exist");
-        }
+        ensure_playlist(&connection, playlist_id)?;
+        let position = next_playlist_position(&connection, playlist_id)?;
         connection.execute(
             "INSERT OR IGNORE INTO playlist_tracks(playlist_id, track_id, position)
-             VALUES (?1, ?2, COALESCE((SELECT MAX(position)+1 FROM playlist_tracks WHERE playlist_id=?1), 0))",
-            params![playlist_id, track_id],
+             VALUES (?1, ?2, ?3)",
+            params![playlist_id, track_id, position],
         )?;
         Ok(())
     }
@@ -312,6 +374,55 @@ impl LibraryStore {
         connection.execute(
             "DELETE FROM playlist_tracks WHERE playlist_id=?1 AND track_id=?2",
             params![playlist_id, track_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_cached_to_playlist(
+        &self,
+        playlist_id: i64,
+        track: &CachedPlaylistTrack,
+    ) -> Result<()> {
+        validate_cached_track(track)?;
+        let connection = self.connection.lock().unwrap();
+        ensure_playlist(&connection, playlist_id)?;
+        let position = next_playlist_position(&connection, playlist_id)?;
+        connection.execute(
+            "INSERT OR IGNORE INTO playlist_cached_tracks(
+               playlist_id, provider_id, provider_track_id, quality, title, artist, album, position
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                playlist_id,
+                track.provider_id.trim(),
+                track.provider_track_id.trim(),
+                track.quality.trim(),
+                track.title.trim(),
+                track.artist,
+                track.album,
+                position,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_cached_from_playlist(
+        &self,
+        playlist_id: i64,
+        provider_id: &str,
+        provider_track_id: &str,
+        quality: &str,
+    ) -> Result<()> {
+        validate_cached_key(provider_id, provider_track_id, quality)?;
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "DELETE FROM playlist_cached_tracks
+             WHERE playlist_id=?1 AND provider_id=?2 AND provider_track_id=?3 AND quality=?4",
+            params![
+                playlist_id,
+                provider_id.trim(),
+                provider_track_id.trim(),
+                quality.trim(),
+            ],
         )?;
         Ok(())
     }
@@ -326,6 +437,56 @@ impl LibraryStore {
              WHERE pt.playlist_id=?1 ORDER BY pt.position",
             [playlist_id],
         )
+    }
+
+    pub fn playlist_items(&self, playlist_id: i64) -> Result<Vec<PlaylistItem>> {
+        let connection = self.connection.lock().unwrap();
+        ensure_playlist(&connection, playlist_id)?;
+        let mut statement = connection.prepare(
+            "SELECT * FROM (
+               SELECT 0 AS item_kind, pt.position,
+                      t.id, t.path, t.title, t.artist, t.album, t.duration_seconds,
+                      EXISTS(SELECT 1 FROM favorites f WHERE f.track_id=t.id), t.added_at_ms,
+                      NULL, NULL, NULL, NULL, NULL, NULL
+               FROM playlist_tracks pt JOIN tracks t ON t.id=pt.track_id
+               WHERE pt.playlist_id=?1
+               UNION ALL
+               SELECT 1 AS item_kind, pc.position,
+                      NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                      pc.provider_id, pc.provider_track_id, pc.quality,
+                      pc.title, pc.artist, pc.album
+               FROM playlist_cached_tracks pc
+               WHERE pc.playlist_id=?1
+             ) ORDER BY position, item_kind",
+        )?;
+        let rows = statement.query_map([playlist_id], |row| {
+            if row.get::<_, i64>(0)? == 0 {
+                Ok(PlaylistItem::Local {
+                    track: LibraryTrack {
+                        id: row.get(2)?,
+                        path: row.get(3)?,
+                        title: row.get(4)?,
+                        artist: row.get(5)?,
+                        album: row.get(6)?,
+                        duration_seconds: row.get(7)?,
+                        favorite: row.get(8)?,
+                        added_at_ms: row.get(9)?,
+                        missing: false,
+                    },
+                })
+            } else {
+                Ok(PlaylistItem::Cached {
+                    provider_id: row.get(10)?,
+                    provider_track_id: row.get(11)?,
+                    quality: row.get(12)?,
+                    title: row.get(13)?,
+                    artist: row.get(14)?,
+                    album: row.get(15)?,
+                })
+            }
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Mark library tracks whose files no longer exist on disk.
@@ -478,16 +639,36 @@ impl LibraryStore {
             .map(|playlist| {
                 Ok(PlaylistBackup {
                     name: playlist.name,
-                    track_paths: self
-                        .playlist_tracks(playlist.id)?
+                    track_paths: Vec::new(),
+                    items: self
+                        .playlist_items(playlist.id)?
                         .into_iter()
-                        .map(|track| track.path)
+                        .map(|item| match item {
+                            PlaylistItem::Local { track } => PlaylistBackupItem::Local {
+                                track_path: track.path,
+                            },
+                            PlaylistItem::Cached {
+                                provider_id,
+                                provider_track_id,
+                                quality,
+                                title,
+                                artist,
+                                album,
+                            } => PlaylistBackupItem::Cached {
+                                provider_id,
+                                provider_track_id,
+                                quality,
+                                title,
+                                artist,
+                                album,
+                            },
+                        })
                         .collect(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(LibraryBackup {
-            version: 1,
+            version: 2,
             tracks,
             playlists,
         })
@@ -495,7 +676,10 @@ impl LibraryStore {
 
     /// Validate every constraint used by backup restoration without changing the database.
     pub fn validate_backup(backup: &LibraryBackup) -> Result<()> {
-        if backup.version != 1 || backup.tracks.len() > 10_000 || backup.playlists.len() > 1_000 {
+        if !matches!(backup.version, 1 | 2)
+            || backup.tracks.len() > 10_000
+            || backup.playlists.len() > 1_000
+        {
             bail!("unsupported or oversized library backup");
         }
 
@@ -513,6 +697,7 @@ impl LibraryStore {
         }
 
         let mut playlist_names = HashSet::with_capacity(backup.playlists.len());
+        let mut total_playlist_items = 0usize;
         for playlist in &backup.playlists {
             let name = playlist.name.trim();
             if name.is_empty() || name.chars().count() > 80 {
@@ -522,14 +707,33 @@ impl LibraryStore {
             if !playlist_names.insert(name.to_ascii_lowercase()) {
                 bail!("library backup contains duplicate playlist name '{name}'");
             }
-            let mut playlist_paths = HashSet::with_capacity(playlist.track_paths.len());
-            for path in &playlist.track_paths {
-                if !track_paths.contains(path.as_str()) {
-                    bail!("playlist '{name}' references a track missing from the backup");
+
+            let item_count = if backup.version == 1 {
+                playlist.track_paths.len()
+            } else {
+                playlist.items.len()
+            };
+            total_playlist_items = total_playlist_items
+                .checked_add(item_count)
+                .context("library backup playlist item count overflow")?;
+            if total_playlist_items > MAX_BACKUP_PLAYLIST_ITEMS {
+                bail!("library backup contains too many playlist items");
+            }
+
+            match backup.version {
+                1 => {
+                    if !playlist.items.is_empty() {
+                        bail!("version 1 playlist '{name}' unexpectedly contains version 2 items");
+                    }
+                    validate_v1_playlist(name, playlist, &track_paths)?;
                 }
-                if !playlist_paths.insert(path.as_str()) {
-                    bail!("playlist '{name}' contains a duplicate track");
+                2 => {
+                    if !playlist.track_paths.is_empty() {
+                        bail!("version 2 playlist '{name}' unexpectedly contains trackPaths");
+                    }
+                    validate_v2_playlist(name, playlist, &track_paths)?;
                 }
+                _ => unreachable!("library backup version was checked above"),
             }
         }
         Ok(())
@@ -540,7 +744,7 @@ impl LibraryStore {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction()?;
         transaction.execute_batch(
-            "DELETE FROM playlist_tracks; DELETE FROM playlists; DELETE FROM favorites; DELETE FROM tracks;",
+            "DELETE FROM playlist_cached_tracks; DELETE FROM playlist_tracks; DELETE FROM playlists; DELETE FROM favorites; DELETE FROM tracks;",
         )?;
         for track in &backup.tracks {
             transaction.execute(
@@ -566,23 +770,212 @@ impl LibraryStore {
                 params![playlist.name, now_ms()],
             )?;
             let playlist_id = transaction.last_insert_rowid();
-            for (position, path) in playlist.track_paths.iter().enumerate() {
-                let track_id: Option<i64> = transaction
-                    .query_row("SELECT id FROM tracks WHERE path=?1", [path], |row| {
-                        row.get(0)
-                    })
-                    .optional()?;
-                if let Some(track_id) = track_id {
-                    transaction.execute(
-                        "INSERT INTO playlist_tracks(playlist_id, track_id, position) VALUES (?1, ?2, ?3)",
-                        params![playlist_id, track_id, position as i64],
-                    )?;
+            if backup.version == 1 {
+                for (position, path) in playlist.track_paths.iter().enumerate() {
+                    insert_local_playlist_item(&transaction, playlist_id, path, position as i64)?;
+                }
+            } else {
+                for (position, item) in playlist.items.iter().enumerate() {
+                    match item {
+                        PlaylistBackupItem::Local { track_path } => insert_local_playlist_item(
+                            &transaction,
+                            playlist_id,
+                            track_path,
+                            position as i64,
+                        )?,
+                        PlaylistBackupItem::Cached {
+                            provider_id,
+                            provider_track_id,
+                            quality,
+                            title,
+                            artist,
+                            album,
+                        } => {
+                            transaction.execute(
+                                "INSERT INTO playlist_cached_tracks(
+                                   playlist_id, provider_id, provider_track_id, quality,
+                                   title, artist, album, position
+                                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                params![
+                                    playlist_id,
+                                    provider_id.trim(),
+                                    provider_track_id.trim(),
+                                    quality.trim(),
+                                    title.trim(),
+                                    artist,
+                                    album,
+                                    position as i64,
+                                ],
+                            )?;
+                        }
+                    }
                 }
             }
         }
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn validate_v1_playlist(
+    name: &str,
+    playlist: &PlaylistBackup,
+    track_paths: &HashSet<&str>,
+) -> Result<()> {
+    if playlist.track_paths.len() > 10_000 {
+        bail!("playlist '{name}' contains too many tracks");
+    }
+    let mut playlist_paths = HashSet::with_capacity(playlist.track_paths.len());
+    for path in &playlist.track_paths {
+        if !track_paths.contains(path.as_str()) {
+            bail!("playlist '{name}' references a track missing from the backup");
+        }
+        if !playlist_paths.insert(path.as_str()) {
+            bail!("playlist '{name}' contains a duplicate track");
+        }
+    }
+    Ok(())
+}
+
+fn validate_v2_playlist(
+    name: &str,
+    playlist: &PlaylistBackup,
+    track_paths: &HashSet<&str>,
+) -> Result<()> {
+    if playlist.items.len() > 10_000 {
+        bail!("playlist '{name}' contains too many items");
+    }
+    let mut local_paths = HashSet::new();
+    let mut cached_keys = HashSet::new();
+    for item in &playlist.items {
+        match item {
+            PlaylistBackupItem::Local { track_path } => {
+                if !track_paths.contains(track_path.as_str()) {
+                    bail!("playlist '{name}' references a track missing from the backup");
+                }
+                if !local_paths.insert(track_path.as_str()) {
+                    bail!("playlist '{name}' contains a duplicate local track");
+                }
+            }
+            PlaylistBackupItem::Cached {
+                provider_id,
+                provider_track_id,
+                quality,
+                title,
+                artist,
+                album,
+            } => {
+                validate_cached_fields(
+                    provider_id,
+                    provider_track_id,
+                    quality,
+                    title,
+                    artist,
+                    album,
+                )?;
+                let key = (provider_id.trim(), provider_track_id.trim(), quality.trim());
+                if !cached_keys.insert(key) {
+                    bail!("playlist '{name}' contains a duplicate cached track");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_cached_track(track: &CachedPlaylistTrack) -> Result<()> {
+    validate_cached_fields(
+        &track.provider_id,
+        &track.provider_track_id,
+        &track.quality,
+        &track.title,
+        &track.artist,
+        &track.album,
+    )
+}
+
+fn validate_cached_key(provider_id: &str, provider_track_id: &str, quality: &str) -> Result<()> {
+    if provider_id.trim().is_empty()
+        || provider_track_id.trim().is_empty()
+        || quality.trim().is_empty()
+    {
+        bail!("cached track provider, id, and quality are required");
+    }
+    if provider_id.chars().count() > 256
+        || provider_track_id.chars().count() > 2_048
+        || quality.chars().count() > 128
+    {
+        bail!("cached track identity is too long");
+    }
+    Ok(())
+}
+
+fn validate_cached_fields(
+    provider_id: &str,
+    provider_track_id: &str,
+    quality: &str,
+    title: &str,
+    artist: &str,
+    album: &str,
+) -> Result<()> {
+    validate_cached_key(provider_id, provider_track_id, quality)?;
+    if title.trim().is_empty() {
+        bail!("cached track title is required");
+    }
+    if title.chars().count() > 1_000
+        || artist.chars().count() > 1_000
+        || album.chars().count() > 1_000
+    {
+        bail!("cached track metadata is too long");
+    }
+    Ok(())
+}
+
+fn ensure_playlist(connection: &Connection, playlist_id: i64) -> Result<()> {
+    if connection
+        .query_row("SELECT 1 FROM playlists WHERE id=?1", [playlist_id], |_| {
+            Ok(())
+        })
+        .optional()?
+        .is_none()
+    {
+        bail!("playlist does not exist");
+    }
+    Ok(())
+}
+
+fn next_playlist_position(connection: &Connection, playlist_id: i64) -> Result<i64> {
+    let max_position = connection.query_row(
+        "SELECT MAX(position) FROM (
+           SELECT position FROM playlist_tracks WHERE playlist_id=?1
+           UNION ALL
+           SELECT position FROM playlist_cached_tracks WHERE playlist_id=?1
+         )",
+        [playlist_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    match max_position {
+        Some(position) => position
+            .checked_add(1)
+            .context("playlist position overflow"),
+        None => Ok(0),
+    }
+}
+
+fn insert_local_playlist_item(
+    transaction: &rusqlite::Transaction<'_>,
+    playlist_id: i64,
+    path: &str,
+    position: i64,
+) -> Result<()> {
+    let track_id = transaction.query_row("SELECT id FROM tracks WHERE path=?1", [path], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    transaction.execute(
+        "INSERT INTO playlist_tracks(playlist_id, track_id, position) VALUES (?1, ?2, ?3)",
+        params![playlist_id, track_id, position],
+    )?;
+    Ok(())
 }
 
 fn query_tracks<P: rusqlite::Params>(
@@ -813,5 +1206,241 @@ mod tests {
         assert_eq!(relinked.path, "E:/Music/found.flac");
         assert_eq!(relinked.title, "Found");
         assert_eq!(store.list_tracks(10).unwrap(), vec![relinked]);
+    }
+
+    #[test]
+    fn mixed_playlist_preserves_shared_order_and_count() {
+        let store = LibraryStore::open(":memory:").unwrap();
+        store
+            .upsert_tracks(&[
+                NewTrack {
+                    path: "C:/Music/one.flac".into(),
+                    title: "One".into(),
+                    artist: "Local".into(),
+                    album: String::new(),
+                    duration_seconds: Some(60.0),
+                },
+                NewTrack {
+                    path: "C:/Music/two.flac".into(),
+                    title: "Two".into(),
+                    artist: "Local".into(),
+                    album: String::new(),
+                    duration_seconds: Some(70.0),
+                },
+            ])
+            .unwrap();
+        let one = store.track_by_path("C:/Music/one.flac").unwrap().unwrap();
+        let two = store.track_by_path("C:/Music/two.flac").unwrap().unwrap();
+        let playlist = store.create_playlist("混合歌单").unwrap();
+        store.add_to_playlist(playlist.id, one.id).unwrap();
+        store
+            .add_cached_to_playlist(
+                playlist.id,
+                &CachedPlaylistTrack {
+                    provider_id: "wy".into(),
+                    provider_track_id: "42".into(),
+                    quality: "flac".into(),
+                    title: "Cached".into(),
+                    artist: "Remote".into(),
+                    album: "Cloud".into(),
+                },
+            )
+            .unwrap();
+        store.add_to_playlist(playlist.id, two.id).unwrap();
+
+        assert_eq!(store.list_playlists().unwrap()[0].track_count, 3);
+        assert_eq!(
+            store.playlist_items(playlist.id).unwrap(),
+            vec![
+                PlaylistItem::Local { track: one.clone() },
+                PlaylistItem::Cached {
+                    provider_id: "wy".into(),
+                    provider_track_id: "42".into(),
+                    quality: "flac".into(),
+                    title: "Cached".into(),
+                    artist: "Remote".into(),
+                    album: "Cloud".into(),
+                },
+                PlaylistItem::Local { track: two.clone() },
+            ]
+        );
+        assert_eq!(store.playlist_tracks(playlist.id).unwrap(), vec![one, two]);
+
+        store
+            .remove_cached_from_playlist(playlist.id, "wy", "42", "flac")
+            .unwrap();
+        assert_eq!(store.list_playlists().unwrap()[0].track_count, 2);
+    }
+
+    #[test]
+    fn version_two_backup_round_trips_mixed_playlist() {
+        let store = LibraryStore::open(":memory:").unwrap();
+        let local = store
+            .add_tracks(&[NewTrack {
+                path: "C:/Music/local.flac".into(),
+                title: "Local".into(),
+                artist: "Artist".into(),
+                album: "Album".into(),
+                duration_seconds: Some(120.0),
+            }])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let playlist = store.create_playlist("备份").unwrap();
+        store.add_to_playlist(playlist.id, local.id).unwrap();
+        store
+            .add_cached_to_playlist(
+                playlist.id,
+                &CachedPlaylistTrack {
+                    provider_id: "tx".into(),
+                    provider_track_id: "remote-1".into(),
+                    quality: "320k".into(),
+                    title: "Remote".into(),
+                    artist: "Singer".into(),
+                    album: "Record".into(),
+                },
+            )
+            .unwrap();
+
+        let backup = store.export_backup().unwrap();
+        assert_eq!(backup.version, 2);
+        LibraryStore::validate_backup(&backup).unwrap();
+        let json = serde_json::to_value(&backup).unwrap();
+        let playlist_json = &json["playlists"][0];
+        assert!(playlist_json.get("trackPaths").is_none());
+        assert_eq!(playlist_json["items"][0]["kind"], "local");
+        assert_eq!(playlist_json["items"][0]["trackPath"], local.path);
+        assert_eq!(playlist_json["items"][1]["kind"], "cached");
+        assert_eq!(playlist_json["items"][1]["providerId"], "tx");
+        assert_eq!(playlist_json["items"][1]["providerTrackId"], "remote-1");
+
+        let restored = LibraryStore::open(":memory:").unwrap();
+        restored.restore_backup(&backup).unwrap();
+        let restored_playlist = restored.list_playlists().unwrap().pop().unwrap();
+        assert_eq!(
+            restored.playlist_items(restored_playlist.id).unwrap(),
+            store.playlist_items(playlist.id).unwrap()
+        );
+        assert_eq!(restored.export_backup().unwrap(), backup);
+    }
+
+    #[test]
+    fn restores_legacy_version_one_playlist_without_items_field() {
+        let backup: LibraryBackup = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "tracks": [{
+                "id": 99,
+                "path": "D:/Legacy/song.mp3",
+                "title": "Legacy",
+                "artist": "",
+                "album": "",
+                "durationSeconds": 42.0,
+                "favorite": false,
+                "addedAtMs": 10
+            }],
+            "playlists": [{
+                "name": "旧歌单",
+                "trackPaths": ["D:/Legacy/song.mp3"]
+            }]
+        }))
+        .unwrap();
+        LibraryStore::validate_backup(&backup).unwrap();
+
+        let store = LibraryStore::open(":memory:").unwrap();
+        store.restore_backup(&backup).unwrap();
+        let playlist = store.list_playlists().unwrap().pop().unwrap();
+        assert_eq!(
+            store.playlist_tracks(playlist.id).unwrap()[0].title,
+            "Legacy"
+        );
+        assert_eq!(store.export_backup().unwrap().version, 2);
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_duplicate_version_two_playlist_items() {
+        let track = LibraryTrack {
+            id: 1,
+            path: "C:/Music/one.flac".into(),
+            title: "One".into(),
+            artist: String::new(),
+            album: String::new(),
+            duration_seconds: None,
+            favorite: false,
+            added_at_ms: 1,
+            missing: false,
+        };
+        let cached = PlaylistBackupItem::Cached {
+            provider_id: "wy".into(),
+            provider_track_id: "42".into(),
+            quality: "flac".into(),
+            title: "Cached".into(),
+            artist: String::new(),
+            album: String::new(),
+        };
+        let backup = LibraryBackup {
+            version: 2,
+            tracks: vec![track],
+            playlists: vec![PlaylistBackup {
+                name: "Invalid".into(),
+                track_paths: Vec::new(),
+                items: vec![cached.clone(), cached],
+            }],
+        };
+        assert!(LibraryStore::validate_backup(&backup).is_err());
+
+        let mut mixed_formats = backup;
+        mixed_formats.playlists[0].items.truncate(1);
+        mixed_formats.playlists[0]
+            .track_paths
+            .push("C:/Music/one.flac".into());
+        assert!(LibraryStore::validate_backup(&mixed_formats).is_err());
+    }
+
+    #[test]
+    fn limits_total_items_across_all_backup_playlists() {
+        let tracks = (0..101)
+            .map(|index| LibraryTrack {
+                id: index + 1,
+                path: format!("C:/Music/{index}.flac"),
+                title: format!("Track {index}"),
+                artist: String::new(),
+                album: String::new(),
+                duration_seconds: None,
+                favorite: false,
+                added_at_ms: 1,
+                missing: false,
+            })
+            .collect::<Vec<_>>();
+        let hundred_items = tracks
+            .iter()
+            .take(100)
+            .map(|track| PlaylistBackupItem::Local {
+                track_path: track.path.clone(),
+            })
+            .collect::<Vec<_>>();
+        let playlists = (0..1_000)
+            .map(|index| PlaylistBackup {
+                name: format!("Playlist {index}"),
+                track_paths: Vec::new(),
+                items: hundred_items.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut backup = LibraryBackup {
+            version: 2,
+            tracks,
+            playlists,
+        };
+        LibraryStore::validate_backup(&backup).unwrap();
+
+        backup
+            .playlists
+            .last_mut()
+            .unwrap()
+            .items
+            .push(PlaylistBackupItem::Local {
+                track_path: "C:/Music/100.flac".into(),
+            });
+        let error = LibraryStore::validate_backup(&backup).unwrap_err();
+        assert!(error.to_string().contains("too many playlist items"));
     }
 }

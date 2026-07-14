@@ -15,6 +15,7 @@ use gx_library::{LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistSu
 use gx_source::{SourceStore, safe_http};
 
 mod artwork;
+mod backup_commands;
 mod cache_commands;
 mod diagnostic_log;
 mod media_session;
@@ -29,6 +30,7 @@ mod window_state;
 mod windows_identity;
 
 use artwork::artwork_get;
+use backup_commands::{backup_preview_restore, backup_restore_atomic};
 use cache_commands::{
     cache_clear, cache_list_entries, cache_online_favorites, cache_remove_by_quality,
     cache_remove_entries, cache_remove_entry, cache_reset_directory, cache_set_directory,
@@ -1070,6 +1072,8 @@ pub fn run() {
             window_set_mini_mode,
             backup_write_file,
             backup_read_file,
+            backup_preview_restore,
+            backup_restore_atomic,
             sandbox_ready,
             source_list,
             source_status,

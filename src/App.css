@@ -2389,6 +2389,34 @@ select {
   font: 12px/1.6 "Geist Mono Variable", monospace;
 }
 
+.backup-restore-preview {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 4px 12px;
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--soft-border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 8%, var(--control-bg));
+}
+
+.backup-restore-preview strong {
+  color: var(--accent-readable);
+  font-size: 12px;
+}
+
+.backup-restore-preview span {
+  color: var(--text-hi);
+  font-size: 12px;
+}
+
+.backup-restore-preview small {
+  grid-column: 2;
+  color: var(--text-mute);
+  font-size: 11px;
+}
+
 /* ── Now playing + sound stage (signature) ─────────────── */
 
 .now-playing-page {

@@ -2625,7 +2625,10 @@ pub fn sandbox_became_ready(
     reload_runtime(&Some(window.clone()), runtime)
 }
 
-fn reload_runtime(sandbox: &Option<WebviewWindow>, runtime: &SourceRuntime) -> Result<(), String> {
+pub(crate) fn reload_runtime(
+    sandbox: &Option<WebviewWindow>,
+    runtime: &SourceRuntime,
+) -> Result<(), String> {
     let reload = runtime
         .prepare_reload_plan()
         .map_err(|error| error.to_string())?;

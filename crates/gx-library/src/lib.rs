@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,7 +66,7 @@ pub struct PlaylistSummary {
     pub created_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryBackup {
     pub version: u32,
@@ -73,7 +74,7 @@ pub struct LibraryBackup {
     pub playlists: Vec<PlaylistBackup>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistBackup {
     pub name: String,
@@ -414,10 +415,50 @@ impl LibraryStore {
         })
     }
 
-    pub fn restore_backup(&self, backup: &LibraryBackup) -> Result<()> {
+    /// Validate every constraint used by backup restoration without changing the database.
+    pub fn validate_backup(backup: &LibraryBackup) -> Result<()> {
         if backup.version != 1 || backup.tracks.len() > 10_000 || backup.playlists.len() > 1_000 {
             bail!("unsupported or oversized library backup");
         }
+
+        let mut track_paths = HashSet::with_capacity(backup.tracks.len());
+        for track in &backup.tracks {
+            if track.path.trim().is_empty() || track.title.trim().is_empty() {
+                bail!("library backup contains a track without a path or title");
+            }
+            if !track_paths.insert(track.path.as_str()) {
+                bail!(
+                    "library backup contains duplicate track path '{}'",
+                    track.path
+                );
+            }
+        }
+
+        let mut playlist_names = HashSet::with_capacity(backup.playlists.len());
+        for playlist in &backup.playlists {
+            let name = playlist.name.trim();
+            if name.is_empty() || name.chars().count() > 80 {
+                bail!("library backup contains an invalid playlist name");
+            }
+            // SQLite's NOCASE collation is ASCII case-insensitive.
+            if !playlist_names.insert(name.to_ascii_lowercase()) {
+                bail!("library backup contains duplicate playlist name '{name}'");
+            }
+            let mut playlist_paths = HashSet::with_capacity(playlist.track_paths.len());
+            for path in &playlist.track_paths {
+                if !track_paths.contains(path.as_str()) {
+                    bail!("playlist '{name}' references a track missing from the backup");
+                }
+                if !playlist_paths.insert(path.as_str()) {
+                    bail!("playlist '{name}' contains a duplicate track");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn restore_backup(&self, backup: &LibraryBackup) -> Result<()> {
+        Self::validate_backup(backup)?;
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction()?;
         transaction.execute_batch(

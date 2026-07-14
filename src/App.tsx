@@ -12,6 +12,7 @@ import { QueuePanel } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
 import { TextPlaylistImportDialog } from "./components/TextPlaylistImportDialog";
 import { isRemoteArtworkUrl, useArtworkUrl } from "./hooks/useArtwork";
+import { useBackupRestore } from "./hooks/useBackupRestore";
 import { useCatalogSearch } from "./hooks/useCatalogSearch";
 import { useEngineSnapshot } from "./hooks/useEngineSnapshot";
 import { useLiveVolume } from "./hooks/useLiveVolume";
@@ -1864,6 +1865,7 @@ function App() {
       invoke("source_export_backup"),
     ]);
     const text = JSON.stringify({ version: 1, library: libraryBackup, sources: sourceBackup }, null, 2);
+    resetBackupRestorePreview();
     setBackupText(text);
     const path = await save({
       defaultPath: "gxplayer-backup.json",
@@ -1953,6 +1955,7 @@ function App() {
     });
     if (!path || Array.isArray(path)) return;
     const content = await invoke<string>("backup_read_file", { path });
+    resetBackupRestorePreview();
     setBackupText(content);
     setMessage("已读入备份文件，确认无误后点击「恢复备份」。");
   };
@@ -2360,21 +2363,23 @@ function App() {
       invoke("library_export_backup"),
       invoke("source_export_backup"),
     ]);
+    resetBackupRestorePreview();
     setBackupText(JSON.stringify({ version: 1, library: libraryBackup, sources: sourceBackup }, null, 2));
   };
 
-  const restoreBackup = async () => {
-    try {
-      const backup = JSON.parse(backupText) as { version: number; library: unknown; sources: unknown };
-      if (backup.version !== 1) throw new Error("不支持的备份版本");
-      await invoke("library_restore_backup", { backup: backup.library });
-      await invoke("source_restore_backup", { backup: backup.sources });
+  const {
+    preview: backupRestorePreview,
+    busy: backupRestoreBusy,
+    inspect: inspectBackupRestore,
+    restore: restoreBackup,
+    resetPreview: resetBackupRestorePreview,
+  } = useBackupRestore({
+    backupText,
+    onRestored: async () => {
       await Promise.all([refreshLibrary(), refreshSources()]);
-      setMessage("备份已恢复。");
-    } catch (error) {
-      setMessage(String(error), true);
-    }
-  };
+    },
+    onMessage: setMessage,
+  });
 
   const commitSeek = async (seconds: number) => {
     if (!currentQueueItem) return;
@@ -2960,13 +2965,37 @@ function App() {
               <p>包含本地曲库、歌单、音源脚本及音源密钥；可存为文件或从文件读入。备份内容请勿公开。</p>
             </div>
             <div className="cache-actions">
-              <button type="button" onClick={() => void exportBackup()}>生成到文本框</button>
-              <button type="button" onClick={() => void exportBackupFile()}>存为文件…</button>
-              <button type="button" onClick={() => void importBackupFile()}>从文件读入…</button>
-              <button type="button" className="primary" disabled={!backupText.trim()} onClick={() => void restoreBackup()}>恢复备份</button>
+              <button type="button" disabled={Boolean(backupRestoreBusy)} onClick={() => void exportBackup()}>生成到文本框</button>
+              <button type="button" disabled={Boolean(backupRestoreBusy)} onClick={() => void exportBackupFile()}>存为文件…</button>
+              <button type="button" disabled={Boolean(backupRestoreBusy)} onClick={() => void importBackupFile()}>从文件读入…</button>
+              {backupRestorePreview ? (
+                <button type="button" className="primary" disabled={Boolean(backupRestoreBusy)} onClick={() => void restoreBackup()}>
+                  {backupRestoreBusy === "restore" ? "正在恢复…" : "确认覆盖并恢复"}
+                </button>
+              ) : (
+                <button type="button" className="primary" disabled={!backupText.trim() || Boolean(backupRestoreBusy)} onClick={() => void inspectBackupRestore()}>
+                  {backupRestoreBusy === "preview" ? "正在校验…" : "检查备份"}
+                </button>
+              )}
             </div>
           </div>
-          <textarea aria-label="GXPlayer 备份 JSON" placeholder="生成的备份会显示在这里，也可以粘贴已有备份。" value={backupText} onChange={(event) => setBackupText(event.target.value)} />
+          {backupRestorePreview && (
+            <div className="backup-restore-preview" role="status" aria-live="polite">
+              <strong>恢复预览</strong>
+              <span>将覆盖 {backupRestorePreview.trackCount} 首曲目 / {backupRestorePreview.playlistCount} 个歌单 / {backupRestorePreview.sourceCount} 个音源</span>
+              <small>下一步仍会要求确认；恢复失败时会自动回滚到当前数据。</small>
+            </div>
+          )}
+          <textarea
+            aria-label="GXPlayer 备份 JSON"
+            placeholder="生成的备份会显示在这里，也可以粘贴已有备份。"
+            value={backupText}
+            disabled={Boolean(backupRestoreBusy)}
+            onChange={(event) => {
+              resetBackupRestorePreview();
+              setBackupText(event.target.value);
+            }}
+          />
         </section>
       </div>
     );

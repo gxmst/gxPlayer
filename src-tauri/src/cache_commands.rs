@@ -343,6 +343,49 @@ pub fn player_play_cache_entry(
     Ok(())
 }
 
+#[tauri::command]
+pub fn player_play_history_cache(
+    window: WebviewWindow,
+    cache: tauri::State<'_, CacheStore>,
+    engine: tauri::State<'_, LocalAudioEngine>,
+    request: HistoryCachePlaybackRequest,
+) -> Result<Option<String>, String> {
+    require_window(&window, "main")?;
+    let Some(hit) = cache.lookup_track(
+        &request.provider_id,
+        &request.provider_track_id,
+        request.quality.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let hit_quality = hit.key.quality.clone();
+    let location = hit.audio_path.display().to_string();
+    let minimum_generation = crate::media_session::next_engine_generation(&engine);
+    engine
+        .load_cached_online(hit.audio_path, request.title.clone())
+        .map_err(|error| error.to_string())?;
+    crate::media_session::set_cached_metadata(
+        window.app_handle(),
+        request.title,
+        request.artist,
+        String::new(),
+        None,
+        minimum_generation,
+        location,
+    );
+    Ok(Some(hit_quality))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryCachePlaybackRequest {
+    provider_id: String,
+    provider_track_id: String,
+    quality: Option<String>,
+    title: String,
+    artist: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::cache_error_code;

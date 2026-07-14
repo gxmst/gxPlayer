@@ -240,6 +240,41 @@ impl CacheStore {
         Some(result)
     }
 
+    pub fn lookup_track(
+        &self,
+        provider_id: &str,
+        provider_track_id: &str,
+        preferred_quality: Option<&str>,
+    ) -> Option<CacheEntry> {
+        if let Some(quality) = preferred_quality.filter(|quality| !quality.trim().is_empty()) {
+            let key = CacheKey {
+                provider_id: provider_id.to_owned(),
+                provider_track_id: provider_track_id.to_owned(),
+                quality: quality.to_owned(),
+            };
+            if let Some(hit) = self.lookup(&key) {
+                return Some(hit);
+            }
+        }
+        let mut candidates = {
+            let state = self.inner.lock().unwrap();
+            state
+                .manifest
+                .entries
+                .values()
+                .filter(|entry| {
+                    entry.key.provider_id == provider_id
+                        && entry.key.provider_track_id == provider_track_id
+                })
+                .map(|entry| (entry.key.clone(), entry.last_accessed_at_ms))
+                .collect::<Vec<_>>()
+        };
+        candidates.sort_by_key(|(_, accessed)| std::cmp::Reverse(*accessed));
+        candidates
+            .into_iter()
+            .find_map(|(key, _)| self.lookup(&key))
+    }
+
     pub fn drain_diagnostics(&self) -> Vec<CacheDiagnostic> {
         self.diagnostics.lock().unwrap().drain(..).collect()
     }
@@ -1400,6 +1435,27 @@ mod tests {
         }
         assert!(store.lookup(&cache_key).is_some());
         assert!(store.revision() > revision);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stable_track_lookup_prefers_requested_quality_then_falls_back() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        let low = key("stable-track", "128k");
+        let high = key("stable-track", "flac");
+        write_entry(&store, low.clone(), 8);
+        write_entry(&store, high.clone(), 16);
+
+        let preferred = store
+            .lookup_track(&high.provider_id, &high.provider_track_id, Some("128k"))
+            .unwrap();
+        assert_eq!(preferred.key.quality, "128k");
+        store.remove_entry(&low).unwrap();
+        let fallback = store
+            .lookup_track(&high.provider_id, &high.provider_track_id, Some("128k"))
+            .unwrap();
+        assert_eq!(fallback.key.quality, "flac");
         fs::remove_dir_all(root).unwrap();
     }
 

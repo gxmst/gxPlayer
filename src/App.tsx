@@ -1557,6 +1557,76 @@ function App() {
     setMessage(`已从本地缓存秒开 · ${entry.quality}`);
   };
 
+  const playHistoryEntry = async (entry: HistoryEntry) => {
+    if (entry.kind === "local" && entry.path) {
+      const track = { id: -1, path: entry.path, title: entry.title, artist: entry.artist, album: "", durationSeconds: null, favorite: false, addedAtMs: 0 };
+      await playLocalInList([track], track);
+      return;
+    }
+    if (!entry.providerId || !entry.providerTrackId) return;
+    try {
+      const quality = await invoke<string | null>("player_play_history_cache", {
+        request: {
+          providerId: entry.providerId,
+          providerTrackId: entry.providerTrackId,
+          quality: entry.quality,
+          title: entry.title,
+          artist: entry.artist,
+        },
+      });
+      if (quality) {
+        const cached: Extract<PlaylistEntry, { kind: "cached" }> = {
+          kind: "cached",
+          providerId: entry.providerId,
+          providerTrackId: entry.providerTrackId,
+          quality,
+          title: entry.title,
+          artist: entry.artist,
+        };
+        setPlaylist([cached]);
+        setPlaylistIndex(0);
+        setSelectedCatalogTrack(cacheEntryToCatalog({
+          providerId: cached.providerId,
+          providerTrackId: cached.providerTrackId,
+          quality,
+          title: cached.title,
+          artist: cached.artist,
+          album: "",
+          byteLen: 0,
+          sourceSampleRate: null,
+          sourceBitDepth: null,
+          sourceChannels: null,
+          mediaType: "unknown",
+          pinned: false,
+          lastAccessedAtMs: 0,
+          completedAtMs: 0,
+          fileName: "",
+        }));
+        setCurrentQuality(quality);
+        clearLyrics();
+        setMessage(`历史记录已从本地缓存播放 · ${quality}`);
+        return;
+      }
+      if (entry.kind === "cached") {
+        setMessage(`《${entry.title}》的缓存已不存在，未发起联网请求。`, true);
+        return;
+      }
+      await playCatalog({
+        providerId: entry.providerId,
+        providerTrackId: entry.providerTrackId,
+        title: entry.title,
+        artist: entry.artist,
+        album: "",
+        durationMs: null,
+        artworkUrl: null,
+        resolverPayload: {},
+        preview: null,
+      });
+    } catch (error) {
+      setMessage(`播放历史记录失败：${String(error)}`, true);
+    }
+  };
+
   /** Try to start one playlist entry. Does not chain-skip on failure (caller decides). */
   const tryStartEntry = async (
     entries: PlaylistEntry[],
@@ -3052,26 +3122,7 @@ function App() {
                   <button
                     type="button"
                     className="track-main"
-                    onClick={() => {
-                      if (entry.kind === "local" && entry.path) {
-                        void playLocalInList(
-                          [{ id: -1, path: entry.path, title: entry.title, artist: entry.artist, album: "", durationSeconds: null, favorite: false, addedAtMs: 0 }],
-                          { id: -1, path: entry.path, title: entry.title, artist: entry.artist, album: "", durationSeconds: null, favorite: false, addedAtMs: 0 },
-                        );
-                      } else if (entry.providerId && entry.providerTrackId) {
-                        void playCatalog({
-                          providerId: entry.providerId,
-                          providerTrackId: entry.providerTrackId,
-                          title: entry.title,
-                          artist: entry.artist,
-                          album: "",
-                          durationMs: null,
-                          artworkUrl: null,
-                          resolverPayload: {},
-                          preview: null,
-                        });
-                      }
-                    }}
+                    onClick={() => void playHistoryEntry(entry)}
                   >
                     <span className="track-index">{entry.kind.slice(0, 2)}</span>
                     <span>

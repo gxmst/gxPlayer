@@ -26,18 +26,18 @@ repository = "https://github.com/gxmst/gxPlayer"
 
 [workspace.dependencies]
 anyhow = "1.0.103"
-cpal = "0.15.3"
+cpal = "0.18.1"
 crossbeam-channel = "0.5.15"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls", "system-proxy"] }
 regex = "=1.13.0"
-rusqlite = { version = "0.38.0", features = ["bundled"] }
-ringbuf = "0.4.8"
-rubato = "0.16.2"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+ringbuf = "0.5.1"
+rubato = "4.0.0"
 rustfft = "6.4.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-sha2 = "0.10.9"
-symphonia = { version = "0.5.5", features = ["aac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
+sha2 = "0.11.0"
+symphonia = { version = "0.6.0", features = ["aac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }

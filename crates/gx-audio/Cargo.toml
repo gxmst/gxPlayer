@@ -22,4 +22,4 @@ symphonia.workspace = true
 gx-streaming = { path = "../gx-streaming", features = ["test-private-network"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_System_Threading"] }
+windows = { version = "0.62", features = ["Win32_System_Threading"] }

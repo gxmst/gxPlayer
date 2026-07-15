@@ -1,13 +1,14 @@
 import { useEffect, useState } from "react";
 
 export const NARROW_LAYOUT_QUERY = "(max-width: 900.98px)";
+const NARROW_LAYOUT_FALLBACK_MAX_WIDTH = 900.98;
 
 function currentMatch(): boolean {
   if (typeof window === "undefined") return false;
   if (typeof window.matchMedia === "function") {
     return window.matchMedia(NARROW_LAYOUT_QUERY).matches;
   }
-  return window.innerWidth <= 720.98;
+  return window.innerWidth <= NARROW_LAYOUT_FALLBACK_MAX_WIDTH;
 }
 
 export function useNarrowLayout(): boolean {

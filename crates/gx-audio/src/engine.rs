@@ -144,28 +144,152 @@ pub enum PlayMode {
 }
 
 impl AudioMode {
-    fn dsp_settings(self) -> DspSettings {
+    fn dsp_control(self) -> DspControlState {
         match self {
-            Self::Music => DspSettings::default(),
-            Self::CinemaGame => DspSettings {
-                enabled: true,
-                eq_enabled: false,
-                crossfeed: CrossfeedSettings {
+            Self::Music => DspControlState::default(),
+            Self::CinemaGame => DspControlState {
+                settings: DspSettings {
                     enabled: true,
-                    ..CrossfeedSettings::default()
+                    eq_enabled: false,
+                    crossfeed: CrossfeedSettings {
+                        enabled: true,
+                        amount: 0.18,
+                        delay_ms: 0.28,
+                        cutoff_hz: 700.0,
+                    },
+                    hrtf: HrtfSettings {
+                        enabled: true,
+                        mix: 0.72,
+                        output_gain_db: -6.0,
+                    },
+                    limiter: LimiterSettings {
+                        enabled: true,
+                        ..LimiterSettings::default()
+                    },
+                    ..DspSettings::default()
                 },
-                hrtf: HrtfSettings {
-                    enabled: true,
-                    ..HrtfSettings::default()
-                },
-                limiter: LimiterSettings {
-                    enabled: true,
-                    ..LimiterSettings::default()
-                },
-                ..DspSettings::default()
+                active_preset_id: DspPresetId::Spatial,
+                intensity: 0.5,
+                spatial_amount: 1.0,
             },
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DspPresetId {
+    #[default]
+    Bypass,
+    HeadphoneDaily,
+    Vocal,
+    Bass,
+    Spatial,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DspControlState {
+    pub settings: DspSettings,
+    pub active_preset_id: DspPresetId,
+    pub intensity: f32,
+    pub spatial_amount: f32,
+}
+
+impl Default for DspControlState {
+    fn default() -> Self {
+        Self {
+            settings: DspSettings::default(),
+            active_preset_id: DspPresetId::Bypass,
+            intensity: 0.5,
+            spatial_amount: 0.5,
+        }
+    }
+}
+
+impl DspControlState {
+    pub fn from_audio_mode(mode: AudioMode) -> Self {
+        mode.dsp_control()
+    }
+
+    pub fn from_settings(settings: DspSettings) -> Self {
+        let active_preset_id = if !settings.enabled {
+            DspPresetId::Bypass
+        } else if settings.hrtf.enabled {
+            DspPresetId::Spatial
+        } else if settings.eq_enabled {
+            DspPresetId::Vocal
+        } else {
+            DspPresetId::HeadphoneDaily
+        };
+        Self {
+            settings,
+            active_preset_id,
+            intensity: 0.5,
+            spatial_amount: 0.5,
+        }
+    }
+
+    pub fn audio_mode(&self) -> AudioMode {
+        if self.active_preset_id == DspPresetId::Spatial {
+            AudioMode::CinemaGame
+        } else {
+            AudioMode::Music
+        }
+    }
+
+    pub fn validate_product(&self) -> Result<()> {
+        if !self.intensity.is_finite() || !(0.0..=1.0).contains(&self.intensity) {
+            bail!("DSP intensity must be in the range 0..=1");
+        }
+        if !self.spatial_amount.is_finite() || !(0.0..=1.0).contains(&self.spatial_amount) {
+            bail!("DSP spatial amount must be in the range 0..=1");
+        }
+        if self.settings.eq_bands.len() > 10 {
+            bail!("product DSP supports at most 10 EQ bands");
+        }
+        if self
+            .settings
+            .eq_bands
+            .iter()
+            .any(|band| !band.gain_db.is_finite() || band.gain_db.abs() > 12.0)
+        {
+            bail!("product EQ gain must stay in the range -12..=12 dB");
+        }
+        match self.active_preset_id {
+            DspPresetId::Bypass if self.settings.enabled => {
+                bail!("bypass preset must disable the complete DSP chain")
+            }
+            DspPresetId::Bypass => {}
+            _ if !self.settings.enabled => bail!("non-bypass preset must enable DSP"),
+            DspPresetId::Spatial if !self.settings.hrtf.enabled => {
+                bail!("spatial preset must enable HRTF")
+            }
+            DspPresetId::Spatial => {}
+            _ if self.settings.hrtf.enabled => {
+                bail!("only the spatial preset may enable HRTF")
+            }
+            _ => {}
+        }
+        if self.settings.hrtf.enabled && !self.settings.limiter.enabled {
+            bail!("HRTF requires the limiter to remain enabled");
+        }
+        DspChain::new(48_000, 2, self.settings.clone())?;
+        Ok(())
+    }
+}
+
+fn validate_dsp_control_for_output(
+    control: &DspControlState,
+    output_sample_rate: Option<u32>,
+) -> Result<()> {
+    control.validate_product()?;
+    if let Some(sample_rate) = output_sample_rate {
+        DspChain::new(sample_rate, 2, control.settings.clone()).with_context(|| {
+            format!("DSP settings are invalid at the active {sample_rate} Hz output rate")
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -257,6 +381,9 @@ pub struct EngineSnapshot {
     pub audio_mode: AudioMode,
     pub play_mode: PlayMode,
     pub dsp_settings: DspSettings,
+    pub active_preset_id: DspPresetId,
+    pub intensity: f32,
+    pub spatial_amount: f32,
     pub generation: u64,
     pub underrun_callbacks: u64,
     pub output_sample_rate: Option<u32>,
@@ -279,6 +406,9 @@ impl Default for EngineSnapshot {
             audio_mode: AudioMode::Music,
             play_mode: PlayMode::Sequential,
             dsp_settings: DspSettings::default(),
+            active_preset_id: DspPresetId::Bypass,
+            intensity: 0.5,
+            spatial_amount: 0.5,
             generation: 0,
             underrun_callbacks: 0,
             output_sample_rate: None,
@@ -309,9 +439,11 @@ enum EngineCommand {
     Pause,
     Seek(f64),
     SetVolume(f32),
-    SetAudioMode(AudioMode),
     SetPlayMode(PlayMode),
-    SetDspSettings(DspSettings),
+    SetDspControl {
+        control: DspControlState,
+        reply: Sender<std::result::Result<(), String>>,
+    },
     SetOutputDevice(Option<String>),
     Next,
     Previous,
@@ -328,6 +460,7 @@ impl EngineCommand {
                 | Self::ClearQueue
                 | Self::Pause
                 | Self::Seek(_)
+                | Self::SetDspControl { .. }
                 | Self::SetOutputDevice(_)
                 | Self::Next
                 | Self::Previous
@@ -348,6 +481,7 @@ pub struct LocalAudioEngine {
     diagnostics: EngineDiagnosticQueue,
     streaming_diagnostics: StreamingDiagnosticQueue,
     output_device_events: OutputDeviceEventQueue,
+    ab_dry_active: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -364,6 +498,8 @@ impl LocalAudioEngine {
         let interruption_for_worker = stream_interruption.clone();
         let output_device_events = OutputDeviceEventQueue::default();
         let output_device_events_for_worker = output_device_events.clone();
+        let ab_dry_active = Arc::new(AtomicBool::new(false));
+        let ab_dry_active_for_worker = Arc::clone(&ab_dry_active);
         let worker = thread::Builder::new()
             .name("gx-local-audio-engine".into())
             .spawn(move || {
@@ -374,6 +510,7 @@ impl LocalAudioEngine {
                     streaming_diagnostics_for_worker,
                     interruption_for_worker,
                     output_device_events_for_worker,
+                    ab_dry_active_for_worker,
                 )
             })
             .context("failed to spawn local audio engine worker")?;
@@ -384,6 +521,7 @@ impl LocalAudioEngine {
             diagnostics,
             streaming_diagnostics,
             output_device_events,
+            ab_dry_active,
             worker: Mutex::new(Some(worker)),
         })
     }
@@ -544,14 +682,35 @@ impl LocalAudioEngine {
     }
 
     pub fn set_dsp_settings(&self, settings: DspSettings) -> Result<()> {
-        DspChain::new(48_000, 2, settings.clone())?;
-        self.send(EngineCommand::SetDspSettings(settings))
+        self.set_dsp_control(DspControlState::from_settings(settings))
+    }
+
+    pub fn set_dsp_control(&self, control: DspControlState) -> Result<()> {
+        self.set_dsp_control_confirmed(control)
+    }
+
+    /// Applies a DSP control transaction on the worker before returning.
+    ///
+    /// `Ok(())` means either the active DSP chain was updated successfully, or the desired state
+    /// was accepted and an output-topology/session rebuild was queued. An active-chain validation
+    /// failure is returned to the caller and leaves the prior worker state authoritative.
+    pub fn set_dsp_control_confirmed(&self, control: DspControlState) -> Result<()> {
+        let output_sample_rate = self.snapshot.lock().unwrap().output_sample_rate;
+        validate_dsp_control_for_output(&control, output_sample_rate)?;
+        let (reply, confirmation) = bounded(1);
+        self.send(EngineCommand::SetDspControl { control, reply })?;
+        confirmation
+            .recv()
+            .map_err(|_| anyhow!("audio engine stopped before confirming DSP settings"))?
+            .map_err(anyhow::Error::msg)
     }
 
     pub fn set_audio_mode(&self, mode: AudioMode) -> Result<()> {
-        let settings = mode.dsp_settings();
-        DspChain::new(48_000, 2, settings.clone())?;
-        self.send(EngineCommand::SetAudioMode(mode))
+        self.set_dsp_control_confirmed(DspControlState::from_audio_mode(mode))
+    }
+
+    pub fn set_ab_dry(&self, enabled: bool) {
+        self.ab_dry_active.store(enabled, Ordering::Relaxed);
     }
 
     pub fn set_play_mode(&self, mode: PlayMode) -> Result<()> {
@@ -657,7 +816,7 @@ struct WorkerModel {
     shuffle_played: Vec<bool>,
     /// LCG state for shuffle — no external RNG dependency.
     shuffle_rng: u64,
-    dsp_settings: DspSettings,
+    dsp_control: DspControlState,
     generation: u64,
     error: Option<String>,
     output_device: Option<String>,
@@ -679,7 +838,7 @@ impl Default for WorkerModel {
             shuffle_played: Vec::new(),
             // Mix process/thread entropy lightly without pulling in the rand crate.
             shuffle_rng: default_shuffle_seed(),
-            dsp_settings: DspSettings::default(),
+            dsp_control: DspControlState::default(),
             generation: 0,
             error: None,
             output_device: None,
@@ -869,6 +1028,7 @@ fn run_worker(
     streaming_diagnostics: StreamingDiagnosticQueue,
     stream_interruption: StreamInterruption,
     output_device_events: OutputDeviceEventQueue,
+    ab_dry_active: Arc<AtomicBool>,
 ) {
     let mut model = WorkerModel::default();
     let mut session: Option<PlaybackSession> = None;
@@ -905,10 +1065,13 @@ fn run_worker(
                     &item.source,
                     model.start_seconds,
                     model.volume,
-                    model.dsp_settings.clone(),
+                    model.dsp_control.settings.clone(),
                     model.output_device.as_deref(),
-                    streaming_diagnostics.clone(),
-                    stream_interruption.clone(),
+                    PlaybackSessionRuntime {
+                        streaming_diagnostics: streaming_diagnostics.clone(),
+                        stream_interruption: stream_interruption.clone(),
+                        ab_dry_active: Arc::clone(&ab_dry_active),
+                    },
                 ) {
                     Ok(mut next_session) => {
                         if let Some(index) = model.index
@@ -1319,12 +1482,6 @@ fn handle_command(
                 volume,
             );
         }
-        EngineCommand::SetAudioMode(mode) => {
-            let settings = mode.dsp_settings();
-            if apply_dsp_change(model, session.as_mut(), settings) {
-                model.audio_mode = mode;
-            }
-        }
         EngineCommand::SetPlayMode(mode) => {
             let previous = model.play_mode;
             model.play_mode = mode;
@@ -1336,8 +1493,10 @@ fn handle_command(
                 }
             }
         }
-        EngineCommand::SetDspSettings(settings) => {
-            apply_dsp_change(model, session.as_mut(), settings);
+        EngineCommand::SetDspControl { control, reply } => {
+            let result =
+                apply_dsp_change(model, session, control).map_err(|error| error.to_string());
+            let _ = reply.send(result);
         }
         EngineCommand::SetOutputDevice(name) => {
             model.output_device = name;
@@ -1396,18 +1555,54 @@ fn apply_volume_change(model: &mut WorkerModel, volume_bits: Option<&AtomicU32>,
 
 fn apply_dsp_change(
     model: &mut WorkerModel,
-    session: Option<&mut PlaybackSession>,
-    settings: DspSettings,
-) -> bool {
-    if let Some(active) = session
-        && let Err(error) = active.set_dsp_settings(settings.clone())
+    session: &mut Option<PlaybackSession>,
+    control: DspControlState,
+) -> Result<()> {
+    if let Some(active) = session.as_ref()
+        && dsp_change_requires_output_rebuild(
+            active.dsp_chain.settings(),
+            &control.settings,
+            active.source_channels,
+            active.output_channels,
+        )
     {
-        model.error = Some(format!("failed to update DSP settings: {error}"));
-        return false;
+        model.start_seconds = active.position_seconds();
+        model.audio_mode = control.audio_mode();
+        model.dsp_control = control;
+        model.reload_requested = true;
+        model.status = PlaybackStatus::Loading;
+        model.generation = model.generation.wrapping_add(1);
+        model.error = None;
+        *session = None;
+        return Ok(());
     }
-    model.dsp_settings = settings;
+    if let Some(active) = session.as_mut()
+        && let Err(error) = active.set_dsp_settings(control.settings.clone())
+    {
+        let error = format!("failed to update DSP settings: {error}");
+        model.error = Some(error.clone());
+        return Err(anyhow!(error));
+    }
+    model.audio_mode = control.audio_mode();
+    model.dsp_control = control;
     model.error = None;
-    true
+    Ok(())
+}
+
+fn dsp_change_requires_output_rebuild(
+    current: &DspSettings,
+    next: &DspSettings,
+    source_channels: usize,
+    output_channels: usize,
+) -> bool {
+    let current_requires_stereo = dsp_requires_stereo(current);
+    let next_requires_stereo = dsp_requires_stereo(next);
+    (next_requires_stereo && output_channels != 2)
+        || (current_requires_stereo && !next_requires_stereo && source_channels != 2)
+}
+
+fn dsp_requires_stereo(settings: &DspSettings) -> bool {
+    settings.crossfeed.enabled || settings.hrtf.enabled
 }
 
 fn local_queue_item(path: PathBuf) -> EngineQueueItem {
@@ -1454,7 +1649,10 @@ fn publish_snapshot(
         volume: model.volume,
         audio_mode: model.audio_mode,
         play_mode: model.play_mode,
-        dsp_settings: model.dsp_settings.clone(),
+        dsp_settings: model.dsp_control.settings.clone(),
+        active_preset_id: model.dsp_control.active_preset_id,
+        intensity: model.dsp_control.intensity,
+        spatial_amount: model.dsp_control.spatial_amount,
         generation: model.generation,
         underrun_callbacks: underruns,
         output_sample_rate,
@@ -1472,12 +1670,34 @@ enum PumpResult {
     Ended,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AbSample {
+    processed: f32,
+    dry: f32,
+}
+
+struct PlaybackSessionRuntime {
+    streaming_diagnostics: StreamingDiagnosticQueue,
+    stream_interruption: StreamInterruption,
+    ab_dry_active: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl AbSample {
+    fn same(sample: f32) -> Self {
+        Self {
+            processed: sample,
+            dry: sample,
+        }
+    }
+}
+
 struct PlaybackSession {
     media: OpenedMedia,
     rate_adapter: RateAdapter,
     dsp_chain: DspChain,
     sample_buffer: Option<SampleBuffer<f32>>,
-    producer: HeapProd<f32>,
+    producer: HeapProd<AbSample>,
     stream: Stream,
     played_samples: Arc<AtomicU64>,
     underrun_callbacks: Arc<AtomicU64>,
@@ -1497,6 +1717,7 @@ struct PlaybackSession {
     cache_committed: bool,
     prebuffer_samples: usize,
     pending: Vec<f32>,
+    pending_ab_dry: Vec<f32>,
     pending_offset: usize,
     eof: bool,
     flushed: bool,
@@ -1512,8 +1733,7 @@ impl PlaybackSession {
         volume: f32,
         dsp_settings: DspSettings,
         output_device_name: Option<&str>,
-        streaming_diagnostics: StreamingDiagnosticQueue,
-        stream_interruption: StreamInterruption,
+        runtime: PlaybackSessionRuntime,
     ) -> Result<Self> {
         let cache_plan = match source {
             PlaybackSource::Online { cache_plan, .. } => cache_plan.clone(),
@@ -1534,8 +1754,8 @@ impl PlaybackSession {
                 let http = HttpMediaSource::new_with_cache_diagnostics_and_interruption(
                     request.clone(),
                     cache_plan.clone(),
-                    streaming_diagnostics,
-                    stream_interruption,
+                    runtime.streaming_diagnostics,
+                    runtime.stream_interruption,
                 )?;
                 let mut media = open_media_source(Box::new(http), extension, &description)?;
                 let discard = seek_media_coarse(&mut media, start_seconds)?;
@@ -1586,7 +1806,7 @@ impl PlaybackSession {
                 .default_output_device()
                 .context("no default audio output device is available")?,
         };
-        let preferred_channels = if dsp_settings.crossfeed.enabled || dsp_settings.hrtf.enabled {
+        let preferred_channels = if dsp_requires_stereo(&dsp_settings) {
             2
         } else {
             channels as u16
@@ -1601,7 +1821,7 @@ impl PlaybackSession {
         let ring_capacity = ((output_sample_rate as f64 * output_channels as f64 * RING_SECONDS)
             as usize)
             .max(4096);
-        let ring = HeapRb::<f32>::new(ring_capacity);
+        let ring = HeapRb::<AbSample>::new(ring_capacity);
         let (producer, consumer) = ring.split();
         let played_samples = Arc::new(AtomicU64::new(0));
         let underrun_callbacks = Arc::new(AtomicU64::new(0));
@@ -1618,6 +1838,9 @@ impl PlaybackSession {
                 underruns: Arc::clone(&underrun_callbacks),
                 enabled: Arc::clone(&callback_enabled),
                 volume_bits: Arc::clone(&volume_bits),
+                ab_dry_active: runtime.ab_dry_active,
+                output_sample_rate,
+                output_channels,
             },
             Arc::clone(&output_device_failed),
         )
@@ -1631,7 +1854,8 @@ impl PlaybackSession {
             rate_adapter.process(&prefetched)?
         };
         pending = remap_channels(&pending, channels, output_channels)?;
-        dsp_chain.process_interleaved_in_place(&mut pending)?;
+        let mut pending_ab_dry = vec![0.0; pending.len()];
+        dsp_chain.process_interleaved_with_ab_dry(&mut pending, &mut pending_ab_dry)?;
 
         Ok(Self {
             media,
@@ -1660,6 +1884,7 @@ impl PlaybackSession {
                 * output_channels as f64
                 * PREBUFFER_SECONDS) as usize,
             pending,
+            pending_ab_dry,
             pending_offset: 0,
             eof: false,
             flushed: false,
@@ -1672,7 +1897,10 @@ impl PlaybackSession {
     fn pump(&mut self) -> Result<PumpResult> {
         if self.pending_offset < self.pending.len() {
             while self.pending_offset < self.pending.len() {
-                let sample = self.pending[self.pending_offset];
+                let sample = AbSample {
+                    processed: self.pending[self.pending_offset],
+                    dry: self.pending_ab_dry[self.pending_offset],
+                };
                 match self.producer.try_push(sample) {
                     Ok(()) => self.pending_offset += 1,
                     Err(_) => {
@@ -1682,6 +1910,7 @@ impl PlaybackSession {
                 }
             }
             self.pending.clear();
+            self.pending_ab_dry.clear();
             self.pending_offset = 0;
             self.maybe_start()?;
             return Ok(PumpResult::Progress);
@@ -1692,8 +1921,9 @@ impl PlaybackSession {
                 self.pending = self.rate_adapter.finish()?;
                 self.pending =
                     remap_channels(&self.pending, self.source_channels, self.output_channels)?;
+                self.pending_ab_dry.resize(self.pending.len(), 0.0);
                 self.dsp_chain
-                    .process_interleaved_in_place(&mut self.pending)?;
+                    .process_interleaved_with_ab_dry(&mut self.pending, &mut self.pending_ab_dry)?;
                 self.flushed = true;
                 if !self.pending.is_empty() {
                     return Ok(PumpResult::Progress);
@@ -1746,8 +1976,9 @@ impl PlaybackSession {
         }
         self.pending = self.rate_adapter.process(samples)?;
         self.pending = remap_channels(&self.pending, self.source_channels, self.output_channels)?;
+        self.pending_ab_dry.resize(self.pending.len(), 0.0);
         self.dsp_chain
-            .process_interleaved_in_place(&mut self.pending)?;
+            .process_interleaved_with_ab_dry(&mut self.pending, &mut self.pending_ab_dry)?;
         Ok(PumpResult::Progress)
     }
 
@@ -1858,13 +2089,52 @@ struct OutputCallbackCounters {
     underruns: Arc<AtomicU64>,
     enabled: Arc<AtomicBool>,
     volume_bits: Arc<AtomicU32>,
+    ab_dry_active: Arc<AtomicBool>,
+    output_sample_rate: u32,
+    output_channels: usize,
+}
+
+struct AbDryRamp {
+    position_frames: u64,
+    ramp_frames: u64,
+    initialized: bool,
+}
+
+impl AbDryRamp {
+    fn new(sample_rate: u32) -> Self {
+        // Integer rounding keeps the transition at exactly one hundredth of a second without
+        // accumulating an extra frame at rates such as 8 or 96 kHz. Widen before adding so even a
+        // defensive u32::MAX input cannot overflow.
+        let ramp_frames = ((u64::from(sample_rate) + 50) / 100).max(1);
+        Self {
+            position_frames: 0,
+            ramp_frames,
+            initialized: false,
+        }
+    }
+
+    #[inline]
+    fn advance(&mut self, dry: bool) -> f32 {
+        // A newly built stream may sit in prebuffering while the momentary A/B state changes. Its
+        // first audible frame must start at the current state rather than ramping from the stale
+        // state observed while the stream was constructed.
+        if !self.initialized {
+            self.position_frames = if dry { self.ramp_frames } else { 0 };
+            self.initialized = true;
+        } else if dry {
+            self.position_frames = (self.position_frames + 1).min(self.ramp_frames);
+        } else {
+            self.position_frames = self.position_frames.saturating_sub(1);
+        }
+        self.position_frames as f32 / self.ramp_frames as f32
+    }
 }
 
 fn build_engine_output_stream(
     device: &cpal::Device,
     config: &StreamConfig,
     sample_format: SampleFormat,
-    consumer: HeapCons<f32>,
+    consumer: HeapCons<AbSample>,
     counters: OutputCallbackCounters,
     output_device_failed: Arc<AtomicBool>,
 ) -> Result<Stream> {
@@ -1946,7 +2216,7 @@ fn build_engine_output_stream(
 fn build_typed_engine_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
-    mut consumer: HeapCons<f32>,
+    mut consumer: HeapCons<AbSample>,
     counters: OutputCallbackCounters,
     output_device_failed: Arc<AtomicBool>,
 ) -> Result<Stream>
@@ -1954,11 +2224,12 @@ where
     T: Sample + SizedSample + FromSample<f32>,
 {
     let mut callback_thread_priority = AudioThreadPriority::default();
+    let mut ab_dry_ramp = AbDryRamp::new(counters.output_sample_rate);
     let stream = device.build_output_stream(
         config,
         move |output: &mut [T], _| {
             callback_thread_priority.ensure_registered();
-            render_output_callback(output, &mut consumer, &counters);
+            render_output_callback(output, &mut consumer, &counters, &mut ab_dry_ramp);
         },
         move |error| {
             output_device_failed.store(true, Ordering::Release);
@@ -1972,8 +2243,9 @@ where
 #[inline]
 fn render_output_callback<T>(
     output: &mut [T],
-    consumer: &mut HeapCons<f32>,
+    consumer: &mut HeapCons<AbSample>,
     counters: &OutputCallbackCounters,
+    ab_dry_ramp: &mut AbDryRamp,
 ) where
     T: Sample + SizedSample + FromSample<f32>,
 {
@@ -1981,18 +2253,27 @@ fn render_output_callback<T>(
     let volume = f32::from_bits(counters.volume_bits.load(Ordering::Relaxed));
     let mut starved = false;
     let mut consumed = 0u64;
-    for target in output {
-        let sample = match consumer.try_pop() {
-            Some(value) => {
-                consumed += 1;
-                value * volume
+    let output_channels = counters.output_channels.max(1);
+    for frame in output.chunks_mut(output_channels) {
+        let dry = counters.ab_dry_active.load(Ordering::Relaxed);
+        let dry_mix = ab_dry_ramp.advance(dry);
+        // Never consume a partial interleaved frame. A producer can publish one channel just
+        // before backpressure; popping it alone would shift every channel after the underrun.
+        if frame.len() != output_channels || consumer.occupied_len() < output_channels {
+            starved |= enabled;
+            for target in frame {
+                *target = T::from_sample(0.0);
             }
-            None => {
-                starved = enabled;
-                0.0
-            }
-        };
-        *target = T::from_sample(sample);
+            continue;
+        }
+        for target in frame {
+            let value = consumer
+                .try_pop()
+                .expect("complete output frame was checked before popping");
+            let sample = (value.processed + (value.dry - value.processed) * dry_mix) * volume;
+            *target = T::from_sample(sample);
+        }
+        consumed += output_channels as u64;
     }
     counters
         .played_samples
@@ -2222,6 +2503,81 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_dsp_control_updates_worker_state_before_returning() {
+        let engine = LocalAudioEngine::new().unwrap();
+        let spatial = DspControlState::from_audio_mode(AudioMode::CinemaGame);
+
+        engine.set_dsp_control_confirmed(spatial.clone()).unwrap();
+        wait_for_engine(&engine, |snapshot| {
+            snapshot.active_preset_id == DspPresetId::Spatial
+        });
+        assert_eq!(engine.snapshot().dsp_settings, spatial.settings);
+
+        engine
+            .set_dsp_control_confirmed(DspControlState::default())
+            .unwrap();
+        wait_for_engine(&engine, |snapshot| {
+            snapshot.active_preset_id == DspPresetId::Bypass
+        });
+    }
+
+    #[test]
+    fn confirmed_dsp_control_validates_the_active_output_sample_rate() {
+        let control = DspControlState {
+            settings: DspSettings {
+                enabled: true,
+                eq_enabled: true,
+                eq_bands: vec![gx_dsp::EqBand::peak(16_000.0, 3.0, 0.7)],
+                ..DspSettings::default()
+            },
+            active_preset_id: DspPresetId::Vocal,
+            intensity: 0.5,
+            spatial_amount: 0.5,
+        };
+        control.validate_product().unwrap();
+
+        let error = validate_dsp_control_for_output(&control, Some(32_000)).unwrap_err();
+
+        assert!(error.to_string().contains("active 32000 Hz output rate"));
+    }
+
+    #[test]
+    fn spatial_dsp_change_rebuilds_only_incompatible_output_topologies() {
+        let spatial = DspControlState::from_audio_mode(AudioMode::CinemaGame);
+        let bypass = DspControlState::default();
+        assert!(dsp_change_requires_output_rebuild(
+            &bypass.settings,
+            &spatial.settings,
+            1,
+            1,
+        ));
+        assert!(!dsp_change_requires_output_rebuild(
+            &bypass.settings,
+            &spatial.settings,
+            1,
+            2,
+        ));
+        assert!(dsp_change_requires_output_rebuild(
+            &bypass.settings,
+            &spatial.settings,
+            6,
+            6,
+        ));
+        assert!(dsp_change_requires_output_rebuild(
+            &spatial.settings,
+            &bypass.settings,
+            6,
+            2,
+        ));
+        assert!(!dsp_change_requires_output_rebuild(
+            &spatial.settings,
+            &bypass.settings,
+            2,
+            2,
+        ));
+    }
+
+    #[test]
     fn local_queue_item_is_built_without_media_probe() {
         let item = local_queue_item(PathBuf::from("definitely-missing/queued-song.flac"));
         assert_eq!(item.public.title, "queued-song");
@@ -2331,6 +2687,34 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn confirmed_dsp_control_interrupts_a_blocked_stream_and_replies_within_budget() {
+        let mut server = BlackholeServer::start(2);
+        let engine = LocalAudioEngine::new().unwrap();
+        engine
+            .load_resolved(blackhole_request(&server.url), "DSP blackhole".into())
+            .unwrap();
+        server.wait_for_connection(1);
+
+        let started = Instant::now();
+        engine
+            .set_dsp_control_confirmed(DspControlState::from_audio_mode(AudioMode::CinemaGame))
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_millis(200), "elapsed={elapsed:?}");
+        wait_for_engine(&engine, |snapshot| {
+            snapshot.active_preset_id == DspPresetId::Spatial
+        });
+        server.wait_for_connection(2);
+
+        engine.clear_queue().unwrap();
+        wait_for_engine(&engine, |snapshot| snapshot.queue.is_empty());
+        server.unblock();
+        thread::sleep(Duration::from_millis(30));
+        assert!(engine.drain_diagnostics().is_empty());
     }
 
     #[test]
@@ -2673,10 +3057,10 @@ mod tests {
 
     #[test]
     fn audio_callback_path_allocates_nothing_and_uses_only_atomics() {
-        let ring = HeapRb::<f32>::new(256);
+        let ring = HeapRb::<AbSample>::new(256);
         let (mut producer, mut consumer) = ring.split();
         for _ in 0..128 {
-            producer.try_push(1.0).unwrap();
+            producer.try_push(AbSample::same(1.0)).unwrap();
         }
         let volume_bits = Arc::new(AtomicU32::new(0.5f32.to_bits()));
         let counters = OutputCallbackCounters {
@@ -2684,19 +3068,23 @@ mod tests {
             underruns: Arc::new(AtomicU64::new(0)),
             enabled: Arc::new(AtomicBool::new(true)),
             volume_bits: Arc::clone(&volume_bits),
+            ab_dry_active: Arc::new(AtomicBool::new(false)),
+            output_sample_rate: 48_000,
+            output_channels: 2,
         };
+        let mut ab_dry_ramp = AbDryRamp::new(48_000);
         let mut output = [0.0f32; 128];
         ALLOCATION_COUNT.with(|count| count.set(0));
         TRACK_ALLOCATIONS.with(|enabled| enabled.set(true));
-        render_output_callback(&mut output, &mut consumer, &counters);
+        render_output_callback(&mut output, &mut consumer, &counters, &mut ab_dry_ramp);
         for sample in &output {
             assert_eq!(*sample, 0.5);
         }
         for _ in 0..128 {
-            producer.try_push(1.0).unwrap();
+            producer.try_push(AbSample::same(1.0)).unwrap();
         }
         volume_bits.store(0.25f32.to_bits(), Ordering::Relaxed);
-        render_output_callback(&mut output, &mut consumer, &counters);
+        render_output_callback(&mut output, &mut consumer, &counters, &mut ab_dry_ramp);
         TRACK_ALLOCATIONS.with(|enabled| enabled.set(false));
         assert_eq!(ALLOCATION_COUNT.with(Cell::get), 0);
         for sample in &output {
@@ -2704,6 +3092,124 @@ mod tests {
         }
         assert_eq!(counters.played_samples.load(Ordering::Relaxed), 256);
         assert_eq!(counters.underruns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ab_dry_crossfade_is_stereo_linked_and_completes_in_ten_milliseconds() {
+        let ring = HeapRb::<AbSample>::new(64);
+        let (mut producer, mut consumer) = ring.split();
+        for _ in 0..20 {
+            producer
+                .try_push(AbSample {
+                    processed: 1.0,
+                    dry: 0.0,
+                })
+                .unwrap();
+        }
+        let ab_dry_active = Arc::new(AtomicBool::new(false));
+        let counters = OutputCallbackCounters {
+            played_samples: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
+            enabled: Arc::new(AtomicBool::new(true)),
+            volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            ab_dry_active: Arc::clone(&ab_dry_active),
+            output_sample_rate: 1_000,
+            output_channels: 2,
+        };
+        let mut ramp = AbDryRamp::new(1_000);
+        assert_eq!(ramp.advance(false), 0.0);
+        ab_dry_active.store(true, Ordering::Release);
+        let mut output = [0.0f32; 20];
+        render_output_callback(&mut output, &mut consumer, &counters, &mut ramp);
+        for frame in output.chunks_exact(2) {
+            assert_eq!(frame[0], frame[1]);
+        }
+        assert!((output[0] - 0.9).abs() < 1.0e-6);
+        assert_eq!(output[18], 0.0);
+        assert_eq!(output[19], 0.0);
+    }
+
+    #[test]
+    fn ab_dry_ramp_hits_endpoints_at_exact_device_rate_frame_counts() {
+        for sample_rate in [8_000, 44_100, 48_000, 96_000, 192_000] {
+            let ramp_frames = (u64::from(sample_rate) + 50) / 100;
+            let mut ramp = AbDryRamp::new(sample_rate);
+            assert_eq!(ramp.advance(false), 0.0);
+
+            for _ in 1..ramp_frames {
+                assert!(ramp.advance(true) < 1.0, "sample_rate={sample_rate}");
+            }
+            assert_eq!(ramp.advance(true), 1.0, "sample_rate={sample_rate}");
+
+            for _ in 1..ramp_frames {
+                assert!(ramp.advance(false) > 0.0, "sample_rate={sample_rate}");
+            }
+            assert_eq!(ramp.advance(false), 0.0, "sample_rate={sample_rate}");
+        }
+
+        assert_eq!(AbDryRamp::new(0).ramp_frames, 1);
+        assert_eq!(AbDryRamp::new(u32::MAX).ramp_frames, 42_949_673);
+    }
+
+    #[test]
+    fn rebuilt_callback_uses_current_ab_state_on_its_first_frame() {
+        let ring = HeapRb::<AbSample>::new(4);
+        let (mut producer, mut consumer) = ring.split();
+        for _ in 0..2 {
+            producer
+                .try_push(AbSample {
+                    processed: 1.0,
+                    dry: 0.0,
+                })
+                .unwrap();
+        }
+        let ab_dry_active = Arc::new(AtomicBool::new(false));
+        let counters = OutputCallbackCounters {
+            played_samples: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
+            enabled: Arc::new(AtomicBool::new(true)),
+            volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            ab_dry_active: Arc::clone(&ab_dry_active),
+            output_sample_rate: 48_000,
+            output_channels: 2,
+        };
+        let mut ramp = AbDryRamp::new(48_000);
+
+        // Model a stream constructed while wet and prebuffered until after A/B was pressed.
+        ab_dry_active.store(true, Ordering::Relaxed);
+        let mut output = [1.0f32; 2];
+        render_output_callback(&mut output, &mut consumer, &counters, &mut ramp);
+
+        assert_eq!(output, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn callback_does_not_consume_a_partial_interleaved_frame() {
+        let ring = HeapRb::<AbSample>::new(8);
+        let (mut producer, mut consumer) = ring.split();
+        producer.try_push(AbSample::same(0.25)).unwrap();
+        let counters = OutputCallbackCounters {
+            played_samples: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
+            enabled: Arc::new(AtomicBool::new(true)),
+            volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            ab_dry_active: Arc::new(AtomicBool::new(false)),
+            output_sample_rate: 48_000,
+            output_channels: 2,
+        };
+        let mut ramp = AbDryRamp::new(48_000);
+        let mut output = [1.0f32; 2];
+
+        render_output_callback(&mut output, &mut consumer, &counters, &mut ramp);
+        assert_eq!(output, [0.0, 0.0]);
+        assert_eq!(counters.played_samples.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.underruns.load(Ordering::Relaxed), 1);
+
+        producer.try_push(AbSample::same(0.75)).unwrap();
+        render_output_callback(&mut output, &mut consumer, &counters, &mut ramp);
+        assert_eq!(output, [0.25, 0.75]);
+        assert_eq!(counters.played_samples.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.underruns.load(Ordering::Relaxed), 1);
     }
 
     #[test]

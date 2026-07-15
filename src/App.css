@@ -2339,6 +2339,10 @@ select {
   padding: 22px;
 }
 
+.dsp-settings-card {
+  grid-column: 1 / -1;
+}
+
 .settings-card select {
   width: 100%;
   margin-top: 18px;
@@ -2626,6 +2630,16 @@ select {
 .now-playing-layout-switch {
   justify-content: center;
   margin-top: -12px;
+}
+
+.now-playing-dsp-strip {
+  max-width: 1180px;
+  margin: 0 auto 28px;
+  padding: 16px 18px;
+  border: 1px solid var(--soft-border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--panel-bg) 82%, transparent);
+  box-shadow: var(--glass-inset), var(--shadow-sm);
 }
 
 .layout-lyrics .now-grid {
@@ -2931,8 +2945,6 @@ select {
 
 .front-left { left: 13%; top: 19%; }
 .front-right { right: 13%; top: 19%; }
-.rear-left { left: 9%; bottom: 21%; }
-.rear-right { right: 9%; bottom: 21%; }
 
 .sound-stage.bypassed .stage-speaker {
   opacity: 0.22;
@@ -2954,8 +2966,6 @@ select {
 }
 
 .sound-stage.enabled.is-playing .front-right { animation-delay: 0.15s; }
-.sound-stage.enabled.is-playing .rear-left { animation-delay: 0.3s; }
-.sound-stage.enabled.is-playing .rear-right { animation-delay: 0.45s; }
 
 .stage-mode-chip {
   position: absolute;
@@ -3426,6 +3436,24 @@ select {
     radial-gradient(circle at 50% 50%, var(--accent-contrast) 0 1.5px, transparent 1.6px);
   box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 35%, transparent);
   opacity: 1;
+}
+
+.tool-btn.preset-tool-btn {
+  width: auto;
+  padding: 0 9px;
+  gap: 6px;
+  border-radius: 999px;
+  line-height: 1;
+}
+
+.preset-tool-label {
+  max-width: 72px;
+  overflow: hidden;
+  color: currentColor;
+  font-size: 11px;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .timeline {
@@ -4311,6 +4339,15 @@ select {
 }
 
 @media (max-width: 900.98px) {
+  .preset-tool-label {
+    display: none;
+  }
+
+  .tool-btn.preset-tool-btn {
+    width: 32px;
+    padding: 0;
+  }
+
   .theme-trigger {
     width: 34px;
     min-width: 34px;
@@ -4388,7 +4425,7 @@ select {
   }
 }
 
-@media (max-width: 720.98px) {
+@media (max-width: 900.98px) {
   .app-shell:not(.mini-mode) {
     grid-template: 104px minmax(0, 1fr) 112px / 1fr;
   }
@@ -4921,7 +4958,7 @@ select {
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 720.98px) {
+@media (max-width: 900.98px) {
   .app-shell:not(.mini-mode) .queue-panel {
     right: 8px;
     bottom: 120px;

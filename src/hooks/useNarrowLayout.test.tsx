@@ -38,10 +38,11 @@ function installMatchMedia(initial: boolean) {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("useNarrowLayout", () => {
-  it("tracks the 720px media query without changing desktop sidebar preference", () => {
+  it("tracks the shared 900px media query without changing desktop sidebar preference", () => {
     const match = installMatchMedia(false);
     const { result, unmount } = renderHook(() => useNarrowLayout());
     expect(result.current).toBe(false);
+    expect(NARROW_LAYOUT_QUERY).toBe("(max-width: 900.98px)");
     expect(window.matchMedia).toHaveBeenCalledWith(NARROW_LAYOUT_QUERY);
 
     act(() => match.set(true));

@@ -2,7 +2,8 @@ import { invoke as nativeInvoke } from "@tauri-apps/api/core";
 import { listen as nativeListen, type Event, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow as nativeGetCurrentWindow } from "@tauri-apps/api/window";
 import { open as nativeOpen, save as nativeSave } from "@tauri-apps/plugin-dialog";
-import { EMPTY_ENGINE } from "../types";
+import { EMPTY_ENGINE, type DspControlState } from "../types";
+import { buildDspControlState } from "./dspPresets";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 const TEST_MODE = import.meta.env.MODE === "test";
@@ -46,10 +47,30 @@ const demoCatalog = [
   },
 ];
 
+let demoDspControl = buildDspControlState("bypass");
+
+function demoPreferences() {
+  return {
+    version: 2,
+    closeBehavior: "hide_to_tray",
+    closeToTrayNoticeShown: true,
+    volume: 0.72,
+    outputDevice: null,
+    dspControl: demoDspControl,
+  };
+}
+
 function mockResult(command: string, args?: Record<string, unknown>): unknown {
   switch (command) {
     case "player_snapshot":
-      return EMPTY_ENGINE;
+      return {
+        ...EMPTY_ENGINE,
+        audioMode: demoDspControl.activePresetId === "spatial" ? "cinema_game" : "music",
+        dspSettings: demoDspControl.settings,
+        activePresetId: demoDspControl.activePresetId,
+        intensity: demoDspControl.intensity,
+        spatialAmount: demoDspControl.spatialAmount,
+      };
     case "library_tracks":
     case "library_scan_missing":
       return demoLibrary;
@@ -81,7 +102,12 @@ function mockResult(command: string, args?: Record<string, unknown>): unknown {
     case "preview_cache_status":
       return { totalBytes: 0, entryCount: 0, limitBytes: 256 * 1024 ** 2 };
     case "app_preferences_get":
-      return { version: 1, closeBehavior: "hide_to_tray", closeToTrayNoticeShown: true, volume: 0.72, outputDevice: null };
+      return demoPreferences();
+    case "player_set_dsp_settings":
+      demoDspControl = (args?.control as DspControlState | undefined) ?? demoDspControl;
+      return demoPreferences();
+    case "player_set_ab_dry":
+      return undefined;
     case "player_refresh_output_devices":
       return { devices: ["浏览器演示设备"], defaultDevice: "浏览器演示设备", selectedDevice: null };
     case "network_proxy_status":

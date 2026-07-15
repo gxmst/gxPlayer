@@ -9,9 +9,8 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
-use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine, PlayMode};
+use gx_audio::engine::{AudioMode, DspControlState, EngineSnapshot, LocalAudioEngine, PlayMode};
 use gx_contracts::ResolvedMediaRequest;
-use gx_dsp::DspSettings;
 use gx_library::{
     CachedPlaylistTrack, LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistItem,
     PlaylistSummary,
@@ -54,8 +53,7 @@ use library_commands::{library_import_folders, library_relink_tracks, library_re
 use metadata_commands::{
     MetadataCancellationRegistry, maybe_start_phase3_smoke, metadata_cancel_request,
     metadata_chart, metadata_find_replacements, metadata_lyrics, metadata_play_preview,
-    metadata_read_local_lyrics,
-    metadata_search,
+    metadata_read_local_lyrics, metadata_search,
 };
 use network_settings::{network_proxy_status, network_set_proxy_mode};
 use product_commands::{
@@ -654,24 +652,61 @@ fn player_commit_volume(
 fn player_set_dsp_settings(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
-    settings: DspSettings,
-) -> Result<(), String> {
+    preferences: tauri::State<AppPreferencesState>,
+    control: DspControlState,
+) -> Result<AppPreferences, String> {
     require_window(&window, "main")?;
-    engine
-        .set_dsp_settings(settings)
-        .map_err(|error| error.to_string())
+    apply_persisted_dsp_control(&engine, &preferences, control)
 }
 
 #[tauri::command]
 fn player_set_audio_mode(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
+    preferences: tauri::State<AppPreferencesState>,
     mode: AudioMode,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    apply_persisted_dsp_control(
+        &engine,
+        &preferences,
+        DspControlState::from_audio_mode(mode),
+    )
+}
+
+fn apply_persisted_dsp_control(
+    engine: &LocalAudioEngine,
+    preferences: &AppPreferencesState,
+    control: DspControlState,
+) -> Result<AppPreferences, String> {
+    control
+        .validate_product()
+        .map_err(|error| error.to_string())?;
+    let _transaction = preferences.lock_dsp_transaction();
+    let previous = preferences.get().dsp_control;
+    engine
+        .set_dsp_control_confirmed(control.clone())
+        .map_err(|error| error.to_string())?;
+    match preferences.set_dsp_control(control) {
+        Ok(next) => Ok(next),
+        Err(error) => match engine.set_dsp_control_confirmed(previous) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; failed to restore the previous DSP state: {rollback_error}"
+            )),
+        },
+    }
+}
+
+#[tauri::command]
+fn player_set_ab_dry(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    enabled: bool,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
-    engine
-        .set_audio_mode(mode)
-        .map_err(|error| error.to_string())
+    engine.set_ab_dry(enabled);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1200,6 +1235,9 @@ pub fn run() {
             engine
                 .set_volume(restored_preferences.volume)
                 .map_err(tauri::Error::Anyhow)?;
+            engine
+                .set_dsp_control_confirmed(restored_preferences.dsp_control.clone())
+                .map_err(tauri::Error::Anyhow)?;
             if let Some(device) = restored_preferences.output_device.as_ref() {
                 let available = engine.output_devices().unwrap_or_default();
                 if available.iter().any(|candidate| candidate == device) {
@@ -1321,6 +1359,7 @@ pub fn run() {
             player_set_audio_mode,
             player_set_play_mode,
             player_set_dsp_settings,
+            player_set_ab_dry,
             player_next,
             player_previous,
             player_jump,
@@ -1423,4 +1462,66 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod dsp_preference_tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn test_root() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "gxplayer-dsp-preference-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn wait_for_dsp_control(engine: &LocalAudioEngine, expected: &DspControlState) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            if snapshot.dsp_settings == expected.settings
+                && snapshot.active_preset_id == expected.active_preset_id
+                && snapshot.intensity == expected.intensity
+                && snapshot.spatial_amount == expected.spatial_amount
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine did not publish the acknowledged DSP state"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn failed_dsp_persist_confirmedly_restores_the_previous_runtime_state() {
+        let root = test_root();
+        let preferences = AppPreferencesState::open(&root);
+        let engine = LocalAudioEngine::new().unwrap();
+        let previous = DspControlState::from_audio_mode(AudioMode::CinemaGame);
+
+        apply_persisted_dsp_control(&engine, &preferences, previous.clone()).unwrap();
+        wait_for_dsp_control(&engine, &previous);
+
+        fs::remove_file(root.join("app-preferences.json")).unwrap();
+        fs::create_dir_all(root.join("app-preferences.json")).unwrap();
+        let error = apply_persisted_dsp_control(&engine, &preferences, DspControlState::default())
+            .unwrap_err();
+
+        assert!(error.contains("path is a directory"));
+        assert_eq!(preferences.get().dsp_control, previous);
+        wait_for_dsp_control(&engine, &previous);
+
+        drop(engine);
+        drop(preferences);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

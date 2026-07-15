@@ -1,8 +1,8 @@
 use gx_audio::engine::LocalAudioEngine;
 use gx_metadata::{
     CatalogTrack, LyricDocument, MetadataClient, ReplacementMatch, SearchBatch, apple_chart,
-    fetch_lyrics, fetch_preview_bytes, find_replacements, parse_lrc, preview_is_available, search_all,
-    select_playable_with,
+    fetch_lyrics, fetch_preview_bytes, find_replacements, parse_lrc, preview_is_available,
+    search_all, select_playable_with,
 };
 use gx_source::safe_http::RequestCancellation;
 use serde::{Deserialize, Serialize};
@@ -259,7 +259,11 @@ pub async fn metadata_read_local_lyrics(
 ) -> Result<LyricDocument, String> {
     require_window(&window, "main")?;
     let path = PathBuf::from(path);
-    if !path.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("lrc")) {
+    if !path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("lrc"))
+    {
         return Err("请选择 .lrc 歌词文件".into());
     }
     tauri::async_runtime::spawn_blocking(move || {

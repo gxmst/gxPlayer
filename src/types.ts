@@ -232,6 +232,15 @@ export type DspSettings = {
   limiter: { enabled: boolean; ceilingDb: number; releaseMs: number };
 };
 
+export type DspPresetId = "bypass" | "headphone_daily" | "vocal" | "bass" | "spatial";
+
+export type DspControlState = {
+  settings: DspSettings;
+  activePresetId: DspPresetId;
+  intensity: number;
+  spatialAmount: number;
+};
+
 export type PlayMode = "sequential" | "repeat_all" | "repeat_one" | "shuffle";
 
 export type EngineSnapshot = {
@@ -244,6 +253,9 @@ export type EngineSnapshot = {
   audioMode: "music" | "cinema_game";
   playMode: PlayMode;
   dspSettings: DspSettings;
+  activePresetId: DspPresetId;
+  intensity: number;
+  spatialAmount: number;
   generation: number;
   underrunCallbacks: number;
   outputSampleRate?: number | null;
@@ -283,6 +295,9 @@ export const EMPTY_ENGINE: EngineSnapshot = {
     hrtf: { enabled: false, mix: 0.72, outputGainDb: -6 },
     limiter: { enabled: false, ceilingDb: -1, releaseMs: 80 },
   },
+  activePresetId: "bypass",
+  intensity: 0.5,
+  spatialAmount: 0.5,
   generation: 0,
   underrunCallbacks: 0,
   sourceSampleRate: null,

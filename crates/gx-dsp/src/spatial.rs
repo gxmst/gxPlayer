@@ -120,10 +120,16 @@ pub(crate) struct StereoHrtf {
     left_to_right: PartitionedConvolver,
     right_to_left: PartitionedConvolver,
     right_to_right: PartitionedConvolver,
-    dry_left: VecDeque<f32>,
-    dry_right: VecDeque<f32>,
+    dry_left: VecDeque<DelayedDrySample>,
+    dry_right: VecDeque<DelayedDrySample>,
     mix: f32,
     wet_gain: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DelayedDrySample {
+    processed: f32,
+    untreated: f32,
 }
 
 impl StereoHrtf {
@@ -133,8 +139,8 @@ impl StereoHrtf {
         let near = resample_hrir(&kemar::NEAR_EAR_30, sample_rate);
         let mut dry_left = VecDeque::with_capacity(PARTITION_SIZE * 2);
         let mut dry_right = VecDeque::with_capacity(PARTITION_SIZE * 2);
-        dry_left.resize(PARTITION_SIZE, 0.0);
-        dry_right.resize(PARTITION_SIZE, 0.0);
+        dry_left.resize(PARTITION_SIZE, DelayedDrySample::default());
+        dry_right.resize(PARTITION_SIZE, DelayedDrySample::default());
         Ok(Self {
             // Left virtual speaker at -30° is the mirror of the measured +30° response.
             left_to_left: PartitionedConvolver::new(&near),
@@ -152,17 +158,53 @@ impl StereoHrtf {
         for frame in pcm.chunks_exact_mut(2) {
             let left = frame[0];
             let right = frame[1];
-            let wet_left =
-                self.left_to_left.process_sample(left) + self.right_to_left.process_sample(right);
-            let wet_right =
-                self.left_to_right.process_sample(left) + self.right_to_right.process_sample(right);
-            self.dry_left.push_back(left);
-            self.dry_right.push_back(right);
-            let dry_left = self.dry_left.pop_front().unwrap_or(0.0);
-            let dry_right = self.dry_right.pop_front().unwrap_or(0.0);
-            frame[0] = dry_left * (1.0 - self.mix) + wet_left * self.mix * self.wet_gain;
-            frame[1] = dry_right * (1.0 - self.mix) + wet_right * self.mix * self.wet_gain;
+            let (processed_left, processed_right, _, _) =
+                self.process_frame(left, right, left, right);
+            frame[0] = processed_left;
+            frame[1] = processed_right;
         }
+    }
+
+    pub(crate) fn process_with_ab_dry(&mut self, pcm: &mut [f32], ab_dry: &mut [f32]) {
+        debug_assert_eq!(pcm.len(), ab_dry.len());
+        for (frame, ab_frame) in pcm.chunks_exact_mut(2).zip(ab_dry.chunks_exact_mut(2)) {
+            let (processed_left, processed_right, untreated_left, untreated_right) =
+                self.process_frame(frame[0], frame[1], ab_frame[0], ab_frame[1]);
+            frame[0] = processed_left;
+            frame[1] = processed_right;
+            ab_frame[0] = untreated_left;
+            ab_frame[1] = untreated_right;
+        }
+    }
+
+    #[inline]
+    fn process_frame(
+        &mut self,
+        left: f32,
+        right: f32,
+        untreated_left: f32,
+        untreated_right: f32,
+    ) -> (f32, f32, f32, f32) {
+        let wet_left =
+            self.left_to_left.process_sample(left) + self.right_to_left.process_sample(right);
+        let wet_right =
+            self.left_to_right.process_sample(left) + self.right_to_right.process_sample(right);
+        self.dry_left.push_back(DelayedDrySample {
+            processed: left,
+            untreated: untreated_left,
+        });
+        self.dry_right.push_back(DelayedDrySample {
+            processed: right,
+            untreated: untreated_right,
+        });
+        let dry_left = self.dry_left.pop_front().unwrap_or_default();
+        let dry_right = self.dry_right.pop_front().unwrap_or_default();
+        (
+            dry_left.processed * (1.0 - self.mix) + wet_left * self.mix * self.wet_gain,
+            dry_right.processed * (1.0 - self.mix) + wet_right * self.mix * self.wet_gain,
+            dry_left.untreated,
+            dry_right.untreated,
+        )
     }
 }
 
@@ -184,23 +226,50 @@ impl LinkedLimiter {
 
     pub(crate) fn process(&mut self, pcm: &mut [f32], channels: usize) {
         for frame in pcm.chunks_exact_mut(channels) {
-            let peak = frame
-                .iter()
-                .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
-            let target = if peak > self.ceiling {
-                self.ceiling / peak
-            } else {
-                1.0
-            };
-            if target <= self.gain {
-                self.gain = target;
-            } else {
-                self.gain = 1.0 - (1.0 - self.gain) * self.release_coefficient;
-            }
+            let gain = self.next_gain(frame);
             for sample in frame {
-                *sample *= self.gain;
+                *sample *= gain;
             }
         }
+    }
+
+    pub(crate) fn process_with_ab_dry(
+        &mut self,
+        pcm: &mut [f32],
+        ab_dry: &mut [f32],
+        channels: usize,
+    ) {
+        debug_assert_eq!(pcm.len(), ab_dry.len());
+        for (frame, ab_frame) in pcm
+            .chunks_exact_mut(channels)
+            .zip(ab_dry.chunks_exact_mut(channels))
+        {
+            let gain = self.next_gain(frame);
+            for sample in frame {
+                *sample *= gain;
+            }
+            for sample in ab_frame {
+                *sample *= gain;
+            }
+        }
+    }
+
+    #[inline]
+    fn next_gain(&mut self, frame: &[f32]) -> f32 {
+        let peak = frame
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        let target = if peak > self.ceiling {
+            self.ceiling / peak
+        } else {
+            1.0
+        };
+        if target <= self.gain {
+            self.gain = target;
+        } else {
+            self.gain = 1.0 - (1.0 - self.gain) * self.release_coefficient;
+        }
+        self.gain
     }
 }
 
@@ -372,5 +441,37 @@ mod tests {
         let hrir = resample_hrir(&kemar::NEAR_EAR_30, 48_000);
         assert_eq!(hrir.len(), 139);
         assert!(hrir.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn linked_limiter_applies_the_processed_gain_to_the_ab_lane() {
+        let settings = LimiterSettings {
+            enabled: true,
+            ceiling_db: -6.0,
+            release_ms: 80.0,
+        };
+        let mut limiter = LinkedLimiter::new(48_000, &settings).unwrap();
+        let mut below_ceiling = [0.25, -0.25];
+        let mut loud_ab_dry = [2.0, -2.0];
+        limiter.process_with_ab_dry(&mut below_ceiling, &mut loud_ab_dry, 2);
+        assert_eq!(below_ceiling, [0.25, -0.25]);
+        assert_eq!(loud_ab_dry, [2.0, -2.0]);
+
+        let mut processed = [2.0, -1.0, 0.5, -0.25];
+        let processed_before = processed;
+        let mut ab_dry = [0.4, -0.2, 0.75, -0.375];
+        let ab_before = ab_dry;
+
+        limiter.process_with_ab_dry(&mut processed, &mut ab_dry, 2);
+
+        for frame in 0..2 {
+            let processed_gain = processed[frame * 2] / processed_before[frame * 2];
+            assert!((ab_dry[frame * 2] - ab_before[frame * 2] * processed_gain).abs() < 1.0e-6);
+            assert!(
+                (ab_dry[frame * 2 + 1] - ab_before[frame * 2 + 1] * processed_gain).abs() < 1.0e-6
+            );
+        }
+        assert!(processed.iter().all(|sample| sample.is_finite()));
+        assert!(ab_dry.iter().all(|sample| sample.is_finite()));
     }
 }

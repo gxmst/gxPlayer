@@ -9,6 +9,7 @@ import { QueuePanel, type QueueAvailabilityStatus } from "./components/QueuePane
 import { ResolveBanner } from "./components/ResolveBanner";
 import { TextPlaylistImportDialog } from "./components/TextPlaylistImportDialog";
 import { useLibraryView, type LibraryScope, type LibrarySort } from "./features/library/useLibraryView";
+import { DspPresetControls } from "./features/player/DspPresetControls";
 import { LyricsPanel } from "./features/player/LyricsPanel";
 import { isRemoteArtworkUrl, useArtworkUrl } from "./hooks/useArtwork";
 import { useBackupRestore } from "./hooks/useBackupRestore";
@@ -26,6 +27,7 @@ import {
 } from "./lib/playlistLogic";
 import { splitArtistNames } from "./lib/artistNames";
 import { diagnosticEntryDisplay } from "./lib/diagnosticDisplay";
+import { getDspPreset } from "./lib/dspPresets";
 import { groupConsecutiveHistory } from "./lib/historyGrouping";
 import {
   engineMatchesLocalQueue,
@@ -67,6 +69,7 @@ import {
   type DiagnosticLogEntry,
   type DiagnosticLogExportResult,
   type DiagnosticLogStatus,
+  type DspControlState,
   type EngineSnapshot,
   type HistoryEntry,
   type LibraryImportResult,
@@ -82,7 +85,6 @@ import {
   type ViewId,
 } from "./types";
 
-type AudioMode = EngineSnapshot["audioMode"];
 type CloseBehavior = "hide_to_tray" | "exit";
 type AppPreferences = {
   version: number;
@@ -90,6 +92,7 @@ type AppPreferences = {
   closeToTrayNoticeShown: boolean;
   volume: number;
   outputDevice: string | null;
+  dspControl: DspControlState;
 };
 type OutputDeviceStatus = {
   devices: string[];
@@ -682,6 +685,9 @@ function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const themePickerRef = useRef<HTMLDivElement | null>(null);
   const toastTimerRef = useRef<number | null>(null);
+  const pendingDspControlRef = useRef<DspControlState | null>(null);
+  const dspApplyRunningRef = useRef(false);
+  const abDryCommandRef = useRef<Promise<void>>(Promise.resolve());
 
   const [searchQuery, setSearchQuery] = useState("");
   const [artistQuery, setArtistQuery] = useState("");
@@ -754,6 +760,13 @@ function App() {
   playlistRef.current = playlist;
   playlistIndexRef.current = playlistIndex;
   snapshotRef.current = snapshot;
+  const dspControl = useMemo<DspControlState>(() => ({
+    settings: snapshot.dspSettings,
+    activePresetId: snapshot.activePresetId,
+    intensity: snapshot.intensity,
+    spatialAmount: snapshot.spatialAmount,
+  }), [snapshot.activePresetId, snapshot.dspSettings, snapshot.intensity, snapshot.spatialAmount]);
+  const activeDspPreset = getDspPreset(snapshot.activePresetId);
 
   const pushMessage = (text: string, isError = false) => {
     setMessageState(text);
@@ -2787,13 +2800,57 @@ function App() {
     }
   };
 
-  const setAudioMode = async (mode: AudioMode) => {
+  const updateSnapshotDspControl = (control: DspControlState) => {
+    setSnapshot((state) => ({
+      ...state,
+      audioMode: control.activePresetId === "spatial" ? "cinema_game" : "music",
+      dspSettings: control.settings,
+      activePresetId: control.activePresetId,
+      intensity: control.intensity,
+      spatialAmount: control.spatialAmount,
+    }));
+  };
+
+  const flushPendingDspControl = async () => {
+    if (dspApplyRunningRef.current) return;
+    dspApplyRunningRef.current = true;
     try {
-      await invoke("player_set_audio_mode", { mode });
-      setSnapshot((state) => ({ ...state, audioMode: mode }));
-    } catch (error) {
-      setMessage(String(error), true);
+      while (pendingDspControlRef.current) {
+        const control = pendingDspControlRef.current;
+        pendingDspControlRef.current = null;
+        try {
+          const preferences = await invoke<AppPreferences>("player_set_dsp_settings", { control });
+          setAppPreferences(preferences);
+          if (!pendingDspControlRef.current) updateSnapshotDspControl(preferences.dspControl);
+        } catch (error) {
+          pendingDspControlRef.current = null;
+          setMessage(String(error), true);
+          try {
+            setSnapshot(await invoke<EngineSnapshot>("player_snapshot"));
+          } catch {
+            // Keep the optimistic snapshot until the regular snapshot refresh recovers it.
+          }
+        }
+      }
+    } finally {
+      dspApplyRunningRef.current = false;
+      if (pendingDspControlRef.current) void flushPendingDspControl();
     }
+  };
+
+  const applyDspControl = (control: DspControlState) => {
+    updateSnapshotDspControl(control);
+    pendingDspControlRef.current = control;
+    void flushPendingDspControl();
+  };
+
+  const setAbDry = (enabled: boolean) => {
+    abDryCommandRef.current = abDryCommandRef.current
+      .catch(() => undefined)
+      .then(() => invoke<void>("player_set_ab_dry", { enabled }))
+      .catch((error) => {
+        setMessage(String(error), true);
+      });
   };
 
   const toggleFavorite = async (track: LibraryTrack) => {
@@ -3290,15 +3347,15 @@ function App() {
           <div>
             <p className="eyebrow">GXPLAYER · YOUR ROOM, YOUR SOUND</p>
             <h1><span>让音乐留在</span><span>原本的位置。</span></h1>
-            <p>默认原声直通。需要电影和游戏的空间感时，再打开影院/游戏模式。</p>
+            <p>默认原声直通。需要更合适的耳机听感时，再选择对应预设。</p>
             <div className="hero-actions">
               <button className="primary" onClick={chooseFiles}>导入本地音乐</button>
               <button onClick={() => navigateTo("now-playing")}>打开播放页</button>
             </div>
           </div>
           <div
-            className={`mini-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"} ${animatePlayback ? "is-playing" : ""}`}
-            aria-label={`当前音效模式：${snapshot.audioMode === "music" ? "原声音乐" : "影院游戏"}`}
+            className={`mini-stage ${snapshot.activePresetId === "bypass" ? "bypassed" : "enabled"} ${animatePlayback ? "is-playing" : ""}`}
+            aria-label={`当前音效预设：${activeDspPreset.label}`}
           >
             <div className="stage-glow" aria-hidden="true" />
             <div className="stage-orbit stage-orbit-outer" />
@@ -3306,7 +3363,7 @@ function App() {
             <span className="stage-listener">你</span>
             <i className="speaker speaker-left" />
             <i className="speaker speaker-right" />
-            <strong className="stage-badge">{snapshot.audioMode === "music" ? "原声" : "空间"}</strong>
+            <strong className="stage-badge">{activeDspPreset.label}</strong>
           </div>
         </section>
         <section className="section-block panel-enter delay-1">
@@ -3618,7 +3675,11 @@ function App() {
         <div className="settings-grid">
           {!advancedSettings && <section className="settings-card"><h3>输出设备</h3><p>进入设置时会重新枚举；设备断开后自动回退到系统默认设备。</p><select value={outputDeviceStatus?.selectedDevice ?? appPreferences?.outputDevice ?? ""} disabled={outputDeviceBusy} onChange={(event) => void selectOutputDevice(event.target.value || null)}><option value="">系统默认设备{outputDeviceStatus?.defaultDevice ? ` · ${outputDeviceStatus.defaultDevice}` : ""}</option>{outputDevices.map((device) => <option key={device} value={device}>{device}</option>)}</select><button type="button" disabled={outputDeviceBusy} onClick={() => void refreshOutputDevices().catch((error) => setMessage(String(error), true))}>{outputDeviceBusy ? "正在刷新…" : "重新枚举设备"}</button></section>}
           {!advancedSettings && <section className="settings-card"><h3>默认音质</h3><p>自动会按当前平台能力从高到低尝试，并在解析失败时逐档回退。</p><select value={qualityPreference} onChange={(event) => updateQualityPreference(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></section>}
-          {!advancedSettings && <section className="settings-card"><h3>听感模式</h3><p>仅本次运行有效；重启后恢复原声直通，避免意外带入空间处理。</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></section>}
+          {!advancedSettings && <section className="settings-card dsp-settings-card">
+            <h3>音效预设</h3>
+            <p>预设与微调会自动保存；原声会关闭整条 DSP 链并保持零 DSP 延迟。</p>
+            <DspPresetControls value={dspControl} onChange={applyDspControl} onAbDryChange={setAbDry} />
+          </section>}
           {!advancedSettings && <section className="settings-card"><h3>主题</h3><p>切换整体色调；动态强调色仍会随封面自然变化。</p><select value={theme} onChange={(event) => setTheme(event.target.value as ThemeId)}>{THEME_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label} · {option.description}</option>)}</select></section>}
           {advancedSettings && <section className="settings-card proxy-settings">
             <h3>网络代理</h3>
@@ -3741,6 +3802,15 @@ function App() {
           <button type="button" role="tab" aria-selected={nowPlayingLayout === "lyrics"} className={nowPlayingLayout === "lyrics" ? "active" : ""} onClick={() => changeNowPlayingLayout("lyrics")}>歌词优先</button>
           <button type="button" role="tab" aria-selected={nowPlayingLayout === "immersive"} className={nowPlayingLayout === "immersive" ? "active" : ""} onClick={() => changeNowPlayingLayout("immersive")}>沉浸模式</button>
         </div>
+        <div className="now-playing-dsp-strip panel-enter">
+          <DspPresetControls
+            value={dspControl}
+            onChange={applyDspControl}
+            onAbDryChange={setAbDry}
+            compact
+            showSystemEffectsHint={false}
+          />
+        </div>
         <div className="now-grid">
           <section className={`record-column ${animatePlayback ? "is-playing" : ""}`}>
             <div className={`record-stage ${animatePlayback ? "live" : ""}`}>
@@ -3767,7 +3837,7 @@ function App() {
             )}
           </section>
           {nowPlayingLayout === "lyrics" ? lyricsPanel : <section className="stage-panel">
-            <div className={`sound-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"} ${animatePlayback ? "is-playing" : ""}`} aria-label="声场模式盘">
+            <div className={`sound-stage ${snapshot.activePresetId === "bypass" ? "bypassed" : "enabled"} ${animatePlayback ? "is-playing" : ""}`} aria-label={`当前音效预设：${activeDspPreset.label}`}>
               <div className="stage-field" aria-hidden="true" />
               <div className="stage-ring stage-ring-outer" aria-hidden="true" />
               <div className="orbit orbit-one" />
@@ -3776,15 +3846,12 @@ function App() {
               <span className="listener">你</span>
               <i className="stage-speaker front-left"><b>FL</b></i>
               <i className="stage-speaker front-right"><b>FR</b></i>
-              <i className="stage-speaker rear-left"><b>RL</b></i>
-              <i className="stage-speaker rear-right"><b>RR</b></i>
-              <span className="stage-mode-chip">{snapshot.audioMode === "music" ? "直通" : "空间"}</span>
+              <span className="stage-mode-chip">{activeDspPreset.label}</span>
             </div>
             <div className="mode-copy">
-              <p className="eyebrow">SOUND MODE</p>
-              <h2>{snapshot.audioMode === "music" ? "原声 / 音乐" : "影院 / 游戏"}</h2>
-              <p>{snapshot.audioMode === "music" ? "透明直通，不添加空间处理。你的盲测首选。" : "Crossfeed + 立体声 HRTF，仅在需要空间感时开启。"}</p>
-              <ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} />
+              <p className="eyebrow">SOUND PRESET</p>
+              <h2>{activeDspPreset.label}</h2>
+              <p>{activeDspPreset.description}</p>
             </div>
           </section>}
         </div>
@@ -3983,7 +4050,7 @@ function App() {
           )}
         </div>
         <div className="top-bar-trail">
-          <button className={`mode-pill ${snapshot.audioMode === "cinema_game" ? "active" : ""}`} onClick={() => navigateTo("now-playing")}><span>⊙</span>{snapshot.audioMode === "music" ? "原声" : "空间"}</button>
+          <button className={`mode-pill ${snapshot.activePresetId !== "bypass" ? "active" : ""}`} onClick={() => navigateTo("now-playing")} aria-label={`当前音效预设：${activeDspPreset.label}`}><span>⊙</span>{activeDspPreset.label}</button>
           <div className="theme-picker" ref={themePickerRef}>
             <button
               type="button"
@@ -4245,12 +4312,13 @@ function App() {
           </div>
           <button
             type="button"
-            className={`tool-btn ${snapshot.audioMode === "cinema_game" ? "active" : ""}`}
-            onClick={() => void setAudioMode(snapshot.audioMode === "music" ? "cinema_game" : "music")}
-            aria-label="切换音效模式"
-            title={snapshot.audioMode === "music" ? "原声直通" : "影院/游戏空间"}
+            className={`tool-btn preset-tool-btn ${snapshot.activePresetId !== "bypass" ? "active" : ""}`}
+            onClick={() => navigateTo("now-playing")}
+            aria-label={`当前音效预设：${activeDspPreset.label}`}
+            title={`音效预设：${activeDspPreset.label}`}
           >
             <span className="glyph-spatial" aria-hidden="true" />
+            <span className="preset-tool-label">{activeDspPreset.label}</span>
           </button>
           <button
             type="button"
@@ -4316,23 +4384,6 @@ function ErrorState({ title, copy, onRetry }: { title: string; copy: string; onR
 
 function LoadingState() {
   return <div className="empty-state"><i className="large-spinner" /><h3>正在找音乐</h3><p>搜索会同时整理不同平台的结果。</p></div>;
-}
-
-function ModeButtons({ mode, onChange }: { mode: AudioMode; onChange: (mode: AudioMode) => Promise<void> }) {
-  return (
-    <div className="mode-buttons" role="radiogroup" aria-label="音效模式">
-      <button role="radio" aria-checked={mode === "music"} className={mode === "music" ? "active" : ""} onClick={() => void onChange("music")}>
-        <span>♫</span>
-        <strong>原声 / 音乐</strong>
-        <small>默认 · 透明直通</small>
-      </button>
-      <button role="radio" aria-checked={mode === "cinema_game"} className={mode === "cinema_game" ? "active" : ""} onClick={() => void onChange("cinema_game")}>
-        <span>◎</span>
-        <strong>影院 / 游戏</strong>
-        <small>可选 · 空间处理</small>
-      </button>
-    </div>
-  );
 }
 
 function SuggestionGroup({ label, children }: { label: string; children: ReactNode }) {

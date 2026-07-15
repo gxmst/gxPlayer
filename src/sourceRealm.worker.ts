@@ -2,6 +2,10 @@ import { Buffer } from "buffer";
 import CryptoJS from "crypto-js";
 import forge from "node-forge";
 import * as pako from "pako";
+import {
+  SOURCE_BRIDGE_LIMIT_ERROR,
+  hasSourceBridgeCapacity,
+} from "./lib/sourceBridgeLimit";
 
 type RequestHandler = (payload: unknown) => unknown | Promise<unknown>;
 
@@ -89,6 +93,9 @@ function post(message: Record<string, unknown>): void {
 }
 
 function bridge(command: "http" | "send", payload: Record<string, unknown>): Promise<unknown> {
+  if (!hasSourceBridgeCapacity(pendingBridge.size)) {
+    return Promise.reject(new Error(SOURCE_BRIDGE_LIMIT_ERROR));
+  }
   const callId = nextCallId++;
   return new Promise((resolve, reject) => {
     pendingBridge.set(callId, { resolve, reject });

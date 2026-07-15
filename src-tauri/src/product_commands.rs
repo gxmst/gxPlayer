@@ -1,7 +1,9 @@
 //! Product-facing commands: history, covers, window chrome, backup files, sleep is frontend-only.
 
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use gx_library::{HistoryEntry, LibraryStore, LibraryTrack, NewHistoryEntry};
@@ -15,6 +17,9 @@ use crate::window_state::{self, WindowState};
 const MAX_LOCAL_PATH_CHECKS: usize = 10_000;
 const MAX_LOCAL_PATH_BYTES: usize = 32 * 1024;
 const MAX_LOCAL_PATH_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BACKUP_FILE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_STAGING_PATH_ATTEMPTS: usize = 128;
+static BACKUP_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,7 +100,19 @@ pub fn library_scan_missing(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    fn backup_test_root(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "gxplayer-product-backup-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn local_path_batch_limits_count_individual_and_total_size() {
@@ -110,6 +127,113 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn atomic_backup_write_replaces_content_without_leaving_staging_files() {
+        let root = backup_test_root("replace");
+        let path = root.join("gxplayer-backup.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&path, b"old backup").unwrap();
+
+        write_backup_file_atomic(&path, b"new backup").unwrap();
+
+        assert_eq!(read_backup_file_limited(&path).unwrap(), "new backup");
+        let entries = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [path.file_name().unwrap().to_os_string()]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_replacement_uses_one_namespace_operation() {
+        let root = backup_test_root("single-rename");
+        let path = root.join("gxplayer-backup.json");
+        let staged = root.join("staged.tmp");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&path, b"old backup").unwrap();
+        fs::write(&staged, b"new backup").unwrap();
+        let mut rename_count = 0;
+
+        replace_staged_file_with(&staged, &path, |from, to| {
+            rename_count += 1;
+            fs::rename(from, to)
+        })
+        .unwrap();
+
+        assert_eq!(rename_count, 1);
+        assert_eq!(fs::read(&path).unwrap(), b"new backup");
+        assert!(!staged.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_atomic_replacement_keeps_the_previous_backup() {
+        let root = backup_test_root("failed-rename");
+        let path = root.join("gxplayer-backup.json");
+        let staged = root.join("staged.tmp");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&path, b"old backup").unwrap();
+        fs::write(&staged, b"new backup").unwrap();
+        let mut rename_count = 0;
+
+        let error = replace_staged_file_with(&staged, &path, |from, to| {
+            assert_eq!(from, staged);
+            assert_eq!(to, path);
+            rename_count += 1;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "replace denied",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(rename_count, 1);
+        assert!(error.contains("目标未改动"));
+        assert_eq!(fs::read(&path).unwrap(), b"old backup");
+        assert!(!staged.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_write_refuses_to_replace_a_non_file_target() {
+        let root = backup_test_root("non-file");
+        let path = root.join("gxplayer-backup.json");
+        let sentinel = path.join("keep.txt");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(&sentinel, b"keep").unwrap();
+
+        let error = write_backup_file_atomic(&path, b"new backup").unwrap_err();
+
+        assert!(error.contains("普通文件"));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_read_checks_metadata_before_allocating() {
+        let root = backup_test_root("oversized");
+        let path = root.join("oversized.json");
+        fs::create_dir_all(&root).unwrap();
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_BACKUP_FILE_BYTES as u64 + 1)
+            .unwrap();
+
+        assert!(
+            read_backup_file_limited(&path)
+                .unwrap_err()
+                .contains("过大")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn limited_reader_detects_a_file_that_grows_after_metadata() {
+        let error = read_bytes_limited(Cursor::new(b"123456789"), 8, 8).unwrap_err();
+        assert!(error.contains("读取时超过"));
     }
 }
 
@@ -312,6 +436,164 @@ pub fn window_set_mini_mode(
     Ok(())
 }
 
+fn backup_staging_path(target: &Path, label: &str) -> Result<PathBuf, String> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let target_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("backup");
+
+    for _ in 0..MAX_STAGING_PATH_ATTEMPTS {
+        let sequence = BACKUP_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{target_name}.gxplayer-{label}-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(error) => return Err(format!("无法检查备份临时路径: {error}")),
+        }
+    }
+
+    Err("无法创建唯一的备份临时路径".into())
+}
+
+fn create_backup_staging_file(target: &Path) -> Result<(PathBuf, File), String> {
+    for _ in 0..MAX_STAGING_PATH_ATTEMPTS {
+        let path = backup_staging_path(target, "staging")?;
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("无法创建备份临时文件: {error}")),
+        }
+    }
+
+    Err("无法创建唯一的备份临时文件".into())
+}
+
+fn remove_staging_file(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("无法清理备份临时文件 {}: {error}", path.display())),
+    }
+}
+
+fn cleanup_staging_after_error(message: String, staged: &Path) -> String {
+    match remove_staging_file(staged) {
+        Ok(()) => message,
+        Err(cleanup_error) => format!("{message}；{cleanup_error}"),
+    }
+}
+
+fn replace_staged_file_with<F>(staged: &Path, target: &Path, mut rename: F) -> Result<(), String>
+where
+    F: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(cleanup_staging_after_error(
+                "备份目标不是普通文件，已拒绝覆盖".into(),
+                staged,
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(cleanup_staging_after_error(
+                format!("无法检查现有备份: {error}"),
+                staged,
+            ));
+        }
+    }
+
+    match rename(staged, target) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(cleanup_staging_after_error(
+            format!("无法原子提交备份文件，目标未改动: {error}"),
+            staged,
+        )),
+    }
+}
+
+fn replace_staged_file(staged: &Path, target: &Path) -> Result<(), String> {
+    replace_staged_file_with(staged, target, |from, to| fs::rename(from, to))
+}
+
+fn write_backup_file_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err("备份目标不是普通文件，已拒绝覆盖".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("无法检查备份目标: {error}")),
+    }
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建备份目录: {error}"))?;
+    }
+
+    let (staged_path, mut staged_file) = create_backup_staging_file(path)?;
+    let write_result = (|| -> io::Result<()> {
+        staged_file.write_all(content)?;
+        staged_file.flush()?;
+        staged_file.sync_all()
+    })();
+    drop(staged_file);
+
+    if let Err(error) = write_result {
+        return Err(cleanup_staging_after_error(
+            format!("无法完整写入备份临时文件: {error}"),
+            &staged_path,
+        ));
+    }
+
+    replace_staged_file(&staged_path, path)
+}
+
+fn read_bytes_limited<R: Read>(
+    reader: R,
+    metadata_len: u64,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    if metadata_len > limit as u64 {
+        return Err("备份文件过大".into());
+    }
+
+    let mut bytes = Vec::with_capacity(metadata_len as usize);
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("无法读取备份文件: {error}"))?;
+    if bytes.len() > limit {
+        return Err("备份文件读取时超过大小限制".into());
+    }
+    Ok(bytes)
+}
+
+fn read_backup_file_limited(path: &Path) -> Result<String, String> {
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !path_metadata.file_type().is_file() {
+        return Err("备份路径不是普通文件".into());
+    }
+    if path_metadata.len() > MAX_BACKUP_FILE_BYTES as u64 {
+        return Err("备份文件过大".into());
+    }
+
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let file_metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !file_metadata.file_type().is_file() {
+        return Err("备份路径不是普通文件".into());
+    }
+    let bytes = read_bytes_limited(file, file_metadata.len(), MAX_BACKUP_FILE_BYTES)?;
+    String::from_utf8(bytes).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub fn backup_write_file(
     window: WebviewWindow,
@@ -319,14 +601,11 @@ pub fn backup_write_file(
     content: String,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
-    if path.len() > 1024 || content.len() > 32 * 1024 * 1024 {
+    if path.len() > 1024 || content.len() > MAX_BACKUP_FILE_BYTES {
         return Err("备份内容或路径超出限制".into());
     }
     let path = PathBuf::from(path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    fs::write(path, content).map_err(|e| e.to_string())
+    write_backup_file_atomic(&path, content.as_bytes())
 }
 
 #[tauri::command]
@@ -335,11 +614,7 @@ pub fn backup_read_file(window: WebviewWindow, path: String) -> Result<String, S
     if path.len() > 1024 {
         return Err("路径过长".into());
     }
-    let bytes = fs::read(PathBuf::from(path)).map_err(|e| e.to_string())?;
-    if bytes.len() > 32 * 1024 * 1024 {
-        return Err("备份文件过大".into());
-    }
-    String::from_utf8(bytes).map_err(|e| e.to_string())
+    read_backup_file_limited(Path::new(&path))
 }
 
 /// Soft media-command bridge used by future SMTC / hotkeys.

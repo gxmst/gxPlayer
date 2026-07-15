@@ -36,7 +36,7 @@ GX_PHASE4_MEASURE_OK latency_frames=128 latency_ms=2.667 peak=0.152622 cpu_realt
 
 ## Real-device verification
 
-`cargo run -p engine-smoke -- "E:\diff\gxMusic\gxPlayer\GxPlayer\Assets\test.mp3"` passed on two enumerated devices:
+`cargo run -p engine-smoke -- "<local-test.mp3>"` passed with a local fixture on two enumerated devices:
 
 - `CS3555 (NVIDIA High Definition Audio)`
 - `扬声器 (Realtek High Definition Audio)`
@@ -58,7 +58,7 @@ GX_PHASE3_SEARCH_PLAY_LYRICS_OK position=0.242 underruns=0
 A 12-trial randomized A/B package was generated at:
 
 ```text
-C:\Users\super\AppData\Local\Temp\gxplayer-spatial-blind-phase4
+%TEMP%\gxplayer-spatial-blind-phase4
 ```
 
 It contains dry/spatial references, randomized trial WAV files, `trials.json`, hidden scoring answers, and `listening-notes.md`.

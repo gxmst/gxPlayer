@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "engine-smoke"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "gx-audio",
@@ -1501,7 +1501,7 @@ dependencies = [
 
 [[package]]
 name = "gx-audio"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "gx-cache"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "gx-contracts",
@@ -1530,7 +1530,7 @@ dependencies = [
 
 [[package]]
 name = "gx-contracts"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "gx-dsp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rustfft",
  "serde",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "gx-library"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "gx-metadata"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "gx-contracts",
  "gx-source",
@@ -1573,7 +1573,7 @@ dependencies = [
 
 [[package]]
 name = "gx-source"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "gx-contracts",
  "reqwest",
@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "gx-streaming"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "gxplayer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "gx-audio",
@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "http-stream"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "gx-contracts",
@@ -2230,7 +2230,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "local-playback"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "gx-audio",
@@ -2303,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "metadata-smoke"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "gx-metadata",
@@ -3869,7 +3869,7 @@ dependencies = [
 
 [[package]]
 name = "spatial-lab"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "gx-dsp",

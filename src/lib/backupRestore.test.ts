@@ -1,8 +1,22 @@
 import { describe, expect, it } from "vitest";
 
-import { formatRestoreConfirmation, parseBackupText } from "./backupRestore";
+import {
+  createApplicationBackup,
+  formatRestoreConfirmation,
+  parseBackupText,
+} from "./backupRestore";
 
 describe("backup restore helpers", () => {
+  it("uses the exported library version for the application envelope", () => {
+    const library = { version: 2, tracks: [], playlists: [] };
+    const sources = { version: 1, sources: [] };
+
+    const backup = createApplicationBackup(library, sources);
+
+    expect(backup).toEqual({ version: 2, library, sources });
+    expect(parseBackupText(JSON.stringify(backup))).toEqual(backup);
+  });
+
   it("accepts compatible v1 and v2 envelopes and rejects mismatches", () => {
     expect(parseBackupText(JSON.stringify({
       version: 1,

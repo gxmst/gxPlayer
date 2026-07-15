@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use gx_audio::engine::LocalAudioEngine;
@@ -29,10 +29,58 @@ use crate::{LxHttpResponse, LxPocState, SANDBOX_LABEL, require_window};
 const MAX_HTTP_OPTIONS_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LX_HTTP_IN_FLIGHT: usize = 32;
 const MAX_SOURCE_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
 const RUNTIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const RUNTIME_INIT_TIMEOUT: Duration = Duration::from_secs(8);
 const MEDIA_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+
+pub(crate) struct LxHttpConcurrencyLimiter {
+    in_flight: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+impl Default for LxHttpConcurrencyLimiter {
+    fn default() -> Self {
+        Self::new(MAX_LX_HTTP_IN_FLIGHT)
+    }
+}
+
+impl LxHttpConcurrencyLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    fn try_acquire(&self) -> Result<LxHttpPermit, String> {
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.limit).then_some(current + 1)
+            })
+            .map_err(|_| {
+                format!(
+                    "LX HTTP bridge allows at most {} concurrent requests",
+                    self.limit
+                )
+            })?;
+        Ok(LxHttpPermit {
+            in_flight: Arc::clone(&self.in_flight),
+        })
+    }
+}
+
+struct LxHttpPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for LxHttpPermit {
+    fn drop(&mut self) {
+        let previous = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2041,6 +2089,7 @@ pub fn lx_runtime_failure(
 pub async fn lx_http_request(
     window: WebviewWindow,
     runtime: tauri::State<'_, SourceRuntime>,
+    concurrency: tauri::State<'_, LxHttpConcurrencyLimiter>,
     url: String,
     options: Value,
     generation: u64,
@@ -2054,9 +2103,11 @@ pub async fn lx_http_request(
     {
         return crate::phase1_http_mock(&url, &options);
     }
+    let permit = concurrency.try_acquire()?;
     let (source_id, route) = runtime.source_id_and_route_for_generation(generation)?;
     let request = parse_http_request(&url, options)?;
     let response = match tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
         execute_on_route(request, route)
     })
     .await
@@ -3007,6 +3058,23 @@ fn parse_body(options: &Map<String, Value>) -> Result<Option<Vec<u8>>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lx_http_concurrency_limiter_rejects_excess_and_releases_permits() {
+        let limiter = LxHttpConcurrencyLimiter::new(2);
+        let first = limiter.try_acquire().unwrap();
+        let second = limiter.try_acquire().unwrap();
+        let error = limiter.try_acquire().err().unwrap();
+        assert!(error.contains("at most 2 concurrent requests"));
+
+        drop(first);
+        let replacement = limiter.try_acquire().unwrap();
+        assert_eq!(limiter.in_flight.load(Ordering::Acquire), 2);
+
+        drop(second);
+        drop(replacement);
+        assert_eq!(limiter.in_flight.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn replaced_request_finish_cannot_detach_the_new_owner() {

@@ -27,6 +27,7 @@ import {
 } from "./lib/playlistLogic";
 import { splitArtistNames } from "./lib/artistNames";
 import { diagnosticEntryDisplay } from "./lib/diagnosticDisplay";
+import { createApplicationBackup } from "./lib/backupRestore";
 import { getDspPreset } from "./lib/dspPresets";
 import { groupConsecutiveHistory } from "./lib/historyGrouping";
 import {
@@ -2342,7 +2343,7 @@ function App() {
       invoke("library_export_backup"),
       invoke("source_export_backup"),
     ]);
-    const text = JSON.stringify({ version: 1, library: libraryBackup, sources: sourceBackup }, null, 2);
+    const text = JSON.stringify(createApplicationBackup(libraryBackup, sourceBackup), null, 2);
     resetBackupRestorePreview();
     setBackupText(text);
     const path = await save({
@@ -3025,7 +3026,7 @@ function App() {
       invoke("source_export_backup"),
     ]);
     resetBackupRestorePreview();
-    setBackupText(JSON.stringify({ version: 1, library: libraryBackup, sources: sourceBackup }, null, 2));
+    setBackupText(JSON.stringify(createApplicationBackup(libraryBackup, sourceBackup), null, 2));
   };
 
   const {

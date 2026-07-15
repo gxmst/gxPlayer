@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+pub const MAX_LIBRARY_TRACKS: usize = 10_000;
 const MAX_BACKUP_PLAYLIST_ITEMS: usize = 100_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -211,13 +212,16 @@ impl LibraryStore {
 
     pub fn add_tracks(&self, tracks: &[NewTrack]) -> Result<Vec<LibraryTrack>> {
         self.upsert_tracks(tracks)?;
-        self.list_tracks(10_000)
+        self.list_tracks(MAX_LIBRARY_TRACKS)
     }
 
     /// Insert or refresh track metadata without allocating and returning the
     /// entire library. Playback/import command paths should prefer this method;
     /// `add_tracks` remains for callers that explicitly need a refreshed list.
     pub fn upsert_tracks(&self, tracks: &[NewTrack]) -> Result<()> {
+        if tracks.len() > MAX_LIBRARY_TRACKS {
+            bail!("cannot upsert more than {MAX_LIBRARY_TRACKS} tracks at once");
+        }
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction()?;
         let now = now_ms();
@@ -243,18 +247,23 @@ impl LibraryStore {
                 ],
             )?;
         }
+        ensure_library_track_limit(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
 
     pub fn list_tracks(&self, limit: usize) -> Result<Vec<LibraryTrack>> {
+        if limit > MAX_LIBRARY_TRACKS {
+            bail!("track list limit cannot exceed {MAX_LIBRARY_TRACKS}");
+        }
         let connection = self.connection.lock().unwrap();
+        ensure_library_track_limit(&connection)?;
         query_tracks(
             &connection,
             "SELECT t.id, t.path, t.title, t.artist, t.album, t.duration_seconds,
                     EXISTS(SELECT 1 FROM favorites f WHERE f.track_id=t.id), t.added_at_ms
              FROM tracks t ORDER BY t.added_at_ms DESC, t.id DESC LIMIT ?1",
-            params![limit.min(10_000) as i64],
+            params![limit as i64],
         )
     }
 
@@ -520,7 +529,7 @@ impl LibraryStore {
 
     /// Mark library tracks whose files no longer exist on disk.
     pub fn scan_missing(&self) -> Result<Vec<LibraryTrack>> {
-        let mut tracks = self.list_tracks(10_000)?;
+        let mut tracks = self.list_tracks(MAX_LIBRARY_TRACKS)?;
         for track in &mut tracks {
             track.missing = !Path::new(&track.path).is_file();
         }
@@ -599,6 +608,7 @@ impl LibraryStore {
             )?;
         }
 
+        ensure_library_track_limit(&transaction)?;
         transaction.commit()?;
         drop(connection);
         self.track_by_path(&replacement.path)?
@@ -661,7 +671,7 @@ impl LibraryStore {
     }
 
     pub fn export_backup(&self) -> Result<LibraryBackup> {
-        let tracks = self.list_tracks(10_000)?;
+        let tracks = self.list_tracks(MAX_LIBRARY_TRACKS)?;
         let playlists = self
             .list_playlists()?
             .into_iter()
@@ -706,7 +716,7 @@ impl LibraryStore {
     /// Validate every constraint used by backup restoration without changing the database.
     pub fn validate_backup(backup: &LibraryBackup) -> Result<()> {
         if !matches!(backup.version, 1 | 2)
-            || backup.tracks.len() > 10_000
+            || backup.tracks.len() > MAX_LIBRARY_TRACKS
             || backup.playlists.len() > 1_000
         {
             bail!("unsupported or oversized library backup");
@@ -841,6 +851,7 @@ impl LibraryStore {
                 }
             }
         }
+        ensure_library_track_limit(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1028,6 +1039,16 @@ fn query_tracks<P: rusqlite::Params>(
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+fn ensure_library_track_limit(connection: &Connection) -> Result<()> {
+    let count = connection.query_row("SELECT COUNT(*) FROM tracks", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    if count > MAX_LIBRARY_TRACKS as i64 {
+        bail!("library contains {count} tracks, exceeding the limit of {MAX_LIBRARY_TRACKS}");
+    }
+    Ok(())
 }
 
 fn ensure_track(connection: &Connection, track_id: i64) -> Result<()> {
@@ -1449,6 +1470,135 @@ mod tests {
             "Legacy"
         );
         assert_eq!(store.export_backup().unwrap().version, 2);
+    }
+
+    #[test]
+    fn enforces_total_track_limit_without_truncating_full_library_operations() {
+        let store = LibraryStore::open(":memory:").unwrap();
+        let missing_root = std::env::temp_dir().join(format!(
+            "gxplayer-library-limit-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let path_for = |index: usize| {
+            missing_root
+                .join(format!("track-{index}.flac"))
+                .display()
+                .to_string()
+        };
+        let initial_tracks = (0..MAX_LIBRARY_TRACKS - 1)
+            .map(|index| NewTrack {
+                path: path_for(index),
+                title: format!("Track {index}"),
+                artist: String::new(),
+                album: String::new(),
+                duration_seconds: None,
+            })
+            .collect::<Vec<_>>();
+        store.upsert_tracks(&initial_tracks).unwrap();
+        drop(initial_tracks);
+
+        let first_path = path_for(0);
+        store
+            .upsert_tracks(&[
+                NewTrack {
+                    path: first_path.clone(),
+                    title: "Refreshed at boundary".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                },
+                NewTrack {
+                    path: path_for(MAX_LIBRARY_TRACKS - 1),
+                    title: "Boundary track".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            store.list_tracks(MAX_LIBRARY_TRACKS).unwrap().len(),
+            MAX_LIBRARY_TRACKS
+        );
+        let scanned = store.scan_missing().unwrap();
+        assert_eq!(scanned.len(), MAX_LIBRARY_TRACKS);
+        assert!(scanned.iter().all(|track| track.missing));
+
+        let backup = store.export_backup().unwrap();
+        assert_eq!(backup.tracks.len(), MAX_LIBRARY_TRACKS);
+        LibraryStore::validate_backup(&backup).unwrap();
+        let restored = LibraryStore::open(":memory:").unwrap();
+        restored.restore_backup(&backup).unwrap();
+        assert_eq!(
+            restored.list_tracks(MAX_LIBRARY_TRACKS).unwrap().len(),
+            MAX_LIBRARY_TRACKS
+        );
+
+        let overflow_path = path_for(MAX_LIBRARY_TRACKS);
+        let error = store
+            .upsert_tracks(&[
+                NewTrack {
+                    path: first_path.clone(),
+                    title: "Must be rolled back".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                },
+                NewTrack {
+                    path: overflow_path.clone(),
+                    title: "Overflow".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                },
+            ])
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeding the limit"));
+        assert_eq!(
+            store.track_by_path(&first_path).unwrap().unwrap().title,
+            "Refreshed at boundary"
+        );
+        assert!(store.track_by_path(&overflow_path).unwrap().is_none());
+
+        let mut oversized_backup = backup;
+        oversized_backup.tracks.push(LibraryTrack {
+            id: (MAX_LIBRARY_TRACKS + 1) as i64,
+            path: overflow_path.clone(),
+            title: "Oversized backup entry".into(),
+            artist: String::new(),
+            album: String::new(),
+            duration_seconds: None,
+            favorite: false,
+            added_at_ms: now_ms(),
+            missing: false,
+        });
+        assert!(store.restore_backup(&oversized_backup).is_err());
+        assert_eq!(
+            store.list_tracks(MAX_LIBRARY_TRACKS).unwrap().len(),
+            MAX_LIBRARY_TRACKS
+        );
+
+        // Simulate a database created before the total limit was enforced. Complete reads must
+        // fail loudly instead of returning a plausible-looking, truncated 10,000-track snapshot.
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO tracks(path, title, artist, album, duration_seconds, added_at_ms)
+                     VALUES (?1, ?2, '', '', NULL, ?3)",
+                    params![overflow_path, "Legacy overflow", now_ms()],
+                )
+                .unwrap();
+        }
+        for error in [
+            store.list_tracks(MAX_LIBRARY_TRACKS).unwrap_err(),
+            store.scan_missing().unwrap_err(),
+            store.export_backup().unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("10001 tracks"));
+        }
     }
 
     #[test]

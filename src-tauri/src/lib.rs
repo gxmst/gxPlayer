@@ -12,8 +12,8 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindo
 use gx_audio::engine::{AudioMode, DspControlState, EngineSnapshot, LocalAudioEngine, PlayMode};
 use gx_contracts::ResolvedMediaRequest;
 use gx_library::{
-    CachedPlaylistTrack, LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistItem,
-    PlaylistSummary,
+    CachedPlaylistTrack, LibraryBackup, LibraryStore, LibraryTrack, MAX_LIBRARY_TRACKS, NewTrack,
+    PlaylistItem, PlaylistSummary,
 };
 use gx_metadata::MetadataClient;
 use gx_source::{SourceStore, safe_http};
@@ -63,10 +63,10 @@ use product_commands::{
     window_set_always_on_top, window_set_mini_mode,
 };
 use source_commands::{
-    ResolveCancellationRegistry, lx_http_request, lx_runtime_failure, lx_runtime_result, lx_send,
-    player_cancel_resolve, player_play_online_track, source_activate, source_export_backup,
-    source_get_config, source_get_fallback_config, source_import_file, source_import_url,
-    source_list, source_reimport, source_reload, source_remove, source_resolve,
+    LxHttpConcurrencyLimiter, ResolveCancellationRegistry, lx_http_request, lx_runtime_failure,
+    lx_runtime_result, lx_send, player_cancel_resolve, player_play_online_track, source_activate,
+    source_export_backup, source_get_config, source_get_fallback_config, source_import_file,
+    source_import_url, source_list, source_reimport, source_reload, source_remove, source_resolve,
     source_restore_backup, source_set_config, source_set_enabled, source_set_fallback_config,
     source_set_order, source_set_updates_enabled, source_status,
 };
@@ -228,8 +228,8 @@ async fn library_import_files(
     paths: Vec<String>,
 ) -> Result<LibraryImportResult, String> {
     require_window(&window, "main")?;
-    if paths.len() > 10_000 {
-        return Err("单次最多导入 10000 个本地音频文件".into());
+    if paths.len() > MAX_LIBRARY_TRACKS {
+        return Err(format!("单次最多导入 {MAX_LIBRARY_TRACKS} 个本地音频文件"));
     }
     let app = window.app_handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -402,7 +402,7 @@ fn library_tracks(
 ) -> Result<Vec<LibraryTrack>, String> {
     require_window(&window, "main")?;
     library
-        .list_tracks(10_000)
+        .list_tracks(MAX_LIBRARY_TRACKS)
         .map_err(|error| error.to_string())
 }
 
@@ -938,6 +938,36 @@ pub(crate) fn phase1_lx_send(
     }
 }
 
+fn phase1_lx_poc_enabled() -> bool {
+    std::env::var_os("GX_PHASE1_LX_POC").is_some()
+}
+
+fn require_phase1_lx_poc_enabled(enabled: bool) -> Result<(), String> {
+    if enabled {
+        Ok(())
+    } else {
+        Err("Phase-1 LX POC commands are disabled".into())
+    }
+}
+
+fn require_phase1_lx_poc() -> Result<(), String> {
+    require_phase1_lx_poc_enabled(phase1_lx_poc_enabled())
+}
+
+fn phase1_poc_failure_exit_code(enabled: bool) -> Result<i32, String> {
+    require_phase1_lx_poc_enabled(enabled)?;
+    Ok(2)
+}
+
+fn phase1_poc_should_auto_exit(
+    enabled: bool,
+    complete: bool,
+    auto_exit: bool,
+) -> Result<bool, String> {
+    require_phase1_lx_poc_enabled(enabled)?;
+    Ok(complete && auto_exit)
+}
+
 #[tauri::command]
 fn lx_poc_result(
     window: WebviewWindow,
@@ -946,6 +976,7 @@ fn lx_poc_result(
     result: Value,
 ) -> Result<(), String> {
     require_window(&window, SANDBOX_LABEL)?;
+    require_phase1_lx_poc()?;
     let url = result
         .get("url")
         .and_then(Value::as_str)
@@ -958,7 +989,7 @@ fn lx_poc_result(
     window
         .eval("window.__gxRunCryptoSelfTest(); window.__gxRunSecuritySelfTest();")
         .map_err(|error| error.to_string())?;
-    maybe_finish(&app, &state);
+    maybe_finish(&app, &state)?;
     Ok(())
 }
 
@@ -971,12 +1002,13 @@ fn lx_crypto_result(
     details: Value,
 ) -> Result<(), String> {
     require_window(&window, SANDBOX_LABEL)?;
+    require_phase1_lx_poc()?;
     if !passed {
         return Err(format!("synchronous crypto self-test failed: {details}"));
     }
     println!("GX_PHASE1_LX_SYNC_CRYPTO_OK {details}");
     state.progress.lock().unwrap().crypto_passed = true;
-    maybe_finish(&app, &state);
+    maybe_finish(&app, &state)?;
     Ok(())
 }
 
@@ -988,6 +1020,7 @@ fn lx_security_result(
     results: SecurityResults,
 ) -> Result<(), String> {
     require_window(&window, SANDBOX_LABEL)?;
+    require_phase1_lx_poc()?;
     if !(results.main_command_blocked
         && results.source_command_blocked
         && results.opener_blocked
@@ -1001,7 +1034,7 @@ fn lx_security_result(
     }
     println!("GX_PHASE1_LX_SECURITY_OK");
     state.progress.lock().unwrap().security_passed = true;
-    maybe_finish(&app, &state);
+    maybe_finish(&app, &state)?;
     Ok(())
 }
 
@@ -1013,19 +1046,27 @@ fn lx_poc_failure(
     error: String,
 ) -> Result<(), String> {
     require_window(&window, SANDBOX_LABEL)?;
+    let exit_code = phase1_poc_failure_exit_code(phase1_lx_poc_enabled())?;
     eprintln!("GX_PHASE1_LX_FAILED stage={stage} error={error}");
-    app.exit(2);
+    app.exit(exit_code);
     Ok(())
 }
 
-fn maybe_finish(app: &AppHandle, state: &tauri::State<LxPocState>) {
+fn maybe_finish(app: &AppHandle, state: &tauri::State<LxPocState>) -> Result<(), String> {
     let progress = state.progress.lock().unwrap();
-    if progress.music_url_passed && progress.crypto_passed && progress.security_passed {
+    let complete = progress.music_url_passed && progress.crypto_passed && progress.security_passed;
+    let should_exit = phase1_poc_should_auto_exit(
+        phase1_lx_poc_enabled(),
+        complete,
+        std::env::var_os("GX_PHASE1_AUTO_EXIT").is_some(),
+    )?;
+    if complete {
         println!("GX_PHASE1_LX_SANDBOX_OK");
-        if std::env::var_os("GX_PHASE1_AUTO_EXIT").is_some() {
+        if should_exit {
             app.exit(0);
         }
     }
+    Ok(())
 }
 
 fn phase1_script_path() -> PathBuf {
@@ -1036,6 +1077,30 @@ fn phase1_script_path() -> PathBuf {
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(".phase1-cache/lx-script/dist/lx-source-script.js")
         })
+}
+
+#[cfg(test)]
+mod phase1_poc_guard_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_poc_mode_cannot_produce_any_process_exit_decision() {
+        assert_eq!(
+            require_phase1_lx_poc_enabled(false).unwrap_err(),
+            "Phase-1 LX POC commands are disabled"
+        );
+        assert!(phase1_poc_failure_exit_code(false).is_err());
+        assert!(phase1_poc_should_auto_exit(false, true, true).is_err());
+        assert!(phase1_poc_should_auto_exit(false, false, false).is_err());
+    }
+
+    #[test]
+    fn enabled_poc_mode_preserves_explicit_smoke_exit_semantics() {
+        assert_eq!(phase1_poc_failure_exit_code(true).unwrap(), 2);
+        assert!(phase1_poc_should_auto_exit(true, true, true).unwrap());
+        assert!(!phase1_poc_should_auto_exit(true, true, false).unwrap());
+        assert!(!phase1_poc_should_auto_exit(true, false, true).unwrap());
+    }
 }
 
 /// Size and show the main window before first paint.
@@ -1190,6 +1255,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(audio_engine)
+        .manage(LxHttpConcurrencyLimiter::default())
         .manage(ResolveCancellationRegistry::default())
         .manage(MetadataClient::default())
         .manage(MetadataCancellationRegistry::default())

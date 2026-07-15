@@ -14,6 +14,22 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function createApplicationBackup(
+  library: unknown,
+  sources: unknown,
+): ApplicationBackupPayload {
+  if (!isObject(library)) throw new Error("无法导出：曲库备份数据无效。");
+  if (!isObject(sources)) throw new Error("无法导出：音源备份数据无效。");
+  if (library.version !== 1 && library.version !== 2) {
+    throw new Error("无法导出：曲库备份版本不受支持。");
+  }
+  return {
+    version: library.version,
+    library,
+    sources,
+  };
+}
+
 export function parseBackupText(text: string): ApplicationBackupPayload {
   let value: unknown;
   try {

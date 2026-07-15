@@ -11,7 +11,7 @@ use crate::{
 };
 
 const MAX_FOLDER_ROOTS: usize = 128;
-const MAX_FOLDER_IMPORT_FILES: usize = 10_000;
+const MAX_FOLDER_IMPORT_FILES: usize = gx_library::MAX_LIBRARY_TRACKS;
 const MAX_SCANNED_ENTRIES: usize = 250_000;
 const MAX_REMOVE_TRACKS: usize = 10_000;
 const MAX_RELINK_TRACKS: usize = 1_000;

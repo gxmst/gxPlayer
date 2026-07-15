@@ -94,6 +94,8 @@ beforeEach(() => {
       case "player_refresh_output_devices": return { devices: [], defaultDevice: null, selectedDevice: null };
       case "network_proxy_status": return { mode: "auto", detected: false };
       case "diagnostic_log_status": return { enabled: true };
+      case "library_export_backup": return { version: 2, tracks: [], playlists: [] };
+      case "source_export_backup": return { version: 1, sources: [] };
       default: return undefined;
     }
   });
@@ -145,5 +147,22 @@ describe("App shell", () => {
       ]);
     });
     expect(runtime.invoke.mock.calls.some(([command]) => command === "player_set_dsp_settings")).toBe(false);
+  });
+
+  it("exports a restorable v2 backup envelope", async () => {
+    render(<App />);
+    fireEvent.click((await screen.findAllByTitle("设置与备份"))[0]);
+    fireEvent.click(await screen.findByRole("tab", { name: "高级" }));
+    fireEvent.click(screen.getByRole("button", { name: "生成到文本框" }));
+
+    const textarea = await screen.findByRole("textbox", { name: "GXPlayer 备份 JSON" });
+    await waitFor(() => {
+      const backup = JSON.parse((textarea as HTMLTextAreaElement).value) as {
+        version: number;
+        library: { version: number };
+      };
+      expect(backup.version).toBe(2);
+      expect(backup.library.version).toBe(2);
+    });
   });
 });

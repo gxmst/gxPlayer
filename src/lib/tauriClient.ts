@@ -125,8 +125,10 @@ function mockResult(command: string, args?: Record<string, unknown>): unknown {
       return { removedTrackIds: args?.trackIds ?? [] };
     case "library_relink_tracks":
       return { relinked: [], failures: [] };
-    case "backup_export":
-      return JSON.stringify({ version: 1, browserMock: true }, null, 2);
+    case "library_export_backup":
+      return { version: 2, tracks: demoLibrary, playlists: [] };
+    case "source_export_backup":
+      return { version: 1, sources: [] };
     case "backup_preview_restore":
     case "backup_restore_atomic":
       return { trackCount: 0, playlistCount: 0, sourceCount: 0 };

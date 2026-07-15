@@ -24,6 +24,7 @@ mod artwork;
 mod backup_commands;
 mod cache_commands;
 mod diagnostic_log;
+mod library_commands;
 mod media_session;
 mod metadata_commands;
 mod network_settings;
@@ -49,9 +50,11 @@ use diagnostic_log::{
     DiagnosticLogState, diagnostic_log_clear, diagnostic_log_export, diagnostic_log_recent,
     diagnostic_log_set_enabled, diagnostic_log_status,
 };
+use library_commands::{library_import_folders, library_relink_tracks, library_remove_tracks};
 use metadata_commands::{
     MetadataCancellationRegistry, maybe_start_phase3_smoke, metadata_cancel_request,
     metadata_chart, metadata_find_replacements, metadata_lyrics, metadata_play_preview,
+    metadata_read_local_lyrics,
     metadata_search,
 };
 use network_settings::{network_proxy_status, network_set_proxy_mode};
@@ -1335,7 +1338,10 @@ pub fn run() {
             app_close_notice_cancel,
             player_media_action,
             library_import_files,
+            library_import_folders,
             library_relink_track,
+            library_relink_tracks,
+            library_remove_tracks,
             library_tracks,
             library_favorites,
             library_set_favorite,
@@ -1388,6 +1394,7 @@ pub fn run() {
             metadata_cancel_request,
             metadata_chart,
             metadata_lyrics,
+            metadata_read_local_lyrics,
             metadata_find_replacements,
             metadata_play_preview,
             lx_http_request,

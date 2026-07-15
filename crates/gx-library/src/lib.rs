@@ -308,6 +308,35 @@ impl LibraryStore {
         Ok(())
     }
 
+    /// Forget one or more tracks from the library without touching their source files.
+    ///
+    /// Favorites and local playlist memberships are removed by SQLite's foreign-key cascades.
+    /// Missing IDs are ignored so callers can safely retry a batch after a partial UI refresh.
+    /// Returned IDs preserve the first-seen order from `track_ids`.
+    pub fn remove_tracks(&self, track_ids: &[i64]) -> Result<Vec<i64>> {
+        if track_ids.iter().any(|track_id| *track_id <= 0) {
+            bail!("track ids must be positive");
+        }
+
+        let mut seen = HashSet::new();
+        let unique_ids = track_ids
+            .iter()
+            .copied()
+            .filter(|track_id| seen.insert(*track_id))
+            .collect::<Vec<_>>();
+
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        let mut removed = Vec::new();
+        for track_id in unique_ids {
+            if transaction.execute("DELETE FROM tracks WHERE id=?1", [track_id])? == 1 {
+                removed.push(track_id);
+            }
+        }
+        transaction.commit()?;
+        Ok(removed)
+    }
+
     pub fn create_playlist(&self, name: &str) -> Result<PlaylistSummary> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 80 {
@@ -1206,6 +1235,72 @@ mod tests {
         assert_eq!(relinked.path, "E:/Music/found.flac");
         assert_eq!(relinked.title, "Found");
         assert_eq!(store.list_tracks(10).unwrap(), vec![relinked]);
+    }
+
+    #[test]
+    fn remove_tracks_forgets_records_and_relationships_but_keeps_source_files() {
+        let source_path = std::env::temp_dir().join(format!(
+            "gxplayer-library-remove-{}-{}.flac",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::write(&source_path, b"source must remain untouched").unwrap();
+        let source_path = source_path.display().to_string();
+
+        let store = LibraryStore::open(":memory:").unwrap();
+        store
+            .upsert_tracks(&[
+                NewTrack {
+                    path: source_path.clone(),
+                    title: "Forget me".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                },
+                NewTrack {
+                    path: "C:/Music/keep.flac".into(),
+                    title: "Keep me".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                },
+            ])
+            .unwrap();
+        let forgotten = store.track_by_path(&source_path).unwrap().unwrap();
+        store.set_favorite(forgotten.id, true).unwrap();
+        let playlist = store.create_playlist("Temporary").unwrap();
+        store.add_to_playlist(playlist.id, forgotten.id).unwrap();
+
+        let removed = store
+            .remove_tracks(&[forgotten.id, forgotten.id, i64::MAX])
+            .unwrap();
+
+        assert_eq!(removed, vec![forgotten.id]);
+        assert!(store.track_by_path(&source_path).unwrap().is_none());
+        assert!(store.list_favorites().unwrap().is_empty());
+        assert!(store.playlist_tracks(playlist.id).unwrap().is_empty());
+        assert_eq!(store.list_tracks(10).unwrap().len(), 1);
+        assert!(Path::new(&source_path).is_file());
+
+        std::fs::remove_file(source_path).unwrap();
+    }
+
+    #[test]
+    fn remove_tracks_rejects_invalid_ids_before_changing_the_library() {
+        let store = LibraryStore::open(":memory:").unwrap();
+        store
+            .upsert_tracks(&[NewTrack {
+                path: "C:/Music/keep.flac".into(),
+                title: "Keep me".into(),
+                artist: String::new(),
+                album: String::new(),
+                duration_seconds: None,
+            }])
+            .unwrap();
+        let track = store.list_tracks(10).unwrap().pop().unwrap();
+
+        assert!(store.remove_tracks(&[track.id, 0]).is_err());
+        assert!(store.track_by_path(&track.path).unwrap().is_some());
     }
 
     #[test]

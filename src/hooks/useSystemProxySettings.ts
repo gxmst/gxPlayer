@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/tauriClient";
 import type { ProxyMode, ProxyStatus } from "../types";
 
 export function useSystemProxySettings(onError: (error: unknown) => void) {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/tauriClient";
 
 const MAX_CACHE_ENTRIES = 96;
 const MAX_CACHE_CHARACTERS = 24 * 1024 * 1024;

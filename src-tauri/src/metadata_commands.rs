@@ -1,12 +1,13 @@
 use gx_audio::engine::LocalAudioEngine;
 use gx_metadata::{
     CatalogTrack, LyricDocument, MetadataClient, ReplacementMatch, SearchBatch, apple_chart,
-    fetch_lyrics, fetch_preview_bytes, find_replacements, preview_is_available, search_all,
+    fetch_lyrics, fetch_preview_bytes, find_replacements, parse_lrc, preview_is_available, search_all,
     select_playable_with,
 };
 use gx_source::safe_http::RequestCancellation;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -249,6 +250,28 @@ pub async fn metadata_lyrics(
         .await;
     registry.finish(&token);
     result.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn metadata_read_local_lyrics(
+    window: WebviewWindow,
+    path: String,
+) -> Result<LyricDocument, String> {
+    require_window(&window, "main")?;
+    let path = PathBuf::from(path);
+    if !path.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("lrc")) {
+        return Err("请选择 .lrc 歌词文件".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.len() > 2 * 1024 * 1024 {
+            return Err("LRC 文件不能超过 2 MiB".into());
+        }
+        let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        Ok(parse_lrc(&text))
+    })
+    .await
+    .map_err(|error| format!("读取本地歌词任务失败: {error}"))?
 }
 
 #[tauri::command]

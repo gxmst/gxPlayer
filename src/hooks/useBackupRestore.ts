@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/tauriClient";
 
 import {
   parseBackupText,
@@ -17,12 +17,14 @@ const defaultBackupInvoke: BackupInvoke = (command, args) => invoke<BackupRestor
 type UseBackupRestoreOptions = {
   backupText: string;
   onMessage: (message: string, isError?: boolean) => void;
+  onRestored?: (preview: BackupRestorePreview) => void | Promise<void>;
   invokeCommand?: BackupInvoke;
 };
 
 export function useBackupRestore({
   backupText,
   onMessage,
+  onRestored,
   invokeCommand = defaultBackupInvoke,
 }: UseBackupRestoreOptions) {
   const [preview, setPreview] = useState<BackupRestorePreview | null>(null);
@@ -77,12 +79,13 @@ export function useBackupRestore({
       const restoredPreview = await invokeCommand("backup_restore_atomic", { backup });
       previewedTextRef.current = backupText;
       setPreview(restoredPreview);
+      await onRestored?.(restoredPreview);
       return restoredPreview;
     } finally {
       operationLockedRef.current = false;
       setBusy(null);
     }
-  }, [backupText, invokeCommand, preview]);
+  }, [backupText, invokeCommand, onRestored, preview]);
 
   return { preview, busy, inspect, restore, resetPreview };
 }

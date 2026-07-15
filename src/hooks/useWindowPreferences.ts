@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, invoke } from "../lib/tauriClient";
+import { hasTauriWindowRuntime } from "../lib/tauriRuntime";
 
 export function useWindowPreferences(onError: (error: unknown) => void) {
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
@@ -14,6 +14,8 @@ export function useWindowPreferences(onError: (error: unknown) => void) {
   errorHandler.current = onError;
 
   useEffect(() => {
+    if (!hasTauriWindowRuntime()) return;
+
     const appWindow = getCurrentWindow();
     const syncMaximized = () => {
       void appWindow.isMaximized().then(setIsMaximized).catch(() => undefined);
@@ -46,6 +48,8 @@ export function useWindowPreferences(onError: (error: unknown) => void) {
   }, []);
 
   const toggleAlwaysOnTop = useCallback(async () => {
+    if (!hasTauriWindowRuntime()) return false;
+
     const next = !alwaysOnTop;
     try {
       await invoke("window_set_always_on_top", { enabled: next });
@@ -58,6 +62,8 @@ export function useWindowPreferences(onError: (error: unknown) => void) {
   }, [alwaysOnTop]);
 
   const toggleMiniMode = useCallback(async () => {
+    if (!hasTauriWindowRuntime()) return false;
+
     const next = !miniMode;
     try {
       await invoke("window_set_mini_mode", { enabled: next });

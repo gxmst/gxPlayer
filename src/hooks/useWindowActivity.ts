@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow } from "../lib/tauriClient";
+import { hasTauriWindowRuntime } from "../lib/tauriRuntime";
 
 type WindowActivity = {
   documentVisible: boolean;
@@ -16,6 +17,20 @@ export function useWindowActivity(): boolean {
   const [active, setActive] = useState(() => !document.hidden && document.hasFocus());
 
   useEffect(() => {
+    if (!hasTauriWindowRuntime()) {
+      const syncBrowserState = () => setActive(!document.hidden && document.hasFocus());
+      const markUnfocused = () => setActive(false);
+
+      document.addEventListener("visibilitychange", syncBrowserState);
+      window.addEventListener("blur", markUnfocused);
+      window.addEventListener("focus", syncBrowserState);
+      return () => {
+        document.removeEventListener("visibilitychange", syncBrowserState);
+        window.removeEventListener("blur", markUnfocused);
+        window.removeEventListener("focus", syncBrowserState);
+      };
+    }
+
     const appWindow = getCurrentWindow();
     let disposed = false;
     let syncRevision = 0;

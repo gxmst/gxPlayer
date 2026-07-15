@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export const NARROW_LAYOUT_QUERY = "(max-width: 720.98px)";
+export const NARROW_LAYOUT_QUERY = "(max-width: 900.98px)";
 
 function currentMatch(): boolean {
   if (typeof window === "undefined") return false;

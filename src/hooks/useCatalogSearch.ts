@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { invoke, listen } from "../lib/tauriClient";
 import type { CatalogTrack } from "../types";
 
 export type AsyncSearchState = "idle" | "loading" | "ready" | "empty" | "error";

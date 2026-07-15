@@ -3213,6 +3213,92 @@ mod tests {
     }
 
     #[test]
+    fn vocal_38_percent_ab_survives_dsp_ring_and_callback_switching() {
+        const SAMPLE_RATE: u32 = 48_000;
+        const CHANNELS: usize = 2;
+        const FRAMES: usize = 8_192;
+        let intensity_scale = 0.6 + 0.38 * 0.8;
+        let settings = DspSettings {
+            enabled: true,
+            eq_enabled: true,
+            eq_bands: vec![
+                gx_dsp::EqBand::peak(125.0, -2.0 * intensity_scale, 1.0),
+                gx_dsp::EqBand::peak(250.0, -intensity_scale, 1.0),
+                gx_dsp::EqBand::peak(1_000.0, 2.0 * intensity_scale, 1.0),
+                gx_dsp::EqBand::peak(2_000.0, 2.5 * intensity_scale, 1.0),
+            ],
+            crossfeed: CrossfeedSettings {
+                enabled: true,
+                amount: 0.13,
+                delay_ms: 0.28,
+                cutoff_hz: 700.0,
+            },
+            limiter: LimiterSettings {
+                enabled: true,
+                ceiling_db: -1.0,
+                release_ms: 80.0,
+            },
+            ..DspSettings::default()
+        };
+        let mut processed = Vec::with_capacity(FRAMES * CHANNELS);
+        for frame in 0..FRAMES {
+            let time = frame as f32 / SAMPLE_RATE as f32;
+            let left = (std::f32::consts::TAU * 125.0 * time).sin() * 0.16
+                + (std::f32::consts::TAU * 1_000.0 * time).sin() * 0.11;
+            let right = (std::f32::consts::TAU * 250.0 * time).sin() * 0.13
+                + (std::f32::consts::TAU * 2_000.0 * time).sin() * 0.09;
+            processed.extend_from_slice(&[left, right]);
+        }
+        let mut dry = vec![0.0; processed.len()];
+        let mut chain = DspChain::new(SAMPLE_RATE, CHANNELS, settings).unwrap();
+        chain
+            .process_interleaved_with_ab_dry(&mut processed, &mut dry)
+            .unwrap();
+
+        let ring = HeapRb::<AbSample>::new(processed.len() + CHANNELS);
+        let (mut producer, mut consumer) = ring.split();
+        for (&processed, &dry) in processed.iter().zip(&dry) {
+            producer.try_push(AbSample { processed, dry }).unwrap();
+        }
+        let ab_dry_active = Arc::new(AtomicBool::new(false));
+        let counters = OutputCallbackCounters {
+            played_samples: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
+            enabled: Arc::new(AtomicBool::new(true)),
+            volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            ab_dry_active: Arc::clone(&ab_dry_active),
+            output_sample_rate: SAMPLE_RATE,
+            output_channels: CHANNELS,
+        };
+        let mut ramp = AbDryRamp::new(SAMPLE_RATE);
+        let mut callback_wet = vec![0.0; processed.len()];
+        render_output_callback(&mut callback_wet, &mut consumer, &counters, &mut ramp);
+        assert_eq!(callback_wet, processed);
+
+        for (&processed, &dry) in processed.iter().zip(&dry) {
+            producer.try_push(AbSample { processed, dry }).unwrap();
+        }
+        ab_dry_active.store(true, Ordering::Relaxed);
+        let mut callback_dry = vec![0.0; dry.len()];
+        render_output_callback(&mut callback_dry, &mut consumer, &counters, &mut ramp);
+
+        let settled_sample = ((SAMPLE_RATE / 100) as usize + 1) * CHANNELS;
+        assert!(
+            callback_dry[settled_sample..]
+                .iter()
+                .zip(&dry[settled_sample..])
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-6)
+        );
+        let mean_delta = callback_wet[settled_sample..]
+            .iter()
+            .zip(&callback_dry[settled_sample..])
+            .map(|(wet, dry)| (wet - dry).abs())
+            .sum::<f32>()
+            / (callback_dry.len() - settled_sample) as f32;
+        assert!(mean_delta > 0.01, "mean wet/dry delta={mean_delta}");
+    }
+
+    #[test]
     fn engine_diagnostics_are_bounded_and_never_include_error_details() {
         let diagnostics = EngineDiagnosticQueue::default();
         for generation in 0..(DIAGNOSTIC_CAPACITY + 5) {

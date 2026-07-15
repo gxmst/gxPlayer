@@ -283,11 +283,11 @@ pub fn window_set_mini_mode(
         state.mini_mode = false;
         let width = state
             .width
-            .unwrap_or(1100.0)
+            .unwrap_or(window_state::DEFAULT_WIDTH)
             .max(window_state::NORMAL_MIN_WIDTH);
         let height = state
             .height
-            .unwrap_or(688.0)
+            .unwrap_or(window_state::DEFAULT_HEIGHT)
             .max(window_state::NORMAL_MIN_HEIGHT);
         window
             .set_size(tauri::LogicalSize::new(width, height))

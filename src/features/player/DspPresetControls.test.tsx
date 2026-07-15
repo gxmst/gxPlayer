@@ -90,7 +90,7 @@ describe("DspPresetControls", () => {
     expect(screen.getAllByText("固定前方 ±30° 音箱感，可能偏闷；建议不与系统杜比耳机虚拟化同时开。").length).toBeGreaterThan(0);
   });
 
-  it("rebuilds the full settings when a slider changes", () => {
+  it("keeps pointer range input local and commits the final draft once", () => {
     const onChange = vi.fn();
     render(
       <DspPresetControls
@@ -100,8 +100,115 @@ describe("DspPresetControls", () => {
       />,
     );
 
-    fireEvent.change(screen.getByRole("slider", { name: "强度" }), { target: { value: "1" } });
-    expect(onChange).toHaveBeenCalledWith(buildDspControlState("bass", 1, 0.5));
+    const slider = screen.getByRole("slider", { name: "强度" });
+    expect(slider.style.getPropertyValue("--fill")).toBe("50%");
+
+    fireEvent.pointerDown(slider, { button: 0, pointerId: 5 });
+    fireEvent.change(slider, { target: { value: "0.68" } });
+    fireEvent.change(slider, { target: { value: "0.82" } });
+
+    expect(slider).toHaveValue("0.82");
+    expect(slider).toHaveAttribute("aria-valuetext", "82%");
+    expect(slider.style.getPropertyValue("--fill")).toBe("82%");
+    expect(onChange).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(slider, { pointerId: 5 });
+    fireEvent.pointerCancel(slider, { pointerId: 5 });
+    fireEvent.blur(slider);
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith(buildDspControlState("bass", 0.82, 0.5));
+  });
+
+  it("coalesces repeated keyboard changes until keyup and uses blur as a fallback", () => {
+    const onChange = vi.fn();
+    render(
+      <DspPresetControls
+        value={buildDspControlState("vocal", 0.5, 0.5)}
+        onChange={onChange}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+    const slider = screen.getByRole("slider", { name: "强度" });
+
+    fireEvent.keyDown(slider, { key: "ArrowRight" });
+    fireEvent.change(slider, { target: { value: "0.51" } });
+    fireEvent.keyDown(slider, { key: "ArrowRight", repeat: true });
+    fireEvent.change(slider, { target: { value: "0.52" } });
+    expect(onChange).not.toHaveBeenCalled();
+
+    fireEvent.keyUp(slider, { key: "ArrowRight" });
+    fireEvent.keyUp(slider, { key: "ArrowRight" });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenLastCalledWith(buildDspControlState("vocal", 0.52, 0.5));
+
+    fireEvent.change(slider, { target: { value: "0.7" } });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    fireEvent.blur(window);
+    fireEvent.blur(slider);
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(onChange).toHaveBeenLastCalledWith(buildDspControlState("vocal", 0.7, 0.5));
+  });
+
+  it("commits the spatial amount as a complete control state", () => {
+    const onChange = vi.fn();
+    render(
+      <DspPresetControls
+        value={buildDspControlState("spatial", 0.3, 0.4)}
+        onChange={onChange}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+    const slider = screen.getByRole("slider", { name: "空间感" });
+
+    fireEvent.change(slider, { target: { value: "0.73" } });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.blur(slider);
+
+    expect(onChange).toHaveBeenCalledOnce();
+    expect(onChange).toHaveBeenCalledWith(buildDspControlState("spatial", 0.3, 0.73));
+  });
+
+  it("replaces an uncommitted draft when an authoritative value arrives", () => {
+    const onChange = vi.fn();
+    const onAbDryChange = vi.fn();
+    const { rerender } = render(
+      <DspPresetControls
+        value={buildDspControlState("bass", 0.25, 0.5)}
+        onChange={onChange}
+        onAbDryChange={onAbDryChange}
+      />,
+    );
+    const slider = screen.getByRole("slider", { name: "强度" });
+
+    fireEvent.pointerDown(slider, { button: 0, pointerId: 6 });
+    fireEvent.change(slider, { target: { value: "0.9" } });
+    expect(slider).toHaveValue("0.9");
+
+    rerender(
+      <DspPresetControls
+        value={buildDspControlState("bass", 0.35, 0.5)}
+        onChange={onChange}
+        onAbDryChange={onAbDryChange}
+      />,
+    );
+
+    expect(screen.getByRole("slider", { name: "强度" })).toHaveValue("0.35");
+    expect(screen.getByRole("slider", { name: "强度" })).toHaveAttribute("aria-valuetext", "35%");
+    expect(screen.getByRole("slider", { name: "强度" }).style.getPropertyValue("--fill")).toBe("35%");
+    fireEvent.pointerUp(screen.getByRole("slider", { name: "强度" }), { pointerId: 6 });
+    expect(onChange).not.toHaveBeenCalled();
+
+    rerender(
+      <DspPresetControls
+        value={buildDspControlState("spatial", 0.6, 0.64)}
+        onChange={onChange}
+        onAbDryChange={onAbDryChange}
+      />,
+    );
+    const spatial = screen.getByRole("slider", { name: "空间感" });
+    expect(spatial).toHaveValue("0.64");
+    expect(spatial.style.getPropertyValue("--fill")).toBe("64%");
   });
 
   it("uses a separate momentary A/B path for pointer input", () => {
@@ -115,14 +222,55 @@ describe("DspPresetControls", () => {
       />,
     );
     const button = screen.getByRole("button", { name: DSP_AB_LABEL });
+    const setPointerCapture = vi.fn(() => {
+      throw new Error("pointer capture unavailable");
+    });
+    Object.defineProperty(button, "setPointerCapture", {
+      configurable: true,
+      value: setPointerCapture,
+    });
 
+    fireEvent.pointerDown(button, { button: 2, pointerId: 6 });
+    expect(onAbDryChange).not.toHaveBeenCalled();
+    expect(setPointerCapture).not.toHaveBeenCalled();
     fireEvent.pointerDown(button, { button: 0, pointerId: 7 });
+    expect(setPointerCapture).toHaveBeenCalledWith(7);
     expect(button).toHaveAttribute("aria-pressed", "true");
+    fireEvent.pointerUp(window, { pointerId: 7 });
+    fireEvent.pointerCancel(button, { pointerId: 7 });
     fireEvent.pointerUp(button, { pointerId: 7 });
     expect(button).toHaveAttribute("aria-pressed", "false");
 
     expect(onAbDryChange.mock.calls.map(([active]) => active)).toEqual([true, false]);
     expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("does not swallow A/B when a range draft is still pending", () => {
+    const onChange = vi.fn();
+    const onAbDryChange = vi.fn();
+    render(
+      <DspPresetControls
+        value={buildDspControlState("vocal", 0.5, 0.5)}
+        onChange={onChange}
+        onAbDryChange={onAbDryChange}
+      />,
+    );
+    fireEvent.change(screen.getByRole("slider", { name: "强度" }), {
+      target: { value: "0.66" },
+    });
+
+    const button = screen.getByRole("button", { name: DSP_AB_LABEL });
+    fireEvent.pointerDown(button, { button: 0, pointerId: 8 });
+
+    expect(onChange).not.toHaveBeenCalled();
+    expect(onAbDryChange.mock.calls.map(([active]) => active)).toEqual([true]);
+    expect(button).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.pointerUp(button, { pointerId: 8 });
+    expect(onChange).toHaveBeenCalledOnce();
+    expect(onChange).toHaveBeenCalledWith(buildDspControlState("vocal", 0.66, 0.5));
+    expect(onAbDryChange.mock.calls.map(([active]) => active)).toEqual([true, false]);
+    expect(button).toHaveAttribute("aria-pressed", "false");
   });
 
   it("releases keyboard A/B on keyup and window blur without duplicate calls", () => {

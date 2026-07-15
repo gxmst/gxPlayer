@@ -19,8 +19,8 @@ pub const MINI_MIN_WIDTH: f64 = 320.0;
 pub const MINI_MIN_HEIGHT: f64 = 120.0;
 pub const MINI_DEFAULT_WIDTH: f64 = 380.0;
 pub const MINI_DEFAULT_HEIGHT: f64 = 140.0;
-const DEFAULT_WIDTH: f64 = 1100.0;
-const DEFAULT_HEIGHT: f64 = 688.0;
+pub const DEFAULT_WIDTH: f64 = 1024.0;
+pub const DEFAULT_HEIGHT: f64 = 640.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -162,6 +162,22 @@ fn minimum_size(mini_mode: bool) -> LogicalSize<f64> {
     }
 }
 
+fn default_size_for_monitor(logical_width: f64, logical_height: f64) -> LogicalSize<f64> {
+    let aspect_ratio = DEFAULT_WIDTH / DEFAULT_HEIGHT;
+    let mut width = (logical_width * 0.88).min(DEFAULT_WIDTH);
+    let mut height = width / aspect_ratio;
+    let maximum_height = logical_height * 0.86;
+    if height > maximum_height {
+        height = maximum_height;
+        width = height * aspect_ratio;
+    }
+
+    LogicalSize::new(
+        width.max(NORMAL_MIN_WIDTH).floor(),
+        height.max(NORMAL_MIN_HEIGHT).floor(),
+    )
+}
+
 pub fn apply_minimum_size(window: &WebviewWindow, mini_mode: bool) -> Result<(), String> {
     window
         .set_min_size(Some(minimum_size(mini_mode)))
@@ -179,16 +195,7 @@ pub fn apply_default_placement(window: &WebviewWindow) {
         let logical_width = physical.width as f64 / scale;
         let logical_height = physical.height as f64 / scale;
 
-        let mut width = (logical_width * 0.88).min(1280.0);
-        let mut height = width / 1.6;
-        let maximum_height = logical_height * 0.86;
-        if height > maximum_height {
-            height = maximum_height;
-            width = height * 1.6;
-        }
-        width = width.max(NORMAL_MIN_WIDTH);
-        height = height.max(NORMAL_MIN_HEIGHT);
-        let _ = window.set_size(LogicalSize::new(width.floor(), height.floor()));
+        let _ = window.set_size(default_size_for_monitor(logical_width, logical_height));
     } else {
         let _ = window.set_size(LogicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT));
     }
@@ -322,6 +329,11 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_normal_window_size_is_not_replaced_by_the_first_launch_default() {
+        assert_eq!(clamp_size(1180.0, 720.0, false), (1180.0, 720.0));
+    }
+
+    #[test]
     fn minimum_size_matches_the_active_window_mode() {
         assert_eq!(
             minimum_size(false),
@@ -330,6 +342,22 @@ mod tests {
         assert_eq!(
             minimum_size(true),
             LogicalSize::new(MINI_MIN_WIDTH, MINI_MIN_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn first_launch_uses_the_compact_default_on_a_large_monitor() {
+        assert_eq!(
+            default_size_for_monitor(1920.0, 1080.0),
+            LogicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn first_launch_default_scales_down_to_fit_a_short_monitor() {
+        assert_eq!(
+            default_size_for_monitor(1280.0, 720.0),
+            LogicalSize::new(990.0, 619.0)
         );
     }
 }

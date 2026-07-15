@@ -1,5 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import SourceRealmWorker from "./sourceRealm.worker.ts?worker&inline";
+import {
+  SOURCE_BRIDGE_LIMIT_ERROR,
+  hasSourceBridgeCapacity,
+} from "./lib/sourceBridgeLimit";
 
 type LxHttpResponse = {
   statusCode: number;
@@ -26,6 +30,8 @@ type RealmMessage = {
 let realmWorker: Worker | null = null;
 let realmNonce = "";
 let currentGeneration = 0;
+// Prevent a delayed eval for an aborted generation from recreating its terminated worker.
+let retiredGeneration = -1;
 let pocMode = false;
 
 function randomNonce(): string {
@@ -42,21 +48,60 @@ function destroySourceRealm(): void {
   }
 }
 
+function retireSourceRealm(generation: number): void {
+  if (!Number.isSafeInteger(generation) || generation !== currentGeneration) return;
+  retiredGeneration = Math.max(retiredGeneration, generation);
+  destroySourceRealm();
+}
+
+function clearSourceRealm(generation: number): void {
+  if (!Number.isSafeInteger(generation) || generation < currentGeneration) return;
+  currentGeneration = generation;
+  retiredGeneration = Math.max(retiredGeneration, generation);
+  pocMode = false;
+  destroySourceRealm();
+}
+
 function isActiveRealm(worker: Worker, nonce: string): boolean {
   return realmWorker === worker && realmNonce === nonce;
 }
 
-async function reportRealmFailure(stage: string, error: unknown, generation: number, poc: boolean) {
-  if (poc) {
+async function reportRealmFailure(
+  stage: string,
+  error: unknown,
+  generation: number,
+  trustedPocMode: boolean,
+) {
+  if (trustedPocMode) {
     await invoke("lx_poc_failure", { stage, error: String(error) });
   } else {
     await invoke("lx_runtime_failure", { generation, stage, error: String(error) });
   }
 }
 
-async function handleBridgeCall(worker: Worker, nonce: string, message: RealmMessage) {
+async function handleBridgeCall(
+  worker: Worker,
+  nonce: string,
+  activeBridgeCalls: Set<number>,
+  message: RealmMessage,
+) {
   const callId = message.callId;
-  if (typeof callId !== "number" || !message.command || !message.payload) return;
+  if (
+    typeof callId !== "number" ||
+    !Number.isSafeInteger(callId) ||
+    callId <= 0 ||
+    !message.command ||
+    !message.payload
+  ) {
+    return;
+  }
+  if (activeBridgeCalls.has(callId) || !hasSourceBridgeCapacity(activeBridgeCalls.size)) {
+    if (isActiveRealm(worker, nonce)) {
+      worker.postMessage({ type: "bridgeResult", nonce, callId, error: SOURCE_BRIDGE_LIMIT_ERROR });
+    }
+    return;
+  }
+  activeBridgeCalls.add(callId);
   try {
     let result: unknown;
     if (message.command === "http") {
@@ -85,17 +130,27 @@ async function handleBridgeCall(worker: Worker, nonce: string, message: RealmMes
     if (isActiveRealm(worker, nonce)) {
       worker.postMessage({ type: "bridgeResult", nonce, callId, error: String(error) });
     }
+  } finally {
+    activeBridgeCalls.delete(callId);
   }
 }
 
-async function handleRealmMessage(worker: Worker, nonce: string, message: RealmMessage) {
+async function handleRealmMessage(
+  worker: Worker,
+  nonce: string,
+  trustedPocMode: boolean,
+  activeBridgeCalls: Set<number>,
+  message: RealmMessage,
+) {
   if (!isActiveRealm(worker, nonce) || message.nonce !== nonce) return;
   switch (message.type) {
     case "bridge":
-      await handleBridgeCall(worker, nonce, message);
+      await handleBridgeCall(worker, nonce, activeBridgeCalls, message);
       break;
     case "runtimeResult":
-      if (message.poc) {
+      // `poc` is worker-controlled data. Only the parent-created realm mode may select a POC
+      // command because those commands can terminate the process after a smoke test.
+      if (trustedPocMode) {
         if (message.error) {
           await invoke("lx_poc_failure", { stage: "music-url", error: message.error });
         } else {
@@ -115,10 +170,13 @@ async function handleRealmMessage(worker: Worker, nonce: string, message: RealmM
         message.stage ?? "community-script",
         message.error ?? "unknown source realm failure",
         message.generation ?? currentGeneration,
-        Boolean(message.poc),
+        trustedPocMode,
       );
       break;
     case "cryptoResult":
+      // Crypto self-test reports are POC-only. A production source realm cannot promote itself
+      // into that control plane by forging a worker message.
+      if (!trustedPocMode) break;
       if (message.error) {
         await invoke("lx_poc_failure", { stage: "sync-crypto", error: message.error });
       } else {
@@ -140,15 +198,23 @@ function createSourceRealm(
     config?: Record<string, unknown>;
   },
 ): void {
+  const generation = context.generation ?? 0;
+  if (!context.poc && (generation < currentGeneration || generation <= retiredGeneration)) return;
   destroySourceRealm();
+  currentGeneration = generation;
+  const trustedPocMode = context.poc === true;
+  pocMode = trustedPocMode;
   const nonce = randomNonce();
   const worker = new SourceRealmWorker({ name: "gx-lx-source-realm" });
+  const activeBridgeCalls = new Set<number>();
   realmWorker = worker;
   realmNonce = nonce;
   worker.addEventListener("message", (event: MessageEvent<RealmMessage>) => {
-    void handleRealmMessage(worker, nonce, event.data).catch((error) => {
-      if (isActiveRealm(worker, nonce)) console.error("LX source bridge failed", error);
-    });
+    void handleRealmMessage(worker, nonce, trustedPocMode, activeBridgeCalls, event.data).catch(
+      (error) => {
+        if (isActiveRealm(worker, nonce)) console.error("LX source bridge failed", error);
+      },
+    );
   });
   worker.addEventListener("error", (event) => {
     if (!isActiveRealm(worker, nonce)) return;
@@ -156,7 +222,7 @@ function createSourceRealm(
       "source-worker",
       event.message || "LX source worker crashed",
       currentGeneration,
-      pocMode,
+      trustedPocMode,
     );
   });
   worker.postMessage({ type: "launch", nonce, script, context });
@@ -172,25 +238,30 @@ Object.assign(window, {
       config?: Record<string, unknown>;
     } = {},
   ) {
-    currentGeneration = context.generation ?? 0;
-    pocMode = context.poc ?? false;
     createSourceRealm(script, context);
+  },
+  __gxRetireSourceRealm(generation: number) {
+    retireSourceRealm(generation);
+  },
+  __gxClearSourceRealm(generation: number) {
+    clearSourceRealm(generation);
   },
   async __gxDispatchRequest(requestId: string | unknown, payload?: unknown, generation?: number) {
     const worker = realmWorker;
     const nonce = realmNonce;
     if (!worker || !nonce) throw new Error("LX source realm is unavailable");
-    const isPocRequest = payload === undefined;
+    const isPocRequest = pocMode && payload === undefined;
     worker.postMessage({
       type: "dispatch",
       nonce,
       requestId,
       payload: isPocRequest ? requestId : payload,
       generation: generation ?? currentGeneration,
-      poc: isPocRequest || pocMode,
+      poc: pocMode,
     });
   },
   async __gxRunCryptoSelfTest() {
+    if (!pocMode) throw new Error("LX crypto self-test is only available in POC mode");
     const worker = realmWorker;
     const nonce = realmNonce;
     if (!worker || !nonce) {
@@ -203,6 +274,7 @@ Object.assign(window, {
     worker.postMessage({ type: "cryptoSelfTest", nonce });
   },
   async __gxRunSecuritySelfTest() {
+    if (!pocMode) throw new Error("LX security self-test is only available in POC mode");
     const results = {
       mainCommandBlocked: false,
       sourceCommandBlocked: false,

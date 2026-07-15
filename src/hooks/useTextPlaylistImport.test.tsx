@@ -3,6 +3,8 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CatalogTrack } from "../types";
 import {
+  buildTextPlaylistUnmatchedText,
+  collectIncludedTextPlaylistTracks,
   createTextPlaylistSearch,
   useTextPlaylistImport,
   type TextPlaylistSearch,
@@ -118,6 +120,7 @@ describe("useTextPlaylistImport", () => {
     expect(search).toHaveBeenCalledTimes(1);
     expect(result.current.state.phase).toBe("cancelled");
     expect(result.current.state.rows.map((row) => row.status)).toEqual(["cancelled", "cancelled"]);
+    expect(buildTextPlaylistUnmatchedText(result.current.state.rows)).toBe("当前\n下一首");
   });
 
   it("does not search rejected URL lines", async () => {
@@ -130,19 +133,103 @@ describe("useTextPlaylistImport", () => {
     expect(result.current.state.rows[0]).toMatchObject({ status: "invalid", error: "不支持链接格式，请输入歌曲文本" });
     expect(result.current.state.rows[1]?.status).toBe("matched");
   });
+
+  it("keeps duplicate-query choices independent and leaves low-confidence candidates unchecked", async () => {
+    const top = track("目标歌", "其他歌手");
+    const alternate = track("另一个版本", "目标歌手");
+    const search: TextPlaylistSearch = vi.fn(async () => [alternate, top]);
+    const { result } = renderHook(() => useTextPlaylistImport(search, { delayMs: 0 }));
+
+    await act(async () => {
+      await result.current.start("目标歌 - 目标歌手\n目标歌 - 目标歌手");
+    });
+
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(result.current.state.rows).toEqual([
+      expect.objectContaining({ track: top, included: false, selectedCandidateIndex: 0 }),
+      expect.objectContaining({ track: top, included: false, selectedCandidateIndex: 0 }),
+    ]);
+    expect(result.current.state.needsConfirmation).toBe(2);
+
+    act(() => {
+      result.current.setRowIncluded(1, true);
+      result.current.selectCandidate(2, 1);
+    });
+
+    expect(result.current.state.rows[0]).toMatchObject({ track: top, included: true, selectedCandidateIndex: 0 });
+    expect(result.current.state.rows[1]).toMatchObject({ track: alternate, included: false, selectedCandidateIndex: 1 });
+    expect(collectIncludedTextPlaylistTracks(result.current.state.rows)).toEqual([top]);
+  });
+
+  it("exports failures and unconfirmed weak matches but not an unchecked strong match", async () => {
+    const search: TextPlaylistSearch = vi.fn(async (query) => {
+      if (query === "未找到") return [];
+      if (query === "失败") throw new Error("网络错误");
+      if (query === "低信 原歌手") return [track("低信", "其他歌手")];
+      return [track(query)];
+    });
+    const { result } = renderHook(() => useTextPlaylistImport(search, { delayMs: 0 }));
+
+    await act(async () => {
+      await result.current.start("高信\n低信 - 原歌手\n未找到\n失败\nhttps://invalid.example/list");
+    });
+    act(() => result.current.setRowIncluded(1, false));
+
+    expect(result.current.state.excluded).toBe(1);
+    expect(result.current.state.needsConfirmation).toBe(1);
+    expect(buildTextPlaylistUnmatchedText(result.current.state.rows)).toBe([
+      "低信 - 原歌手",
+      "未找到",
+      "失败",
+      "https://invalid.example/list",
+    ].join("\n"));
+  });
 });
 
 describe("createTextPlaylistSearch", () => {
   it("injects the existing metadata command and bounds the candidate count", async () => {
     const invoke = vi.fn(async <T,>(command: string, args?: Record<string, unknown>) => {
       expect(command).toBe("metadata_search");
-      expect(args).toEqual({ query: "歌曲", limit: 7 });
+      expect(args).toMatchObject({
+        query: "歌曲",
+        limit: 7,
+        lane: "searchImport",
+        requestId: expect.any(String),
+      });
       return [track("歌曲")] as T;
     });
     const search = createTextPlaylistSearch(invoke, 7);
+    const controller = new AbortController();
 
-    await expect(search("歌曲", new AbortController().signal)).resolves.toEqual([track("歌曲")]);
+    await expect(search("歌曲", controller.signal)).resolves.toEqual([track("歌曲")]);
+    controller.abort();
     expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels an in-flight backend import search and rejects promptly with AbortError", async () => {
+    const pending = deferred<unknown>();
+    const invoke = vi.fn((command: string, _args?: Record<string, unknown>) => (
+      command === "metadata_cancel_request" ? Promise.resolve(undefined) : pending.promise
+    ));
+    const search = createTextPlaylistSearch(invoke);
+    const controller = new AbortController();
+    const request = search("歌曲", controller.signal);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+      "metadata_search",
+      expect.objectContaining({ lane: "searchImport", requestId: expect.any(String) }),
+    ));
+    const searchArgs = invoke.mock.calls.find(([command]) => command === "metadata_search")?.[1] as {
+      requestId: string;
+    };
+
+    controller.abort();
+
+    await expect(request).rejects.toMatchObject({ name: "AbortError" });
+    expect(invoke).toHaveBeenCalledWith("metadata_cancel_request", {
+      lane: "searchImport",
+      requestId: searchArgs.requestId,
+    });
+    pending.resolve([]);
   });
 
   it("does not invoke after cancellation is already requested", async () => {

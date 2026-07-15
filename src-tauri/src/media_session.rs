@@ -204,6 +204,7 @@ fn spawn_diagnostic_drain(app: AppHandle) {
         .name("gx-diagnostic-drain".into())
         .spawn(move || {
             let mut logged_failed_generation = None;
+            let mut cache_revision = 0;
             loop {
                 if let Some(cache) = app.try_state::<gx_cache::CacheStore>() {
                     for diagnostic in cache.drain_diagnostics() {
@@ -213,6 +214,13 @@ fn spawn_diagnostic_drain(app: AppHandle) {
                             Some(diagnostic.source),
                             diagnostic.summary,
                         );
+                    }
+                    let next_revision = cache.revision();
+                    if next_revision != cache_revision {
+                        cache_revision = next_revision;
+                        if let Err(error) = app.emit("gx-cache-changed", next_revision) {
+                            eprintln!("cache change event failed: {error}");
+                        }
                     }
                 }
                 if let Some(engine) = app.try_state::<LocalAudioEngine>() {
@@ -231,6 +239,28 @@ fn spawn_diagnostic_drain(app: AppHandle) {
                             Some(diagnostic.source),
                             diagnostic.summary,
                         );
+                    }
+                    for event in engine.drain_output_device_events() {
+                        if let Some(preferences) =
+                            app.try_state::<crate::app_preferences::AppPreferencesState>()
+                            && let Err(error) = preferences
+                                .clear_output_device_if_matches(&event.unavailable_device)
+                        {
+                            eprintln!("failed to clear unavailable output device: {error}");
+                        }
+                        crate::diagnostic_log::record_diagnostic(
+                            &app,
+                            "output_device_fallback",
+                            Some("audio"),
+                            format!(
+                                "unavailable={} fallback={}",
+                                event.unavailable_device,
+                                event.fallback_device.as_deref().unwrap_or("none")
+                            ),
+                        );
+                        if let Err(error) = app.emit("gx-output-device-fallback", &event) {
+                            eprintln!("output device fallback event failed: {error}");
+                        }
                     }
                     let snapshot = engine.snapshot();
                     if snapshot.status == PlaybackStatus::Failed

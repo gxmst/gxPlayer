@@ -1,20 +1,29 @@
 use std::cmp::Ordering;
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use gx_contracts::{MediaType, ResolvedMediaRequest};
 use gx_source::network_policy::source_route_attempts;
-use gx_source::safe_http::{SafeHttpRequest, SafeHttpResponse, execute, execute_on_route};
+use gx_source::safe_http::{
+    RequestCancellation, SafeHttpError, SafeHttpRequest, SafeHttpResponse, execute, execute_async,
+    execute_on_route, execute_on_route_async,
+};
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 
 const RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const PREVIEW_LIMIT: usize = 8 * 1024 * 1024;
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECT_SEARCH_BUDGET: Duration = Duration::from_secs(3);
+const MAX_CONCURRENT_REQUESTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +80,329 @@ pub enum MetadataError {
     Json(#[from] serde_json::Error),
     #[error("metadata URL failed: {0}")]
     Url(#[from] url::ParseError),
+    #[error("metadata request cancelled")]
+    Cancelled,
+}
+
+type TransportFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SafeHttpResponse, SafeHttpError>> + Send + 'a>>;
+
+trait MetadataTransport: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        request: SafeHttpRequest,
+        cancellation: &'a RequestCancellation,
+    ) -> TransportFuture<'a>;
+
+    fn execute_on_route<'a>(
+        &'a self,
+        request: SafeHttpRequest,
+        route: gx_contracts::NetworkRoute,
+        cancellation: &'a RequestCancellation,
+    ) -> TransportFuture<'a>;
+}
+
+struct SafeHttpTransport;
+
+impl MetadataTransport for SafeHttpTransport {
+    fn execute<'a>(
+        &'a self,
+        request: SafeHttpRequest,
+        cancellation: &'a RequestCancellation,
+    ) -> TransportFuture<'a> {
+        Box::pin(execute_async(request, cancellation))
+    }
+
+    fn execute_on_route<'a>(
+        &'a self,
+        request: SafeHttpRequest,
+        route: gx_contracts::NetworkRoute,
+        cancellation: &'a RequestCancellation,
+    ) -> TransportFuture<'a> {
+        Box::pin(execute_on_route_async(request, route, cancellation))
+    }
+}
+
+#[derive(Clone)]
+pub struct MetadataClient {
+    transport: Arc<dyn MetadataTransport>,
+    requests: Arc<Semaphore>,
+}
+
+impl Default for MetadataClient {
+    fn default() -> Self {
+        Self {
+            transport: Arc::new(SafeHttpTransport),
+            requests: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+        }
+    }
+}
+
+impl MetadataClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn search_all_progressive<F>(
+        &self,
+        query: &str,
+        limit: usize,
+        cancellation: &RequestCancellation,
+        mut on_batch: F,
+    ) -> Result<Vec<CatalogTrack>, MetadataError>
+    where
+        F: FnMut(SearchBatch) + Send,
+    {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(MetadataError::EmptyQuery);
+        }
+        if cancellation.is_cancelled() {
+            return Err(MetadataError::Cancelled);
+        }
+
+        let mut tasks = JoinSet::new();
+        for provider in SEARCH_PROVIDERS {
+            let client = self.clone();
+            let query = query.to_owned();
+            let cancellation = cancellation.clone();
+            tasks.spawn(async move {
+                let result = client
+                    .search_provider(provider, &query, limit, &cancellation)
+                    .await;
+                (provider.id(), result)
+            });
+        }
+
+        let mut tracks = Vec::new();
+        let mut errors = Vec::new();
+        let mut successful_providers = 0usize;
+        while !tasks.is_empty() {
+            let completed = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    abort_and_drain(&mut tasks).await;
+                    return Err(MetadataError::Cancelled);
+                }
+                completed = tasks.join_next() => completed,
+            };
+            if cancellation.is_cancelled() {
+                abort_and_drain(&mut tasks).await;
+                return Err(MetadataError::Cancelled);
+            }
+            match completed {
+                Some(Ok((_, Err(MetadataError::Cancelled)))) => {
+                    abort_and_drain(&mut tasks).await;
+                    return Err(MetadataError::Cancelled);
+                }
+                Some(Ok((provider_id, result))) => accumulate_search_result(
+                    provider_id,
+                    result,
+                    &mut tracks,
+                    &mut errors,
+                    &mut successful_providers,
+                    &mut on_batch,
+                ),
+                Some(Err(error)) => accumulate_search_result(
+                    "unknown",
+                    Err(MetadataError::Http(format!(
+                        "metadata search worker failed: {error}"
+                    ))),
+                    &mut tracks,
+                    &mut errors,
+                    &mut successful_providers,
+                    &mut on_batch,
+                ),
+                None => break,
+            }
+        }
+        finish_search_results(tracks, errors, successful_providers)
+    }
+
+    pub async fn fetch_lyrics(
+        &self,
+        title: &str,
+        artist: &str,
+        duration_ms: Option<u64>,
+        cancellation: &RequestCancellation,
+    ) -> Result<Option<LyricDocument>, MetadataError> {
+        let url = lyrics_url(title, artist)?;
+        let candidates: Vec<LrcLibItem> = self.request_json(url, cancellation).await?;
+        Ok(select_lyrics(candidates, duration_ms))
+    }
+
+    async fn search_provider(
+        &self,
+        provider: SearchProvider,
+        query: &str,
+        limit: usize,
+        cancellation: &RequestCancellation,
+    ) -> Result<Vec<CatalogTrack>, MetadataError> {
+        let request = provider.request(query, limit)?;
+        let response = self.execute_search_request(request, cancellation).await?;
+        provider.map_response(&response.body)
+    }
+
+    async fn execute_search_request(
+        &self,
+        request: SafeHttpRequest,
+        cancellation: &RequestCancellation,
+    ) -> Result<SafeHttpResponse, MetadataError> {
+        let _permit = self.acquire(cancellation).await?;
+        let routes = source_route_attempts(None);
+        let deadline = tokio::time::Instant::now() + SEARCH_TIMEOUT;
+        let mut last_error = None;
+        for (index, route) in routes.iter().copied().enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(MetadataError::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let mut attempt = request.clone();
+            attempt.timeout = search_attempt_timeout(remaining, routes.len() - index);
+            let response = tokio::time::timeout(
+                remaining,
+                self.transport
+                    .execute_on_route(attempt, route, cancellation),
+            )
+            .await;
+            match response {
+                Ok(Ok(response)) if (200..300).contains(&response.status) => return Ok(response),
+                Ok(Ok(response)) => last_error = Some(MetadataError::HttpStatus(response.status)),
+                Ok(Err(SafeHttpError::Cancelled)) => return Err(MetadataError::Cancelled),
+                Ok(Err(error)) => last_error = Some(MetadataError::Http(error.to_string())),
+                Err(_) => last_error = Some(MetadataError::Http("search request timed out".into())),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| MetadataError::Http("search request timed out".into())))
+    }
+
+    async fn request_json<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        cancellation: &RequestCancellation,
+    ) -> Result<T, MetadataError> {
+        let mut last_error = None;
+        for attempt in 0..3 {
+            if cancellation.is_cancelled() {
+                return Err(MetadataError::Cancelled);
+            }
+            let request = SafeHttpRequest {
+                url: url.clone(),
+                method: Method::GET,
+                headers: vec![("user-agent".into(), "GXPlayer/0.1 metadata".into())],
+                body: None,
+                timeout: Duration::from_secs(15),
+                max_response_bytes: RESPONSE_LIMIT,
+            };
+            let permit = self.acquire(cancellation).await?;
+            let response = self.transport.execute(request, cancellation).await;
+            drop(permit);
+            match response {
+                Ok(response) if (200..300).contains(&response.status) => {
+                    return Ok(serde_json::from_slice(&response.body)?);
+                }
+                Ok(response) => last_error = Some(MetadataError::HttpStatus(response.status)),
+                Err(SafeHttpError::Cancelled) => return Err(MetadataError::Cancelled),
+                Err(error) => last_error = Some(MetadataError::Http(error.to_string())),
+            }
+            if attempt < 2 {
+                cancelable_sleep(Duration::from_millis(200 * (attempt + 1)), cancellation).await?;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| MetadataError::Http("request did not run".into())))
+    }
+
+    async fn acquire(
+        &self,
+        cancellation: &RequestCancellation,
+    ) -> Result<OwnedSemaphorePermit, MetadataError> {
+        let requests = self.requests.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(MetadataError::Cancelled),
+            permit = requests.acquire_owned() => permit.map_err(|_| {
+                MetadataError::Http("metadata request limiter closed".into())
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_transport(transport: Arc<dyn MetadataTransport>) -> Self {
+        Self {
+            transport,
+            requests: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+        }
+    }
+}
+
+async fn abort_and_drain(
+    tasks: &mut JoinSet<(&'static str, Result<Vec<CatalogTrack>, MetadataError>)>,
+) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn cancelable_sleep(
+    duration: Duration,
+    cancellation: &RequestCancellation,
+) -> Result<(), MetadataError> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(MetadataError::Cancelled),
+        _ = tokio::time::sleep(duration) => Ok(()),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SearchProvider {
+    Kugou,
+    Kuwo,
+    Netease,
+    Itunes,
+    Deezer,
+}
+
+const SEARCH_PROVIDERS: [SearchProvider; 5] = [
+    SearchProvider::Kugou,
+    SearchProvider::Kuwo,
+    SearchProvider::Netease,
+    SearchProvider::Itunes,
+    SearchProvider::Deezer,
+];
+
+impl SearchProvider {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Kugou => "kg",
+            Self::Kuwo => "kw",
+            Self::Netease => "wy",
+            Self::Itunes => "itunes",
+            Self::Deezer => "deezer",
+        }
+    }
+
+    fn request(self, query: &str, limit: usize) -> Result<SafeHttpRequest, MetadataError> {
+        match self {
+            Self::Kugou => kugou_search_request(query, limit),
+            Self::Kuwo => kuwo_search_request(query, limit),
+            Self::Netease => netease_search_request(query, limit),
+            Self::Itunes => itunes_search_request(query, limit),
+            Self::Deezer => deezer_search_request(query, limit),
+        }
+    }
+
+    fn map_response(self, body: &[u8]) -> Result<Vec<CatalogTrack>, MetadataError> {
+        match self {
+            Self::Kugou => map_kugou_response(serde_json::from_slice(body)?),
+            Self::Kuwo => Ok(map_kuwo_response(serde_json::from_slice(body)?)),
+            Self::Netease => map_netease_response(serde_json::from_slice(body)?),
+            Self::Itunes => Ok(map_itunes_response(serde_json::from_slice(body)?)),
+            Self::Deezer => Ok(map_deezer_response(serde_json::from_slice(body)?)),
+        }
+    }
 }
 
 pub fn search_all(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
@@ -90,25 +422,20 @@ where
         return Err(MetadataError::EmptyQuery);
     }
     let limit = limit.clamp(1, 50);
-    type SearchFn = fn(&str, usize) -> Result<Vec<CatalogTrack>, MetadataError>;
-    let providers: [(&'static str, SearchFn); 5] = [
-        ("kg", search_kugou),
-        ("kw", search_kuwo),
-        ("wy", search_netease),
-        ("itunes", search_itunes),
-        ("deezer", search_deezer),
-    ];
     let (sender, receiver) = mpsc::channel();
     std::thread::scope(|scope| {
-        for (provider_id, search) in providers {
+        for provider in SEARCH_PROVIDERS {
             let sender = sender.clone();
             scope.spawn(move || {
-                let result = catch_unwind(AssertUnwindSafe(|| search(query, limit)))
-                    .unwrap_or_else(|_| {
-                        Err(MetadataError::Http(format!(
-                            "{provider_id} search worker panicked"
-                        )))
-                    });
+                let provider_id = provider.id();
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    search_provider_sync(provider, query, limit)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(MetadataError::Http(format!(
+                        "{provider_id} search worker panicked"
+                    )))
+                });
                 let _ = sender.send((provider_id, result));
             });
         }
@@ -129,27 +456,55 @@ where
     let mut errors = Vec::new();
     let mut successful_providers = 0usize;
     for (provider_id, result) in results {
-        match result {
-            Ok(found) => {
-                successful_providers += 1;
-                on_batch(SearchBatch {
-                    provider_id: provider_id.to_owned(),
-                    tracks: found.clone(),
-                    error: None,
-                });
-                tracks.extend(found);
-            }
-            Err(error) => {
-                let error = error.to_string();
-                on_batch(SearchBatch {
-                    provider_id: provider_id.to_owned(),
-                    tracks: Vec::new(),
-                    error: Some(error.clone()),
-                });
-                errors.push(error);
-            }
+        accumulate_search_result(
+            provider_id,
+            result,
+            &mut tracks,
+            &mut errors,
+            &mut successful_providers,
+            &mut on_batch,
+        );
+    }
+    finish_search_results(tracks, errors, successful_providers)
+}
+
+fn accumulate_search_result<F>(
+    provider_id: &'static str,
+    result: Result<Vec<CatalogTrack>, MetadataError>,
+    tracks: &mut Vec<CatalogTrack>,
+    errors: &mut Vec<String>,
+    successful_providers: &mut usize,
+    on_batch: &mut F,
+) where
+    F: FnMut(SearchBatch),
+{
+    match result {
+        Ok(found) => {
+            *successful_providers += 1;
+            on_batch(SearchBatch {
+                provider_id: provider_id.to_owned(),
+                tracks: found.clone(),
+                error: None,
+            });
+            tracks.extend(found);
+        }
+        Err(error) => {
+            let error = error.to_string();
+            on_batch(SearchBatch {
+                provider_id: provider_id.to_owned(),
+                tracks: Vec::new(),
+                error: Some(error.clone()),
+            });
+            errors.push(error);
         }
     }
+}
+
+fn finish_search_results(
+    tracks: Vec<CatalogTrack>,
+    errors: Vec<String>,
+    successful_providers: usize,
+) -> Result<Vec<CatalogTrack>, MetadataError> {
     if successful_providers == 0 && !errors.is_empty() {
         return Err(MetadataError::Http(errors.join("; ")));
     }
@@ -157,6 +512,46 @@ where
 }
 
 pub fn search_kugou(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+    search_provider_sync(SearchProvider::Kugou, query, limit)
+}
+
+pub fn search_kuwo(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+    search_provider_sync(SearchProvider::Kuwo, query, limit)
+}
+
+pub fn search_netease(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+    search_provider_sync(SearchProvider::Netease, query, limit)
+}
+
+pub fn search_itunes(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+    search_provider_sync(SearchProvider::Itunes, query, limit)
+}
+
+pub fn search_deezer(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+    search_provider_sync(SearchProvider::Deezer, query, limit)
+}
+
+fn search_provider_sync(
+    provider: SearchProvider,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<CatalogTrack>, MetadataError> {
+    let response = execute_search_request(provider.request(query, limit)?)?;
+    provider.map_response(&response.body)
+}
+
+fn search_get_request(url: Url) -> SafeHttpRequest {
+    SafeHttpRequest {
+        url,
+        method: Method::GET,
+        headers: vec![("user-agent".into(), "GXPlayer/0.1 metadata".into())],
+        body: None,
+        timeout: SEARCH_TIMEOUT,
+        max_response_bytes: RESPONSE_LIMIT,
+    }
+}
+
+fn kugou_search_request(query: &str, limit: usize) -> Result<SafeHttpRequest, MetadataError> {
     let query = query.trim();
     if query.is_empty() {
         return Err(MetadataError::EmptyQuery);
@@ -173,7 +568,10 @@ pub fn search_kugou(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Meta
         .append_pair("iscorrection", "1")
         .append_pair("privilege_filter", "0")
         .append_pair("area_code", "1");
-    let response: KugouResponse = request_search_json(url)?;
+    Ok(search_get_request(url))
+}
+
+fn map_kugou_response(response: KugouResponse) -> Result<Vec<CatalogTrack>, MetadataError> {
     if response.error_code != 0 {
         return Err(MetadataError::HttpStatus(response.error_code.max(0) as u16));
     }
@@ -186,7 +584,7 @@ pub fn search_kugou(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Meta
         .collect())
 }
 
-pub fn search_kuwo(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+fn kuwo_search_request(query: &str, limit: usize) -> Result<SafeHttpRequest, MetadataError> {
     let query = query.trim();
     if query.is_empty() {
         return Err(MetadataError::EmptyQuery);
@@ -210,15 +608,18 @@ pub fn search_kuwo(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Metad
         .append_pair("vermerge", "1")
         .append_pair("mobi", "1")
         .append_pair("issubtitle", "1");
-    let response: KuwoResponse = request_search_json(url)?;
-    Ok(response
+    Ok(search_get_request(url))
+}
+
+fn map_kuwo_response(response: KuwoResponse) -> Vec<CatalogTrack> {
+    response
         .tracks
         .into_iter()
         .filter_map(KuwoTrack::into_catalog)
-        .collect())
+        .collect()
 }
 
-pub fn search_netease(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+fn netease_search_request(query: &str, limit: usize) -> Result<SafeHttpRequest, MetadataError> {
     let query = query.trim();
     if query.is_empty() {
         return Err(MetadataError::EmptyQuery);
@@ -232,7 +633,7 @@ pub fn search_netease(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Me
         .append_pair("limit", &limit.clamp(1, 50).to_string())
         .finish()
         .into_bytes();
-    let response = execute_search_request(SafeHttpRequest {
+    Ok(SafeHttpRequest {
         url,
         method: Method::POST,
         headers: vec![
@@ -249,8 +650,10 @@ pub fn search_netease(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Me
         body: Some(body),
         timeout: SEARCH_TIMEOUT,
         max_response_bytes: RESPONSE_LIMIT,
-    })?;
-    let response: NeteaseResponse = serde_json::from_slice(&response.body)?;
+    })
+}
+
+fn map_netease_response(response: NeteaseResponse) -> Result<Vec<CatalogTrack>, MetadataError> {
     if response.code != 200 {
         return Err(MetadataError::HttpStatus(response.code.max(0) as u16));
     }
@@ -263,32 +666,38 @@ pub fn search_netease(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, Me
         .collect())
 }
 
-pub fn search_itunes(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+fn itunes_search_request(query: &str, limit: usize) -> Result<SafeHttpRequest, MetadataError> {
     let mut url = Url::parse("https://itunes.apple.com/search")?;
     url.query_pairs_mut()
         .append_pair("term", query)
         .append_pair("entity", "song")
         .append_pair("country", "CN")
         .append_pair("limit", &limit.clamp(1, 50).to_string());
-    let response: ItunesResponse = request_search_json(url)?;
-    Ok(response
+    Ok(search_get_request(url))
+}
+
+fn map_itunes_response(response: ItunesResponse) -> Vec<CatalogTrack> {
+    response
         .results
         .into_iter()
         .filter_map(ItunesTrack::into_catalog)
-        .collect())
+        .collect()
 }
 
-pub fn search_deezer(query: &str, limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+fn deezer_search_request(query: &str, limit: usize) -> Result<SafeHttpRequest, MetadataError> {
     let mut url = Url::parse("https://api.deezer.com/search")?;
     url.query_pairs_mut()
         .append_pair("q", query)
         .append_pair("limit", &limit.clamp(1, 50).to_string());
-    let response: DeezerResponse = request_search_json(url)?;
-    Ok(response
+    Ok(search_get_request(url))
+}
+
+fn map_deezer_response(response: DeezerResponse) -> Vec<CatalogTrack> {
+    response
         .data
         .into_iter()
         .filter_map(DeezerTrack::into_catalog)
-        .collect())
+        .collect()
 }
 
 pub fn apple_chart(limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
@@ -310,17 +719,25 @@ pub fn fetch_lyrics(
     artist: &str,
     duration_ms: Option<u64>,
 ) -> Result<Option<LyricDocument>, MetadataError> {
+    let candidates: Vec<LrcLibItem> = request_json(lyrics_url(title, artist)?)?;
+    Ok(select_lyrics(candidates, duration_ms))
+}
+
+fn lyrics_url(title: &str, artist: &str) -> Result<Url, MetadataError> {
     let mut url = Url::parse("https://lrclib.net/api/search")?;
     url.query_pairs_mut()
         .append_pair("track_name", title)
         .append_pair("artist_name", artist);
-    let candidates: Vec<LrcLibItem> = request_json(url)?;
+    Ok(url)
+}
+
+fn select_lyrics(candidates: Vec<LrcLibItem>, duration_ms: Option<u64>) -> Option<LyricDocument> {
     let selected = candidates.into_iter().min_by_key(|item| {
         duration_ms.map_or(0, |target| {
             target.abs_diff((item.duration.max(0.0) * 1000.0) as u64)
         })
     });
-    Ok(selected.map(|item| {
+    selected.map(|item| {
         if let Some(synced) = item.synced_lyrics.filter(|text| !text.trim().is_empty()) {
             parse_lrc(&synced)
         } else {
@@ -338,7 +755,7 @@ pub fn fetch_lyrics(
                     .collect(),
             }
         }
-    }))
+    })
 }
 
 pub fn parse_lrc(input: &str) -> LyricDocument {
@@ -496,18 +913,6 @@ fn request_json<T: DeserializeOwned>(url: Url) -> Result<T, MetadataError> {
         }
     }
     Err(last_error.unwrap_or_else(|| MetadataError::Http("request did not run".into())))
-}
-
-fn request_search_json<T: DeserializeOwned>(url: Url) -> Result<T, MetadataError> {
-    let response = execute_search_request(SafeHttpRequest {
-        url,
-        method: Method::GET,
-        headers: vec![("user-agent".into(), "GXPlayer/0.1 metadata".into())],
-        body: None,
-        timeout: SEARCH_TIMEOUT,
-        max_response_bytes: RESPONSE_LIMIT,
-    })?;
-    Ok(serde_json::from_slice(&response.body)?)
 }
 
 fn execute_search_request(request: SafeHttpRequest) -> Result<SafeHttpResponse, MetadataError> {
@@ -1076,6 +1481,136 @@ struct LrcLibItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    struct FakeTransport {
+        delay: Duration,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        started: AtomicUsize,
+    }
+
+    impl FakeTransport {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                started: AtomicUsize::new(0),
+            }
+        }
+
+        fn run<'a>(
+            &'a self,
+            request: SafeHttpRequest,
+            cancellation: &'a RequestCancellation,
+        ) -> TransportFuture<'a> {
+            Box::pin(async move {
+                self.started.fetch_add(1, AtomicOrdering::SeqCst);
+                let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                self.peak.fetch_max(active, AtomicOrdering::SeqCst);
+                let _active = ActiveRequest(&self.active);
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(SafeHttpError::Cancelled),
+                    _ = tokio::time::sleep(self.delay) => Ok(fake_search_response(request.url)),
+                }
+            })
+        }
+    }
+
+    impl MetadataTransport for FakeTransport {
+        fn execute<'a>(
+            &'a self,
+            request: SafeHttpRequest,
+            cancellation: &'a RequestCancellation,
+        ) -> TransportFuture<'a> {
+            self.run(request, cancellation)
+        }
+
+        fn execute_on_route<'a>(
+            &'a self,
+            request: SafeHttpRequest,
+            _route: gx_contracts::NetworkRoute,
+            cancellation: &'a RequestCancellation,
+        ) -> TransportFuture<'a> {
+            self.run(request, cancellation)
+        }
+    }
+
+    struct ImmediateTransport {
+        cancelled: bool,
+        attempts: AtomicUsize,
+    }
+
+    impl ImmediateTransport {
+        fn run(&self, request: SafeHttpRequest) -> TransportFuture<'_> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                if self.cancelled {
+                    Err(SafeHttpError::Cancelled)
+                } else {
+                    Ok(SafeHttpResponse {
+                        final_url: request.url,
+                        status: 503,
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                    })
+                }
+            })
+        }
+    }
+
+    impl MetadataTransport for ImmediateTransport {
+        fn execute<'a>(
+            &'a self,
+            request: SafeHttpRequest,
+            _cancellation: &'a RequestCancellation,
+        ) -> TransportFuture<'a> {
+            self.run(request)
+        }
+
+        fn execute_on_route<'a>(
+            &'a self,
+            request: SafeHttpRequest,
+            _route: gx_contracts::NetworkRoute,
+            _cancellation: &'a RequestCancellation,
+        ) -> TransportFuture<'a> {
+            self.run(request)
+        }
+    }
+
+    struct ActiveRequest<'a>(&'a AtomicUsize);
+
+    impl Drop for ActiveRequest<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    fn fake_search_response(url: Url) -> SafeHttpResponse {
+        let body = match url.host_str().unwrap_or_default() {
+            "songsearch.kugou.com" => json!({ "error_code": 0, "data": { "lists": [] } }),
+            "search.kuwo.cn" => json!({ "abslist": [] }),
+            "music.163.com" => json!({ "code": 200, "result": { "songs": [] } }),
+            "itunes.apple.com" => json!({ "results": [] }),
+            "api.deezer.com" => json!({ "data": [] }),
+            _ => json!([]),
+        };
+        SafeHttpResponse {
+            final_url: url,
+            status: 200,
+            headers: Vec::new(),
+            body: serde_json::to_vec(&body).unwrap(),
+        }
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
 
     fn track(provider: &str, title: &str, artist: &str, duration: u64) -> CatalogTrack {
         CatalogTrack {
@@ -1089,6 +1624,107 @@ mod tests {
             resolver_payload: Value::Null,
             preview: None,
         }
+    }
+
+    #[test]
+    fn async_search_shares_a_three_request_limit_across_provider_tasks() {
+        test_runtime().block_on(async {
+            let transport = Arc::new(FakeTransport::new(Duration::from_millis(20)));
+            let client = MetadataClient::with_transport(transport.clone());
+            let cancellation = RequestCancellation::new();
+            let mut batches = Vec::new();
+
+            let tracks = client
+                .search_all_progressive("song", 10, &cancellation, |batch| batches.push(batch))
+                .await
+                .unwrap();
+
+            assert!(tracks.is_empty());
+            assert_eq!(batches.len(), SEARCH_PROVIDERS.len());
+            assert_eq!(transport.started.load(AtomicOrdering::SeqCst), 5);
+            assert_eq!(transport.peak.load(AtomicOrdering::SeqCst), 3);
+            assert_eq!(transport.active.load(AtomicOrdering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn async_search_cancellation_emits_no_batch_and_releases_tasks() {
+        test_runtime().block_on(async {
+            let transport = Arc::new(FakeTransport::new(Duration::from_secs(30)));
+            let client = MetadataClient::with_transport(transport.clone());
+            let cancellation = RequestCancellation::new();
+            let cancel_when_saturated = cancellation.clone();
+            let observed_transport = transport.clone();
+            let canceller = tokio::spawn(async move {
+                while observed_transport.started.load(AtomicOrdering::SeqCst)
+                    < MAX_CONCURRENT_REQUESTS
+                {
+                    tokio::task::yield_now().await;
+                }
+                cancel_when_saturated.cancel();
+            });
+            let mut batches = Vec::new();
+
+            let result = client
+                .search_all_progressive("song", 10, &cancellation, |batch| batches.push(batch))
+                .await;
+            canceller.await.unwrap();
+
+            assert!(matches!(result, Err(MetadataError::Cancelled)));
+            assert!(batches.is_empty());
+            assert_eq!(
+                transport.started.load(AtomicOrdering::SeqCst),
+                MAX_CONCURRENT_REQUESTS
+            );
+            assert_eq!(transport.active.load(AtomicOrdering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn async_lyrics_retry_delay_is_cancellable() {
+        test_runtime().block_on(async {
+            let transport = Arc::new(ImmediateTransport {
+                cancelled: false,
+                attempts: AtomicUsize::new(0),
+            });
+            let client = MetadataClient::with_transport(transport.clone());
+            let cancellation = RequestCancellation::new();
+            let cancel_after_first = cancellation.clone();
+            let observed_transport = transport.clone();
+            let canceller = tokio::spawn(async move {
+                while observed_transport.attempts.load(AtomicOrdering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                cancel_after_first.cancel();
+            });
+
+            let result = client
+                .fetch_lyrics("Song", "Artist", None, &cancellation)
+                .await;
+            canceller.await.unwrap();
+
+            assert!(matches!(result, Err(MetadataError::Cancelled)));
+            assert_eq!(transport.attempts.load(AtomicOrdering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn transport_cancellation_is_not_retried() {
+        test_runtime().block_on(async {
+            let transport = Arc::new(ImmediateTransport {
+                cancelled: true,
+                attempts: AtomicUsize::new(0),
+            });
+            let client = MetadataClient::with_transport(transport.clone());
+            let cancellation = RequestCancellation::new();
+
+            let result = client
+                .fetch_lyrics("Song", "Artist", None, &cancellation)
+                .await;
+
+            assert!(matches!(result, Err(MetadataError::Cancelled)));
+            assert_eq!(transport.attempts.load(AtomicOrdering::SeqCst), 1);
+        });
     }
 
     #[test]

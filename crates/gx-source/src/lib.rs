@@ -827,14 +827,18 @@ impl SourceStore {
         })
     }
 
-    pub fn restore_backup(&mut self, backup: SourceBackup) -> Result<(), SourceStoreError> {
+    /// Validate every size, script and configuration constraint used by restoration
+    /// without writing scripts or replacing the current source configuration.
+    pub fn validate_backup(backup: &SourceBackup) -> Result<(), SourceStoreError> {
         if backup.version != 1 {
             return Err(SourceStoreError::InvalidBackupVersion(backup.version));
         }
         let total_size = backup.sources.iter().try_fold(0usize, |total, source| {
-            Ok::<_, SourceStoreError>(
-                total + source.script.len() + serde_json::to_vec(&source.config)?.len(),
-            )
+            let config_size = serde_json::to_vec(&source.config)?.len();
+            total
+                .checked_add(source.script.len())
+                .and_then(|total| total.checked_add(config_size))
+                .ok_or(SourceStoreError::BackupTooLarge)
         })?;
         if backup.sources.len() > 64 || total_size > 20 * 1024 * 1024 {
             return Err(SourceStoreError::BackupTooLarge);
@@ -843,6 +847,11 @@ impl SourceStore {
             validate_script(&source.script)?;
             validate_config(&source.config)?;
         }
+        Ok(())
+    }
+
+    pub fn restore_backup(&mut self, backup: SourceBackup) -> Result<(), SourceStoreError> {
+        Self::validate_backup(&backup)?;
         let legacy_active_source_id = backup.active_source_id.clone();
         let legacy_fallback_enabled = backup.fallback_enabled;
         let legacy_fallback_source_ids = backup.fallback_source_ids.clone();

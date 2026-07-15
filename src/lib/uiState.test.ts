@@ -3,7 +3,11 @@ import { nextOptionIndex, putLruValue, shouldSkipAfterStart } from "./uiState";
 
 describe("playback start outcomes", () => {
   it("skips only hard failures", () => {
-    expect(shouldSkipAfterStart({ outcome: "failed" })).toBe(true);
+    expect(shouldSkipAfterStart({ outcome: "failed", failureKind: "track_unavailable" })).toBe(true);
+    expect(shouldSkipAfterStart({ outcome: "failed", failureKind: "network" })).toBe(false);
+    expect(shouldSkipAfterStart({ outcome: "failed", failureKind: "authentication" })).toBe(false);
+    expect(shouldSkipAfterStart({ outcome: "failed", failureKind: "rate_limited" })).toBe(false);
+    expect(shouldSkipAfterStart({ outcome: "failed" })).toBe(false);
     expect(shouldSkipAfterStart({ outcome: "cancelled" })).toBe(false);
     expect(shouldSkipAfterStart({ outcome: "stale" })).toBe(false);
     expect(shouldSkipAfterStart({ outcome: "started" })).toBe(false);

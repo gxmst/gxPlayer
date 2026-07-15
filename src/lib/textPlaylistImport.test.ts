@@ -4,7 +4,9 @@ import {
   chooseCatalogMatch,
   normalizeTextPlaylistQuery,
   parseTextPlaylist,
+  rankCatalogCandidates,
   scoreCatalogCandidate,
+  TEXT_PLAYLIST_CONFIDENCE_THRESHOLD,
 } from "./textPlaylistImport";
 
 function track(title: string, artist = "歌手", providerId = "provider"): CatalogTrack {
@@ -85,5 +87,20 @@ describe("text playlist candidate ranking", () => {
 
     expect(chooseCatalogMatch(line, [first, second])).toBe(first);
     expect(chooseCatalogMatch(line, [])).toBeNull();
+  });
+
+  it("returns a stable scored ranking and exposes the fixed confidence threshold", () => {
+    const line = parseTextPlaylist("目标歌 - 目标歌手").lines[0]!;
+    const tiedFirst = track("目标歌", "目标歌手", "first");
+    const tiedSecond = track("目标歌", "目标歌手", "second");
+    const weak = track("目标歌", "其他人", "weak");
+
+    const ranked = rankCatalogCandidates(line, [weak, tiedFirst, tiedSecond]);
+
+    expect(TEXT_PLAYLIST_CONFIDENCE_THRESHOLD).toBe(0.72);
+    expect(ranked.map((candidate) => candidate.track.providerId)).toEqual(["first", "second", "weak"]);
+    expect(ranked.map((candidate) => candidate.sourceIndex)).toEqual([1, 2, 0]);
+    expect(ranked[0]?.score).toBe(1);
+    expect(ranked[2]?.score).toBeLessThan(TEXT_PLAYLIST_CONFIDENCE_THRESHOLD);
   });
 });

@@ -1,6 +1,7 @@
 //! Headless native audio primitives used by the Phase -1 local playback PoC.
 
 pub mod engine;
+mod mmcss;
 
 use std::fs::File;
 use std::io::ErrorKind;
@@ -803,9 +804,11 @@ where
     T: Sample + SizedSample + FromSample<f32>,
     C: Consumer<Item = f32> + Send + 'static,
 {
+    let mut callback_thread_priority = mmcss::AudioThreadPriority::default();
     let stream = device.build_output_stream(
         config,
         move |output: &mut [T], _| {
+            callback_thread_priority.ensure_registered();
             let mut starved = false;
             for target in output {
                 let sample = match consumer.try_pop() {

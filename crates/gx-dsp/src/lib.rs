@@ -131,6 +131,13 @@ pub enum DspError {
     InvalidChannels,
     #[error("PCM sample count {samples} is not divisible by channel count {channels}")]
     MisalignedPcm { samples: usize, channels: usize },
+    #[error(
+        "A/B dry sample count {ab_dry_samples} does not match processed sample count {processed_samples}"
+    )]
+    MismatchedAbDry {
+        processed_samples: usize,
+        ab_dry_samples: usize,
+    },
     #[error("EQ frequency {frequency_hz} Hz must be between 5 Hz and {max_hz} Hz")]
     InvalidFrequency { frequency_hz: f32, max_hz: f32 },
     #[error("EQ Q {0} must be in the range 0.05..=30")]
@@ -230,6 +237,50 @@ impl DspChain {
         }
         if let Some(limiter) = &mut self.limiter {
             limiter.process(pcm, self.channels);
+        }
+        Ok(())
+    }
+
+    /// Processes `pcm` through the configured chain while writing an untreated A/B lane into the
+    /// caller-provided `ab_dry` buffer.
+    ///
+    /// The A/B lane starts as an exact copy of the input. EQ and Crossfeed affect only `pcm`. When
+    /// HRTF is enabled, both lanes use the same fixed 128-frame dry queue so the untreated lane is
+    /// aligned with the processed HRTF output. The limiter derives one linked gain from `pcm` and
+    /// applies that same gain to both lanes. Processing performs no heap allocation.
+    pub fn process_interleaved_with_ab_dry(
+        &mut self,
+        pcm: &mut [f32],
+        ab_dry: &mut [f32],
+    ) -> Result<(), DspError> {
+        if pcm.len() != ab_dry.len() {
+            return Err(DspError::MismatchedAbDry {
+                processed_samples: pcm.len(),
+                ab_dry_samples: ab_dry.len(),
+            });
+        }
+        if !pcm.len().is_multiple_of(self.channels) {
+            return Err(DspError::MisalignedPcm {
+                samples: pcm.len(),
+                channels: self.channels,
+            });
+        }
+
+        ab_dry.copy_from_slice(pcm);
+        if !self.settings.enabled {
+            return Ok(());
+        }
+        if self.settings.eq_enabled {
+            self.equalizer.process_interleaved_in_place(pcm);
+        }
+        if let Some(crossfeed) = &mut self.crossfeed {
+            crossfeed.process(pcm);
+        }
+        if let Some(hrtf) = &mut self.hrtf {
+            hrtf.process_with_ab_dry(pcm, ab_dry);
+        }
+        if let Some(limiter) = &mut self.limiter {
+            limiter.process_with_ab_dry(pcm, ab_dry, self.channels);
         }
         Ok(())
     }
@@ -452,6 +503,56 @@ mod tests {
     }
 
     #[test]
+    fn disabled_dual_chain_is_bitwise_transparent() {
+        let mut chain = DspChain::new(
+            48_000,
+            2,
+            DspSettings {
+                enabled: false,
+                eq_enabled: true,
+                eq_bands: vec![EqBand::peak(1_000.0, 12.0, 0.7)],
+                crossfeed: CrossfeedSettings {
+                    enabled: true,
+                    ..CrossfeedSettings::default()
+                },
+                hrtf: HrtfSettings {
+                    enabled: true,
+                    ..HrtfSettings::default()
+                },
+                limiter: LimiterSettings {
+                    enabled: true,
+                    ..LimiterSettings::default()
+                },
+            },
+        )
+        .unwrap();
+        let mut pcm = vec![
+            f32::from_bits(0),
+            f32::from_bits(0x8000_0000),
+            f32::from_bits(0x3f12_3456),
+            f32::from_bits(0x7fc0_1234),
+        ];
+        let before = pcm.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        let mut ab_dry = vec![42.0; pcm.len()];
+
+        chain
+            .process_interleaved_with_ab_dry(&mut pcm, &mut ab_dry)
+            .unwrap();
+
+        assert_eq!(
+            pcm.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(
+            ab_dry
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
     fn eq_disabled_is_bitwise_transparent() {
         let mut chain = DspChain::new(
             48_000,
@@ -522,6 +623,21 @@ mod tests {
         TRACK_ALLOCATIONS.with(|enabled| enabled.set(false));
         let allocations = ALLOCATION_COUNT.with(Cell::get);
         assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn dual_spatial_processing_performs_no_heap_allocation() {
+        let mut chain = DspChain::new(48_000, 2, enabled_spatial_settings()).unwrap();
+        let mut pcm = vec![0.1f32; 4096];
+        let mut ab_dry = vec![0.0f32; pcm.len()];
+
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        TRACK_ALLOCATIONS.with(|enabled| enabled.set(true));
+        chain
+            .process_interleaved_with_ab_dry(&mut pcm, &mut ab_dry)
+            .unwrap();
+        TRACK_ALLOCATIONS.with(|enabled| enabled.set(false));
+        assert_eq!(ALLOCATION_COUNT.with(Cell::get), 0);
     }
 
     #[test]
@@ -607,6 +723,17 @@ mod tests {
                 channels: 2
             })
         );
+        let mut processed = [0.25, -0.25];
+        let mut ab_dry = [9.0];
+        assert_eq!(
+            chain.process_interleaved_with_ab_dry(&mut processed, &mut ab_dry),
+            Err(DspError::MismatchedAbDry {
+                processed_samples: 2,
+                ab_dry_samples: 1,
+            })
+        );
+        assert_eq!(processed, [0.25, -0.25]);
+        assert_eq!(ab_dry, [9.0]);
     }
 
     #[test]
@@ -691,6 +818,90 @@ mod tests {
             near_peak < far_peak,
             "near ear should receive the impulse before the far ear"
         );
+    }
+
+    #[test]
+    fn dual_hrtf_dry_and_wet_stay_aligned_across_mix_values() {
+        fn render(mix: f32) -> (Vec<f32>, Vec<f32>) {
+            let settings = DspSettings {
+                enabled: true,
+                hrtf: HrtfSettings {
+                    enabled: true,
+                    mix,
+                    output_gain_db: -6.0,
+                },
+                ..DspSettings::default()
+            };
+            let mut chain = DspChain::new(48_000, 2, settings).unwrap();
+            let mut processed = vec![0.0f32; 512 * 2];
+            processed[0] = 1.0;
+            let mut ab_dry = vec![0.0f32; processed.len()];
+            chain
+                .process_interleaved_with_ab_dry(&mut processed, &mut ab_dry)
+                .unwrap();
+            (processed, ab_dry)
+        }
+
+        let (fully_dry, reference_ab_dry) = render(0.0);
+        let (fully_wet, wet_ab_dry) = render(1.0);
+        let mut expected_delayed_input = vec![0.0f32; reference_ab_dry.len()];
+        expected_delayed_input[128 * 2] = 1.0;
+        assert_eq!(reference_ab_dry, expected_delayed_input);
+        assert_eq!(reference_ab_dry, wet_ab_dry);
+        assert_eq!(fully_dry, reference_ab_dry);
+        assert!(fully_wet[..128 * 2].iter().all(|sample| *sample == 0.0));
+
+        for mix in [0.3, 0.55, 0.72] {
+            let (mixed, ab_dry) = render(mix);
+            assert_eq!(ab_dry, reference_ab_dry);
+            for ((actual, dry), wet) in mixed.iter().zip(&reference_ab_dry).zip(&fully_wet) {
+                let expected = dry * (1.0 - mix) + wet * mix;
+                assert!((actual - expected).abs() < 1.0e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn dual_hrtf_ab_lane_delays_the_untreated_input_not_the_processed_dry() {
+        let settings = DspSettings {
+            enabled: true,
+            eq_enabled: true,
+            eq_bands: vec![EqBand::peak(1_000.0, 12.0, 0.7)],
+            crossfeed: CrossfeedSettings {
+                enabled: true,
+                amount: 0.27,
+                ..CrossfeedSettings::default()
+            },
+            hrtf: HrtfSettings {
+                enabled: true,
+                mix: 0.55,
+                ..HrtfSettings::default()
+            },
+            ..DspSettings::default()
+        };
+        let mut chain = DspChain::new(48_000, 2, settings).unwrap();
+        let mut processed = (0..512 * 2)
+            .map(|index| (index as f32 * 0.013).sin() * 0.2)
+            .collect::<Vec<_>>();
+        let original = processed.clone();
+        let mut ab_dry = vec![0.0f32; processed.len()];
+
+        chain
+            .process_interleaved_with_ab_dry(&mut processed, &mut ab_dry)
+            .unwrap();
+
+        for frame in 0..512 {
+            for channel in 0..2 {
+                let actual = ab_dry[frame * 2 + channel].to_bits();
+                let expected = if frame < 128 {
+                    0.0f32.to_bits()
+                } else {
+                    original[(frame - 128) * 2 + channel].to_bits()
+                };
+                assert_eq!(actual, expected);
+            }
+        }
+        assert_ne!(processed[128 * 2].to_bits(), ab_dry[128 * 2].to_bits());
     }
 
     #[test]

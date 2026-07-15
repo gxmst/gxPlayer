@@ -48,6 +48,10 @@ function emitBatch(payload: {
   }));
 }
 
+function commandCalls(command: string) {
+  return vi.mocked(invoke).mock.calls.filter(([calledCommand]) => calledCommand === command);
+}
+
 afterEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
@@ -59,7 +63,8 @@ describe("useCatalogSearch", () => {
     vi.useFakeTimers();
     const older = deferred<CatalogTrack[]>();
     const latest = deferred<CatalogTrack[]>();
-    vi.mocked(invoke).mockImplementation((_command, args) => {
+    vi.mocked(invoke).mockImplementation((command, args) => {
+      if (command === "metadata_cancel_request") return Promise.resolve(undefined) as never;
       const query = (args as { query: string }).query;
       return (query === "older" ? older.promise : latest.promise) as never;
     });
@@ -71,6 +76,15 @@ describe("useCatalogSearch", () => {
     await act(async () => { vi.advanceTimersByTime(210); });
 
     rerender({ query: "latest" });
+    const olderArgs = commandCalls("metadata_search")[0]?.[1] as {
+      requestId: string;
+      lane: string;
+    };
+    expect(olderArgs.lane).toBe("searchSuggestions");
+    expect(invoke).toHaveBeenCalledWith("metadata_cancel_request", {
+      lane: "searchSuggestions",
+      requestId: olderArgs.requestId,
+    });
     await act(async () => { vi.advanceTimersByTime(210); });
     await act(async () => { latest.resolve([track("latest result")]); });
     expect(result.current.suggestions[0]?.title).toBe("latest result");
@@ -82,15 +96,20 @@ describe("useCatalogSearch", () => {
 
   it("shows provider batches before the final search response completes", async () => {
     const pending = deferred<CatalogTrack[]>();
-    vi.mocked(invoke).mockReturnValue(pending.promise as never);
+    vi.mocked(invoke).mockImplementation((command) => (
+      command === "metadata_cancel_request"
+        ? Promise.resolve(undefined) as never
+        : pending.promise as never
+    ));
     const { result } = renderHook(() => useCatalogSearch(""));
 
     let searchPromise: Promise<CatalogTrack[] | null> | undefined;
     await act(async () => {
       searchPromise = result.current.search("hello");
     });
-    await waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
-    const args = vi.mocked(invoke).mock.calls[0]?.[1] as { requestId: string };
+    await waitFor(() => expect(commandCalls("metadata_search")).toHaveLength(1));
+    const args = commandCalls("metadata_search")[0]?.[1] as { requestId: string; lane: string };
+    expect(args.lane).toBe("searchResults");
 
     act(() => emitBatch({
       requestId: args.requestId,
@@ -112,17 +131,22 @@ describe("useCatalogSearch", () => {
   it("ignores batches and final responses from an obsolete full search", async () => {
     const older = deferred<CatalogTrack[]>();
     const latest = deferred<CatalogTrack[]>();
-    vi.mocked(invoke).mockImplementation((_command, args) => {
+    vi.mocked(invoke).mockImplementation((command, args) => {
+      if (command === "metadata_cancel_request") return Promise.resolve(undefined) as never;
       const query = (args as { query: string }).query;
       return (query === "older" ? older.promise : latest.promise) as never;
     });
     const { result } = renderHook(() => useCatalogSearch(""));
 
     await act(async () => { void result.current.search("older"); });
-    await waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
-    const olderArgs = vi.mocked(invoke).mock.calls[0]?.[1] as { requestId: string };
+    await waitFor(() => expect(commandCalls("metadata_search")).toHaveLength(1));
+    const olderArgs = commandCalls("metadata_search")[0]?.[1] as { requestId: string };
     await act(async () => { void result.current.search("latest"); });
-    await waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(commandCalls("metadata_search")).toHaveLength(2));
+    expect(invoke).toHaveBeenCalledWith("metadata_cancel_request", {
+      lane: "searchResults",
+      requestId: olderArgs.requestId,
+    });
 
     act(() => emitBatch({
       requestId: olderArgs.requestId,
@@ -134,5 +158,33 @@ describe("useCatalogSearch", () => {
     await act(async () => latest.resolve([track("latest result")]));
     await act(async () => older.resolve([track("older result")]));
     expect(result.current.results.map((item) => item.title)).toEqual(["latest result"]);
+  });
+
+  it("cancels active result requests when seeding results and unmounting", async () => {
+    const pending = deferred<CatalogTrack[]>();
+    vi.mocked(invoke).mockImplementation((command) => (
+      command === "metadata_cancel_request"
+        ? Promise.resolve(undefined) as never
+        : pending.promise as never
+    ));
+    const { result, unmount } = renderHook(() => useCatalogSearch(""));
+
+    await act(async () => { void result.current.search("first"); });
+    await waitFor(() => expect(commandCalls("metadata_search")).toHaveLength(1));
+    const firstArgs = commandCalls("metadata_search")[0]?.[1] as { requestId: string };
+    act(() => result.current.seedResults([track("seeded")], "seed"));
+    expect(invoke).toHaveBeenCalledWith("metadata_cancel_request", {
+      lane: "searchResults",
+      requestId: firstArgs.requestId,
+    });
+
+    await act(async () => { void result.current.search("second"); });
+    await waitFor(() => expect(commandCalls("metadata_search")).toHaveLength(2));
+    const secondArgs = commandCalls("metadata_search")[1]?.[1] as { requestId: string };
+    unmount();
+    expect(invoke).toHaveBeenCalledWith("metadata_cancel_request", {
+      lane: "searchResults",
+      requestId: secondArgs.requestId,
+    });
   });
 });

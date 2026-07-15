@@ -1,20 +1,24 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow, invoke, isBrowserMockRuntime, listen, open, save } from "./lib/tauriClient";
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
-import "@fontsource-variable/noto-sans-sc";
 import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
-import { QueuePanel } from "./components/QueuePanel";
+import { useActionDialog, type ActionErrorClassifier } from "./components/ActionDialog";
+import { QueuePanel, type QueueAvailabilityStatus } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
 import { TextPlaylistImportDialog } from "./components/TextPlaylistImportDialog";
+import { useLibraryView, type LibraryScope, type LibrarySort } from "./features/library/useLibraryView";
+import { DspPresetControls } from "./features/player/DspPresetControls";
+import { LyricsPanel } from "./features/player/LyricsPanel";
 import { isRemoteArtworkUrl, useArtworkUrl } from "./hooks/useArtwork";
+import { useBackupRestore } from "./hooks/useBackupRestore";
 import { useCatalogSearch } from "./hooks/useCatalogSearch";
 import { useEngineSnapshot } from "./hooks/useEngineSnapshot";
+import { useLiveVolume } from "./hooks/useLiveVolume";
+import { useNarrowLayout } from "./hooks/useNarrowLayout";
 import { useSystemProxySettings } from "./hooks/useSystemProxySettings";
+import { useWindowActivity } from "./hooks/useWindowActivity";
 import { useWindowPreferences } from "./hooks/useWindowPreferences";
 import {
   frontendNextIndex,
@@ -23,9 +27,17 @@ import {
 } from "./lib/playlistLogic";
 import { splitArtistNames } from "./lib/artistNames";
 import { diagnosticEntryDisplay } from "./lib/diagnosticDisplay";
+import { createApplicationBackup } from "./lib/backupRestore";
+import { getDspPreset } from "./lib/dspPresets";
 import { groupConsecutiveHistory } from "./lib/historyGrouping";
 import {
-  filterUnavailableLocalEntries,
+  engineMatchesLocalQueue,
+  localQueuePaths,
+  relinkLocalQueuePath,
+  unavailablePathsFromChecks,
+  type LocalPathAvailability,
+} from "./lib/localQueueAvailability";
+import {
   loadPlaylistSession,
   savePlaylistSession,
   type PersistablePlaylistEntry,
@@ -58,9 +70,11 @@ import {
   type DiagnosticLogEntry,
   type DiagnosticLogExportResult,
   type DiagnosticLogStatus,
+  type DspControlState,
   type EngineSnapshot,
   type HistoryEntry,
   type LibraryImportResult,
+  type LibraryPlaylistItem,
   type LibraryTrack,
   type ListedSource,
   type LyricDocument,
@@ -72,13 +86,31 @@ import {
   type ViewId,
 } from "./types";
 
-type AudioMode = EngineSnapshot["audioMode"];
+type CloseBehavior = "hide_to_tray" | "exit";
+type AppPreferences = {
+  version: number;
+  closeBehavior: CloseBehavior;
+  closeToTrayNoticeShown: boolean;
+  volume: number;
+  outputDevice: string | null;
+  dspControl: DspControlState;
+};
+type OutputDeviceStatus = {
+  devices: string[];
+  defaultDevice: string | null;
+  selectedDevice: string | null;
+};
+type OutputDeviceFallbackEvent = {
+  unavailableDevice: string;
+  fallbackDevice: string | null;
+};
 type SourceConfigDraft = {
   json: string;
   enabled: boolean;
   updatesEnabled: boolean;
 };
 type SearchOption =
+  | { id: string; kind: "local"; track: LibraryTrack }
   | { id: string; kind: "track"; track: CatalogTrack }
   | { id: string; kind: "artist" | "album"; query: string }
   | { id: string; kind: "all" };
@@ -96,6 +128,47 @@ const PLAY_MODE_META: Record<PlayMode, { label: string; glyph: string }> = {
 const TOAST_OK_MS = 3_000;
 const TOAST_ERROR_MS = 10_000;
 const COVER_CACHE_LIMIT = 96;
+let lyricsRequestSequence = 0;
+
+type NowPlayingLayout = "lyrics" | "immersive";
+
+type LibraryFolderImportResult = LibraryImportResult & {
+  scannedFileCount: number;
+  skippedFileCount: number;
+};
+
+type LibraryRelinkResult = {
+  relinked: LibraryTrack[];
+  failures: Array<{ oldPath: string; newPath: string; error: string }>;
+};
+
+function nextLyricsRequestId(): string {
+  lyricsRequestSequence += 1;
+  return `lyrics-${Date.now()}-${lyricsRequestSequence}`;
+}
+
+function isMetadataCancellation(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return message.includes("cancel") || message.includes("取消");
+}
+
+const classifyUiActionError: ActionErrorClassifier = (error) => {
+  const message = (error instanceof Error ? error.message : String(error)).trim() || "操作未能完成。";
+  const normalized = message.toLowerCase();
+  if ((error instanceof DOMException && error.name === "AbortError")
+    || normalized === "cancelled"
+    || normalized === "canceled"
+    || normalized === "已取消") {
+    return { kind: "cancelled", message };
+  }
+  if (error instanceof SyntaxError || /invalid|validation|必须|不能为空|格式|校验/.test(normalized)) {
+    return { kind: "validation", message };
+  }
+  if (/timeout|network|connection|429|502|503|504|超时|网络|暂时/.test(normalized)) {
+    return { kind: "transient", message };
+  }
+  return { kind: "permanent", message };
+};
 
 function catalogKey(track: CatalogTrack): string {
   return `${track.providerId}:${track.providerTrackId}`;
@@ -137,6 +210,22 @@ function cacheEntryToPlaylist(entry: CacheEntryView): PlaylistEntry {
   };
 }
 
+function cachedIdentityKey(providerId: string, providerTrackId: string, quality: string): string {
+  return `${providerId}\u0000${providerTrackId}\u0000${quality}`;
+}
+
+function libraryPlaylistItemToQueueEntry(item: LibraryPlaylistItem): PlaylistEntry {
+  if (item.kind === "local") return localEntryFromLibrary(item.track);
+  return {
+    kind: "cached",
+    providerId: item.providerId,
+    providerTrackId: item.providerTrackId,
+    quality: item.quality,
+    title: item.title,
+    artist: item.artist,
+  };
+}
+
 function cacheEntryToCatalog(entry: CacheEntryView): CatalogTrack {
   return {
     providerId: entry.providerId,
@@ -151,7 +240,7 @@ function cacheEntryToCatalog(entry: CacheEntryView): CatalogTrack {
   };
 }
 
-function localEntryFromLibrary(track: LibraryTrack): PlaylistEntry {
+function localEntryFromLibrary(track: LibraryTrack): Extract<PlaylistEntry, { kind: "local" }> {
   return {
     kind: "local",
     path: track.path,
@@ -163,6 +252,10 @@ function localEntryFromLibrary(track: LibraryTrack): PlaylistEntry {
 
 function onlineEntryFromCatalog(track: CatalogTrack, quality: QualityPreference): PlaylistEntry {
   return { kind: "online", track, quality };
+}
+
+function pathFileName(path: string): string {
+  return path.split(/[\\/]/).pop()?.toLocaleLowerCase() ?? path.toLocaleLowerCase();
 }
 
 function playlistIsLocalOnly(entries: PlaylistEntry[]): boolean {
@@ -484,6 +577,10 @@ function ArtistLinks({ artist, onSelect, className = "", fallback = "未知歌�
 }
 
 function App() {
+  const actionDialog = useActionDialog();
+  const browserMock = isBrowserMockRuntime();
+  const windowActive = useWindowActivity();
+  const isNarrow = useNarrowLayout();
   const [restoredPlaylistSession] = useState(loadPlaylistSession);
   const [view, setView] = useState<ViewId>(initialView);
   const [viewHistory, setViewHistory] = useState<ViewId[]>([]);
@@ -505,6 +602,10 @@ function App() {
     setMessageState(String(error));
     setMessageIsError(true);
   });
+  const narrowLayout = isNarrow && !miniMode;
+  const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
   const {
     status: proxyStatus,
     busy: proxyBusy,
@@ -520,9 +621,15 @@ function App() {
   const [theme, setTheme] = useState<ThemeId>(() => loadThemePreference());
   const [themePickerOpen, setThemePickerOpen] = useState(false);
   const [dragPosition, setDragPosition] = useState<number | null>(null);
-  const [volumeDraft, setVolumeDraft] = useState<number | null>(null);
   const [pendingSeek, setPendingSeek] = useState<{ target: number; generation: number; queueKey: string } | null>(null);
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
+  const [outputDeviceStatus, setOutputDeviceStatus] = useState<OutputDeviceStatus | null>(null);
+  const [outputDeviceBusy, setOutputDeviceBusy] = useState(false);
+  const [appPreferences, setAppPreferences] = useState<AppPreferences | null>(null);
+  const [closeNoticeOpen, setCloseNoticeOpen] = useState(false);
+  const [closeNoticeBusy, setCloseNoticeBusy] = useState(false);
+  const [outputDeviceFallback, setOutputDeviceFallback] = useState<OutputDeviceFallbackEvent | null>(null);
+  const closeNoticeConfirmRef = useRef<HTMLButtonElement>(null);
   const [qualityPreference, setQualityPreference] = useState<QualityPreference>(() => {
     const stored = window.localStorage.getItem("gxplayer.defaultQuality");
     return QUALITY_OPTIONS.some((option) => option.value === stored) ? stored as QualityPreference : "auto";
@@ -535,8 +642,10 @@ function App() {
   const [favorites, setFavorites] = useState<LibraryTrack[]>([]);
   const [playlists, setPlaylists] = useState<PlaylistSummary[]>([]);
   const [activePlaylist, setActivePlaylist] = useState<PlaylistSummary | null>(null);
-  const [playlistTracks, setPlaylistTracks] = useState<LibraryTrack[]>([]);
+  const [playlistItems, setPlaylistItems] = useState<LibraryPlaylistItem[]>([]);
   const [newPlaylistName, setNewPlaylistName] = useState("");
+  const [libraryImportBusy, setLibraryImportBusy] = useState<"files" | "folder" | "relink" | null>(null);
+  const [advancedSettings, setAdvancedSettings] = useState(false);
 
   const [sources, setSources] = useState<ListedSource[]>([]);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
@@ -559,6 +668,10 @@ function App() {
   const cacheLimitDirtyRef = useRef(false);
   const [onlineFavorites, setOnlineFavorites] = useState<CatalogTrack[]>([]);
   const [cacheEntries, setCacheEntries] = useState<CacheEntryView[]>([]);
+  const availableCacheKeys = useMemo(
+    () => new Set(cacheEntries.map((entry) => cachedIdentityKey(entry.providerId, entry.providerTrackId, entry.quality))),
+    [cacheEntries],
+  );
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
   const [selectedCacheKeys, setSelectedCacheKeys] = useState<string[]>([]);
   const [coverCache, setCoverCache] = useState<Record<string, string>>({});
@@ -573,6 +686,9 @@ function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const themePickerRef = useRef<HTMLDivElement | null>(null);
   const toastTimerRef = useRef<number | null>(null);
+  const pendingDspControlRef = useRef<DspControlState | null>(null);
+  const dspApplyRunningRef = useRef(false);
+  const abDryCommandRef = useRef<Promise<void>>(Promise.resolve());
 
   const [searchQuery, setSearchQuery] = useState("");
   const [artistQuery, setArtistQuery] = useState("");
@@ -589,6 +705,21 @@ function App() {
     retryResults,
     seedResults,
   } = useCatalogSearch(searchQuery);
+  const {
+    libraryQuery,
+    setLibraryQuery,
+    librarySort,
+    setLibrarySort,
+    libraryScope,
+    setLibraryScope,
+    selectedLibraryIds,
+    setSelectedLibraryIds,
+    filteredLibrary,
+    libraryArtists,
+    libraryAlbums,
+    localSuggestions,
+    localSearchResults,
+  } = useLibraryView(library, searchQuery, resultsQuery);
   const [chartTracks, setChartTracks] = useState<CatalogTrack[]>([]);
   const [chartLoading, setChartLoading] = useState(false);
   const [suggestionOpen, setSuggestionOpen] = useState(false);
@@ -598,13 +729,26 @@ function App() {
   const [selectedCatalogTrack, setSelectedCatalogTrack] = useState<CatalogTrack | null>(null);
   const [lyrics, setLyrics] = useState<LyricDocument | null>(null);
   const lyricsGenerationRef = useRef(0);
+  const activeLyricsRequestRef = useRef<string | null>(null);
   const lyricRefs = useRef<Array<HTMLParagraphElement | null>>([]);
+  const [lyricOffsetMs, setLyricOffsetMs] = useState(() => Number(window.localStorage.getItem("gxplayer.lyricOffsetMs")) || 0);
+  const [nowPlayingLayout, setNowPlayingLayout] = useState<NowPlayingLayout>(() =>
+    window.localStorage.getItem("gxplayer.nowPlayingLayout") === "immersive" ? "immersive" : "lyrics",
+  );
 
   /** Logical playlist (local paths + online CatalogTrack metadata). Online never pre-resolved. */
   const [playlist, setPlaylist] = useState<PlaylistEntry[]>(restoredPlaylistSession.playlist);
   const [playlistIndex, setPlaylistIndex] = useState<number | null>(restoredPlaylistSession.currentIndex);
   const [playlistSessionReady, setPlaylistSessionReady] = useState(false);
   const [queuePanelOpen, setQueuePanelOpen] = useState(false);
+  const [localQueueAvailability, setLocalQueueAvailability] = useState<{
+    status: QueueAvailabilityStatus;
+    unavailablePaths: Set<string>;
+  }>(() => ({
+    status: localQueuePaths(restoredPlaylistSession.playlist).length ? "checking" : "ready",
+    unavailablePaths: new Set<string>(),
+  }));
+  const [relinkingQueueIndex, setRelinkingQueueIndex] = useState<number | null>(null);
   const shufflePlayedRef = useRef<Set<number>>(new Set());
   const shuffleRngRef = useRef({ state: (Date.now() ^ 0x9e3779b9) >>> 0 || 1 });
   const advancingRef = useRef(false);
@@ -613,9 +757,17 @@ function App() {
   const snapshotRef = useRef(snapshot);
   const mediaActionHandlerRef = useRef<(action: TransportAction) => void>(() => undefined);
   const transportCapabilitiesRef = useRef({ signature: "", revision: 0 });
+  const localQueueAvailabilityGenerationRef = useRef(0);
   playlistRef.current = playlist;
   playlistIndexRef.current = playlistIndex;
   snapshotRef.current = snapshot;
+  const dspControl = useMemo<DspControlState>(() => ({
+    settings: snapshot.dspSettings,
+    activePresetId: snapshot.activePresetId,
+    intensity: snapshot.intensity,
+    spatialAmount: snapshot.spatialAmount,
+  }), [snapshot.activePresetId, snapshot.dspSettings, snapshot.intensity, snapshot.spatialAmount]);
+  const activeDspPreset = getDspPreset(snapshot.activePresetId);
 
   const pushMessage = (text: string, isError = false) => {
     setMessageState(text);
@@ -639,6 +791,37 @@ function App() {
     } catch (error) {
       pushMessage(String(error), true);
       return undefined;
+    }
+  };
+
+  const checkLocalQueueAvailability = async (
+    entries: PlaylistEntry[] = playlistRef.current,
+    announce = false,
+  ): Promise<void> => {
+    const generation = ++localQueueAvailabilityGenerationRef.current;
+    const paths = localQueuePaths(entries);
+    if (!paths.length) {
+      setLocalQueueAvailability({ status: "ready", unavailablePaths: new Set() });
+      if (announce) setMessage("队列中没有需要检查的本地歌曲。");
+      return;
+    }
+
+    setLocalQueueAvailability((state) => ({ ...state, status: "checking" }));
+    try {
+      const checks = await invoke<LocalPathAvailability[]>("library_check_local_paths", { paths });
+      if (generation !== localQueueAvailabilityGenerationRef.current) return;
+      const unavailablePaths = unavailablePathsFromChecks(entries, checks);
+      setLocalQueueAvailability({ status: "ready", unavailablePaths });
+      if (announce) {
+        setMessage(unavailablePaths.size
+          ? `检查完成：仍有 ${unavailablePaths.size} 首本地歌曲暂不可用。`
+          : "本地歌曲路径已全部恢复可用。");
+      }
+    } catch (error) {
+      if (generation !== localQueueAvailabilityGenerationRef.current) return;
+      setLocalQueueAvailability((state) => ({ ...state, status: "failed" }));
+      console.warn("[GXPlayer] local queue availability check failed", error);
+      if (announce) setMessage(`本地歌曲检查失败，队列已保持不变：${String(error)}`, true);
     }
   };
 
@@ -693,6 +876,42 @@ function App() {
   const refreshHistory = async () => {
     const entries = await invoke<HistoryEntry[]>("library_history", { limit: 500 });
     setHistoryEntries(entries);
+  };
+
+  const refreshOutputDevices = async () => {
+    setOutputDeviceBusy(true);
+    try {
+      const status = await invoke<OutputDeviceStatus>("player_refresh_output_devices");
+      setOutputDeviceStatus(status);
+      setOutputDevices(status.devices);
+    } finally {
+      setOutputDeviceBusy(false);
+    }
+  };
+
+  const selectOutputDevice = async (name: string | null) => {
+    if (outputDeviceBusy) return;
+    setOutputDeviceBusy(true);
+    try {
+      const status = await invoke<OutputDeviceStatus>("player_set_output_device", { name });
+      setOutputDeviceStatus(status);
+      setOutputDevices(status.devices);
+      setAppPreferences((preferences) => preferences ? { ...preferences, outputDevice: status.selectedDevice } : preferences);
+      setOutputDeviceFallback(null);
+    } catch (error) {
+      setMessage(String(error), true);
+      await refreshOutputDevices().catch(() => undefined);
+    } finally {
+      setOutputDeviceBusy(false);
+    }
+  };
+
+  const setCloseBehavior = async (behavior: CloseBehavior) => {
+    try {
+      setAppPreferences(await invoke<AppPreferences>("app_preferences_set_close_behavior", { behavior }));
+    } catch (error) {
+      setMessage(String(error), true);
+    }
   };
 
   const beginDiagnosticLogOperation = () => {
@@ -770,22 +989,17 @@ function App() {
     void refreshSources().catch((error) => setMessage(String(error), true));
     void refreshCache().catch((error) => setMessage(String(error), true));
     void refreshHistory().catch(() => undefined);
-    void invoke<string[]>("player_output_devices")
-      .then(setOutputDevices)
+    void invoke<AppPreferences>("app_preferences_get")
+      .then(setAppPreferences)
       .catch((error) => setMessage(String(error), true));
 
+    void refreshLibrary(true).catch((error) => {
+      console.warn("[GXPlayer] initial library scan failed", error);
+    });
+    void checkLocalQueueAvailability(restoredPlaylistSession.playlist);
+
     void (async () => {
-      let session = restoredPlaylistSession;
-      try {
-        const tracks = await refreshLibrary(true);
-        const availablePaths = new Set(
-          tracks.filter((track) => !track.missing).map((track) => track.path),
-        );
-        session = filterUnavailableLocalEntries(session, availablePaths);
-      } catch (error) {
-        console.warn("[GXPlayer] local queue validation failed", error);
-        session = filterUnavailableLocalEntries(session, new Set());
-      }
+      const session = restoredPlaylistSession;
       if (disposed) return;
 
       setPlaylist(session.playlist);
@@ -815,13 +1029,36 @@ function App() {
 
     return () => {
       disposed = true;
+      localQueueAvailabilityGenerationRef.current += 1;
     };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<{ paths: string[] }>("tauri://drag-drop", (event) => {
+      const paths = event.payload?.paths ?? [];
+      if (!paths.length) return;
+      const folders = paths.filter((path) => !/\.(?:mp3|flac|wav|m4a|aac|ogg|oga)$/i.test(path));
+      const files = paths.filter((path) => /\.(?:mp3|flac|wav|m4a|aac|ogg|oga)$/i.test(path));
+      if (folders.length) void importFolders(folders);
+      if (files.length) {
+        setLibraryImportBusy("files");
+        void invoke<LibraryImportResult>("library_import_files", { paths: files })
+          .then(async (result) => {
+            await refreshLibrary(true);
+            setMessage(`拖放导入 ${result.imported.length} 首${result.failures.length ? `，${result.failures.length} 首失败` : ""}`);
+          })
+          .catch((error) => setMessage(`拖放导入失败：${String(error)}`, true))
+          .finally(() => setLibraryImportBusy(null));
+      }
+    });
+    return () => { void unlisten.then((stop) => stop()); };
   }, []);
 
   useEffect(() => {
     if (view === "history") void refreshHistory().catch(() => undefined);
     if (view === "sources") void refreshSources().catch(() => undefined);
     if (view === "settings") {
+      void refreshOutputDevices().catch((error) => setMessage(String(error), true));
       const generation = beginDiagnosticLogOperation();
       setDiagnosticLogBusy("refresh");
       void refreshDiagnosticLog(generation)
@@ -867,6 +1104,40 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let disposed = false;
+    const closeUnlisten = listen("gx-close-to-tray-notice-requested", () => {
+      if (!disposed) setCloseNoticeOpen(true);
+    });
+    const fallbackUnlisten = listen<OutputDeviceFallbackEvent>("gx-output-device-fallback", (event) => {
+      if (disposed) return;
+      setOutputDeviceFallback(event.payload);
+      setOutputDeviceStatus((status) => status ? { ...status, selectedDevice: null } : status);
+      setAppPreferences((preferences) => preferences ? { ...preferences, outputDevice: null } : preferences);
+    });
+    return () => {
+      disposed = true;
+      void closeUnlisten.then((stop) => stop());
+      void fallbackUnlisten.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!closeNoticeOpen) return;
+    const frame = window.requestAnimationFrame(() => closeNoticeConfirmRef.current?.focus());
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape" || closeNoticeBusy) return;
+      event.preventDefault();
+      setCloseNoticeOpen(false);
+      void invoke("app_close_notice_cancel").catch((error) => setMessage(String(error), true));
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeNoticeBusy, closeNoticeOpen]);
+
+  useEffect(() => {
     if (!playlistSessionReady) return;
     savePlaylistSession({
       playlist,
@@ -895,8 +1166,14 @@ function App() {
   useEffect(() => {
     if (view !== "settings" && view !== "library") return;
     void refreshCache().catch((error) => pushMessage(String(error), true));
-    const timer = window.setInterval(() => void refreshCache().catch(() => undefined), 2000);
-    return () => window.clearInterval(timer);
+    let disposed = false;
+    const unlisten = listen<number>("gx-cache-changed", () => {
+      if (!disposed) void refreshCache().catch(() => undefined);
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((stop) => stop());
+    };
   }, [view]);
 
   useEffect(() => {
@@ -1038,6 +1315,7 @@ function App() {
   }, [currentLibraryTrack?.path]);
   // Loading only while a session is opening — failed must not look like "still playing".
   const isPlaying = snapshot.status === "playing" || snapshot.status === "loading";
+  const animatePlayback = snapshot.status === "playing";
   const hasEngineCurrent = currentQueueItem !== null;
   useEffect(() => {
     const useFrontendQueue = playlist.length > 0;
@@ -1070,7 +1348,12 @@ function App() {
     snapshot.queueIndex,
   ]);
   const shownPosition = dragPosition ?? pendingSeek?.target ?? snapshot.positionSeconds;
-  const shownVolume = volumeDraft ?? snapshot.volume;
+  const { shownVolume, isAdjustingVolume, previewVolume, commitVolume } = useLiveVolume(
+    snapshot.volume,
+    (volume) => invoke("player_set_volume", { volume }),
+    (volume) => invoke<AppPreferences>("player_commit_volume", { volume }).then(setAppPreferences),
+    (error) => setMessage(String(error), true),
+  );
   const measuredSourceSpec = formatSourceSpec(snapshot);
   const suspiciousQuality = isSuspiciousQuality(currentQuality, snapshot);
   const selectedOnlineFavorite = selectedCatalogTrack
@@ -1100,13 +1383,41 @@ function App() {
     }
   })();
 
+  useEffect(() => {
+    if (!narrowLayout) setSidebarDrawerOpen(false);
+  }, [narrowLayout]);
+
+  useEffect(() => {
+    if (!sidebarDrawerOpen) return;
+    const frame = window.requestAnimationFrame(() => {
+      sidebarRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    });
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setSidebarDrawerOpen(false);
+      window.requestAnimationFrame(() => menuButtonRef.current?.focus());
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [sidebarDrawerOpen]);
+
+  useEffect(() => {
+    if (queuePanelOpen && sidebarDrawerOpen) setSidebarDrawerOpen(false);
+  }, [queuePanelOpen, sidebarDrawerOpen]);
+
   const navigateTo = (next: ViewId) => {
+    setSidebarDrawerOpen(false);
     if (next === view) return;
     setViewHistory((history) => [...history, view].slice(-32));
     setView(next);
   };
 
   const navigateBack = () => {
+    setSidebarDrawerOpen(false);
     setViewHistory((history) => {
       const previous = history[history.length - 1];
       if (!previous) return history;
@@ -1114,11 +1425,6 @@ function App() {
       return history.slice(0, -1);
     });
   };
-
-  useEffect(() => {
-    if (volumeDraft === null) return;
-    if (Math.abs(snapshot.volume - volumeDraft) < 0.005) setVolumeDraft(null);
-  }, [snapshot.volume, volumeDraft]);
 
   useEffect(() => {
     if (!pendingSeek) return;
@@ -1160,13 +1466,13 @@ function App() {
 
   const activeLyricIndex = useMemo(() => {
     if (!lyrics) return -1;
-    const positionMs = snapshot.positionSeconds * 1000;
+    const positionMs = snapshot.positionSeconds * 1000 + lyricOffsetMs;
     let active = -1;
     lyrics.lines.forEach((line, index) => {
       if (line.timestampMs !== null && line.timestampMs <= positionMs) active = index;
     });
     return active;
-  }, [lyrics, snapshot.positionSeconds]);
+  }, [lyricOffsetMs, lyrics, snapshot.positionSeconds]);
 
   useEffect(() => {
     if (activeLyricIndex >= 0) lyricRefs.current[activeLyricIndex]?.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -1182,6 +1488,11 @@ function App() {
   );
   const visibleSuggestions = useMemo(() => suggestions.slice(0, 4), [suggestions]);
   const searchOptions = useMemo<SearchOption[]>(() => [
+    ...localSuggestions.map((track) => ({
+      id: `search-local-${track.id}`,
+      kind: "local" as const,
+      track,
+    })),
     ...visibleSuggestions.map((track) => ({
       id: `search-track-${encodeURIComponent(catalogKey(track))}`,
       kind: "track" as const,
@@ -1198,29 +1509,51 @@ function App() {
       query: album,
     })),
     { id: "search-view-all", kind: "all" as const },
-  ], [albums, artists, visibleSuggestions]);
+  ], [albums, artists, localSuggestions, visibleSuggestions]);
 
   const clearLyrics = () => {
     lyricsGenerationRef.current += 1;
+    const requestId = activeLyricsRequestRef.current;
+    activeLyricsRequestRef.current = null;
+    if (requestId) void invoke("metadata_cancel_request", { lane: "lyrics", requestId }).catch(() => undefined);
     setLyrics(null);
   };
 
   const loadLyricsFor = async (title: string, artist: string, durationMs: number | null, baseMessage: string) => {
     const generation = ++lyricsGenerationRef.current;
+    const previousRequestId = activeLyricsRequestRef.current;
+    activeLyricsRequestRef.current = null;
+    if (previousRequestId) {
+      void invoke("metadata_cancel_request", { lane: "lyrics", requestId: previousRequestId }).catch(() => undefined);
+    }
+    const requestId = nextLyricsRequestId();
+    activeLyricsRequestRef.current = requestId;
     setLyrics(null);
     try {
       const lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
         title,
         artist,
         durationMs,
+        requestId,
       });
-      if (generation === lyricsGenerationRef.current) setLyrics(lyricDocument);
+      if (generation === lyricsGenerationRef.current && activeLyricsRequestRef.current === requestId) setLyrics(lyricDocument);
     } catch (lyricError) {
-      if (generation === lyricsGenerationRef.current) {
+      if (generation === lyricsGenerationRef.current
+        && activeLyricsRequestRef.current === requestId
+        && !isMetadataCancellation(lyricError)) {
         setMessage(`${baseMessage} 歌曲已播放，但歌词加载失败：${String(lyricError)}`);
       }
+    } finally {
+      if (activeLyricsRequestRef.current === requestId) activeLyricsRequestRef.current = null;
     }
   };
+
+  useEffect(() => () => {
+    lyricsGenerationRef.current += 1;
+    const requestId = activeLyricsRequestRef.current;
+    activeLyricsRequestRef.current = null;
+    if (requestId) void invoke("metadata_cancel_request", { lane: "lyrics", requestId }).catch(() => undefined);
+  }, []);
 
   /**
    * Resolve and play a single online CatalogTrack into the engine.
@@ -1382,6 +1715,11 @@ function App() {
       terminalAdvanceGuardTimerRef.current = null;
     }
     if (entry.kind === "local") {
+      if (localQueueAvailability.unavailablePaths.has(entry.path)) {
+        const error = new Error(`《${entry.title}》的本地文件暂不可用`);
+        setMessage("本地文件暂不可用；接回磁盘后请在播放队列中重试，或重新定位文件。", true);
+        return { outcome: "failed", error };
+      }
       try {
         if (playlistIsLocalOnly(entries)) {
           const paths = entries.map((item) => (item as Extract<PlaylistEntry, { kind: "local" }>).path);
@@ -1448,6 +1786,7 @@ function App() {
     try {
       const mode = snapshotRef.current.playMode ?? "sequential";
       let cursor = current;
+      let pausedForExplicitAdvance = false;
       for (let attempt = 0; attempt < Math.max(entries.length, 1); attempt += 1) {
         const next = opts?.fromFailure || attempt > 0
           ? pickFailureSkipIndex(
@@ -1476,6 +1815,17 @@ function App() {
         if (tried.has(next)) {
           setMessage("队列里暂时没有可播放的曲目（解析/加载均失败）。", true);
           return { outcome: "failed" };
+        }
+        if (!pausedForExplicitAdvance && (intent === "next" || intent === "previous")) {
+          try {
+            // Stop feeding the old online stream before resolving the explicitly requested item.
+            // Natural end never enters this branch.
+            await invoke("player_pause");
+            pausedForExplicitAdvance = true;
+          } catch (error) {
+            setMessage(`切歌前暂停当前播放失败：${String(error)}`, true);
+            return { outcome: "failed", error };
+          }
         }
         tried.add(next);
         setPlaylistIndex(next);
@@ -1529,6 +1879,7 @@ function App() {
   };
 
   const chooseFiles = async () => {
+    if (libraryImportBusy) return;
     const selected = await open({
       multiple: true,
       directory: false,
@@ -1536,6 +1887,7 @@ function App() {
     });
     if (!selected) return;
     const paths = Array.isArray(selected) ? selected : [selected];
+    setLibraryImportBusy("files");
     try {
       const result = await invoke<LibraryImportResult>("library_import_files", { paths });
       await refreshLibrary();
@@ -1546,19 +1898,80 @@ function App() {
         return;
       }
 
-      const acceptedPaths = result.imported.map((track) => track.path);
-      await invoke("player_load_local", { paths: acceptedPaths, startIndex: 0 });
-      const entries = result.imported.map(localEntryFromLibrary);
-      shufflePlayedRef.current = new Set([0]);
-      setPlaylist(entries);
-      setPlaylistIndex(0);
-      setSelectedCatalogTrack(null);
-      setCurrentQuality(null);
-      clearLyrics();
       const failureNote = result.failures.length ? `，另有 ${result.failures.length} 个文件导入失败` : "";
-      setMessage(`已导入并播放 ${result.imported.length} 首${failureNote}`);
+      setMessage(`已导入 ${result.imported.length} 首到曲库，当前播放和队列未改变${failureNote}`);
     } catch (error) {
       setMessage(String(error), true);
+    } finally {
+      setLibraryImportBusy(null);
+    }
+  };
+
+  const importFolders = async (foldersOverride?: string[]) => {
+    if (libraryImportBusy) return;
+    const selected = foldersOverride ?? await open({ multiple: true, directory: true });
+    if (!selected) return;
+    const folders = Array.isArray(selected) ? selected : [selected];
+    if (!folders.length) return;
+    setLibraryImportBusy("folder");
+    try {
+      const result = await invoke<LibraryFolderImportResult>("library_import_folders", { folders });
+      await refreshLibrary(true);
+      const failureNote = result.failures.length ? `，${result.failures.length} 项失败` : "";
+      setMessage(`已扫描 ${result.scannedFileCount} 个文件，导入 ${result.imported.length} 首，跳过 ${result.skippedFileCount} 项${failureNote}`);
+    } catch (error) {
+      setMessage(`文件夹导入失败：${String(error)}`, true);
+    } finally {
+      setLibraryImportBusy(null);
+    }
+  };
+
+  const relinkMissingTracks = async () => {
+    if (libraryImportBusy) return;
+    const missingTracks = library.filter((track) => track.missing && (!selectedLibraryIds.length || selectedLibraryIds.includes(track.id)));
+    if (!missingTracks.length) {
+      setMessage("没有需要重新定位的缺失歌曲。", true);
+      return;
+    }
+    const selected = await open({
+      multiple: true,
+      directory: false,
+      filters: [{ name: "音频", extensions: ["mp3", "flac", "wav", "m4a", "aac", "ogg", "oga"] }],
+    });
+    if (!selected) return;
+    const paths = Array.isArray(selected) ? selected : [selected];
+    const replacements = new Map(paths.map((path) => [pathFileName(path), path]));
+    const relinks = missingTracks.flatMap((track) => {
+      const newPath = replacements.get(pathFileName(track.path));
+      return newPath ? [{ oldPath: track.path, newPath }] : [];
+    });
+    if (!relinks.length) {
+      setMessage("所选文件中没有与缺失歌曲同名的音频。", true);
+      return;
+    }
+    setLibraryImportBusy("relink");
+    try {
+      const result = await invoke<LibraryRelinkResult>("library_relink_tracks", { relinks });
+      await refreshLibrary(true);
+      setSelectedLibraryIds([]);
+      setMessage(`已重新定位 ${result.relinked.length} 首${result.failures.length ? `，${result.failures.length} 首失败` : ""}`);
+    } catch (error) {
+      setMessage(`批量重新定位失败：${String(error)}`, true);
+    } finally {
+      setLibraryImportBusy(null);
+    }
+  };
+
+  const chooseLocalLyrics = async () => {
+    const selected = await open({ multiple: false, filters: [{ name: "LRC 歌词", extensions: ["lrc"] }] });
+    if (!selected || Array.isArray(selected)) return;
+    try {
+      const document = await invoke<LyricDocument>("metadata_read_local_lyrics", { path: selected });
+      clearLyrics();
+      setLyrics(document);
+      setMessage(`已载入本地歌词 · ${document.lines.length} 行`);
+    } catch (error) {
+      setMessage(`本地歌词载入失败：${String(error)}`, true);
     }
   };
 
@@ -1585,6 +1998,38 @@ function App() {
       setMessage(`已添加 ${tracks.length} 首到队列`);
     } catch (error) {
       setMessage(String(error), true);
+    }
+  };
+
+  const relinkLocalQueueEntry = async (index: number) => {
+    if (relinkingQueueIndex !== null) return;
+    const entry = playlistRef.current[index];
+    if (!entry || entry.kind !== "local") return;
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "音频", extensions: ["mp3", "flac", "wav", "m4a", "aac", "ogg"] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+
+    setRelinkingQueueIndex(index);
+    try {
+      const relinked = await invoke<LibraryTrack>("library_relink_track", {
+        oldPath: entry.path,
+        newPath: selected,
+      });
+      const replacement = localEntryFromLibrary(relinked);
+      const nextEntries = relinkLocalQueuePath(playlistRef.current, entry.path, replacement);
+      setPlaylist(nextEntries);
+      await checkLocalQueueAvailability(nextEntries);
+      void refreshLibrary(true).catch((error) => {
+        console.warn("[GXPlayer] library refresh after relink failed", error);
+      });
+      setMessage(`已重新定位《${entry.title}》`);
+    } catch (error) {
+      setMessage(`重新定位失败：${String(error)}`, true);
+    } finally {
+      setRelinkingQueueIndex(null);
     }
   };
 
@@ -1680,12 +2125,29 @@ function App() {
     const entries = playlistRef.current;
     const target = entries[index];
     if (!target) return;
+    if (target.kind === "local" && localQueueAvailability.unavailablePaths.has(target.path)) {
+      setMessage("这首歌的本地文件暂不可用；请先重试检查或重新定位。", true);
+      return;
+    }
     shufflePlayedRef.current.add(index);
     setPlaylistIndex(index);
     if (playlistIsLocalOnly(entries) && target.kind === "local") {
-      await run("player_jump", { index });
-      setSelectedCatalogTrack(null);
-      setCurrentQuality(null);
+      try {
+        if (engineMatchesLocalQueue(entries, snapshotRef.current.queue)) {
+          await invoke("player_jump", { index });
+        } else {
+          await invoke("player_load_local", {
+            paths: entries.map((entry) => (entry as Extract<PlaylistEntry, { kind: "local" }>).path),
+            startIndex: index,
+          });
+        }
+        setSelectedCatalogTrack(null);
+        setCurrentQuality(null);
+        clearLyrics();
+        void recordHistory({ kind: "local", title: target.title, artist: target.artist, path: target.path });
+      } catch (error) {
+        setMessage(formatFailureMessage(error, target.title), true);
+      }
       return;
     }
     const key = target.kind === "online" ? catalogKey(target.track) : null;
@@ -1723,20 +2185,26 @@ function App() {
     setMessage(`已添加 ${entries.length} 首缓存歌曲到队列`);
   };
 
-  const removeCacheEntry = async (entry: CacheEntryView) => {
-    if (!window.confirm(`确定删除《${entry.title}》的 ${entry.quality} 缓存吗？`)) return;
-    try {
-      const status = await invoke<CacheStatus>("cache_remove_entry", {
+  const removeCacheEntry = (entry: CacheEntryView) => {
+    actionDialog.openAction({
+      title: "删除缓存",
+      description: `确定删除《${entry.title}》的 ${entry.quality} 缓存吗？`,
+      confirmLabel: "删除缓存",
+      busyLabel: "正在删除…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke<CacheStatus>("cache_remove_entry", {
         providerId: entry.providerId,
         providerTrackId: entry.providerTrackId,
         quality: entry.quality,
-      });
-      setCacheStatus(status);
-      await refreshCache();
-      setMessage(`已删除缓存《${entry.title}》· ${entry.quality}`);
-    } catch (error) {
-      setMessage(String(error), true);
-    }
+      }),
+      afterSuccess: async (status) => {
+        setCacheStatus(status);
+        await refreshCache();
+        setMessage(`已删除缓存《${entry.title}》· ${entry.quality}`);
+      },
+    });
   };
 
   const toggleCachePinned = async (entry: CacheEntryView) => {
@@ -1758,6 +2226,7 @@ function App() {
     const previous = playlistRef.current;
     const entries = [...previous];
     if (index < 0 || index >= entries.length) return;
+    const removedEntry = entries[index];
     const current = playlistIndexRef.current;
     const removedCurrent = current === index;
     const wasLocalOnly = playlistIsLocalOnly(previous);
@@ -1791,6 +2260,9 @@ function App() {
     }
 
     setPlaylist(entries);
+    if (removedEntry?.kind === "local") {
+      void checkLocalQueueAvailability(entries);
+    }
     if (!entries.length) {
       setPlaylistIndex(null);
       setSelectedCatalogTrack(null);
@@ -1810,22 +2282,32 @@ function App() {
     }
   };
 
-  const clearPlaylist = async () => {
-    if (playlistRef.current.length && !window.confirm("确定清空整个播放队列吗？")) return;
-    if (activeResolveRequestRef.current) cancelResolve();
-    try {
+  const clearPlaylist = () => {
+    const clear = async () => {
+      if (activeResolveRequestRef.current) cancelResolve();
       await invoke("player_clear_queue");
-    } catch (error) {
-      setMessage(String(error), true);
-      return;
-    }
-    setPlaylist([]);
-    setPlaylistIndex(null);
-    shufflePlayedRef.current.clear();
-    setSelectedCatalogTrack(null);
-    setCurrentQuality(null);
-    clearLyrics();
-    setMessage("队列已清空");
+    };
+    actionDialog.openAction({
+      title: "清空播放队列",
+      description: `确定清空整个播放队列吗？当前共有 ${playlistRef.current.length} 首。`,
+      confirmLabel: "清空队列",
+      busyLabel: "正在清空…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: clear,
+      afterSuccess: () => {
+        setPlaylist([]);
+        setPlaylistIndex(null);
+        localQueueAvailabilityGenerationRef.current += 1;
+        setLocalQueueAvailability({ status: "ready", unavailablePaths: new Set() });
+        shufflePlayedRef.current.clear();
+        setSelectedCatalogTrack(null);
+        setCurrentQuality(null);
+        clearLyrics();
+        setMessage("队列已清空");
+      },
+    });
   };
 
   const reorderPlaylist = async (from: number, to: number) => {
@@ -1861,7 +2343,8 @@ function App() {
       invoke("library_export_backup"),
       invoke("source_export_backup"),
     ]);
-    const text = JSON.stringify({ version: 1, library: libraryBackup, sources: sourceBackup }, null, 2);
+    const text = JSON.stringify(createApplicationBackup(libraryBackup, sourceBackup), null, 2);
+    resetBackupRestorePreview();
     setBackupText(text);
     const path = await save({
       defaultPath: "gxplayer-backup.json",
@@ -1927,21 +2410,24 @@ function App() {
     }
   };
 
-  const clearDiagnosticLog = async () => {
-    if (diagnosticLogBusy || !window.confirm("确定清空全部诊断日志吗？此操作无法撤销。")) return;
-    const generation = beginDiagnosticLogOperation();
-    setDiagnosticLogBusy("clear");
-    try {
-      await invoke("diagnostic_log_clear");
-      if (!isCurrentDiagnosticLogOperation(generation)) return;
-      setDiagnosticLogEntries([]);
-      await refreshDiagnosticLog(generation);
-      if (isCurrentDiagnosticLogOperation(generation)) setMessage("诊断日志已清空。");
-    } catch (error) {
-      if (isCurrentDiagnosticLogOperation(generation)) setMessage(String(error), true);
-    } finally {
-      if (isCurrentDiagnosticLogOperation(generation)) setDiagnosticLogBusy(null);
-    }
+  const clearDiagnosticLog = () => {
+    if (diagnosticLogBusy) return;
+    actionDialog.openAction({
+      title: "清空诊断日志",
+      description: "确定清空全部诊断日志吗？此操作无法撤销。",
+      confirmLabel: "清空日志",
+      busyLabel: "正在清空…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke("diagnostic_log_clear"),
+      afterSuccess: async () => {
+        const generation = beginDiagnosticLogOperation();
+        setDiagnosticLogEntries([]);
+        await refreshDiagnosticLog(generation);
+        if (isCurrentDiagnosticLogOperation(generation)) setMessage("诊断日志已清空。");
+      },
+    });
   };
 
   const importBackupFile = async () => {
@@ -1951,33 +2437,51 @@ function App() {
     });
     if (!path || Array.isArray(path)) return;
     const content = await invoke<string>("backup_read_file", { path });
+    resetBackupRestorePreview();
     setBackupText(content);
     setMessage("已读入备份文件，确认无误后点击「恢复备份」。");
   };
 
-  const removeSelectedCache = async () => {
+  const removeSelectedCache = () => {
     if (!selectedCacheKeys.length) return;
-    if (!window.confirm(`确定删除选中的 ${selectedCacheKeys.length} 条缓存吗？`)) return;
     const keys = selectedCacheKeys.map((key) => {
       const [providerId, providerTrackId, quality] = key.split("\u0000");
       return { providerId, providerTrackId, quality };
     });
-    const status = await invoke<CacheStatus>("cache_remove_entries", { keys });
-    setCacheStatus(status);
-    setSelectedCacheKeys([]);
-    await refreshCache();
-    setMessage(`已删除 ${keys.length} 条缓存`);
+    actionDialog.openAction({
+      title: "删除所选缓存",
+      description: `确定删除选中的 ${keys.length} 条缓存吗？`,
+      confirmLabel: `删除 ${keys.length} 条`,
+      busyLabel: "正在删除…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke<CacheStatus>("cache_remove_entries", { keys }),
+      afterSuccess: async (status) => {
+        setCacheStatus(status);
+        setSelectedCacheKeys([]);
+        await refreshCache();
+        setMessage(`已删除 ${keys.length} 条缓存`);
+      },
+    });
   };
 
-  const removeCacheByQuality = async (quality: string) => {
-    if (!window.confirm(`确定清理所有未钉住的 ${quality} 缓存吗？`)) return;
-    const status = await invoke<CacheStatus>("cache_remove_by_quality", {
-      quality,
-      includePinned: false,
+  const removeCacheByQuality = (quality: string) => {
+    actionDialog.openAction({
+      title: `清理 ${quality} 缓存`,
+      description: `确定清理所有未钉住的 ${quality} 缓存吗？收藏钉住项会保留。`,
+      confirmLabel: "确认清理",
+      busyLabel: "正在清理…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke<CacheStatus>("cache_remove_by_quality", { quality, includePinned: false }),
+      afterSuccess: async (status) => {
+        setCacheStatus(status);
+        await refreshCache();
+        setMessage(`已清理未钉住的 ${quality} 缓存`);
+      },
     });
-    setCacheStatus(status);
-    await refreshCache();
-    setMessage(`已清理未钉住的 ${quality} 缓存`);
   };
 
   // Engine always stops on natural end (no auto-advance). Frontend picks the next index
@@ -2159,19 +2663,27 @@ function App() {
     }
   };
 
-  const removeSource = async (source: ListedSource) => {
+  const removeSource = (source: ListedSource) => {
     if (sourceActionBusy || sourceOrderBusy) return;
-    if (!window.confirm(`确定删除音源“${source.metadata.name || source.id}”吗？`)) return;
-    setSourceActionBusy({ id: source.id, kind: "remove" });
-    try {
-      await invoke("source_remove", { id: source.id });
-      await refreshSources();
-      setMessage(`已删除音源“${source.metadata.name || source.id}”。`);
-    } catch (error) {
-      setMessage(String(error), true);
-    } finally {
-      setSourceActionBusy(null);
-    }
+    const name = source.metadata.name || source.id;
+    actionDialog.openAction({
+      title: "删除音源",
+      description: `确定删除音源“${name}”吗？脚本及本地配置会一并移除。`,
+      confirmLabel: "删除音源",
+      busyLabel: "正在删除…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: async () => {
+        setSourceActionBusy({ id: source.id, kind: "remove" });
+        try { await invoke("source_remove", { id: source.id }); }
+        finally { setSourceActionBusy(null); }
+      },
+      afterSuccess: async () => {
+        await refreshSources();
+        setMessage(`已删除音源“${name}”。`);
+      },
+    });
   };
 
   const openSourceConfig = async (source: ListedSource) => {
@@ -2250,6 +2762,10 @@ function App() {
   const activateSearchOption = (option: SearchOption) => {
     setSuggestionOpen(false);
     setSuggestionIndex(-1);
+    if (option.kind === "local") {
+      void playLocalInList(library, option.track);
+      return;
+    }
     if (option.kind === "track") {
       void playCatalog(option.track);
       return;
@@ -2285,13 +2801,57 @@ function App() {
     }
   };
 
-  const setAudioMode = async (mode: AudioMode) => {
+  const updateSnapshotDspControl = (control: DspControlState) => {
+    setSnapshot((state) => ({
+      ...state,
+      audioMode: control.activePresetId === "spatial" ? "cinema_game" : "music",
+      dspSettings: control.settings,
+      activePresetId: control.activePresetId,
+      intensity: control.intensity,
+      spatialAmount: control.spatialAmount,
+    }));
+  };
+
+  const flushPendingDspControl = async () => {
+    if (dspApplyRunningRef.current) return;
+    dspApplyRunningRef.current = true;
     try {
-      await invoke("player_set_audio_mode", { mode });
-      setSnapshot((state) => ({ ...state, audioMode: mode }));
-    } catch (error) {
-      setMessage(String(error), true);
+      while (pendingDspControlRef.current) {
+        const control = pendingDspControlRef.current;
+        pendingDspControlRef.current = null;
+        try {
+          const preferences = await invoke<AppPreferences>("player_set_dsp_settings", { control });
+          setAppPreferences(preferences);
+          if (!pendingDspControlRef.current) updateSnapshotDspControl(preferences.dspControl);
+        } catch (error) {
+          pendingDspControlRef.current = null;
+          setMessage(String(error), true);
+          try {
+            setSnapshot(await invoke<EngineSnapshot>("player_snapshot"));
+          } catch {
+            // Keep the optimistic snapshot until the regular snapshot refresh recovers it.
+          }
+        }
+      }
+    } finally {
+      dspApplyRunningRef.current = false;
+      if (pendingDspControlRef.current) void flushPendingDspControl();
     }
+  };
+
+  const applyDspControl = (control: DspControlState) => {
+    updateSnapshotDspControl(control);
+    pendingDspControlRef.current = control;
+    void flushPendingDspControl();
+  };
+
+  const setAbDry = (enabled: boolean) => {
+    abDryCommandRef.current = abDryCommandRef.current
+      .catch(() => undefined)
+      .then(() => invoke<void>("player_set_ab_dry", { enabled }))
+      .catch((error) => {
+        setMessage(String(error), true);
+      });
   };
 
   const toggleFavorite = async (track: LibraryTrack) => {
@@ -2334,16 +2894,16 @@ function App() {
       setNewPlaylistName("");
       await refreshLibrary();
       setActivePlaylist(playlist);
-      setPlaylistTracks([]);
+      setPlaylistItems([]);
       navigateTo("playlist");
     }
   };
 
   const openPlaylist = async (playlist: PlaylistSummary) => {
-    const tracks = await run<LibraryTrack[]>("library_playlist_tracks", { playlistId: playlist.id });
-    if (tracks) {
+    const items = await run<LibraryPlaylistItem[]>("library_playlist_items", { playlistId: playlist.id });
+    if (items) {
       setActivePlaylist(playlist);
-      setPlaylistTracks(tracks);
+      setPlaylistItems(items);
       navigateTo("playlist");
     }
   };
@@ -2353,26 +2913,135 @@ function App() {
     await refreshLibrary();
   };
 
+  const addCachedToPlaylist = async (entry: CacheEntryView, playlistId: number) => {
+    await run("library_add_cached_to_playlist", {
+      playlistId,
+      providerId: entry.providerId,
+      providerTrackId: entry.providerTrackId,
+      quality: entry.quality,
+      title: entry.title,
+      artist: entry.artist,
+      album: entry.album,
+    });
+    await refreshLibrary();
+  };
+
+  const playLibraryPlaylistItem = async (items: LibraryPlaylistItem[], index: number) => {
+    const target = items[index];
+    if (!target) return;
+    if (target.kind === "local" && (target.track.missing || library.some((track) => track.path === target.track.path && track.missing))) {
+      setMessage("这首歌的本地文件暂不可用，请重新定位后再试。", true);
+      return;
+    }
+    if (target.kind === "cached" && !availableCacheKeys.has(cachedIdentityKey(target.providerId, target.providerTrackId, target.quality))) {
+      setMessage("这首歌的缓存已被清理；歌单记录仍保留。", true);
+      return;
+    }
+    const result = await replacePlaylist(items.map(libraryPlaylistItemToQueueEntry), index);
+    if (result.outcome === "started") navigateTo("now-playing");
+  };
+
+  const requestRemoveSelectedLibraryTracks = () => {
+    if (!selectedLibraryIds.length) return;
+    const count = selectedLibraryIds.length;
+    actionDialog.openAction({
+      title: "移出曲库",
+      description: `确定将选中的 ${count} 首歌曲移出曲库吗？磁盘上的音频文件不会被删除。`,
+      confirmLabel: `移出 ${count} 首`,
+      busyLabel: "正在移出…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke<{ removedTrackIds: number[] }>("library_remove_tracks", { trackIds: selectedLibraryIds }),
+      afterSuccess: async (result) => {
+        setSelectedLibraryIds([]);
+        await refreshLibrary(true);
+        setMessage(`已从曲库移出 ${result.removedTrackIds.length} 首，原文件保持不变。`);
+      },
+    });
+  };
+
+  const requestClearHistory = () => {
+    actionDialog.openAction({
+      title: "清空播放历史",
+      description: `确定清空全部 ${historyEntries.length} 条播放记录吗？`,
+      confirmLabel: "清空历史",
+      busyLabel: "正在清空…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke("library_clear_history"),
+      afterSuccess: async () => {
+        await refreshHistory();
+        setMessage("播放历史已清空。");
+      },
+    });
+  };
+
+  const requestDeleteActivePlaylist = () => {
+    const target = activePlaylist;
+    if (!target) return;
+    actionDialog.openAction({
+      title: "删除歌单",
+      description: `确定删除歌单“${target.name}”吗？歌曲文件和缓存不会被删除。`,
+      confirmLabel: "删除歌单",
+      busyLabel: "正在删除…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke("library_delete_playlist", { playlistId: target.id }),
+      afterSuccess: async () => {
+        navigateTo("discovery");
+        setActivePlaylist(null);
+        setPlaylistItems([]);
+        await refreshLibrary();
+        setMessage(`已删除歌单“${target.name}”。`);
+      },
+    });
+  };
+
+  const requestClearCache = (includePinned: boolean) => {
+    actionDialog.openAction({
+      title: includePinned ? "清空全部缓存" : "清理未收藏缓存",
+      description: includePinned
+        ? "确定清空全部在线播放缓存吗？收藏钉住项也会被删除，此操作无法撤销。"
+        : "确定清理所有未收藏缓存吗？收藏钉住项会保留。",
+      confirmLabel: includePinned ? "清空全部" : "确认清理",
+      busyLabel: "正在清理…",
+      tone: "danger",
+      retrySafe: true,
+      classifyError: classifyUiActionError,
+      run: () => invoke<CacheStatus>("cache_clear", { includePinned }),
+      afterSuccess: async (status) => {
+        setCacheStatus(status);
+        await refreshCache();
+        setMessage(includePinned ? "全部在线播放缓存已清空。" : "未收藏缓存已清理。");
+      },
+    });
+  };
+
   const exportBackup = async () => {
     const [libraryBackup, sourceBackup] = await Promise.all([
       invoke("library_export_backup"),
       invoke("source_export_backup"),
     ]);
-    setBackupText(JSON.stringify({ version: 1, library: libraryBackup, sources: sourceBackup }, null, 2));
+    resetBackupRestorePreview();
+    setBackupText(JSON.stringify(createApplicationBackup(libraryBackup, sourceBackup), null, 2));
   };
 
-  const restoreBackup = async () => {
-    try {
-      const backup = JSON.parse(backupText) as { version: number; library: unknown; sources: unknown };
-      if (backup.version !== 1) throw new Error("不支持的备份版本");
-      await invoke("library_restore_backup", { backup: backup.library });
-      await invoke("source_restore_backup", { backup: backup.sources });
+  const {
+    preview: backupRestorePreview,
+    busy: backupRestoreBusy,
+    inspect: inspectBackupRestore,
+    restore: restoreBackup,
+    resetPreview: resetBackupRestorePreview,
+  } = useBackupRestore({
+    backupText,
+    onRestored: async () => {
       await Promise.all([refreshLibrary(), refreshSources()]);
-      setMessage("备份已恢复。");
-    } catch (error) {
-      setMessage(String(error), true);
-    }
-  };
+    },
+    onMessage: setMessage,
+  });
 
   const commitSeek = async (seconds: number) => {
     if (!currentQueueItem) return;
@@ -2382,16 +3051,6 @@ function App() {
       await invoke("player_seek", { seconds });
     } catch (error) {
       setPendingSeek(null);
-      setMessage(String(error), true);
-    }
-  };
-
-  const commitVolume = async (volume: number) => {
-    setVolumeDraft(volume);
-    try {
-      await invoke("player_set_volume", { volume });
-    } catch (error) {
-      setVolumeDraft(null);
       setMessage(String(error), true);
     }
   };
@@ -2438,8 +3097,20 @@ function App() {
     }
   };
 
-  const renderTrackRow = (track: LibraryTrack, index: number, list: LibraryTrack[], playlistId?: number) => (
+  const renderTrackRow = (track: LibraryTrack, index: number, list: LibraryTrack[], playlistId?: number, selectable = false) => (
         <div className="track-row" role="listitem" key={track.id}>
+          {selectable && (
+            <label className="library-select">
+              <input
+                type="checkbox"
+                checked={selectedLibraryIds.includes(track.id)}
+                onChange={(event) => setSelectedLibraryIds((current) => event.target.checked
+                  ? [...current, track.id]
+                  : current.filter((id) => id !== track.id))}
+                aria-label={`选择 ${track.title}`}
+              />
+            </label>
+          )}
           <button className="track-main" onClick={() => void playLocalInList(list, track)} disabled={Boolean(track.missing)}>
             <span className="track-index">{String(index + 1).padStart(2, "0")}</span>
             <span>
@@ -2452,7 +3123,13 @@ function App() {
             </span>
           </button>
           <time>{formatTime(track.durationSeconds)}</time>
-          <button className="icon-button" onClick={() => void enqueueLocalTracks([track])} aria-label="添加到队列" title="添加到队列">＋</button>
+          <button
+            className="icon-button"
+            onClick={() => void enqueueLocalTracks([track])}
+            aria-label={track.missing ? `${track.title} 的文件缺失，无法添加到队列` : `将 ${track.title} 添加到队列`}
+            title={track.missing ? "文件缺失，无法添加" : "添加到队列"}
+            disabled={Boolean(track.missing)}
+          >＋</button>
           <button className={`icon-button ${track.favorite ? "active" : ""}`} onClick={() => void toggleFavorite(track)} aria-label={track.favorite ? "取消收藏" : "收藏"}>
             {track.favorite ? "♥" : "♡"}
           </button>
@@ -2481,11 +3158,11 @@ function App() {
         </div>
   );
 
-  const renderTrackRows = (tracks: LibraryTrack[], playlistId?: number) =>
+  const renderTrackRows = (tracks: LibraryTrack[], playlistId?: number, selectable = false) =>
     tracks.length > 120 ? (
-      <VirtualTrackList tracks={tracks} renderRow={(track, index) => renderTrackRow(track, index, tracks, playlistId)} />
+      <VirtualTrackList tracks={tracks} renderRow={(track, index) => renderTrackRow(track, index, tracks, playlistId, selectable)} />
     ) : (
-      <div className="track-list" role="list">{tracks.map((track, index) => renderTrackRow(track, index, tracks, playlistId))}</div>
+      <div className={`track-list ${selectable ? "selectable-track-list" : ""}`} role="list">{tracks.map((track, index) => renderTrackRow(track, index, tracks, playlistId, selectable))}</div>
     );
 
   const renderCatalogRows = (tracks: CatalogTrack[]) => (
@@ -2495,13 +3172,15 @@ function App() {
         const resolving = playingCatalogKey === trackKey;
         return (
         <div className="catalog-card-wrap" key={trackKey}>
-          <button className="catalog-card" disabled={resolving} aria-busy={resolving} onClick={() => void playCatalogInList(tracks, track)}>
+          <div className="catalog-card" aria-busy={resolving}>
             <Cover artwork={track.artworkUrl} title={track.title} />
             <strong>{track.title}</strong>
             <ArtistLinks artist={track.artist} onSelect={openArtistPage} className="catalog-artist-links" />
             <small>{resolving ? "正在解析整首播放…" : track.album || track.providerId}</small>
-            <i aria-hidden="true">{resolving ? "…" : "▶"}</i>
-          </button>
+            <button className="catalog-play" type="button" disabled={resolving} onClick={() => void playCatalogInList(tracks, track)} aria-label={`播放 ${track.title}`}>
+              <i aria-hidden="true">{resolving ? "…" : "▶"}</i>
+            </button>
+          </div>
           <button
             type="button"
             className="catalog-enqueue"
@@ -2570,6 +3249,14 @@ function App() {
           >
             {entry.pinned ? "♥" : "♡"}
           </button>
+          <select className="cache-playlist-select" aria-label={`将 ${entry.title} 添加到歌单`} defaultValue="" onChange={(event) => {
+            const playlistId = Number(event.target.value);
+            if (playlistId) void addCachedToPlaylist(entry, playlistId);
+            event.target.value = "";
+          }}>
+            <option value="">＋ 歌单</option>
+            {playlists.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
+          </select>
           <button
             type="button"
             className="icon-button"
@@ -2585,11 +3272,74 @@ function App() {
     </div>
   );
 
+  const renderLibraryPlaylistItems = (items: LibraryPlaylistItem[], playlistId: number) => (
+    <div className="track-list" role="list">
+      {items.map((item, index) => {
+        const isLocal = item.kind === "local";
+        const title = isLocal ? item.track.title : item.title;
+        const artist = (isLocal ? item.track.artist : item.artist) || "未知歌手";
+        const album = isLocal ? item.track.album : item.album;
+        const available = isLocal
+          ? !item.track.missing && !library.some((track) => track.path === item.track.path && track.missing)
+          : availableCacheKeys.has(cachedIdentityKey(item.providerId, item.providerTrackId, item.quality));
+        const key = isLocal ? `local:${item.track.id}` : `cached:${cachedIdentityKey(item.providerId, item.providerTrackId, item.quality)}`;
+        return (
+          <div className="track-row playlist-item-row" role="listitem" key={key}>
+            <button type="button" className="track-main" disabled={!available} onClick={() => void playLibraryPlaylistItem(items, index)}>
+              <span className="track-index">{String(index + 1).padStart(2, "0")}</span>
+              <span>
+                <strong>{title}{available ? "" : isLocal ? " · 文件缺失" : " · 缓存不可用"}</strong>
+                <small>{artist}{album ? ` · ${album}` : ""}{isLocal ? " · 本地" : ` · 缓存 ${item.quality}`}</small>
+              </span>
+            </button>
+            {isLocal ? <time>{formatTime(item.track.durationSeconds)}</time> : <span className="cache-quality-badge">{item.quality}</span>}
+            <button type="button" className="icon-button" disabled={!available} aria-label={`将 ${title} 添加到队列`} onClick={() => {
+              const entry = libraryPlaylistItemToQueueEntry(item);
+              const wasEmpty = playlistRef.current.length === 0;
+              setPlaylist((current) => [...current, entry]);
+              if (wasEmpty) setPlaylistIndex(0);
+              setMessage(`已将《${title}》添加到队列`);
+            }}>＋</button>
+            <button type="button" className="icon-button" aria-label={`从歌单移除 ${title}`} onClick={async () => {
+              if (isLocal) await run("library_remove_from_playlist", { playlistId, trackId: item.track.id });
+              else await run("library_remove_cached_from_playlist", { playlistId, providerId: item.providerId, providerTrackId: item.providerTrackId, quality: item.quality });
+              if (activePlaylist) await openPlaylist(activePlaylist);
+              await refreshLibrary();
+            }}>×</button>
+          </div>
+        );
+      })}
+    </div>
+  );
+
   const displayPlaylist = playlist;
   const displayIndex = playlistIndex;
   const upNext = displayPlaylist.length && displayIndex !== null
     ? displayPlaylist.slice(displayIndex + 1, displayIndex + 6)
     : [];
+
+  const updateLyricOffset = (next: number) => {
+    const clamped = Math.max(-5_000, Math.min(5_000, next));
+    setLyricOffsetMs(clamped);
+    window.localStorage.setItem("gxplayer.lyricOffsetMs", String(clamped));
+  };
+
+  const changeNowPlayingLayout = (layout: NowPlayingLayout) => {
+    setNowPlayingLayout(layout);
+    window.localStorage.setItem("gxplayer.nowPlayingLayout", layout);
+  };
+
+  const lyricsPanel = (
+    <LyricsPanel
+      lyrics={lyrics}
+      activeIndex={activeLyricIndex}
+      offsetMs={lyricOffsetMs}
+      lyricRefs={lyricRefs}
+      onOffsetChange={updateLyricOffset}
+      onChooseLocal={() => void chooseLocalLyrics()}
+      onSeek={(seconds) => void commitSeek(seconds)}
+    />
+  );
 
   const renderView = () => {
     if (view === "discovery") return (
@@ -2598,15 +3348,15 @@ function App() {
           <div>
             <p className="eyebrow">GXPLAYER · YOUR ROOM, YOUR SOUND</p>
             <h1><span>让音乐留在</span><span>原本的位置。</span></h1>
-            <p>默认原声直通。需要电影和游戏的空间感时，再打开影院/游戏模式。</p>
+            <p>默认原声直通。需要更合适的耳机听感时，再选择对应预设。</p>
             <div className="hero-actions">
               <button className="primary" onClick={chooseFiles}>导入本地音乐</button>
               <button onClick={() => navigateTo("now-playing")}>打开播放页</button>
             </div>
           </div>
           <div
-            className={`mini-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"}`}
-            aria-label={`当前音效模式：${snapshot.audioMode === "music" ? "原声音乐" : "影院游戏"}`}
+            className={`mini-stage ${snapshot.activePresetId === "bypass" ? "bypassed" : "enabled"} ${animatePlayback ? "is-playing" : ""}`}
+            aria-label={`当前音效预设：${activeDspPreset.label}`}
           >
             <div className="stage-glow" aria-hidden="true" />
             <div className="stage-orbit stage-orbit-outer" />
@@ -2614,7 +3364,7 @@ function App() {
             <span className="stage-listener">你</span>
             <i className="speaker speaker-left" />
             <i className="speaker speaker-right" />
-            <strong className="stage-badge">{snapshot.audioMode === "music" ? "原声" : "空间"}</strong>
+            <strong className="stage-badge">{activeDspPreset.label}</strong>
           </div>
         </section>
         <section className="section-block panel-enter delay-1">
@@ -2647,7 +3397,14 @@ function App() {
 
     if (view === "search") return (
       <div className="page">
-        <PageHeading eyebrow="SEARCH" title={resultsQuery ? `“${resultsQuery}” 的结果` : "搜索音乐"} copy={runtime?.state === "ready" ? `${sourceStatus.copy} 点击歌曲将优先解析整首播放，失败时会明确提示并回退官方 30 秒预览。` : `${sourceStatus.title}：${sourceStatus.copy} 当前仍可尝试官方 30 秒预览。`} />
+        <PageHeading eyebrow="SEARCH" title={resultsQuery ? `“${resultsQuery}” 的结果` : "搜索音乐"} copy={`先匹配本地曲库，再显示在线结果。${runtime?.state === "ready" ? ` ${sourceStatus.copy}` : ` ${sourceStatus.title}：${sourceStatus.copy}`}`} />
+        {localSearchResults.length > 0 && (
+          <section className="section-block local-search-results">
+            <div className="section-heading"><div><h3>本地曲库</h3><p>{localSearchResults.length} 首可直接播放，不需要联网解析。</p></div></div>
+            {renderTrackRows(localSearchResults)}
+          </section>
+        )}
+        <div className="section-heading search-online-heading"><div><h3>在线结果</h3><p>整首播放能力取决于当前音源状态。</p></div></div>
         {resultsState === "loading" && !searchResults.length ? (
           <LoadingState />
         ) : resultsState === "error" ? (
@@ -2695,19 +3452,45 @@ function App() {
           <PageHeading
             eyebrow="LIBRARY"
             title="曲库"
-            copy={`${library.length} 首本地导入 · ${cacheEntries.length} 首在线缓存。本地文件与在线缓存分开展示。`}
-            action={<div className="page-heading-actions"><button type="button" onClick={() => setTextPlaylistDialogOpen(true)}>导入文本列表</button><button className="primary" onClick={chooseFiles}>导入音乐</button></div>}
+            copy={`${library.length} 首本地音乐 · ${cacheEntries.length} 首在线缓存。支持文件夹递归、拖放导入、筛选和批量管理。`}
+            action={<div className="page-heading-actions"><button type="button" onClick={() => setTextPlaylistDialogOpen(true)}>导入文本列表</button><button type="button" disabled={Boolean(libraryImportBusy)} onClick={() => void importFolders()}>{libraryImportBusy === "folder" ? "正在扫描…" : "导入文件夹"}</button><button className="primary" disabled={Boolean(libraryImportBusy)} onClick={chooseFiles}>{libraryImportBusy === "files" ? "正在导入…" : "导入音乐"}</button></div>}
           />
           <section className="section-block">
             <div className="section-heading">
               <div>
                 <h3>本地导入</h3>
-                <p>你从磁盘选择并导入的音频文件。</p>
+                <p>拖放文件或文件夹到窗口也可以导入；移出曲库不会删除原文件。</p>
               </div>
             </div>
-            {library.length
-              ? renderTrackRows(library)
-              : <EmptyState title="还没有本地导入" copy="选择音频文件导入，或先播放在线歌曲生成下方缓存。" action="选择音乐" onAction={chooseFiles} />}
+            <div className="library-toolbar">
+              <label className="library-search"><span aria-hidden="true">⌕</span><input value={libraryQuery} onChange={(event) => setLibraryQuery(event.target.value)} placeholder="搜索本地歌曲、歌手、专辑或路径" aria-label="搜索本地曲库" /></label>
+              <select value={librarySort} onChange={(event) => setLibrarySort(event.target.value as LibrarySort)} aria-label="曲库排序">
+                <option value="added">最近添加</option><option value="title">按歌名</option><option value="artist">按歌手</option><option value="album">按专辑</option>
+              </select>
+            </div>
+            <div className="library-scope-tabs" role="tablist" aria-label="曲库视图">
+              {([['all', '全部'], ['recent', '最近添加'], ['artists', '歌手'], ['albums', '专辑'], ['missing', `缺失 ${library.filter((track) => track.missing).length}`]] as Array<[LibraryScope, string]>).map(([scope, label]) => (
+                <button type="button" role="tab" aria-selected={libraryScope === scope} className={libraryScope === scope ? "active" : ""} key={scope} onClick={() => setLibraryScope(scope)}>{label}</button>
+              ))}
+            </div>
+            {libraryScope === "artists" && (
+              <div className="library-facet-grid">{libraryArtists.map(([name, count]) => <button type="button" key={name} onClick={() => { setLibraryQuery(name === "未知歌手" ? "" : name); setLibraryScope("all"); }}><strong>{name}</strong><small>{count} 首</small></button>)}</div>
+            )}
+            {libraryScope === "albums" && (
+              <div className="library-facet-grid">{libraryAlbums.map(([name, count]) => <button type="button" key={name} onClick={() => { setLibraryQuery(name === "未知专辑" ? "" : name); setLibraryScope("all"); }}><strong>{name}</strong><small>{count} 首</small></button>)}</div>
+            )}
+            {libraryScope !== "artists" && libraryScope !== "albums" && library.length > 0 && (
+              <div className="library-bulk-bar">
+                <label><input type="checkbox" checked={filteredLibrary.length > 0 && filteredLibrary.every((track) => selectedLibraryIds.includes(track.id))} onChange={(event) => setSelectedLibraryIds(event.target.checked ? filteredLibrary.map((track) => track.id) : [])} />选择当前结果</label>
+                <span>{filteredLibrary.length} 首{selectedLibraryIds.length ? ` · 已选 ${selectedLibraryIds.length}` : ""}</span>
+                <button type="button" disabled={!selectedLibraryIds.length} onClick={() => void enqueueLocalTracks(library.filter((track) => selectedLibraryIds.includes(track.id) && !track.missing))}>加入队列</button>
+                <button type="button" disabled={!library.some((track) => track.missing && (!selectedLibraryIds.length || selectedLibraryIds.includes(track.id))) || Boolean(libraryImportBusy)} onClick={() => void relinkMissingTracks()}>{libraryImportBusy === "relink" ? "正在定位…" : "批量重新定位"}</button>
+                <button type="button" className="danger" disabled={!selectedLibraryIds.length} onClick={requestRemoveSelectedLibraryTracks}>移出曲库</button>
+              </div>
+            )}
+            {libraryScope !== "artists" && libraryScope !== "albums" && (filteredLibrary.length
+              ? renderTrackRows(filteredLibrary, undefined, true)
+              : <EmptyState title="没有匹配的本地音乐" copy="调整筛选条件，或导入新的音频文件。" action="选择音乐" onAction={chooseFiles} />)}
           </section>
           <section className="section-block">
             <div className="section-heading">
@@ -2788,7 +3571,7 @@ function App() {
             eyebrow="HISTORY"
             title="播放历史"
             copy={`${historyEntries.length} 条原始播放记录，连续同曲合并显示为 ${groupedHistoryEntries.length} 行（读取最近 500 条）。`}
-            action={<button type="button" className="danger" onClick={async () => { if (!window.confirm("确定清空全部播放历史吗？")) return; try { await invoke("library_clear_history"); await refreshHistory(); } catch (error) { setMessage(String(error), true); } }}>清空历史</button>}
+            action={<button type="button" className="danger" disabled={!historyEntries.length} onClick={requestClearHistory}>清空历史</button>}
           />
           {historyEntries.length === 0 ? (
             <EmptyState title="还没有播放记录" copy="听歌后会出现在这里，方便找回昨晚那首。" />
@@ -2836,7 +3619,7 @@ function App() {
     }
 
     if (view === "playlist") return (
-      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistTracks.length} 首音乐`} action={activePlaylist ? <button className="danger" onClick={async () => { if (!window.confirm(`确定删除歌单“${activePlaylist.name}”吗？`)) return; try { await invoke("library_delete_playlist", { playlistId: activePlaylist.id }); navigateTo("discovery"); setActivePlaylist(null); await refreshLibrary(); } catch (error) { setMessage(String(error), true); } }}>删除歌单</button> : undefined} />{playlistTracks.length && activePlaylist ? renderTrackRows(playlistTracks, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把想听的歌加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
+      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistItems.length} 首音乐 · 支持本地与已缓存歌曲`} action={activePlaylist ? <button className="danger" onClick={requestDeleteActivePlaylist}>删除歌单</button> : undefined} />{playlistItems.length && activePlaylist ? renderLibraryPlaylistItems(playlistItems, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把本地音乐或已缓存歌曲加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
     );
 
     if (view === "sources") return (
@@ -2885,12 +3668,21 @@ function App() {
     );
 
     if (view === "settings") return (
-      <div className="page"><PageHeading eyebrow="SETTINGS" title="设置与备份" copy="输出设备、窗口和本地数据都在这里管理。" />
+      <div className="page"><PageHeading eyebrow="SETTINGS" title="设置" copy="常用设置保持精简；代理、缓存、日志与备份收在高级设置。" />
+        <div className="settings-level-tabs" role="tablist" aria-label="设置分组">
+          <button type="button" role="tab" aria-selected={!advancedSettings} className={!advancedSettings ? "active" : ""} onClick={() => setAdvancedSettings(false)}>常用</button>
+          <button type="button" role="tab" aria-selected={advancedSettings} className={advancedSettings ? "active" : ""} onClick={() => setAdvancedSettings(true)}>高级</button>
+        </div>
         <div className="settings-grid">
-          <section className="settings-card"><h3>输出设备</h3><p>切换时会从当前位置继续播放。</p><select value={snapshot.outputDevice ?? ""} onChange={(event) => void run("player_set_output_device", { name: event.target.value || null })}><option value="">系统默认设备</option>{outputDevices.map((device) => <option key={device} value={device}>{device}</option>)}</select></section>
-          <section className="settings-card"><h3>默认音质</h3><p>自动会按当前平台能力从高到低尝试，并在解析失败时逐档回退。</p><select value={qualityPreference} onChange={(event) => updateQualityPreference(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></section>
-          <section className="settings-card"><h3>默认听感</h3><p>音乐模式保持 DSP 透明旁路；影院/游戏模式启用空间处理。</p><ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} /></section>
-          <section className="settings-card proxy-settings">
+          {!advancedSettings && <section className="settings-card"><h3>输出设备</h3><p>进入设置时会重新枚举；设备断开后自动回退到系统默认设备。</p><select value={outputDeviceStatus?.selectedDevice ?? appPreferences?.outputDevice ?? ""} disabled={outputDeviceBusy} onChange={(event) => void selectOutputDevice(event.target.value || null)}><option value="">系统默认设备{outputDeviceStatus?.defaultDevice ? ` · ${outputDeviceStatus.defaultDevice}` : ""}</option>{outputDevices.map((device) => <option key={device} value={device}>{device}</option>)}</select><button type="button" disabled={outputDeviceBusy} onClick={() => void refreshOutputDevices().catch((error) => setMessage(String(error), true))}>{outputDeviceBusy ? "正在刷新…" : "重新枚举设备"}</button></section>}
+          {!advancedSettings && <section className="settings-card"><h3>默认音质</h3><p>自动会按当前平台能力从高到低尝试，并在解析失败时逐档回退。</p><select value={qualityPreference} onChange={(event) => updateQualityPreference(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></section>}
+          {!advancedSettings && <section className="settings-card dsp-settings-card">
+            <h3>音效预设</h3>
+            <p>预设与微调会自动保存；原声会关闭整条 DSP 链并保持零 DSP 延迟。</p>
+            <DspPresetControls value={dspControl} onChange={applyDspControl} onAbDryChange={setAbDry} />
+          </section>}
+          {!advancedSettings && <section className="settings-card"><h3>主题</h3><p>切换整体色调；动态强调色仍会随封面自然变化。</p><select value={theme} onChange={(event) => setTheme(event.target.value as ThemeId)}>{THEME_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label} · {option.description}</option>)}</select></section>}
+          {advancedSettings && <section className="settings-card proxy-settings">
             <h3>网络代理</h3>
             <p>复用你本机操作系统配置的第三方代理服务，非本应用提供。音源连接优先直连，失败时才按需回退到代理。</p>
             <label className="settings-toggle">
@@ -2907,17 +3699,19 @@ function App() {
               <span>{proxyStatus ? (proxyStatus.detected && proxyStatus.mode !== "off" ? "已检测到，可在直连失败时使用" : proxyStatus.detected ? "已检测到，但当前不允许使用" : "未检测到系统代理，当前直连") : "正在检测系统代理"}</span>
               <button type="button" disabled={!proxyStatus || proxyBusy || proxyStatus.mode === "auto"} onClick={() => void setProxyMode("auto")}>恢复自动检测</button>
             </div>
-          </section>
-          <section className="settings-card">
+          </section>}
+          {!advancedSettings && <section className="settings-card">
             <h3>窗口</h3>
-            <p>位置与尺寸会自动记忆；迷你模式适合边听边干活。</p>
+            <p>位置与尺寸会自动记忆；关闭行为可随时修改。</p>
+            <label><span>关闭按钮（X）</span><select value={appPreferences?.closeBehavior ?? "hide_to_tray"} disabled={!appPreferences} onChange={(event) => void setCloseBehavior(event.target.value as CloseBehavior)}><option value="hide_to_tray">隐藏到系统托盘</option><option value="exit">退出应用</option></select></label>
+            <small>{appPreferences?.closeBehavior === "exit" ? "点击 X 会结束播放并退出。" : "点击 X 后继续后台播放；托盘右键菜单提供显式退出。"}</small>
             <div className="cache-actions">
               <button type="button" className={alwaysOnTop ? "primary" : ""} onClick={() => void toggleAlwaysOnTop()}>{alwaysOnTop ? "取消置顶" : "窗口置顶"}</button>
               <button type="button" className={miniMode ? "primary" : ""} onClick={() => void toggleMiniMode()}>{miniMode ? "退出迷你" : "迷你模式"}</button>
             </div>
-          </section>
-          <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。批量管理请到「曲库」页的在线缓存分区。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => { cacheLimitDirtyRef.current = true; setCacheLimitGiB(event.target.value); }} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={async () => { if (!window.confirm("确定清理所有未收藏缓存吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: false }); setCacheStatus(status); }}>清未收藏</button><button className="danger" onClick={async () => { if (!window.confirm("确定清空全部缓存（包括收藏钉住项）吗？")) return; const status = await invoke<CacheStatus>("cache_clear", { includePinned: true }); setCacheStatus(status); }}>清空全部</button></div></section>
-          <section className="settings-card diagnostic-log-settings">
+          </section>}
+          {advancedSettings && <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。批量管理请到「曲库」页的在线缓存分区。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => { cacheLimitDirtyRef.current = true; setCacheLimitGiB(event.target.value); }} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={() => requestClearCache(false)}>清未收藏</button><button className="danger" onClick={() => requestClearCache(true)}>清空全部</button></div></section>}
+          {advancedSettings && <section className="settings-card diagnostic-log-settings">
             <div className="diagnostic-log-heading">
               <div>
                 <h3>诊断日志</h3>
@@ -2959,42 +3753,79 @@ function App() {
             ) : (
               <div className="diagnostic-log-empty">{diagnosticLogBusy === "refresh" ? "正在读取最近日志…" : diagnosticLogStatus?.enabled ? "目前没有异常或关键事件。" : "日志已关闭，暂无可显示记录。"}</div>
             )}
-          </section>
+          </section>}
         </div>
-        <section className="backup-card">
+        {advancedSettings && <section className="backup-card">
           <div className="section-heading">
             <div>
               <h3>配置备份</h3>
               <p>包含本地曲库、歌单、音源脚本及音源密钥；可存为文件或从文件读入。备份内容请勿公开。</p>
             </div>
             <div className="cache-actions">
-              <button type="button" onClick={() => void exportBackup()}>生成到文本框</button>
-              <button type="button" onClick={() => void exportBackupFile()}>存为文件…</button>
-              <button type="button" onClick={() => void importBackupFile()}>从文件读入…</button>
-              <button type="button" className="primary" disabled={!backupText.trim()} onClick={() => void restoreBackup()}>恢复备份</button>
+              <button type="button" disabled={Boolean(backupRestoreBusy)} onClick={() => void exportBackup()}>生成到文本框</button>
+              <button type="button" disabled={Boolean(backupRestoreBusy)} onClick={() => void exportBackupFile()}>存为文件…</button>
+              <button type="button" disabled={Boolean(backupRestoreBusy)} onClick={() => void importBackupFile()}>从文件读入…</button>
+              {backupRestorePreview ? (
+                <button type="button" className="primary" disabled={Boolean(backupRestoreBusy)} onClick={() => void restoreBackup()}>
+                  {backupRestoreBusy === "restore" ? "正在恢复…" : "确认覆盖并恢复"}
+                </button>
+              ) : (
+                <button type="button" className="primary" disabled={!backupText.trim() || Boolean(backupRestoreBusy)} onClick={() => void inspectBackupRestore()}>
+                  {backupRestoreBusy === "preview" ? "正在校验…" : "检查备份"}
+                </button>
+              )}
             </div>
           </div>
-          <textarea aria-label="GXPlayer 备份 JSON" placeholder="生成的备份会显示在这里，也可以粘贴已有备份。" value={backupText} onChange={(event) => setBackupText(event.target.value)} />
-        </section>
+          {backupRestorePreview && (
+            <div className="backup-restore-preview" role="status" aria-live="polite">
+              <strong>恢复预览</strong>
+              <span>将覆盖 {backupRestorePreview.trackCount} 首曲目 / {backupRestorePreview.playlistCount} 个歌单 / {backupRestorePreview.sourceCount} 个音源</span>
+              <small>下一步仍会要求确认；恢复失败时会自动回滚到当前数据。</small>
+            </div>
+          )}
+          <textarea
+            aria-label="GXPlayer 备份 JSON"
+            placeholder="生成的备份会显示在这里，也可以粘贴已有备份。"
+            value={backupText}
+            disabled={Boolean(backupRestoreBusy)}
+            onChange={(event) => {
+              resetBackupRestorePreview();
+              setBackupText(event.target.value);
+            }}
+          />
+        </section>}
       </div>
     );
 
     return (
-      <div className="page now-playing-page">
+      <div className={`page now-playing-page layout-${nowPlayingLayout}`}>
+        <div className="now-playing-layout-switch" role="tablist" aria-label="播放页布局">
+          <button type="button" role="tab" aria-selected={nowPlayingLayout === "lyrics"} className={nowPlayingLayout === "lyrics" ? "active" : ""} onClick={() => changeNowPlayingLayout("lyrics")}>歌词优先</button>
+          <button type="button" role="tab" aria-selected={nowPlayingLayout === "immersive"} className={nowPlayingLayout === "immersive" ? "active" : ""} onClick={() => changeNowPlayingLayout("immersive")}>沉浸模式</button>
+        </div>
+        <div className="now-playing-dsp-strip panel-enter">
+          <DspPresetControls
+            value={dspControl}
+            onChange={applyDspControl}
+            onAbDryChange={setAbDry}
+            compact
+            showSystemEffectsHint={false}
+          />
+        </div>
         <div className="now-grid">
-          <section className={`record-column ${isPlaying ? "is-playing" : ""}`}>
-            <div className={`record-stage ${isPlaying ? "live" : ""}`}>
+          <section className={`record-column ${animatePlayback ? "is-playing" : ""}`}>
+            <div className={`record-stage ${animatePlayback ? "live" : ""}`}>
               <div className="record-glow" aria-hidden="true" />
-              <div className={`record ${isPlaying ? "spinning" : ""}`}>
+              <div className={`record ${animatePlayback ? "spinning" : ""}`}>
                 <Cover artwork={currentArtwork} title={currentTitle} className="record-cover" eager />
                 <span className="record-hole" />
               </div>
-              <div className={`eq-bars ${isPlaying ? "active" : ""}`} aria-hidden="true">
+              <div className={`eq-bars ${animatePlayback ? "active" : ""}`} aria-hidden="true">
                 <i /><i /><i /><i /><i />
               </div>
             </div>
             <p className="eyebrow">NOW PLAYING</p>
-            <h1 className={isPlaying ? "title-live" : ""}>{currentTitle}</h1>
+            <h1 className={animatePlayback ? "title-live" : ""}>{currentTitle}</h1>
             {displayedCatalogTrack?.artist ? (
               <ArtistLinks artist={displayedCatalogTrack.artist} onSelect={openArtistPage} className="artist-line artist-line-links" />
             ) : <p className="artist-line">{currentArtist}</p>}
@@ -3006,8 +3837,8 @@ function App() {
               </p>
             )}
           </section>
-          <section className="stage-panel">
-            <div className={`sound-stage ${snapshot.audioMode === "music" ? "bypassed" : "enabled"}`} aria-label="声场模式盘">
+          {nowPlayingLayout === "lyrics" ? lyricsPanel : <section className="stage-panel">
+            <div className={`sound-stage ${snapshot.activePresetId === "bypass" ? "bypassed" : "enabled"} ${animatePlayback ? "is-playing" : ""}`} aria-label={`当前音效预设：${activeDspPreset.label}`}>
               <div className="stage-field" aria-hidden="true" />
               <div className="stage-ring stage-ring-outer" aria-hidden="true" />
               <div className="orbit orbit-one" />
@@ -3016,19 +3847,16 @@ function App() {
               <span className="listener">你</span>
               <i className="stage-speaker front-left"><b>FL</b></i>
               <i className="stage-speaker front-right"><b>FR</b></i>
-              <i className="stage-speaker rear-left"><b>RL</b></i>
-              <i className="stage-speaker rear-right"><b>RR</b></i>
-              <span className="stage-mode-chip">{snapshot.audioMode === "music" ? "直通" : "空间"}</span>
+              <span className="stage-mode-chip">{activeDspPreset.label}</span>
             </div>
             <div className="mode-copy">
-              <p className="eyebrow">SOUND MODE</p>
-              <h2>{snapshot.audioMode === "music" ? "原声 / 音乐" : "影院 / 游戏"}</h2>
-              <p>{snapshot.audioMode === "music" ? "透明直通，不添加空间处理。你的盲测首选。" : "Crossfeed + 立体声 HRTF，仅在需要空间感时开启。"}</p>
-              <ModeButtons mode={snapshot.audioMode} onChange={setAudioMode} />
+              <p className="eyebrow">SOUND PRESET</p>
+              <h2>{activeDspPreset.label}</h2>
+              <p>{activeDspPreset.description}</p>
             </div>
-          </section>
+          </section>}
         </div>
-        <section className="lyrics-panel"><div className="lyrics-scroll">{lyrics?.instrumental ? <p className="lyric active">纯音乐</p> : lyrics?.lines.length ? lyrics.lines.map((line, index) => <p className={`lyric ${index === activeLyricIndex ? "active" : ""}`} key={`${line.timestampMs}-${index}`} ref={(element) => { lyricRefs.current[index] = element; }}>{line.text}</p>) : <div className="lyrics-empty"><strong>歌词会出现在这里</strong><span>在线预览会自动匹配同步歌词。</span></div>}</div></section>
+        {nowPlayingLayout === "immersive" && lyricsPanel}
         {upNext.length > 0 && (
           <section className="up-next-panel panel-enter">
             <div className="section-heading">
@@ -3059,13 +3887,30 @@ function App() {
   };
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${miniMode ? "mini-mode" : ""} ${isMaximized ? "is-maximized" : ""}`} data-theme={theme} style={{ "--accent": accent } as CSSProperties}>
+    <div className={`app-shell ${!narrowLayout && sidebarCollapsed ? "sidebar-collapsed" : ""} ${narrowLayout ? "narrow-layout" : ""} ${miniMode ? "mini-mode" : ""} ${isMaximized ? "is-maximized" : ""} ${windowActive ? "" : "app-idle"}`} data-theme={theme} style={{ "--accent": accent } as CSSProperties}>
       <div className="ambient-light" aria-hidden="true" />
       <div className="ambient-light ambient-light-secondary" aria-hidden="true" />
       <div className="shell-noise" aria-hidden="true" />
       <header className="top-bar" data-tauri-drag-region>
         <div className="brand-cluster">
-          <button className="menu-button" onClick={() => setSidebarCollapsed((value) => !value)} aria-pressed={!sidebarCollapsed} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>☰</button>
+          <button
+            ref={menuButtonRef}
+            className="menu-button"
+            onClick={() => {
+              if (narrowLayout) {
+                setQueuePanelOpen(false);
+                setSidebarDrawerOpen((open) => !open);
+              } else {
+                setSidebarCollapsed((value) => !value);
+              }
+            }}
+            aria-controls="app-sidebar"
+            aria-expanded={narrowLayout ? sidebarDrawerOpen : undefined}
+            aria-pressed={narrowLayout ? undefined : !sidebarCollapsed}
+            aria-label={narrowLayout
+              ? sidebarDrawerOpen ? "关闭导航抽屉" : "打开导航抽屉"
+              : sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+          >☰</button>
           <button className="logo" onClick={() => navigateTo("discovery")} aria-label="返回探索页"><img src={gxplayerIcon} alt="" /></button>
           <button className="history-back" onClick={navigateBack} disabled={!viewHistory.length} aria-label="返回上一页" title="返回上一页">‹</button>
           <button className="mini-mode-exit" type="button" onClick={() => void toggleMiniMode()}>退出迷你</button>
@@ -3096,6 +3941,28 @@ function App() {
                   <span>{suggestionError ?? "联想加载失败"}</span>
                   <button type="button" onClick={retrySuggestions}>重试</button>
                 </div>
+              )}
+              {localSuggestions.length > 0 && (
+                <SuggestionGroup label="本地曲库">
+                  {localSuggestions.map((track) => {
+                    const optionIndex = searchOptions.findIndex((option) => option.kind === "local" && option.track.id === track.id);
+                    const option = searchOptions[optionIndex];
+                    return (
+                      <button
+                        role="option"
+                        id={option?.id}
+                        aria-selected={optionIndex === suggestionIndex}
+                        className={optionIndex === suggestionIndex ? "selected" : ""}
+                        key={track.id}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onMouseEnter={() => setSuggestionIndex(optionIndex)}
+                        onClick={() => option && activateSearchOption(option)}
+                      >
+                        <span>⌂</span><strong>{track.title}</strong><small>{track.artist || "未知歌手"} · 本地</small>
+                      </button>
+                    );
+                  })}
+                </SuggestionGroup>
               )}
               {visibleSuggestions.length > 0 && (
                 <SuggestionGroup label="歌曲">
@@ -3184,7 +4051,7 @@ function App() {
           )}
         </div>
         <div className="top-bar-trail">
-          <button className={`mode-pill ${snapshot.audioMode === "cinema_game" ? "active" : ""}`} onClick={() => navigateTo("now-playing")}><span>⊙</span>{snapshot.audioMode === "music" ? "原声" : "空间"}</button>
+          <button className={`mode-pill ${snapshot.activePresetId !== "bypass" ? "active" : ""}`} onClick={() => navigateTo("now-playing")} aria-label={`当前音效预设：${activeDspPreset.label}`}><span>⊙</span>{activeDspPreset.label}</button>
           <div className="theme-picker" ref={themePickerRef}>
             <button
               type="button"
@@ -3224,14 +4091,35 @@ function App() {
             )}
           </div>
         </div>
-        <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button className="maximize-control" onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label="关闭">×</button></div>
+        <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button className="maximize-control" onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label={appPreferences?.closeBehavior === "exit" ? "退出应用" : "隐藏到系统托盘"} title={appPreferences?.closeBehavior === "exit" ? "退出应用" : "隐藏到系统托盘"}>×</button></div>
       </header>
 
-      <aside className="sidebar">
-        <nav>{NAV_ITEMS.map((item) => <button className={view === item.id ? "active" : ""} onClick={() => navigateTo(item.id)} key={item.id} title={item.label}><span>{item.icon}</span><strong>{item.label}</strong></button>)}</nav>
-        <div className="sidebar-playlists"><p><span>创建的歌单</span><small>{playlists.length}</small></p>{playlists.slice(0, 8).map((playlist) => <button key={playlist.id} className={activePlaylist?.id === playlist.id && view === "playlist" ? "active" : ""} onClick={() => void openPlaylist(playlist)} title={playlist.name}><span>♬</span><strong>{playlist.name}</strong></button>)}</div>
-        <div className="engine-health"><i className={snapshot.status === "failed" ? "bad" : ""} /><span><strong>Rust Engine</strong><small>{snapshot.status === "failed" ? "需要处理" : `${snapshot.underrunCallbacks} underrun`}</small></span></div>
-      </aside>
+      {browserMock && <div className="browser-mock-banner" role="status">浏览器演示模式 · 使用 Mock 数据，播放与文件选择请在 Tauri 桌面端验证</div>}
+
+      {narrowLayout && sidebarDrawerOpen && (
+        <button
+          type="button"
+          className="sidebar-drawer-backdrop"
+          tabIndex={-1}
+          aria-label="关闭导航抽屉"
+          onClick={() => {
+            setSidebarDrawerOpen(false);
+            window.requestAnimationFrame(() => menuButtonRef.current?.focus());
+          }}
+        />
+      )}
+      {(!narrowLayout || sidebarDrawerOpen) && (
+        <aside
+          ref={sidebarRef}
+          id="app-sidebar"
+          className={`sidebar ${narrowLayout ? "sidebar-drawer" : ""}`}
+          aria-label="主导航"
+        >
+          <nav>{NAV_ITEMS.map((item) => <button className={view === item.id ? "active" : ""} onClick={() => navigateTo(item.id)} key={item.id} title={item.label} data-tooltip={item.label}><span>{item.icon}</span><strong>{item.label}</strong></button>)}</nav>
+          <div className="sidebar-playlists"><p><span>创建的歌单</span><small>{playlists.length}</small></p>{playlists.slice(0, 8).map((playlist) => <button key={playlist.id} className={activePlaylist?.id === playlist.id && view === "playlist" ? "active" : ""} onClick={() => void openPlaylist(playlist)} title={playlist.name} data-tooltip={playlist.name}><span>♬</span><strong>{playlist.name}</strong></button>)}</div>
+          <div className="engine-health"><i className={snapshot.status === "failed" ? "bad" : ""} /><span><strong>Rust Engine</strong><small>{snapshot.status === "failed" ? "需要处理" : `${snapshot.underrunCallbacks} underrun`}</small></span></div>
+        </aside>
+      )}
 
       <main className="content">{renderView()}</main>
 
@@ -3261,12 +4149,44 @@ function App() {
         </div>
       )}
 
+      {closeNoticeOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="config-modal close-to-tray-modal" role="dialog" aria-modal="true" aria-labelledby="close-to-tray-title" aria-describedby="close-to-tray-copy">
+            <div className="section-heading">
+              <div><p className="eyebrow">BACKGROUND PLAYBACK</p><h3 id="close-to-tray-title">关闭后继续播放</h3></div>
+            </div>
+            <p id="close-to-tray-copy">GXPlayer 关闭后会隐藏到系统托盘，音乐继续播放。左键托盘图标恢复，右键菜单可退出；也可在设置中修改。</p>
+            <div className="modal-actions">
+              <button type="button" disabled={closeNoticeBusy} onClick={() => {
+                setCloseNoticeBusy(true);
+                void invoke("app_close_notice_cancel")
+                  .then(() => setCloseNoticeOpen(false))
+                  .catch((error) => setMessage(String(error), true))
+                  .finally(() => setCloseNoticeBusy(false));
+              }}>暂不关闭</button>
+              <button ref={closeNoticeConfirmRef} type="button" className="primary" disabled={closeNoticeBusy} onClick={() => {
+                setCloseNoticeBusy(true);
+                void invoke<AppPreferences>("app_close_notice_confirm")
+                  .then((preferences) => {
+                    setAppPreferences(preferences);
+                    setCloseNoticeOpen(false);
+                  })
+                  .catch((error) => setMessage(String(error), true))
+                  .finally(() => setCloseNoticeBusy(false));
+              }}>{closeNoticeBusy ? "正在处理…" : "知道了，隐藏到托盘"}</button>
+            </div>
+          </section>
+        </div>
+      )}
+
       <TextPlaylistImportDialog
         open={textPlaylistDialogOpen}
         onClose={() => setTextPlaylistDialogOpen(false)}
         onEnqueue={enqueueCatalogTracks}
         invoke={invoke}
       />
+
+      {actionDialog.dialog}
 
       {(message || (snapshot.error && !engineErrorDismissed)) && (
         <div
@@ -3276,6 +4196,16 @@ function App() {
           <span>{snapshot.error && !engineErrorDismissed || messageIsError ? "!" : "✓"}</span>
           <p>{(!engineErrorDismissed && snapshot.error) ? snapshot.error : message}</p>
           <button type="button" onClick={clearMessage} aria-label="关闭提示">×</button>
+        </div>
+      )}
+
+      {outputDeviceFallback && (
+        <div className="device-fallback-banner" role="alert">
+          <span>!</span>
+          <p>{outputDeviceFallback.fallbackDevice
+            ? `“${outputDeviceFallback.unavailableDevice}”已断开，已切换到系统默认设备“${outputDeviceFallback.fallbackDevice}”。`
+            : `“${outputDeviceFallback.unavailableDevice}”已断开，且没有可用的系统默认输出设备。`}</p>
+          <button type="button" onClick={() => setOutputDeviceFallback(null)} aria-label="关闭输出设备提示">×</button>
         </div>
       )}
 
@@ -3302,10 +4232,10 @@ function App() {
             }}
           />
         </div>
-        <button className={`player-track ${isPlaying ? "is-playing" : ""}`} onClick={() => navigateTo("now-playing")}>
-          <span className={`player-cover-wrap ${isPlaying ? "live" : ""}`}>
+        <button className={`player-track ${animatePlayback ? "is-playing" : ""}`} onClick={() => navigateTo("now-playing")}>
+          <span className={`player-cover-wrap ${animatePlayback ? "live" : ""}`}>
             <Cover artwork={currentArtwork} title={currentTitle} eager />
-            {isPlaying && <span className="player-eq" aria-hidden="true"><i /><i /><i /></span>}
+            {animatePlayback && <span className="player-eq" aria-hidden="true"><i /><i /><i /></span>}
           </span>
           <span>
             <strong>{currentTitle}</strong>
@@ -3341,7 +4271,16 @@ function App() {
         </div>
         <div className="player-tools">
           {selectedCatalogTrack && currentQueueItem?.online && <button className={`online-favorite ${selectedOnlineFavorite ? "active" : ""}`} onClick={() => void toggleOnlineFavorite(selectedCatalogTrack)} aria-label={selectedOnlineFavorite ? "取消在线收藏" : "收藏在线歌曲"} title={selectedOnlineFavorite ? "取消收藏" : "收藏并钉住缓存"}>{selectedOnlineFavorite ? "♥" : "♡"}</button>}
-          {measuredSourceSpec && <span className={`measured-quality ${suspiciousQuality ? "suspicious" : ""}`} title={`${currentQuality ? `${currentQuality}（音源自报） · ` : ""}实测 ${measuredSourceSpec}${suspiciousQuality ? " · 疑似虚标" : ""}`}>{suspiciousQuality ? "⚠ " : ""}{measuredSourceSpec}</span>}
+          <span
+            className={`measured-quality ${suspiciousQuality ? "suspicious" : ""} ${measuredSourceSpec ? "" : "is-placeholder"}`}
+            role={measuredSourceSpec ? "img" : undefined}
+            tabIndex={measuredSourceSpec ? 0 : -1}
+            aria-hidden={measuredSourceSpec ? undefined : true}
+            aria-label={measuredSourceSpec ? `${currentQuality ? `${currentQuality}（音源自报） · ` : ""}实测 ${measuredSourceSpec}${suspiciousQuality ? " · 疑似虚标" : ""}` : undefined}
+            title={measuredSourceSpec ? `${currentQuality ? `${currentQuality}（音源自报） · ` : ""}实测 ${measuredSourceSpec}${suspiciousQuality ? " · 疑似虚标" : ""}` : undefined}
+          >
+            {measuredSourceSpec && <span aria-hidden="true">{suspiciousQuality ? "!" : "i"}</span>}
+          </span>
           {selectedCatalogTrack && currentQueueItem?.online && <select className="quality-select" aria-label="音源自报音质" title={`音源自报档位：${currentQuality ?? "自动"}`} value={QUALITY_OPTIONS.some((option) => option.value === currentQuality) ? currentQuality ?? "auto" : "auto"} disabled={qualitySwitching || Boolean(resolveBanner)} onChange={(event) => void switchOnlineQuality(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.value === "auto" ? `自动${currentQuality ? ` · ${currentQuality}` : ""}` : option.label}</option>)}</select>}
           <div className="volume-cluster">
             <span className="volume-icon" aria-hidden="true" />
@@ -3354,29 +4293,33 @@ function App() {
               step={0.01}
               value={shownVolume}
               style={{ "--fill": `${shownVolume * 100}%` } as CSSProperties}
-              onChange={(event) => setVolumeDraft(Number(event.target.value))}
+              onChange={(event) => previewVolume(Number(event.target.value))}
               onPointerUp={(event) => {
                 const volume = Number(event.currentTarget.value);
-                void commitVolume(volume);
+                commitVolume(volume);
+              }}
+              onPointerCancel={(event) => {
+                commitVolume(Number(event.currentTarget.value));
               }}
               onKeyUp={(event) => {
                 if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
-                  void commitVolume(Number(event.currentTarget.value));
+                  commitVolume(Number(event.currentTarget.value));
                 }
               }}
               onBlur={(event) => {
-                if (volumeDraft !== null) void commitVolume(Number(event.currentTarget.value));
+                if (isAdjustingVolume) commitVolume(Number(event.currentTarget.value));
               }}
             />
           </div>
           <button
             type="button"
-            className={`tool-btn ${snapshot.audioMode === "cinema_game" ? "active" : ""}`}
-            onClick={() => void setAudioMode(snapshot.audioMode === "music" ? "cinema_game" : "music")}
-            aria-label="切换音效模式"
-            title={snapshot.audioMode === "music" ? "原声直通" : "影院/游戏空间"}
+            className={`tool-btn preset-tool-btn ${snapshot.activePresetId !== "bypass" ? "active" : ""}`}
+            onClick={() => navigateTo("now-playing")}
+            aria-label={`当前音效预设：${activeDspPreset.label}`}
+            title={`音效预设：${activeDspPreset.label}`}
           >
             <span className="glyph-spatial" aria-hidden="true" />
+            <span className="preset-tool-label">{activeDspPreset.label}</span>
           </button>
           <button
             type="button"
@@ -3400,15 +4343,20 @@ function App() {
       <QueuePanel
         open={queuePanelOpen}
         playMode={snapshot.playMode ?? "sequential"}
+        availabilityStatus={localQueueAvailability.status}
         rows={displayPlaylist.map((entry, index) => ({
           key: entryKey(entry, index),
           title: entryTitle(entry),
-          subtitle: `${entryArtist(entry)} · ${entrySourceLabel(entry)}${entry.kind === "online" && index !== displayIndex ? " · 待解析" : ""}`,
+          subtitle: `${entryArtist(entry)} · ${entrySourceLabel(entry)}${entry.kind === "online" && index !== displayIndex ? " · 待解析" : ""}${entry.kind === "local" && localQueueAvailability.unavailablePaths.has(entry.path) ? " · 暂不可用" : ""}`,
           active: index === displayIndex,
+          unavailable: entry.kind === "local" && localQueueAvailability.unavailablePaths.has(entry.path),
+          relinking: index === relinkingQueueIndex,
         }))}
         onClose={() => setQueuePanelOpen(false)}
         onClear={() => void clearPlaylist()}
         onJump={(index) => void jumpToPlaylistIndex(index)}
+        onRelink={(index) => void relinkLocalQueueEntry(index)}
+        onRetryAvailability={() => void checkLocalQueueAvailability(playlistRef.current, true)}
         onRemove={(index) => void removePlaylistIndex(index)}
         onReorder={(from, to) => void reorderPlaylist(from, to)}
       />
@@ -3437,23 +4385,6 @@ function ErrorState({ title, copy, onRetry }: { title: string; copy: string; onR
 
 function LoadingState() {
   return <div className="empty-state"><i className="large-spinner" /><h3>正在找音乐</h3><p>搜索会同时整理不同平台的结果。</p></div>;
-}
-
-function ModeButtons({ mode, onChange }: { mode: AudioMode; onChange: (mode: AudioMode) => Promise<void> }) {
-  return (
-    <div className="mode-buttons" role="radiogroup" aria-label="音效模式">
-      <button role="radio" aria-checked={mode === "music"} className={mode === "music" ? "active" : ""} onClick={() => void onChange("music")}>
-        <span>♫</span>
-        <strong>原声 / 音乐</strong>
-        <small>默认 · 透明直通</small>
-      </button>
-      <button role="radio" aria-checked={mode === "cinema_game"} className={mode === "cinema_game" ? "active" : ""} onClick={() => void onChange("cinema_game")}>
-        <span>◎</span>
-        <strong>影院 / 游戏</strong>
-        <small>可选 · 空间处理</small>
-      </button>
-    </div>
-  );
 }
 
 function SuggestionGroup({ label, children }: { label: string; children: ReactNode }) {

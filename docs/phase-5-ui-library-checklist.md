@@ -21,7 +21,7 @@ Post-acceptance review found and corrected a 44.1-to-48 kHz playback starvation 
 
 ## UI specification coverage
 
-- Tokenized near-black palette, elevated surfaces, glass borders, locally bundled Geist / Noto Sans SC / Geist Mono, and no runtime font dependency.
+- Tokenized near-black palette, elevated surfaces, glass borders, locally bundled Geist / Geist Mono, Windows system CJK fallback, and no network font dependency.
 - Custom Tauri title bar with minimize, maximize, and close controls.
 - Collapsible sidebar, discovery, search, local library, favorites, playlists, source management, settings, and persistent native player bar.
 - Global search uses 200 ms debounce, stale-request cancellation, song/artist/album groups, keyboard selection, Enter, and Escape behavior.

@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use gx_contracts::NetworkRoute;
+use reqwest::ClientBuilder as AsyncClientBuilder;
 use reqwest::blocking::ClientBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,23 @@ pub fn configure_client_builder_for_route(
     builder: ClientBuilder,
     route: NetworkRoute,
 ) -> ClientBuilder {
+    match route {
+        NetworkRoute::Direct => builder.no_proxy(),
+        NetworkRoute::SystemProxy => builder,
+    }
+}
+
+pub fn configure_async_client_builder(builder: AsyncClientBuilder) -> AsyncClientBuilder {
+    match route_for(mode(), system_proxy_detected()) {
+        ProxyRoute::System => builder,
+        ProxyRoute::Direct => builder.no_proxy(),
+    }
+}
+
+pub fn configure_async_client_builder_for_route(
+    builder: AsyncClientBuilder,
+    route: NetworkRoute,
+) -> AsyncClientBuilder {
     match route {
         NetworkRoute::Direct => builder.no_proxy(),
         NetworkRoute::SystemProxy => builder,

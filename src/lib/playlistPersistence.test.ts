@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   PLAYLIST_SESSION_STORAGE_KEY,
   clearPlaylistSession,
-  filterUnavailableLocalEntries,
   loadPlaylistSession,
   savePlaylistSession,
   type PlaylistSessionState,
@@ -151,21 +150,24 @@ describe("playlist persistence", () => {
     expect(clearPlaylistSession(brokenStorage)).toBe(false);
   });
 
-  it("drops missing local files and remaps the selected index", () => {
+  it("keeps an unavailable restored local path in persistent storage", () => {
+    const storage = new MemoryStorage();
     const state = mixedSession();
-    expect(filterUnavailableLocalEntries(state, new Set())).toEqual({
-      playlist: [state.playlist[1], state.playlist[2]],
-      currentIndex: 0,
-      playMode: "repeat_all",
-    });
 
-    expect(filterUnavailableLocalEntries({
+    expect(savePlaylistSession(state, storage)).toBe(true);
+    expect(loadPlaylistSession(storage)).toEqual({
       ...state,
-      currentIndex: 0,
-    }, new Set())).toEqual({
-      playlist: [state.playlist[1], state.playlist[2]],
-      currentIndex: 0,
-      playMode: "repeat_all",
+      playlist: [
+        state.playlist[0],
+        {
+          ...state.playlist[1],
+          track: {
+            ...(state.playlist[1]?.kind === "online" ? state.playlist[1].track : {}),
+            preview: null,
+          },
+        },
+        state.playlist[2],
+      ],
     });
   });
 });

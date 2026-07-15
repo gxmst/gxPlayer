@@ -1,7 +1,7 @@
 {
   "name": "gxplayer",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "packageManager": "npm@11.6.2",
   "engines": {
@@ -19,7 +19,6 @@
   "dependencies": {
     "@fontsource-variable/geist": "5.2.9",
     "@fontsource-variable/geist-mono": "5.2.8",
-    "@fontsource-variable/noto-sans-sc": "^5.2.10",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "buffer": "^6.0.3",

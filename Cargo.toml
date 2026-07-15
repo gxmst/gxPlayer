@@ -18,11 +18,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 authors = ["GXPlayer contributors"]
-repository = ""
+repository = "https://github.com/gxmst/gxPlayer"
 
 [workspace.dependencies]
 anyhow = "1.0.103"
@@ -39,5 +39,7 @@ serde_json = "1.0.150"
 sha2 = "0.10.9"
 symphonia = { version = "0.5.5", features = ["aac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
 thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
 url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.23.4", features = ["serde", "v4"] }

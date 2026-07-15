@@ -1,0 +1,61 @@
+.app-error-boundary {
+  box-sizing: border-box;
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 32px;
+  color: #f2f3f7;
+  background:
+    radial-gradient(circle at 50% 20%, rgba(232, 90, 113, 0.14), transparent 42%),
+    #0f1016;
+  font-family: "Geist Variable", "Noto Sans SC Variable", "Microsoft YaHei UI", sans-serif;
+}
+
+.app-error-card {
+  width: min(440px, 100%);
+  padding: 32px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 20px;
+  background: rgba(28, 30, 40, 0.82);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
+}
+
+.app-error-kicker {
+  margin: 0 0 10px;
+  color: #e85a71;
+  font: 650 12px/1.2 "Geist Mono Variable", monospace;
+  letter-spacing: 0.14em;
+}
+
+.app-error-card h1 {
+  margin: 0;
+  font-size: clamp(24px, 5vw, 34px);
+  line-height: 1.15;
+}
+
+.app-error-card > p:not(.app-error-kicker) {
+  margin: 16px 0 24px;
+  color: #a4a6b4;
+  line-height: 1.65;
+}
+
+.app-error-card button {
+  min-height: 40px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: 8px;
+  color: #0e0e14;
+  background: #f2f2f6;
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.app-error-card button:hover {
+  background: #ffffff;
+}
+
+.app-error-card button:focus-visible {
+  outline: 2px solid #e85a71;
+  outline-offset: 3px;
+}

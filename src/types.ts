@@ -73,6 +73,7 @@ export type CatalogTrack = {
 
 export type OnlinePlaybackResult = {
   outcome: "started" | "failed" | "cancelled" | "stale";
+  failureKind: ResolveFailureKind | null;
   attempts: ResolveAttemptDiagnostic[];
   error?: string | null;
   track: CatalogTrack;
@@ -81,6 +82,14 @@ export type OnlinePlaybackResult = {
   quality: string | null;
   cacheHit: boolean;
 };
+
+export type ResolveFailureKind =
+  | "track_unavailable"
+  | "no_source"
+  | "network"
+  | "authentication"
+  | "rate_limited"
+  | "unknown";
 
 export type ResolveAttemptDiagnostic = {
   sourceId: string | null;
@@ -118,12 +127,20 @@ export type DiagnosticLogExportResult = {
 };
 
 export type CacheStatus = {
+  revision: number;
   directory: string;
   customDirectory: string | null;
   limitBytes: number;
   totalBytes: number;
   entryCount: number;
   pinnedCount: number;
+};
+
+export type PreviewCacheStatus = {
+  directory: string;
+  limitBytes: number;
+  totalBytes: number;
+  entryCount: number;
 };
 
 /** Offline/cache list row — never includes absolute disk paths. */
@@ -186,6 +203,18 @@ export type PlaylistSummary = {
   createdAtMs: number;
 };
 
+export type LibraryPlaylistItem =
+  | { kind: "local"; track: LibraryTrack }
+  | {
+      kind: "cached";
+      providerId: string;
+      providerTrackId: string;
+      quality: string;
+      title: string;
+      artist: string;
+      album: string;
+    };
+
 export type EqBand = {
   enabled: boolean;
   kind: "peak" | "low_shelf" | "high_shelf" | "low_pass" | "high_pass";
@@ -203,6 +232,15 @@ export type DspSettings = {
   limiter: { enabled: boolean; ceilingDb: number; releaseMs: number };
 };
 
+export type DspPresetId = "bypass" | "headphone_daily" | "vocal" | "bass" | "spatial";
+
+export type DspControlState = {
+  settings: DspSettings;
+  activePresetId: DspPresetId;
+  intensity: number;
+  spatialAmount: number;
+};
+
 export type PlayMode = "sequential" | "repeat_all" | "repeat_one" | "shuffle";
 
 export type EngineSnapshot = {
@@ -215,6 +253,9 @@ export type EngineSnapshot = {
   audioMode: "music" | "cinema_game";
   playMode: PlayMode;
   dspSettings: DspSettings;
+  activePresetId: DspPresetId;
+  intensity: number;
+  spatialAmount: number;
   generation: number;
   underrunCallbacks: number;
   outputSampleRate?: number | null;
@@ -254,6 +295,9 @@ export const EMPTY_ENGINE: EngineSnapshot = {
     hrtf: { enabled: false, mix: 0.72, outputGainDb: -6 },
     limiter: { enabled: false, ceilingDb: -1, releaseMs: 80 },
   },
+  activePresetId: "bypass",
+  intensity: 0.5,
+  spatialAmount: 0.5,
   generation: 0,
   underrunCallbacks: 0,
   sourceSampleRate: null,

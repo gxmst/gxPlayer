@@ -3,12 +3,13 @@ export type PlaybackStartOutcome = "started" | "failed" | "cancelled" | "stale";
 export type PlaybackStartResult = {
   outcome: PlaybackStartOutcome;
   error?: unknown;
+  failureKind?: "track_unavailable" | "no_source" | "network" | "authentication" | "rate_limited" | "unknown";
 };
 
 export const STARTED: PlaybackStartResult = { outcome: "started" };
 
 export function shouldSkipAfterStart(result: PlaybackStartResult): boolean {
-  return result.outcome === "failed";
+  return result.outcome === "failed" && result.failureKind === "track_unavailable";
 }
 
 export function nextOptionIndex(current: number, count: number, direction: 1 | -1): number {

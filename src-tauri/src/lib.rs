@@ -1,25 +1,33 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
-use gx_audio::engine::{AudioMode, EngineSnapshot, LocalAudioEngine, PlayMode};
+use gx_audio::engine::{AudioMode, DspControlState, EngineSnapshot, LocalAudioEngine, PlayMode};
 use gx_contracts::ResolvedMediaRequest;
-use gx_dsp::DspSettings;
-use gx_library::{LibraryBackup, LibraryStore, LibraryTrack, NewTrack, PlaylistSummary};
+use gx_library::{
+    CachedPlaylistTrack, LibraryBackup, LibraryStore, LibraryTrack, MAX_LIBRARY_TRACKS, NewTrack,
+    PlaylistItem, PlaylistSummary,
+};
+use gx_metadata::MetadataClient;
 use gx_source::{SourceStore, safe_http};
 
+mod app_preferences;
 mod artwork;
+mod backup_commands;
 mod cache_commands;
 mod diagnostic_log;
+mod library_commands;
 mod media_session;
 mod metadata_commands;
 mod network_settings;
+mod preview_cache;
 mod product_commands;
 mod source_commands;
 mod source_runtime;
@@ -28,38 +36,56 @@ mod transport;
 mod window_state;
 mod windows_identity;
 
+use app_preferences::{AppPreferences, AppPreferencesState, CloseAction, CloseBehavior};
 use artwork::artwork_get;
+use backup_commands::{backup_preview_restore, backup_restore_atomic};
 use cache_commands::{
     cache_clear, cache_list_entries, cache_online_favorites, cache_remove_by_quality,
     cache_remove_entries, cache_remove_entry, cache_reset_directory, cache_set_directory,
     cache_set_limit, cache_set_online_favorite, cache_status, player_play_cache_entry,
+    player_play_history_cache, preview_cache_clear, preview_cache_status,
 };
 use diagnostic_log::{
     DiagnosticLogState, diagnostic_log_clear, diagnostic_log_export, diagnostic_log_recent,
     diagnostic_log_set_enabled, diagnostic_log_status,
 };
+use library_commands::{library_import_folders, library_relink_tracks, library_remove_tracks};
 use metadata_commands::{
-    maybe_start_phase3_smoke, metadata_chart, metadata_find_replacements, metadata_lyrics,
-    metadata_play_preview, metadata_search,
+    MetadataCancellationRegistry, maybe_start_phase3_smoke, metadata_cancel_request,
+    metadata_chart, metadata_find_replacements, metadata_lyrics, metadata_play_preview,
+    metadata_read_local_lyrics, metadata_search,
 };
 use network_settings::{network_proxy_status, network_set_proxy_mode};
 use product_commands::{
-    backup_read_file, backup_write_file, library_clear_history, library_embedded_cover,
-    library_history, library_record_history, library_scan_missing, player_media_action,
-    window_force_show, window_get_state, window_save_state, window_set_always_on_top,
-    window_set_mini_mode,
+    backup_read_file, backup_write_file, library_check_local_paths, library_clear_history,
+    library_embedded_cover, library_history, library_record_history, library_scan_missing,
+    player_media_action, window_force_show, window_get_state, window_save_state,
+    window_set_always_on_top, window_set_mini_mode,
 };
 use source_commands::{
-    ResolveCancellationRegistry, lx_http_request, lx_runtime_failure, lx_runtime_result, lx_send,
-    player_cancel_resolve, player_play_online_track, source_activate, source_export_backup,
-    source_get_config, source_get_fallback_config, source_import_file, source_import_url,
-    source_list, source_reimport, source_reload, source_remove, source_resolve,
+    LxHttpConcurrencyLimiter, ResolveCancellationRegistry, lx_http_request, lx_runtime_failure,
+    lx_runtime_result, lx_send, player_cancel_resolve, player_play_online_track, source_activate,
+    source_export_backup, source_get_config, source_get_fallback_config, source_import_file,
+    source_import_url, source_list, source_reimport, source_reload, source_remove, source_resolve,
     source_restore_backup, source_set_config, source_set_enabled, source_set_fallback_config,
     source_set_order, source_set_updates_enabled, source_status,
 };
 use source_runtime::SourceRuntime;
 
 pub(crate) const SANDBOX_LABEL: &str = "lx-sandbox";
+
+#[derive(Default)]
+struct AppCloseRequestState {
+    notice_pending: AtomicBool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutputDeviceStatus {
+    devices: Vec<String>,
+    default_device: Option<String>,
+    selected_device: Option<String>,
+}
 
 pub(crate) fn isolated_smoke_data_root() -> Option<PathBuf> {
     (std::env::var_os("GX_PHASE1_LX_POC").is_some()
@@ -202,8 +228,8 @@ async fn library_import_files(
     paths: Vec<String>,
 ) -> Result<LibraryImportResult, String> {
     require_window(&window, "main")?;
-    if paths.len() > 10_000 {
-        return Err("单次最多导入 10000 个本地音频文件".into());
+    if paths.len() > MAX_LIBRARY_TRACKS {
+        return Err(format!("单次最多导入 {MAX_LIBRARY_TRACKS} 个本地音频文件"));
     }
     let app = window.app_handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -212,6 +238,33 @@ async fn library_import_files(
     })
     .await
     .map_err(|error| format!("本地音乐导入任务失败: {error}"))?
+}
+
+#[tauri::command]
+async fn library_relink_track(
+    window: WebviewWindow,
+    old_path: String,
+    new_path: String,
+) -> Result<LibraryTrack, String> {
+    require_window(&window, "main")?;
+    if old_path.trim().is_empty() || new_path.trim().is_empty() {
+        return Err("原路径和新路径不能为空".into());
+    }
+    if old_path.len() > 32 * 1024 || new_path.len() > 32 * 1024 {
+        return Err("本地音频路径过长".into());
+    }
+
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&new_path);
+        let info = gx_audio::probe_local_file(&path).map_err(|error| error.to_string())?;
+        let replacement = new_library_track(&path, info);
+        app.state::<LibraryStore>()
+            .relink_track(&old_path, &replacement)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("本地音乐重新定位任务失败: {error}"))?
 }
 
 fn import_local_files(
@@ -349,7 +402,7 @@ fn library_tracks(
 ) -> Result<Vec<LibraryTrack>, String> {
     require_window(&window, "main")?;
     library
-        .list_tracks(10_000)
+        .list_tracks(MAX_LIBRARY_TRACKS)
         .map_err(|error| error.to_string())
 }
 
@@ -421,6 +474,18 @@ fn library_playlist_tracks(
 }
 
 #[tauri::command]
+fn library_playlist_items(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    playlist_id: i64,
+) -> Result<Vec<PlaylistItem>, String> {
+    require_window(&window, "main")?;
+    library
+        .playlist_items(playlist_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn library_add_to_playlist(
     window: WebviewWindow,
     library: tauri::State<LibraryStore>,
@@ -443,6 +508,50 @@ fn library_remove_from_playlist(
     require_window(&window, "main")?;
     library
         .remove_from_playlist(playlist_id, track_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn library_add_cached_to_playlist(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    playlist_id: i64,
+    provider_id: String,
+    provider_track_id: String,
+    quality: String,
+    title: String,
+    artist: String,
+    album: String,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .add_cached_to_playlist(
+            playlist_id,
+            &CachedPlaylistTrack {
+                provider_id,
+                provider_track_id,
+                quality,
+                title,
+                artist,
+                album,
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_remove_cached_from_playlist(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    playlist_id: i64,
+    provider_id: String,
+    provider_track_id: String,
+    quality: String,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .remove_cached_from_playlist(playlist_id, &provider_id, &provider_track_id, &quality)
         .map_err(|error| error.to_string())
 }
 
@@ -519,27 +628,85 @@ fn player_set_volume(
 }
 
 #[tauri::command]
+fn player_commit_volume(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    preferences: tauri::State<AppPreferencesState>,
+    volume: f32,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    let previous = preferences.get().volume;
+    engine
+        .set_volume(volume)
+        .map_err(|error| error.to_string())?;
+    match preferences.set_volume(volume) {
+        Ok(next) => Ok(next),
+        Err(error) => {
+            let _ = engine.set_volume(previous);
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
 fn player_set_dsp_settings(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
-    settings: DspSettings,
-) -> Result<(), String> {
+    preferences: tauri::State<AppPreferencesState>,
+    control: DspControlState,
+) -> Result<AppPreferences, String> {
     require_window(&window, "main")?;
-    engine
-        .set_dsp_settings(settings)
-        .map_err(|error| error.to_string())
+    apply_persisted_dsp_control(&engine, &preferences, control)
 }
 
 #[tauri::command]
 fn player_set_audio_mode(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
+    preferences: tauri::State<AppPreferencesState>,
     mode: AudioMode,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    apply_persisted_dsp_control(
+        &engine,
+        &preferences,
+        DspControlState::from_audio_mode(mode),
+    )
+}
+
+fn apply_persisted_dsp_control(
+    engine: &LocalAudioEngine,
+    preferences: &AppPreferencesState,
+    control: DspControlState,
+) -> Result<AppPreferences, String> {
+    control
+        .validate_product()
+        .map_err(|error| error.to_string())?;
+    let _transaction = preferences.lock_dsp_transaction();
+    let previous = preferences.get().dsp_control;
+    engine
+        .set_dsp_control_confirmed(control.clone())
+        .map_err(|error| error.to_string())?;
+    match preferences.set_dsp_control(control) {
+        Ok(next) => Ok(next),
+        Err(error) => match engine.set_dsp_control_confirmed(previous) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; failed to restore the previous DSP state: {rollback_error}"
+            )),
+        },
+    }
+}
+
+#[tauri::command]
+fn player_set_ab_dry(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    enabled: bool,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
-    engine
-        .set_audio_mode(mode)
-        .map_err(|error| error.to_string())
+    engine.set_ab_dry(enabled);
+    Ok(())
 }
 
 #[tauri::command]
@@ -578,16 +745,93 @@ fn player_output_devices(
     engine.output_devices().map_err(|error| error.to_string())
 }
 
+fn output_device_status(
+    engine: &LocalAudioEngine,
+    preferences: &AppPreferencesState,
+) -> Result<OutputDeviceStatus, String> {
+    Ok(OutputDeviceStatus {
+        devices: engine.output_devices().map_err(|error| error.to_string())?,
+        default_device: engine
+            .default_output_device_name()
+            .map_err(|error| error.to_string())?,
+        selected_device: preferences.get().output_device,
+    })
+}
+
+#[tauri::command]
+fn player_refresh_output_devices(
+    window: WebviewWindow,
+    engine: tauri::State<LocalAudioEngine>,
+    preferences: tauri::State<AppPreferencesState>,
+) -> Result<OutputDeviceStatus, String> {
+    require_window(&window, "main")?;
+    output_device_status(&engine, &preferences)
+}
+
 #[tauri::command]
 fn player_set_output_device(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
+    preferences: tauri::State<AppPreferencesState>,
     name: Option<String>,
+) -> Result<OutputDeviceStatus, String> {
+    require_window(&window, "main")?;
+    let devices = engine.output_devices().map_err(|error| error.to_string())?;
+    if let Some(name) = name.as_deref()
+        && !devices.iter().any(|device| device == name)
+    {
+        return Err(format!("输出设备“{name}”当前不可用，请刷新后重试"));
+    }
+    let previous = preferences.get().output_device;
+    preferences.set_output_device(name.clone())?;
+    if let Err(error) = engine.set_output_device(name) {
+        let _ = preferences.set_output_device(previous);
+        return Err(error.to_string());
+    }
+    output_device_status(&engine, &preferences)
+}
+
+#[tauri::command]
+fn app_preferences_get(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    Ok(preferences.get())
+}
+
+#[tauri::command]
+fn app_preferences_set_close_behavior(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    behavior: CloseBehavior,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    preferences.set_close_behavior(behavior)
+}
+
+#[tauri::command]
+fn app_close_notice_confirm(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    close_request: tauri::State<AppCloseRequestState>,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    let next = preferences.mark_close_notice_shown()?;
+    close_request.notice_pending.store(false, Ordering::Release);
+    save_main_window_state(window.app_handle());
+    window.hide().map_err(|error| error.to_string())?;
+    Ok(next)
+}
+
+#[tauri::command]
+fn app_close_notice_cancel(
+    window: WebviewWindow,
+    close_request: tauri::State<AppCloseRequestState>,
 ) -> Result<(), String> {
     require_window(&window, "main")?;
-    engine
-        .set_output_device(name)
-        .map_err(|error| error.to_string())
+    close_request.notice_pending.store(false, Ordering::Release);
+    Ok(())
 }
 
 #[tauri::command]
@@ -694,6 +938,36 @@ pub(crate) fn phase1_lx_send(
     }
 }
 
+fn phase1_lx_poc_enabled() -> bool {
+    std::env::var_os("GX_PHASE1_LX_POC").is_some()
+}
+
+fn require_phase1_lx_poc_enabled(enabled: bool) -> Result<(), String> {
+    if enabled {
+        Ok(())
+    } else {
+        Err("Phase-1 LX POC commands are disabled".into())
+    }
+}
+
+fn require_phase1_lx_poc() -> Result<(), String> {
+    require_phase1_lx_poc_enabled(phase1_lx_poc_enabled())
+}
+
+fn phase1_poc_failure_exit_code(enabled: bool) -> Result<i32, String> {
+    require_phase1_lx_poc_enabled(enabled)?;
+    Ok(2)
+}
+
+fn phase1_poc_should_auto_exit(
+    enabled: bool,
+    complete: bool,
+    auto_exit: bool,
+) -> Result<bool, String> {
+    require_phase1_lx_poc_enabled(enabled)?;
+    Ok(complete && auto_exit)
+}
+
 #[tauri::command]
 fn lx_poc_result(
     window: WebviewWindow,
@@ -702,6 +976,7 @@ fn lx_poc_result(
     result: Value,
 ) -> Result<(), String> {
     require_window(&window, SANDBOX_LABEL)?;
+    require_phase1_lx_poc()?;
     let url = result
         .get("url")
         .and_then(Value::as_str)
@@ -714,7 +989,7 @@ fn lx_poc_result(
     window
         .eval("window.__gxRunCryptoSelfTest(); window.__gxRunSecuritySelfTest();")
         .map_err(|error| error.to_string())?;
-    maybe_finish(&app, &state);
+    maybe_finish(&app, &state)?;
     Ok(())
 }
 
@@ -727,12 +1002,13 @@ fn lx_crypto_result(
     details: Value,
 ) -> Result<(), String> {
     require_window(&window, SANDBOX_LABEL)?;
+    require_phase1_lx_poc()?;
     if !passed {
         return Err(format!("synchronous crypto self-test failed: {details}"));
     }
     println!("GX_PHASE1_LX_SYNC_CRYPTO_OK {details}");
     state.progress.lock().unwrap().crypto_passed = true;
-    maybe_finish(&app, &state);
+    maybe_finish(&app, &state)?;
     Ok(())
 }
 
@@ -744,6 +1020,7 @@ fn lx_security_result(
     results: SecurityResults,
 ) -> Result<(), String> {
     require_window(&window, SANDBOX_LABEL)?;
+    require_phase1_lx_poc()?;
     if !(results.main_command_blocked
         && results.source_command_blocked
         && results.opener_blocked
@@ -757,7 +1034,7 @@ fn lx_security_result(
     }
     println!("GX_PHASE1_LX_SECURITY_OK");
     state.progress.lock().unwrap().security_passed = true;
-    maybe_finish(&app, &state);
+    maybe_finish(&app, &state)?;
     Ok(())
 }
 
@@ -769,19 +1046,27 @@ fn lx_poc_failure(
     error: String,
 ) -> Result<(), String> {
     require_window(&window, SANDBOX_LABEL)?;
+    let exit_code = phase1_poc_failure_exit_code(phase1_lx_poc_enabled())?;
     eprintln!("GX_PHASE1_LX_FAILED stage={stage} error={error}");
-    app.exit(2);
+    app.exit(exit_code);
     Ok(())
 }
 
-fn maybe_finish(app: &AppHandle, state: &tauri::State<LxPocState>) {
+fn maybe_finish(app: &AppHandle, state: &tauri::State<LxPocState>) -> Result<(), String> {
     let progress = state.progress.lock().unwrap();
-    if progress.music_url_passed && progress.crypto_passed && progress.security_passed {
+    let complete = progress.music_url_passed && progress.crypto_passed && progress.security_passed;
+    let should_exit = phase1_poc_should_auto_exit(
+        phase1_lx_poc_enabled(),
+        complete,
+        std::env::var_os("GX_PHASE1_AUTO_EXIT").is_some(),
+    )?;
+    if complete {
         println!("GX_PHASE1_LX_SANDBOX_OK");
-        if std::env::var_os("GX_PHASE1_AUTO_EXIT").is_some() {
+        if should_exit {
             app.exit(0);
         }
     }
+    Ok(())
 }
 
 fn phase1_script_path() -> PathBuf {
@@ -792,6 +1077,30 @@ fn phase1_script_path() -> PathBuf {
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(".phase1-cache/lx-script/dist/lx-source-script.js")
         })
+}
+
+#[cfg(test)]
+mod phase1_poc_guard_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_poc_mode_cannot_produce_any_process_exit_decision() {
+        assert_eq!(
+            require_phase1_lx_poc_enabled(false).unwrap_err(),
+            "Phase-1 LX POC commands are disabled"
+        );
+        assert!(phase1_poc_failure_exit_code(false).is_err());
+        assert!(phase1_poc_should_auto_exit(false, true, true).is_err());
+        assert!(phase1_poc_should_auto_exit(false, false, false).is_err());
+    }
+
+    #[test]
+    fn enabled_poc_mode_preserves_explicit_smoke_exit_semantics() {
+        assert_eq!(phase1_poc_failure_exit_code(true).unwrap(), 2);
+        assert!(phase1_poc_should_auto_exit(true, true, true).unwrap());
+        assert!(!phase1_poc_should_auto_exit(true, true, false).unwrap());
+        assert!(!phase1_poc_should_auto_exit(true, false, true).unwrap());
+    }
 }
 
 /// Size and show the main window before first paint.
@@ -829,6 +1138,30 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn save_main_window_state(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(app_data) = app.path().app_data_dir() else {
+        return;
+    };
+    let mini_mode = app
+        .try_state::<window_state::WindowModeState>()
+        .is_some_and(|mode| mode.mini_mode());
+    if mini_mode {
+        let mut state = window_state::load(&app_data);
+        state.mini_mode = true;
+        let _ = window_state::save(&app_data, &state);
+    } else if let Some(state) = window_state::capture_from_window(&window, false) {
+        let _ = window_state::save(&app_data, &state);
+    }
+}
+
+fn request_app_exit(app: &AppHandle) {
+    save_main_window_state(app);
+    app.exit(0);
+}
+
 fn create_system_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "tray-show", "显示主界面", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "tray-quit", "退出", true, None::<&str>)?;
@@ -845,7 +1178,7 @@ fn create_system_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "tray-show" => show_main_window(app),
-            "tray-quit" => app.exit(0),
+            "tray-quit" => request_app_exit(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -922,9 +1255,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(audio_engine)
+        .manage(LxHttpConcurrencyLimiter::default())
         .manage(ResolveCancellationRegistry::default())
+        .manage(MetadataClient::default())
+        .manage(MetadataCancellationRegistry::default())
         .manage(media_session::MediaSessionState::default())
         .manage(transport::TransportState::default())
+        .manage(AppCloseRequestState::default())
         .manage(LxPocState {
             script_path: phase1_script_path(),
             progress: Mutex::new(LxPocProgress::default()),
@@ -934,16 +1271,59 @@ pub fn run() {
                 && let tauri::WindowEvent::CloseRequested { api, .. } = event
             {
                 api.prevent_close();
-                let _ = window.hide();
+                let app = window.app_handle();
+                let preferences = app.state::<AppPreferencesState>();
+                match preferences.close_action() {
+                    CloseAction::Exit => request_app_exit(app),
+                    CloseAction::Hide => {
+                        save_main_window_state(app);
+                        let _ = window.hide();
+                    }
+                    CloseAction::Explain => {
+                        let close_request = app.state::<AppCloseRequestState>();
+                        if close_request
+                            .notice_pending
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                            && window.emit("gx-close-to-tray-notice-requested", ()).is_err()
+                        {
+                            close_request.notice_pending.store(false, Ordering::Release);
+                        }
+                    }
+                }
             }
         })
         .setup(|app| {
             let app_data = isolated_smoke_data_root().unwrap_or(app.path().app_data_dir()?);
+            let preferences = AppPreferencesState::open(&app_data);
+            let restored_preferences = preferences.get();
+            let engine = app.state::<LocalAudioEngine>();
+            engine
+                .set_volume(restored_preferences.volume)
+                .map_err(tauri::Error::Anyhow)?;
+            engine
+                .set_dsp_control_confirmed(restored_preferences.dsp_control.clone())
+                .map_err(tauri::Error::Anyhow)?;
+            if let Some(device) = restored_preferences.output_device.as_ref() {
+                let available = engine.output_devices().unwrap_or_default();
+                if available.iter().any(|candidate| candidate == device) {
+                    engine
+                        .set_output_device(Some(device.clone()))
+                        .map_err(tauri::Error::Anyhow)?;
+                } else if let Err(error) = preferences.clear_output_device_if_matches(device) {
+                    eprintln!("failed to clear unavailable output device preference: {error}");
+                }
+            }
+            app.manage(preferences);
             app.manage(artwork::ArtworkCache::new(
                 app_data.join("artwork-cache"),
             ));
             app.manage(network_settings::NetworkSettingsState::open(&app_data));
             app.manage(DiagnosticLogState::open(&app_data));
+            app.manage(
+                preview_cache::PreviewCacheStore::open(app_data.join("preview-cache"))
+                    .map_err(std::io::Error::other)?,
+            );
             app.manage(window_state::WindowModeState::new(
                 window_state::load(&app_data).mini_mode,
             ));
@@ -960,7 +1340,16 @@ pub fn run() {
                     error.to_string(),
                 );
             })?;
+            let cache_store_for_validation = cache_store.clone();
             app.manage(cache_store);
+            std::thread::Builder::new()
+                .name("gx-cache-validation".into())
+                .spawn(move || {
+                    if let Err(error) = cache_store_for_validation.deep_validate() {
+                        eprintln!("background cache validation failed: {error}");
+                    }
+                })
+                .ok();
             let source_root = app_data.join("sources");
             let drop_in_root = source_root.join("drop-in");
             let mut source_store = SourceStore::open(&source_root)?;
@@ -1032,9 +1421,11 @@ pub fn run() {
             player_pause,
             player_seek,
             player_set_volume,
+            player_commit_volume,
             player_set_audio_mode,
             player_set_play_mode,
             player_set_dsp_settings,
+            player_set_ab_dry,
             player_next,
             player_previous,
             player_jump,
@@ -1044,9 +1435,18 @@ pub fn run() {
             player_snapshot,
             player_set_transport_capabilities,
             player_output_devices,
+            player_refresh_output_devices,
             player_set_output_device,
+            app_preferences_get,
+            app_preferences_set_close_behavior,
+            app_close_notice_confirm,
+            app_close_notice_cancel,
             player_media_action,
             library_import_files,
+            library_import_folders,
+            library_relink_track,
+            library_relink_tracks,
+            library_remove_tracks,
             library_tracks,
             library_favorites,
             library_set_favorite,
@@ -1054,11 +1454,15 @@ pub fn run() {
             library_create_playlist,
             library_delete_playlist,
             library_playlist_tracks,
+            library_playlist_items,
             library_add_to_playlist,
             library_remove_from_playlist,
+            library_add_cached_to_playlist,
+            library_remove_cached_from_playlist,
             library_export_backup,
             library_restore_backup,
             library_scan_missing,
+            library_check_local_paths,
             library_history,
             library_clear_history,
             library_record_history,
@@ -1070,6 +1474,8 @@ pub fn run() {
             window_set_mini_mode,
             backup_write_file,
             backup_read_file,
+            backup_preview_restore,
+            backup_restore_atomic,
             sandbox_ready,
             source_list,
             source_status,
@@ -1090,8 +1496,10 @@ pub fn run() {
             source_restore_backup,
             source_resolve,
             metadata_search,
+            metadata_cancel_request,
             metadata_chart,
             metadata_lyrics,
+            metadata_read_local_lyrics,
             metadata_find_replacements,
             metadata_play_preview,
             lx_http_request,
@@ -1103,6 +1511,8 @@ pub fn run() {
             lx_security_result,
             lx_poc_failure,
             cache_status,
+            preview_cache_status,
+            preview_cache_clear,
             cache_set_limit,
             cache_set_directory,
             cache_reset_directory,
@@ -1113,8 +1523,71 @@ pub fn run() {
             cache_remove_by_quality,
             cache_online_favorites,
             cache_set_online_favorite,
-            player_play_cache_entry
+            player_play_cache_entry,
+            player_play_history_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod dsp_preference_tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn test_root() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "gxplayer-dsp-preference-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn wait_for_dsp_control(engine: &LocalAudioEngine, expected: &DspControlState) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            if snapshot.dsp_settings == expected.settings
+                && snapshot.active_preset_id == expected.active_preset_id
+                && snapshot.intensity == expected.intensity
+                && snapshot.spatial_amount == expected.spatial_amount
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine did not publish the acknowledged DSP state"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn failed_dsp_persist_confirmedly_restores_the_previous_runtime_state() {
+        let root = test_root();
+        let preferences = AppPreferencesState::open(&root);
+        let engine = LocalAudioEngine::new().unwrap();
+        let previous = DspControlState::from_audio_mode(AudioMode::CinemaGame);
+
+        apply_persisted_dsp_control(&engine, &preferences, previous.clone()).unwrap();
+        wait_for_dsp_control(&engine, &previous);
+
+        fs::remove_file(root.join("app-preferences.json")).unwrap();
+        fs::create_dir_all(root.join("app-preferences.json")).unwrap();
+        let error = apply_persisted_dsp_control(&engine, &preferences, DspControlState::default())
+            .unwrap_err();
+
+        assert!(error.contains("path is a directory"));
+        assert_eq!(preferences.get().dsp_control, previous);
+        wait_for_dsp_control(&engine, &previous);
+
+        drop(engine);
+        drop(preferences);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -1,46 +1,10 @@
-.text-playlist-backdrop {
-  overflow: auto;
-}
-
 .text-playlist-dialog {
-  display: flex;
-  flex-direction: column;
-  width: min(760px, 94vw);
+  width: min(900px, calc(100vw - 48px));
   max-height: min(88vh, 820px);
-  padding: 22px;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-lg);
-  background: var(--panel-strong, rgba(20, 20, 29, 0.98));
-  box-shadow: var(--shadow-lg);
-}
-
-.text-playlist-dialog-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 20px;
-  margin-bottom: 16px;
-}
-
-.text-playlist-dialog-header h2,
-.text-playlist-dialog-header p {
-  margin: 0;
-}
-
-.text-playlist-dialog-header h2 {
-  margin-top: 3px;
-  font-size: 20px;
-}
-
-.text-playlist-dialog-header p:last-child {
-  max-width: 610px;
-  margin-top: 7px;
-  color: var(--text-mute);
-  font-size: 12px;
-  line-height: 1.6;
 }
 
 .text-playlist-input-label {
+  display: block;
   margin-bottom: 6px;
   color: var(--text-mute);
   font-size: 12px;
@@ -48,6 +12,7 @@
 }
 
 .text-playlist-input {
+  display: block;
   width: 100%;
   min-height: 150px;
   resize: vertical;
@@ -58,7 +23,7 @@
 
 .text-playlist-toolbar,
 .text-playlist-progress,
-.text-playlist-actions {
+.text-playlist-summary {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -86,6 +51,24 @@
   font-family: "Geist Mono Variable", monospace;
 }
 
+.text-playlist-summary {
+  flex-wrap: wrap;
+  margin-top: 8px;
+  color: var(--text-mute);
+  font-size: 11px;
+}
+
+.text-playlist-summary strong {
+  margin-right: 2px;
+  color: var(--text-hi);
+}
+
+.text-playlist-summary span {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--glass-border) 45%, transparent);
+}
+
 .text-playlist-warnings {
   margin: 10px 0 0;
   padding: 8px 11px 8px 28px;
@@ -103,12 +86,25 @@
 
 .text-playlist-row {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
+  grid-template-columns: 34px 24px minmax(120px, 0.72fr) minmax(210px, 1.28fr) 62px;
   align-items: center;
   gap: 10px;
   min-height: 46px;
   padding: 7px 2px;
   border-bottom: 1px solid color-mix(in srgb, var(--glass-border) 70%, transparent);
+}
+
+.text-playlist-row-check {
+  display: grid;
+  place-items: center;
+}
+
+.text-playlist-row-check input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .text-playlist-line-number {
@@ -122,6 +118,28 @@
   display: grid;
   min-width: 0;
   gap: 2px;
+}
+
+.text-playlist-row-candidate {
+  min-width: 0;
+}
+
+.text-playlist-row-candidate select {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 3px 26px 3px 8px;
+  color: var(--text-hi);
+  font-size: 11px;
+}
+
+.text-playlist-row-candidate small {
+  display: block;
+  overflow: hidden;
+  color: var(--text-mute);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .text-playlist-row-copy strong,
@@ -154,8 +172,13 @@
 }
 
 .text-playlist-row.status-error .text-playlist-row-status,
-.text-playlist-row.status-invalid .text-playlist-row-status {
+.text-playlist-row.status-invalid .text-playlist-row-status,
+.text-playlist-row.status-not_found .text-playlist-row-status {
   color: var(--error-fg);
+}
+
+.text-playlist-row.status-matched:has(.text-playlist-row-check input:not(:checked)) .text-playlist-row-status {
+  color: var(--warning-fg);
 }
 
 .text-playlist-row.status-searching .text-playlist-row-status {
@@ -168,15 +191,10 @@
   font-size: 12px;
 }
 
-.text-playlist-actions {
-  justify-content: flex-end;
-  margin-top: 16px;
-}
-
 @media (max-width: 560px) {
   .text-playlist-dialog {
-    width: 96vw;
-    max-height: 92vh;
+    width: 100%;
+    max-height: calc(100vh - 24px);
     padding: 16px;
   }
 
@@ -184,5 +202,18 @@
     align-items: flex-start;
     flex-direction: column;
     gap: 3px;
+  }
+
+  .text-playlist-row {
+    grid-template-columns: 26px 20px minmax(0, 1fr) auto;
+  }
+
+  .text-playlist-row-candidate {
+    grid-column: 3 / -1;
+  }
+
+  .text-playlist-row-status {
+    grid-column: 4;
+    grid-row: 1;
   }
 }

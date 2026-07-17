@@ -238,6 +238,17 @@
 }
 
 * { box-sizing: border-box; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 html, body, #root {
   width: 100%;
   height: 100%;
@@ -855,8 +866,16 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .sidebar nav button.active,
 .sidebar-playlists button.active {
   color: var(--text-hi);
-  background: color-mix(in srgb, var(--accent-readable) 11%, var(--control-hover));
+  background: color-mix(in srgb, var(--accent-readable) 14%, var(--control-hover));
   box-shadow: inset 2px 0 0 var(--accent-contrast);
+}
+
+/* The active glyph itself lights up in accent — the selection reads on the
+   icon, not just a thin edge rail (which detaches from the centred icon when
+   the sidebar is collapsed). */
+.sidebar nav button.active span,
+.sidebar-playlists button.active span {
+  color: var(--accent-readable);
 }
 
 .sidebar nav button span {
@@ -961,6 +980,13 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .sidebar-collapsed .sidebar-playlists button {
   grid-template-columns: 1fr;
   text-align: center;
+}
+
+/* Collapsed: the edge rail detaches from the centred icon, so drop it and let
+   the accent glyph + fill carry the selection instead. */
+.sidebar-collapsed .sidebar nav button.active,
+.sidebar-collapsed .sidebar-playlists button.active {
+  box-shadow: none;
 }
 
 /* ── Content / pages ───────────────────────────────────── */

@@ -3603,7 +3603,8 @@ function App() {
                       }
                     }}
                   >
-                    <span className="track-index">{entry.kind.slice(0, 2)}</span>
+                    <span className="track-index" aria-hidden="true">{entry.kind === "local" ? "♪" : entry.kind === "cached" ? "◉" : "☁"}</span>
+                    <span className="sr-only">{entry.kind === "local" ? "本地播放" : entry.kind === "cached" ? "缓存播放" : "在线播放"}</span>
                     <span>
                       <strong>{entry.title}</strong>
                       <small>{entry.artist || "未知歌手"} · {new Date(entry.playedAtMs).toLocaleString()}</small>

@@ -382,6 +382,11 @@ fn resample_hrir(source: &[i16], target_sample_rate: u32) -> Vec<f32> {
     output
 }
 
+/// Highest crossfeed cutoff accepted by `CrossfeedProcessor::new` at `sample_rate`.
+pub(crate) fn max_crossfeed_cutoff_hz(sample_rate: u32) -> f32 {
+    sample_rate as f32 * 0.45
+}
+
 fn validate_crossfeed(sample_rate: u32, settings: &CrossfeedSettings) -> Result<(), DspError> {
     if !settings.amount.is_finite() || !(0.0..=0.5).contains(&settings.amount) {
         return Err(DspError::InvalidCrossfeedAmount(settings.amount));
@@ -389,7 +394,7 @@ fn validate_crossfeed(sample_rate: u32, settings: &CrossfeedSettings) -> Result<
     if !settings.delay_ms.is_finite() || !(0.05..=1.0).contains(&settings.delay_ms) {
         return Err(DspError::InvalidCrossfeedDelay(settings.delay_ms));
     }
-    let max_cutoff = sample_rate as f32 * 0.45;
+    let max_cutoff = max_crossfeed_cutoff_hz(sample_rate);
     if !settings.cutoff_hz.is_finite()
         || settings.cutoff_hz < 100.0
         || settings.cutoff_hz > max_cutoff

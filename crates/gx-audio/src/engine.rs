@@ -1846,7 +1846,13 @@ impl PlaybackSession {
         )
         .context("failed to build output device stream")?;
         let mut rate_adapter = RateAdapter::new(sample_rate, output_sample_rate, channels)?;
-        let mut dsp_chain = DspChain::new(output_sample_rate, output_channels, dsp_settings)?;
+        // Persisted presets are validated at 48 kHz, not at every device rate. On a lower-rate
+        // device, clamp near-Nyquist parameters instead of failing the whole track load.
+        let mut dsp_chain = DspChain::new(
+            output_sample_rate,
+            output_channels,
+            dsp_settings.clamped_for_sample_rate(output_sample_rate),
+        )?;
         let prefetched = std::mem::take(&mut media.prefetched_samples);
         let mut pending = if prefetched.is_empty() {
             Vec::new()
@@ -2014,7 +2020,10 @@ impl PlaybackSession {
     }
 
     fn set_dsp_settings(&mut self, settings: DspSettings) -> Result<()> {
-        self.dsp_chain.set_settings(settings)?;
+        // Same clamp as the session build: the caller validated against a possibly stale output
+        // rate, so a low-rate device must not turn a valid preset into a live-update failure.
+        self.dsp_chain
+            .set_settings(settings.clamped_for_sample_rate(self.output_sample_rate))?;
         Ok(())
     }
 
@@ -2257,9 +2266,17 @@ fn render_output_callback<T>(
     for frame in output.chunks_mut(output_channels) {
         let dry = counters.ab_dry_active.load(Ordering::Relaxed);
         let dry_mix = ab_dry_ramp.advance(dry);
+        // A tail chunk smaller than one interleaved frame cannot carry a complete frame in the
+        // first place, so it is silenced without counting as an underrun.
+        if frame.len() != output_channels {
+            for target in frame {
+                *target = T::from_sample(0.0);
+            }
+            continue;
+        }
         // Never consume a partial interleaved frame. A producer can publish one channel just
         // before backpressure; popping it alone would shift every channel after the underrun.
-        if frame.len() != output_channels || consumer.occupied_len() < output_channels {
+        if consumer.occupied_len() < output_channels {
             starved |= enabled;
             for target in frame {
                 *target = T::from_sample(0.0);
@@ -3209,6 +3226,37 @@ mod tests {
         render_output_callback(&mut output, &mut consumer, &counters, &mut ramp);
         assert_eq!(output, [0.25, 0.75]);
         assert_eq!(counters.played_samples.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.underruns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn partial_tail_chunk_is_not_counted_as_underrun() {
+        let ring = HeapRb::<AbSample>::new(8);
+        let (mut producer, mut consumer) = ring.split();
+        producer.try_push(AbSample::same(0.25)).unwrap();
+        producer.try_push(AbSample::same(0.75)).unwrap();
+        let counters = OutputCallbackCounters {
+            played_samples: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
+            enabled: Arc::new(AtomicBool::new(true)),
+            volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            ab_dry_active: Arc::new(AtomicBool::new(false)),
+            output_sample_rate: 48_000,
+            output_channels: 2,
+        };
+        let mut ramp = AbDryRamp::new(48_000);
+        // Three samples at two channels: one complete frame plus a sub-frame tail chunk.
+        let mut output = [1.0f32; 3];
+
+        render_output_callback(&mut output, &mut consumer, &counters, &mut ramp);
+
+        assert_eq!(output, [0.25, 0.75, 0.0]);
+        assert_eq!(counters.played_samples.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.underruns.load(Ordering::Relaxed), 0);
+
+        // A complete frame that truly lacks data still counts.
+        render_output_callback(&mut output, &mut consumer, &counters, &mut ramp);
+        assert_eq!(output, [0.0, 0.0, 0.0]);
         assert_eq!(counters.underruns.load(Ordering::Relaxed), 1);
     }
 

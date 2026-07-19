@@ -589,7 +589,20 @@ function App() {
   const [snapshot, setSnapshot] = useEngineSnapshot((error) => {
     setMessageState(String(error));
     setMessageIsError(true);
-  });
+  }, (incoming, current) => (
+    // While a DSP change is still in flight, a snapshot generated before it landed
+    // would briefly revert the optimistic preset/intensity fields.
+    pendingDspControlRef.current || dspApplyRunningRef.current
+      ? {
+        ...incoming,
+        audioMode: current.audioMode,
+        dspSettings: current.dspSettings,
+        activePresetId: current.activePresetId,
+        intensity: current.intensity,
+        spatialAmount: current.spatialAmount,
+      }
+      : incoming
+  ));
   const {
     alwaysOnTop,
     miniMode,

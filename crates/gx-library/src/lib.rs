@@ -257,13 +257,27 @@ impl LibraryStore {
             bail!("track list limit cannot exceed {MAX_LIBRARY_TRACKS}");
         }
         let connection = self.connection.lock().unwrap();
-        ensure_library_track_limit(&connection)?;
         query_tracks(
             &connection,
             "SELECT t.id, t.path, t.title, t.artist, t.album, t.duration_seconds,
                     EXISTS(SELECT 1 FROM favorites f WHERE f.track_id=t.id), t.added_at_ms
              FROM tracks t ORDER BY t.added_at_ms DESC, t.id DESC LIMIT ?1",
             params![limit as i64],
+        )
+    }
+
+    /// List every track without the per-request cap. Libraries can legitimately hold
+    /// more than `MAX_LIBRARY_TRACKS` rows (older builds only limited single imports),
+    /// and full reads must not truncate or backups and pruning would silently lose
+    /// tracks.
+    pub fn list_all_tracks(&self) -> Result<Vec<LibraryTrack>> {
+        let connection = self.connection.lock().unwrap();
+        query_tracks(
+            &connection,
+            "SELECT t.id, t.path, t.title, t.artist, t.album, t.duration_seconds,
+                    EXISTS(SELECT 1 FROM favorites f WHERE f.track_id=t.id), t.added_at_ms
+             FROM tracks t ORDER BY t.added_at_ms DESC, t.id DESC",
+            [],
         )
     }
 
@@ -529,7 +543,7 @@ impl LibraryStore {
 
     /// Mark library tracks whose files no longer exist on disk.
     pub fn scan_missing(&self) -> Result<Vec<LibraryTrack>> {
-        let mut tracks = self.list_tracks(MAX_LIBRARY_TRACKS)?;
+        let mut tracks = self.list_all_tracks()?;
         for track in &mut tracks {
             track.missing = !Path::new(&track.path).is_file();
         }
@@ -671,7 +685,7 @@ impl LibraryStore {
     }
 
     pub fn export_backup(&self) -> Result<LibraryBackup> {
-        let tracks = self.list_tracks(MAX_LIBRARY_TRACKS)?;
+        let tracks = self.list_all_tracks()?;
         let playlists = self
             .list_playlists()?
             .into_iter()
@@ -715,10 +729,15 @@ impl LibraryStore {
 
     /// Validate every constraint used by backup restoration without changing the database.
     pub fn validate_backup(backup: &LibraryBackup) -> Result<()> {
-        if !matches!(backup.version, 1 | 2)
-            || backup.tracks.len() > MAX_LIBRARY_TRACKS
-            || backup.playlists.len() > 1_000
-        {
+        if backup.tracks.len() > MAX_LIBRARY_TRACKS {
+            bail!("unsupported or oversized library backup");
+        }
+        Self::validate_backup_contents(backup)
+    }
+
+    /// Structural checks shared with rollback restores, which skip the track-count cap.
+    fn validate_backup_contents(backup: &LibraryBackup) -> Result<()> {
+        if !matches!(backup.version, 1 | 2) || backup.playlists.len() > 1_000 {
             bail!("unsupported or oversized library backup");
         }
 
@@ -780,6 +799,20 @@ impl LibraryStore {
 
     pub fn restore_backup(&self, backup: &LibraryBackup) -> Result<()> {
         Self::validate_backup(backup)?;
+        self.apply_backup(backup, true)
+    }
+
+    /// Restore a snapshot exported from this process to roll back a failed restore.
+    ///
+    /// Skips the track-count cap: legacy libraries can exceed `MAX_LIBRARY_TRACKS`, and
+    /// a rollback must reproduce them exactly or a failed restore would strand the user
+    /// in a half-restored state. Must never be reachable from a frontend command.
+    pub fn restore_backup_for_rollback(&self, backup: &LibraryBackup) -> Result<()> {
+        Self::validate_backup_contents(backup)?;
+        self.apply_backup(backup, false)
+    }
+
+    fn apply_backup(&self, backup: &LibraryBackup, enforce_track_limit: bool) -> Result<()> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction()?;
         transaction.execute_batch(
@@ -851,7 +884,9 @@ impl LibraryStore {
                 }
             }
         }
-        ensure_library_track_limit(&transaction)?;
+        if enforce_track_limit {
+            ensure_library_track_limit(&transaction)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1041,6 +1076,9 @@ fn query_tracks<P: rusqlite::Params>(
         .map_err(Into::into)
 }
 
+/// Guard for write/import paths only. Read and delete paths must keep working on
+/// libraries that already exceed the limit so users can list, back up, and prune
+/// their way back under it.
 fn ensure_library_track_limit(connection: &Connection) -> Result<()> {
     let count = connection.query_row("SELECT COUNT(*) FROM tracks", [], |row| {
         row.get::<_, i64>(0)
@@ -1579,26 +1617,145 @@ mod tests {
             store.list_tracks(MAX_LIBRARY_TRACKS).unwrap().len(),
             MAX_LIBRARY_TRACKS
         );
+    }
 
-        // Simulate a database created before the total limit was enforced. Complete reads must
-        // fail loudly instead of returning a plausible-looking, truncated 10,000-track snapshot.
+    #[test]
+    fn oversized_legacy_library_stays_readable_and_recoverable() {
+        // Databases created before the total limit was enforced could accumulate more
+        // than MAX_LIBRARY_TRACKS rows across multiple imports. Read and delete paths
+        // must keep working on them, otherwise there is no way back under the limit.
+        let store = LibraryStore::open(":memory:").unwrap();
         {
-            let connection = store.connection.lock().unwrap();
-            connection
-                .execute(
-                    "INSERT INTO tracks(path, title, artist, album, duration_seconds, added_at_ms)
-                     VALUES (?1, ?2, '', '', NULL, ?3)",
-                    params![overflow_path, "Legacy overflow", now_ms()],
-                )
-                .unwrap();
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for index in 0..=MAX_LIBRARY_TRACKS {
+                transaction
+                    .execute(
+                        "INSERT INTO tracks(path, title, artist, album, duration_seconds, added_at_ms)
+                         VALUES (?1, ?2, '', '', NULL, ?3)",
+                        params![
+                            format!("C:/Legacy/track-{index}.flac"),
+                            format!("Track {index}"),
+                            index as i64
+                        ],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
         }
-        for error in [
-            store.list_tracks(MAX_LIBRARY_TRACKS).unwrap_err(),
-            store.scan_missing().unwrap_err(),
-            store.export_backup().unwrap_err(),
-        ] {
-            assert!(error.to_string().contains("10001 tracks"));
-        }
+
+        let all = store.list_all_tracks().unwrap();
+        assert_eq!(all.len(), MAX_LIBRARY_TRACKS + 1);
+        assert_eq!(
+            store.list_tracks(MAX_LIBRARY_TRACKS).unwrap().len(),
+            MAX_LIBRARY_TRACKS
+        );
+        assert_eq!(store.scan_missing().unwrap().len(), MAX_LIBRARY_TRACKS + 1);
+        assert_eq!(
+            store.export_backup().unwrap().tracks.len(),
+            MAX_LIBRARY_TRACKS + 1
+        );
+
+        let error = store
+            .upsert_tracks(&[NewTrack {
+                path: "C:/Legacy/new-import.flac".into(),
+                title: "New import".into(),
+                artist: String::new(),
+                album: String::new(),
+                duration_seconds: None,
+            }])
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeding the limit"));
+        assert!(
+            store
+                .track_by_path("C:/Legacy/new-import.flac")
+                .unwrap()
+                .is_none()
+        );
+
+        let newest_id = all[0].id;
+        assert_eq!(store.remove_tracks(&[newest_id]).unwrap(), vec![newest_id]);
+        assert_eq!(store.list_all_tracks().unwrap().len(), MAX_LIBRARY_TRACKS);
+
+        // Back at the limit: refreshing an existing track works, growth stays rejected.
+        store
+            .upsert_tracks(&[NewTrack {
+                path: "C:/Legacy/track-0.flac".into(),
+                title: "Refreshed".into(),
+                artist: String::new(),
+                album: String::new(),
+                duration_seconds: None,
+            }])
+            .unwrap();
+        assert!(
+            store
+                .upsert_tracks(&[NewTrack {
+                    path: "C:/Legacy/new-import.flac".into(),
+                    title: "Still too many".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                }])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rollback_restore_reinstates_an_oversized_snapshot_exactly() {
+        let oversized = LibraryBackup {
+            version: 2,
+            tracks: (0..=MAX_LIBRARY_TRACKS)
+                .map(|index| LibraryTrack {
+                    id: index as i64 + 1,
+                    path: format!("C:/Legacy/track-{index}.flac"),
+                    title: format!("Track {index}"),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                    favorite: index == 0,
+                    added_at_ms: index as i64,
+                    missing: false,
+                })
+                .collect(),
+            playlists: Vec::new(),
+        };
+
+        let store = LibraryStore::open(":memory:").unwrap();
+        // The regular import path keeps rejecting oversized backups before any change.
+        assert!(store.restore_backup(&oversized).is_err());
+        assert!(store.list_all_tracks().unwrap().is_empty());
+
+        store.restore_backup_for_rollback(&oversized).unwrap();
+        assert_eq!(
+            store.list_all_tracks().unwrap().len(),
+            MAX_LIBRARY_TRACKS + 1
+        );
+        assert_eq!(store.list_favorites().unwrap().len(), 1);
+
+        // The rollback variant still applies every structural check.
+        let mut malformed = LibraryBackup {
+            version: 3,
+            tracks: Vec::new(),
+            playlists: Vec::new(),
+        };
+        assert!(store.restore_backup_for_rollback(&malformed).is_err());
+        malformed.version = 2;
+        malformed.tracks = vec![LibraryTrack {
+            id: 1,
+            path: String::new(),
+            title: "No path".into(),
+            artist: String::new(),
+            album: String::new(),
+            duration_seconds: None,
+            favorite: false,
+            added_at_ms: 1,
+            missing: false,
+        }];
+        assert!(store.restore_backup_for_rollback(&malformed).is_err());
+        assert_eq!(
+            store.list_all_tracks().unwrap().len(),
+            MAX_LIBRARY_TRACKS + 1
+        );
     }
 
     #[test]

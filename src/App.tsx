@@ -981,6 +981,22 @@ function App() {
     pushMessage("已取消解析");
   };
 
+  /**
+   * Quietly invalidate any in-flight online resolve before different playback starts.
+   * Without this, a slow resolve can finish after the user has already started a local
+   * or cached track and hijack the audio back to the online stream.
+   */
+  const supersedeActiveResolve = () => {
+    const requestId = activeResolveRequestRef.current;
+    if (!requestId) return;
+    cancelledResolveRequestsRef.current.add(requestId);
+    resolveAbortRef.current = true;
+    resolveGenerationRef.current += 1;
+    activeResolveRequestRef.current = null;
+    setResolveBanner(null);
+    void invoke("player_cancel_resolve", { requestId }).catch(() => undefined);
+  };
+
   useEffect(() => {
     let disposed = false;
     // Window size is set once in Rust (setup) before first show — do not resize here
@@ -1566,6 +1582,7 @@ function App() {
     quality: QualityPreference,
     opts?: { allowPreviewFallback?: boolean; candidates?: CatalogTrack[] },
   ): Promise<PlaybackStartResult> => {
+    supersedeActiveResolve();
     const key = catalogKey(wanted);
     const generation = ++resolveGenerationRef.current;
     const requestId = typeof crypto.randomUUID === "function"
@@ -1720,6 +1737,7 @@ function App() {
         setMessage("本地文件暂不可用；接回磁盘后请在播放队列中重试，或重新定位文件。", true);
         return { outcome: "failed", error };
       }
+      supersedeActiveResolve();
       try {
         if (playlistIsLocalOnly(entries)) {
           const paths = entries.map((item) => (item as Extract<PlaylistEntry, { kind: "local" }>).path);
@@ -1738,6 +1756,7 @@ function App() {
       }
     }
     if (entry.kind === "cached") {
+      supersedeActiveResolve();
       try {
         await playCachedEntry(entry);
         void recordHistory({
@@ -2035,7 +2054,9 @@ function App() {
 
   /** Click a catalog track: queue the whole list as online placeholders; resolve only the clicked one. */
   const playCatalogInList = async (tracks: CatalogTrack[], wanted: CatalogTrack) => {
-    if (playingCatalogKey || advancingRef.current) return;
+    // A click during an in-flight resolve supersedes it (resolveAndPlayOnline does the
+    // invalidation); only an active advance chain still owns the playhead exclusively.
+    if (advancingRef.current) return;
     const list = tracks.length ? tracks : [wanted];
     const startIndex = Math.max(0, list.findIndex((item) => catalogKey(item) === catalogKey(wanted)));
     const entries = list.map((track) => onlineEntryFromCatalog(track, qualityPreference));
@@ -2070,7 +2091,7 @@ function App() {
             : onlineFavorites.some((track) => catalogKey(track) === catalogKey(wanted))
               ? onlineFavorites
               : [wanted];
-    if (playingCatalogKey || advancingRef.current) return;
+    if (advancingRef.current) return;
     await playCatalogInList(context, wanted);
   };
 
@@ -2132,6 +2153,7 @@ function App() {
     shufflePlayedRef.current.add(index);
     setPlaylistIndex(index);
     if (playlistIsLocalOnly(entries) && target.kind === "local") {
+      supersedeActiveResolve();
       try {
         if (engineMatchesLocalQueue(entries, snapshotRef.current.queue)) {
           await invoke("player_jump", { index });
@@ -2160,7 +2182,7 @@ function App() {
   };
 
   const playCacheInList = async (entries: CacheEntryView[], wanted: CacheEntryView) => {
-    if (playingCatalogKey || advancingRef.current) return;
+    if (advancingRef.current) return;
     const startIndex = Math.max(0, entries.findIndex(
       (item) => item.providerId === wanted.providerId
         && item.providerTrackId === wanted.providerTrackId

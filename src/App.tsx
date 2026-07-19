@@ -1584,6 +1584,7 @@ function App() {
   ): Promise<PlaybackStartResult> => {
     supersedeActiveResolve();
     const key = catalogKey(wanted);
+    let failureKind: OnlinePlaybackResult["failureKind"] = null;
     const generation = ++resolveGenerationRef.current;
     const requestId = typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
@@ -1617,6 +1618,7 @@ function App() {
         return { outcome: online.outcome };
       }
       if (online.outcome === "failed") {
+        failureKind = online.failureKind ?? "unknown";
         const diagnostics = formatResolveAttempts(online.attempts);
         throw new Error(`${online.error || "音源未能返回可播放地址"}${diagnostics}`);
       }
@@ -1649,7 +1651,7 @@ function App() {
       console.warn("[GXPlayer] online resolve failed", { key, error: String(onlineError) });
       if (!opts?.allowPreviewFallback) {
         setMessage(formatFailureMessage(onlineError, wanted.title), true);
-        return { outcome: "failed", error: onlineError };
+        return { outcome: "failed", error: onlineError, failureKind: failureKind ?? "unknown" };
       }
       try {
         const preview = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
@@ -1678,7 +1680,7 @@ function App() {
         const previewInterrupted = interruptedOutcome();
         if (previewInterrupted) return previewInterrupted;
         setMessage(formatFailureMessage(`${String(onlineError)}; ${String(previewError)}`, wanted.title), true);
-        return { outcome: "failed", error: previewError };
+        return { outcome: "failed", error: previewError, failureKind: failureKind ?? "unknown" };
       }
     } finally {
       cancelledResolveRequestsRef.current.delete(requestId);

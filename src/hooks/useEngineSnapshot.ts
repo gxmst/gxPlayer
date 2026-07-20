@@ -6,10 +6,15 @@ import { EMPTY_ENGINE, type EngineSnapshot } from "../types";
  * Prefer pushed snapshots when the backend exposes them and keep a low-frequency
  * poll as compatibility fallback. This avoids the former 150 ms whole-app render.
  */
-export function useEngineSnapshot(onError: (error: unknown) => void) {
+export function useEngineSnapshot(
+  onError: (error: unknown) => void,
+  mergeIncoming?: (incoming: EngineSnapshot, current: EngineSnapshot) => EngineSnapshot,
+) {
   const [snapshot, setSnapshot] = useState<EngineSnapshot>(EMPTY_ENGINE);
   const errorHandler = useRef(onError);
   errorHandler.current = onError;
+  const mergeRef = useRef(mergeIncoming);
+  mergeRef.current = mergeIncoming;
 
   useEffect(() => {
     let disposed = false;
@@ -23,7 +28,7 @@ export function useEngineSnapshot(onError: (error: unknown) => void) {
           && lastPushAt.value <= startedAt
           && performance.now() - lastPushAt.value >= 500
         ) {
-          setSnapshot(next);
+          setSnapshot((current) => (mergeRef.current ? mergeRef.current(next, current) : next));
         }
       } catch (error) {
         if (!disposed) errorHandler.current(error);
@@ -35,7 +40,7 @@ export function useEngineSnapshot(onError: (error: unknown) => void) {
     const unlisten = listen<EngineSnapshot>("gx-player-snapshot", (event) => {
       if (!disposed) {
         lastPushAt.value = performance.now();
-        setSnapshot(event.payload);
+        setSnapshot((current) => (mergeRef.current ? mergeRef.current(event.payload, current) : event.payload));
       }
     });
     return () => {

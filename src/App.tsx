@@ -589,7 +589,20 @@ function App() {
   const [snapshot, setSnapshot] = useEngineSnapshot((error) => {
     setMessageState(String(error));
     setMessageIsError(true);
-  });
+  }, (incoming, current) => (
+    // While a DSP change is still in flight, a snapshot generated before it landed
+    // would briefly revert the optimistic preset/intensity fields.
+    pendingDspControlRef.current || dspApplyRunningRef.current
+      ? {
+        ...incoming,
+        audioMode: current.audioMode,
+        dspSettings: current.dspSettings,
+        activePresetId: current.activePresetId,
+        intensity: current.intensity,
+        spatialAmount: current.spatialAmount,
+      }
+      : incoming
+  ));
   const {
     alwaysOnTop,
     miniMode,
@@ -979,6 +992,22 @@ function App() {
     setPlayingCatalogKey(null);
     setResolveBanner(null);
     pushMessage("已取消解析");
+  };
+
+  /**
+   * Quietly invalidate any in-flight online resolve before different playback starts.
+   * Without this, a slow resolve can finish after the user has already started a local
+   * or cached track and hijack the audio back to the online stream.
+   */
+  const supersedeActiveResolve = () => {
+    const requestId = activeResolveRequestRef.current;
+    if (!requestId) return;
+    cancelledResolveRequestsRef.current.add(requestId);
+    resolveAbortRef.current = true;
+    resolveGenerationRef.current += 1;
+    activeResolveRequestRef.current = null;
+    setResolveBanner(null);
+    void invoke("player_cancel_resolve", { requestId }).catch(() => undefined);
   };
 
   useEffect(() => {
@@ -1566,7 +1595,9 @@ function App() {
     quality: QualityPreference,
     opts?: { allowPreviewFallback?: boolean; candidates?: CatalogTrack[] },
   ): Promise<PlaybackStartResult> => {
+    supersedeActiveResolve();
     const key = catalogKey(wanted);
+    let failureKind: OnlinePlaybackResult["failureKind"] = null;
     const generation = ++resolveGenerationRef.current;
     const requestId = typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
@@ -1600,6 +1631,7 @@ function App() {
         return { outcome: online.outcome };
       }
       if (online.outcome === "failed") {
+        failureKind = online.failureKind ?? "unknown";
         const diagnostics = formatResolveAttempts(online.attempts);
         throw new Error(`${online.error || "音源未能返回可播放地址"}${diagnostics}`);
       }
@@ -1632,7 +1664,7 @@ function App() {
       console.warn("[GXPlayer] online resolve failed", { key, error: String(onlineError) });
       if (!opts?.allowPreviewFallback) {
         setMessage(formatFailureMessage(onlineError, wanted.title), true);
-        return { outcome: "failed", error: onlineError };
+        return { outcome: "failed", error: onlineError, failureKind: failureKind ?? "unknown" };
       }
       try {
         const preview = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
@@ -1661,7 +1693,7 @@ function App() {
         const previewInterrupted = interruptedOutcome();
         if (previewInterrupted) return previewInterrupted;
         setMessage(formatFailureMessage(`${String(onlineError)}; ${String(previewError)}`, wanted.title), true);
-        return { outcome: "failed", error: previewError };
+        return { outcome: "failed", error: previewError, failureKind: failureKind ?? "unknown" };
       }
     } finally {
       cancelledResolveRequestsRef.current.delete(requestId);
@@ -1720,6 +1752,7 @@ function App() {
         setMessage("本地文件暂不可用；接回磁盘后请在播放队列中重试，或重新定位文件。", true);
         return { outcome: "failed", error };
       }
+      supersedeActiveResolve();
       try {
         if (playlistIsLocalOnly(entries)) {
           const paths = entries.map((item) => (item as Extract<PlaylistEntry, { kind: "local" }>).path);
@@ -1738,6 +1771,7 @@ function App() {
       }
     }
     if (entry.kind === "cached") {
+      supersedeActiveResolve();
       try {
         await playCachedEntry(entry);
         void recordHistory({
@@ -2035,7 +2069,9 @@ function App() {
 
   /** Click a catalog track: queue the whole list as online placeholders; resolve only the clicked one. */
   const playCatalogInList = async (tracks: CatalogTrack[], wanted: CatalogTrack) => {
-    if (playingCatalogKey || advancingRef.current) return;
+    // A click during an in-flight resolve supersedes it (resolveAndPlayOnline does the
+    // invalidation); only an active advance chain still owns the playhead exclusively.
+    if (advancingRef.current) return;
     const list = tracks.length ? tracks : [wanted];
     const startIndex = Math.max(0, list.findIndex((item) => catalogKey(item) === catalogKey(wanted)));
     const entries = list.map((track) => onlineEntryFromCatalog(track, qualityPreference));
@@ -2070,7 +2106,7 @@ function App() {
             : onlineFavorites.some((track) => catalogKey(track) === catalogKey(wanted))
               ? onlineFavorites
               : [wanted];
-    if (playingCatalogKey || advancingRef.current) return;
+    if (advancingRef.current) return;
     await playCatalogInList(context, wanted);
   };
 
@@ -2132,6 +2168,7 @@ function App() {
     shufflePlayedRef.current.add(index);
     setPlaylistIndex(index);
     if (playlistIsLocalOnly(entries) && target.kind === "local") {
+      supersedeActiveResolve();
       try {
         if (engineMatchesLocalQueue(entries, snapshotRef.current.queue)) {
           await invoke("player_jump", { index });
@@ -2160,7 +2197,7 @@ function App() {
   };
 
   const playCacheInList = async (entries: CacheEntryView[], wanted: CacheEntryView) => {
-    if (playingCatalogKey || advancingRef.current) return;
+    if (advancingRef.current) return;
     const startIndex = Math.max(0, entries.findIndex(
       (item) => item.providerId === wanted.providerId
         && item.providerTrackId === wanted.providerTrackId
@@ -3603,7 +3640,8 @@ function App() {
                       }
                     }}
                   >
-                    <span className="track-index">{entry.kind.slice(0, 2)}</span>
+                    <span className="track-index" aria-hidden="true">{entry.kind === "local" ? "♪" : entry.kind === "cached" ? "◉" : "☁"}</span>
+                    <span className="sr-only">{entry.kind === "local" ? "本地播放" : entry.kind === "cached" ? "缓存播放" : "在线播放"}</span>
                     <span>
                       <strong>{entry.title}</strong>
                       <small>{entry.artist || "未知歌手"} · {new Date(entry.playedAtMs).toLocaleString()}</small>

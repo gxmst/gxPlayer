@@ -1,7 +1,9 @@
 //! Allocation-free-in-process DSP building blocks for GXPlayer.
 //!
-//! Configuration may allocate on the decode/DSP worker. Processing mutates an existing PCM slice
-//! and performs no allocation. A disabled chain returns before reading or writing any sample.
+//! Configuration may allocate on the decode/DSP worker. Steady-state processing mutates an
+//! existing PCM slice and performs no allocation; the short crossfade window after `set_settings`
+//! may grow a worker-owned scratch buffer. A disabled chain with no crossfade in flight returns
+//! before reading or writing any sample.
 
 use std::f64::consts::PI;
 
@@ -14,12 +16,10 @@ mod spatial;
 use spatial::{CrossfeedProcessor, LinkedLimiter, StereoHrtf};
 pub use spatial::{CrossfeedSettings, HrtfSettings, LimiterSettings};
 
-type ProcessorSet = (
-    ParametricEq,
-    Option<CrossfeedProcessor>,
-    Option<StereoHrtf>,
-    Option<LinkedLimiter>,
-);
+/// Length of the crossfade that masks a `set_settings` swap. Long enough to hide the HRTF
+/// 0<->128-frame latency step and the zeroed filter state of a freshly built generation, short
+/// enough to feel instant.
+const SETTINGS_CROSSFADE_SECONDS: f64 = 0.010;
 
 #[cfg(test)]
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -123,6 +123,32 @@ impl Default for DspSettings {
     }
 }
 
+impl DspSettings {
+    /// Conservatively clamps parameters whose validity depends on the sample rate, so settings
+    /// that were validated at a higher rate (persisted presets are checked at 48 kHz) still build
+    /// on a lower-rate output device. Near-Nyquist EQ bands and the crossfeed cutoff are pinned to
+    /// the highest value the device accepts; values that are invalid at every rate are left
+    /// untouched so they keep failing loudly.
+    pub fn clamped_for_sample_rate(mut self, sample_rate: u32) -> Self {
+        let max_frequency = max_band_frequency_hz(sample_rate);
+        for band in &mut self.eq_bands {
+            if band.frequency_hz.is_finite() && band.frequency_hz > max_frequency {
+                band.frequency_hz = max_frequency;
+            }
+        }
+        let max_cutoff = spatial::max_crossfeed_cutoff_hz(sample_rate);
+        if self.crossfeed.cutoff_hz.is_finite() && self.crossfeed.cutoff_hz > max_cutoff {
+            self.crossfeed.cutoff_hz = max_cutoff;
+        }
+        self
+    }
+}
+
+/// Highest EQ band frequency accepted by `BiquadCoefficients::from_band` at `sample_rate`.
+fn max_band_frequency_hz(sample_rate: u32) -> f32 {
+    sample_rate as f32 * 0.5 * 0.999
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum DspError {
     #[error("sample rate must be greater than zero")]
@@ -162,14 +188,108 @@ pub enum DspError {
     UnsupportedSpatialChannels(usize),
 }
 
-pub struct DspChain {
-    sample_rate: u32,
-    channels: usize,
-    settings: DspSettings,
+/// One buildable generation of processors for a settings value.
+struct Processors {
     equalizer: ParametricEq,
     crossfeed: Option<CrossfeedProcessor>,
     hrtf: Option<StereoHrtf>,
     limiter: Option<LinkedLimiter>,
+}
+
+impl Processors {
+    fn process(&mut self, pcm: &mut [f32], settings: &DspSettings, channels: usize) {
+        if !settings.enabled {
+            return;
+        }
+        if settings.eq_enabled {
+            self.equalizer.process_interleaved_in_place(pcm);
+        }
+        if let Some(crossfeed) = &mut self.crossfeed {
+            crossfeed.process(pcm);
+        }
+        if let Some(hrtf) = &mut self.hrtf {
+            hrtf.process(pcm);
+        }
+        if let Some(limiter) = &mut self.limiter {
+            limiter.process(pcm, channels);
+        }
+    }
+
+    fn process_with_ab_dry(
+        &mut self,
+        pcm: &mut [f32],
+        ab_dry: &mut [f32],
+        settings: &DspSettings,
+        channels: usize,
+    ) {
+        ab_dry.copy_from_slice(pcm);
+        if !settings.enabled {
+            return;
+        }
+        if settings.eq_enabled {
+            self.equalizer.process_interleaved_in_place(pcm);
+        }
+        if let Some(crossfeed) = &mut self.crossfeed {
+            crossfeed.process(pcm);
+        }
+        if let Some(hrtf) = &mut self.hrtf {
+            hrtf.process_with_ab_dry(pcm, ab_dry);
+        }
+        if let Some(limiter) = &mut self.limiter {
+            limiter.process_with_ab_dry(pcm, ab_dry, channels);
+        }
+    }
+}
+
+/// The previous processor generation, kept alive after `set_settings` so the processed output can
+/// crossfade to the new generation instead of jumping across an HRTF latency step or zeroed
+/// filter state.
+struct RetiringProcessors {
+    settings: DspSettings,
+    processors: Processors,
+    crossfaded_frames: usize,
+    crossfade_frames: usize,
+    /// Scratch for the retiring generation's output. Only touched while a crossfade is in flight,
+    /// so the steady-state processing path stays allocation-free.
+    scratch: Vec<f32>,
+}
+
+/// Blends the retiring generation's output (in `retiring.scratch`) into `pcm` with a per-frame
+/// linear ramp toward the new generation. Returns `true` once the crossfade window is complete.
+fn crossfade_from_retiring(
+    pcm: &mut [f32],
+    retiring: &mut RetiringProcessors,
+    channels: usize,
+) -> bool {
+    let total = retiring.crossfade_frames;
+    for (new_frame, retired_frame) in pcm
+        .chunks_exact_mut(channels)
+        .zip(retiring.scratch.chunks_exact(channels))
+    {
+        if retiring.crossfaded_frames >= total {
+            break;
+        }
+        retiring.crossfaded_frames += 1;
+        if retiring.crossfaded_frames >= total {
+            // The final step lands on the new generation's untouched samples; blending with a
+            // zero weight could still smear a non-finite retired sample into the output.
+            break;
+        }
+        let new_weight = retiring.crossfaded_frames as f32 / total as f32;
+        let retired_weight = 1.0 - new_weight;
+        for (new_sample, retired_sample) in new_frame.iter_mut().zip(retired_frame) {
+            *new_sample = *retired_sample * retired_weight + *new_sample * new_weight;
+        }
+    }
+    retiring.crossfaded_frames >= total
+}
+
+pub struct DspChain {
+    sample_rate: u32,
+    channels: usize,
+    settings: DspSettings,
+    processors: Processors,
+    retiring: Option<RetiringProcessors>,
 }
 
 impl DspChain {
@@ -180,16 +300,13 @@ impl DspChain {
         if channels == 0 {
             return Err(DspError::InvalidChannels);
         }
-        let (equalizer, crossfeed, hrtf, limiter) =
-            build_processors(sample_rate, channels, &settings)?;
+        let processors = build_processors(sample_rate, channels, &settings)?;
         Ok(Self {
             sample_rate,
             channels,
             settings,
-            equalizer,
-            crossfeed,
-            hrtf,
-            limiter,
+            processors,
+            retiring: None,
         })
     }
 
@@ -197,14 +314,33 @@ impl DspChain {
         &self.settings
     }
 
+    /// Swaps in processors for `settings`, crossfading the processed output from the previous
+    /// generation over a short window so mid-playback preset changes stay click-free.
+    ///
+    /// A bypass-to-bypass change swaps without a crossfade: both generations are pure copies and
+    /// blend arithmetic would break the bit-exact passthrough guarantee. On error the previous
+    /// state stays authoritative.
     pub fn set_settings(&mut self, settings: DspSettings) -> Result<(), DspError> {
-        let (equalizer, crossfeed, hrtf, limiter) =
-            build_processors(self.sample_rate, self.channels, &settings)?;
-        self.equalizer = equalizer;
-        self.crossfeed = crossfeed;
-        self.hrtf = hrtf;
-        self.limiter = limiter;
-        self.settings = settings;
+        if settings == self.settings {
+            // Rebuilding identical settings would only reset filter state audibly.
+            return Ok(());
+        }
+        let processors = build_processors(self.sample_rate, self.channels, &settings)?;
+        let previous_processors = std::mem::replace(&mut self.processors, processors);
+        let previous_settings = std::mem::replace(&mut self.settings, settings);
+        if previous_settings.enabled || self.settings.enabled {
+            let crossfade_frames =
+                ((self.sample_rate as f64 * SETTINGS_CROSSFADE_SECONDS).round() as usize).max(1);
+            self.retiring = Some(RetiringProcessors {
+                settings: previous_settings,
+                processors: previous_processors,
+                crossfaded_frames: 0,
+                crossfade_frames,
+                scratch: Vec::new(),
+            });
+        }
+        // Bypass -> bypass keeps any crossfade already in flight: it keeps fading against the
+        // (identical) copy output of the new generation.
         Ok(())
     }
 
@@ -217,7 +353,7 @@ impl DspChain {
     }
 
     pub fn process_interleaved_in_place(&mut self, pcm: &mut [f32]) -> Result<(), DspError> {
-        if !self.settings.enabled {
+        if !self.settings.enabled && self.retiring.is_none() {
             return Ok(());
         }
         if !pcm.len().is_multiple_of(self.channels) {
@@ -226,18 +362,19 @@ impl DspChain {
                 channels: self.channels,
             });
         }
-        if self.settings.eq_enabled {
-            self.equalizer.process_interleaved_in_place(pcm);
+        if let Some(mut retiring) = self.retiring.take() {
+            retiring.scratch.clear();
+            retiring.scratch.extend_from_slice(pcm);
+            retiring
+                .processors
+                .process(&mut retiring.scratch, &retiring.settings, self.channels);
+            self.processors.process(pcm, &self.settings, self.channels);
+            if !crossfade_from_retiring(pcm, &mut retiring, self.channels) {
+                self.retiring = Some(retiring);
+            }
+            return Ok(());
         }
-        if let Some(crossfeed) = &mut self.crossfeed {
-            crossfeed.process(pcm);
-        }
-        if let Some(hrtf) = &mut self.hrtf {
-            hrtf.process(pcm);
-        }
-        if let Some(limiter) = &mut self.limiter {
-            limiter.process(pcm, self.channels);
-        }
+        self.processors.process(pcm, &self.settings, self.channels);
         Ok(())
     }
 
@@ -247,7 +384,10 @@ impl DspChain {
     /// The A/B lane starts as an exact copy of the input. EQ and Crossfeed affect only `pcm`. When
     /// HRTF is enabled, both lanes use the same fixed 128-frame dry queue so the untreated lane is
     /// aligned with the processed HRTF output. The limiter derives one linked gain from `pcm` and
-    /// applies that same gain to both lanes. Processing performs no heap allocation.
+    /// applies that same gain to both lanes. During a `set_settings` crossfade the retiring
+    /// generation contributes only to the processed lane; the A/B lane follows the new generation
+    /// so its frame alignment never blends two delays. Steady-state processing performs no heap
+    /// allocation.
     pub fn process_interleaved_with_ab_dry(
         &mut self,
         pcm: &mut [f32],
@@ -266,22 +406,21 @@ impl DspChain {
             });
         }
 
-        ab_dry.copy_from_slice(pcm);
-        if !self.settings.enabled {
+        if let Some(mut retiring) = self.retiring.take() {
+            retiring.scratch.clear();
+            retiring.scratch.extend_from_slice(pcm);
+            retiring
+                .processors
+                .process(&mut retiring.scratch, &retiring.settings, self.channels);
+            self.processors
+                .process_with_ab_dry(pcm, ab_dry, &self.settings, self.channels);
+            if !crossfade_from_retiring(pcm, &mut retiring, self.channels) {
+                self.retiring = Some(retiring);
+            }
             return Ok(());
         }
-        if self.settings.eq_enabled {
-            self.equalizer.process_interleaved_in_place(pcm);
-        }
-        if let Some(crossfeed) = &mut self.crossfeed {
-            crossfeed.process(pcm);
-        }
-        if let Some(hrtf) = &mut self.hrtf {
-            hrtf.process_with_ab_dry(pcm, ab_dry);
-        }
-        if let Some(limiter) = &mut self.limiter {
-            limiter.process_with_ab_dry(pcm, ab_dry, self.channels);
-        }
+        self.processors
+            .process_with_ab_dry(pcm, ab_dry, &self.settings, self.channels);
         Ok(())
     }
 }
@@ -290,7 +429,7 @@ fn build_processors(
     sample_rate: u32,
     channels: usize,
     settings: &DspSettings,
-) -> Result<ProcessorSet, DspError> {
+) -> Result<Processors, DspError> {
     if (settings.crossfeed.enabled || settings.hrtf.enabled) && channels != 2 {
         return Err(DspError::UnsupportedSpatialChannels(channels));
     }
@@ -310,7 +449,12 @@ fn build_processors(
         .enabled
         .then(|| LinkedLimiter::new(sample_rate, &settings.limiter))
         .transpose()?;
-    Ok((equalizer, crossfeed, hrtf, limiter))
+    Ok(Processors {
+        equalizer,
+        crossfeed,
+        hrtf,
+        limiter,
+    })
 }
 
 struct ParametricEq {
@@ -366,7 +510,7 @@ pub struct BiquadCoefficients {
 
 impl BiquadCoefficients {
     pub fn from_band(sample_rate: u32, band: EqBand) -> Result<Self, DspError> {
-        let nyquist_guard = sample_rate as f32 * 0.5 * 0.999;
+        let nyquist_guard = max_band_frequency_hz(sample_rate);
         if !band.frequency_hz.is_finite()
             || band.frequency_hz < 5.0
             || band.frequency_hz > nyquist_guard
@@ -994,6 +1138,209 @@ mod tests {
             DspChain::new(48_000, 2, settings),
             Err(DspError::InvalidCrossfeedAmount(_))
         ));
+    }
+
+    #[test]
+    fn set_settings_crossfades_between_generations_without_discontinuity() {
+        fn render(chain: &mut DspChain, start_frame: usize, frames: usize, output: &mut Vec<f32>) {
+            let mut buffer = Vec::with_capacity(frames * 2);
+            for frame in 0..frames {
+                let sample =
+                    ((start_frame + frame) as f32 * 220.0 * std::f32::consts::TAU / 48_000.0).sin()
+                        * 0.5;
+                buffer.extend_from_slice(&[sample, sample]);
+            }
+            chain.process_interleaved_in_place(&mut buffer).unwrap();
+            output.extend_from_slice(&buffer);
+        }
+
+        // Spatial -> EQ-only is the worst case: the HRTF latency steps from 128 frames to zero
+        // and the new equalizer starts from zeroed state.
+        let mut chain = DspChain::new(48_000, 2, enabled_spatial_settings()).unwrap();
+        let eq_only = DspSettings {
+            enabled: true,
+            eq_enabled: true,
+            eq_bands: vec![EqBand::peak(1_000.0, 6.0, 1.0)],
+            ..DspSettings::default()
+        };
+        let mut output = Vec::new();
+        let mut cursor = 0;
+        for _ in 0..16 {
+            render(&mut chain, cursor, 256, &mut output);
+            cursor += 256;
+        }
+        chain.set_settings(eq_only).unwrap();
+        for _ in 0..16 {
+            render(&mut chain, cursor, 256, &mut output);
+            cursor += 256;
+        }
+
+        // Skip the fresh spatial chain's own onset; judge steady state plus the switch window.
+        let mut max_step = 0.0f32;
+        for frame in 513..(output.len() / 2) {
+            for channel in 0..2 {
+                let step = (output[frame * 2 + channel] - output[(frame - 1) * 2 + channel]).abs();
+                max_step = max_step.max(step);
+            }
+        }
+        assert!(
+            max_step < 0.05,
+            "settings switch produced a {max_step} adjacent-frame step"
+        );
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn set_settings_to_bypass_restores_bitwise_passthrough_after_the_crossfade() {
+        let mut chain = DspChain::new(48_000, 2, enabled_spatial_settings()).unwrap();
+        let mut warmup = vec![0.25f32; 2048];
+        chain.process_interleaved_in_place(&mut warmup).unwrap();
+
+        chain.set_settings(DspSettings::default()).unwrap();
+        // Drain the 10 ms (480-frame) crossfade window.
+        let mut fade = vec![0.25f32; 480 * 2];
+        chain.process_interleaved_in_place(&mut fade).unwrap();
+        assert!(fade.iter().all(|sample| sample.is_finite()));
+
+        let mut pcm = vec![
+            f32::from_bits(0),
+            f32::from_bits(0x8000_0000),
+            f32::from_bits(0x3f12_3456),
+            f32::from_bits(0x7fc0_1234),
+        ];
+        let before = pcm.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        chain.process_interleaved_in_place(&mut pcm).unwrap();
+        assert_eq!(
+            pcm.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn bypass_to_bypass_set_settings_keeps_bitwise_transparency() {
+        let mut chain = DspChain::new(48_000, 2, DspSettings::default()).unwrap();
+        chain
+            .set_settings(DspSettings {
+                enabled: false,
+                eq_enabled: true,
+                eq_bands: vec![EqBand::peak(4_000.0, -6.0, 2.0)],
+                ..DspSettings::default()
+            })
+            .unwrap();
+
+        let mut pcm = vec![
+            f32::from_bits(0),
+            f32::from_bits(0x8000_0000),
+            f32::from_bits(0x3f12_3456),
+            f32::from_bits(0x7fc0_1234),
+        ];
+        let before = pcm.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        let mut ab_dry = vec![42.0; pcm.len()];
+        chain
+            .process_interleaved_with_ab_dry(&mut pcm, &mut ab_dry)
+            .unwrap();
+        assert_eq!(
+            pcm.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(
+            ab_dry
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            before
+        );
+        chain.process_interleaved_in_place(&mut pcm).unwrap();
+        assert_eq!(
+            pcm.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn ab_dry_lane_stays_untreated_during_a_settings_crossfade() {
+        let mut chain = DspChain::new(
+            48_000,
+            2,
+            DspSettings {
+                enabled: true,
+                eq_enabled: true,
+                eq_bands: vec![EqBand::peak(1_000.0, 6.0, 1.0)],
+                ..DspSettings::default()
+            },
+        )
+        .unwrap();
+        let mut warmup = vec![0.2f32; 1024];
+        chain.process_interleaved_in_place(&mut warmup).unwrap();
+
+        chain
+            .set_settings(DspSettings {
+                enabled: true,
+                eq_enabled: true,
+                eq_bands: vec![EqBand::peak(250.0, -6.0, 2.0)],
+                ..DspSettings::default()
+            })
+            .unwrap();
+
+        let mut pcm = (0..1024)
+            .map(|index| (index as f32 * 0.019).sin() * 0.2)
+            .collect::<Vec<_>>();
+        let original = pcm.clone();
+        let mut ab_dry = vec![0.0f32; pcm.len()];
+        chain
+            .process_interleaved_with_ab_dry(&mut pcm, &mut ab_dry)
+            .unwrap();
+
+        // Without HRTF the A/B lane is an exact input copy — the crossfade must not touch it.
+        assert_eq!(
+            ab_dry
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            original
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(pcm, original);
+    }
+
+    #[test]
+    fn clamped_settings_build_high_frequency_presets_at_low_sample_rates() {
+        let settings = DspSettings {
+            enabled: true,
+            eq_enabled: true,
+            eq_bands: vec![
+                EqBand::peak(16_000.0, 3.0, 0.7),
+                EqBand {
+                    enabled: true,
+                    kind: FilterKind::HighShelf,
+                    frequency_hz: 12_000.0,
+                    gain_db: 4.0,
+                    q: 0.7,
+                },
+            ],
+            crossfeed: CrossfeedSettings {
+                enabled: true,
+                cutoff_hz: 12_000.0,
+                ..CrossfeedSettings::default()
+            },
+            ..DspSettings::default()
+        };
+        // Valid at the 48 kHz persistence-validation rate.
+        DspChain::new(48_000, 2, settings.clone()).unwrap();
+        // In-range parameters survive clamping untouched.
+        assert_eq!(settings.clone().clamped_for_sample_rate(48_000), settings);
+        // As-is the preset cannot build on a 22.05 kHz output device…
+        assert!(matches!(
+            DspChain::new(22_050, 2, settings.clone()),
+            Err(DspError::InvalidFrequency { .. })
+        ));
+        // …but the clamped variant builds and stays finite.
+        let mut chain = DspChain::new(22_050, 2, settings.clamped_for_sample_rate(22_050)).unwrap();
+        let mut pcm = vec![0.1f32; 2048];
+        chain.process_interleaved_in_place(&mut pcm).unwrap();
+        assert!(pcm.iter().all(|sample| sample.is_finite()));
     }
 
     fn enabled_spatial_settings() -> DspSettings {

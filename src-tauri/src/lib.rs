@@ -401,9 +401,9 @@ fn library_tracks(
     library: tauri::State<LibraryStore>,
 ) -> Result<Vec<LibraryTrack>, String> {
     require_window(&window, "main")?;
-    library
-        .list_tracks(MAX_LIBRARY_TRACKS)
-        .map_err(|error| error.to_string())
+    // Unbounded on purpose: legacy libraries may exceed MAX_LIBRARY_TRACKS, and the
+    // UI needs the full list so users can delete their way back under the limit.
+    library.list_all_tracks().map_err(|error| error.to_string())
 }
 
 #[tauri::command]

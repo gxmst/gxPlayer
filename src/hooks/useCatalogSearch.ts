@@ -155,17 +155,42 @@ export function useCatalogSearch(query: string) {
       }
       stopListener = stop;
       resultsUnlisten.current = stop;
-      const tracks = await invoke<CatalogTrack[]>("metadata_search", {
+      let tracks = await invoke<CatalogTrack[]>("metadata_search", {
         query: normalized,
         limit: 40,
         requestId,
         lane: "searchResults",
       });
       if (generation !== resultsGeneration.current) return null;
+      if (!tracks.length) {
+        tracks = await invoke<CatalogTrack[]>("source_search", {
+          query: normalized,
+          limit: 40,
+        });
+      }
+      if (generation !== resultsGeneration.current) return null;
       setResults(tracks);
       setResultsBucket({ state: tracks.length ? "ready" : "empty", error: null });
       return tracks;
     } catch (error) {
+      if (generation !== resultsGeneration.current) return null;
+      const cancelled = String(error).toLowerCase().includes("cancel");
+      if (!cancelled) {
+        try {
+          const tracks = await invoke<CatalogTrack[]>("source_search", {
+            query: normalized,
+            limit: 40,
+          });
+          if (generation !== resultsGeneration.current) return null;
+          if (tracks.length) {
+            setResults(tracks);
+            setResultsBucket({ state: "ready", error: null });
+            return tracks;
+          }
+        } catch {
+          // Preserve the built-in search error below; source fallback is optional.
+        }
+      }
       if (generation !== resultsGeneration.current) return null;
       setResults([]);
       setResultsBucket({ state: "error", error: String(error) });

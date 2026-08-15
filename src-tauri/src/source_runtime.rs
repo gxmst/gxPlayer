@@ -498,8 +498,12 @@ impl SourceRuntime {
 
     pub fn begin_request(&self, payload: &Value) -> Result<RuntimeRequest, String> {
         ensure_json_size(payload, MAX_RUNTIME_PAYLOAD_BYTES, "resolver payload")?;
-        if payload.get("action").and_then(Value::as_str) != Some("musicUrl") {
-            return Err("LX runtime only accepts the 'musicUrl' action".into());
+        let action = payload
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "LX runtime request must contain an action".to_owned())?;
+        if !matches!(action, "musicUrl" | "search" | "lyric" | "playlist") {
+            return Err(format!("LX runtime does not support the '{action}' action"));
         }
         let mut inner = self.inner.lock().unwrap();
         if inner.status.state != RuntimeState::Ready {
@@ -920,6 +924,15 @@ mod tests {
         assert_eq!(resolved.headers.len(), 1);
         assert_eq!(resolved.expires_at_ms, Some(123));
         assert!(!resolved.redacted_for_log().contains("secret"));
+        let search = runtime
+            .begin_request(&serde_json::json!({"action":"search","info":{"keyword":"Track"}}))
+            .unwrap();
+        runtime.cancel_request(&search.request_id, "test complete");
+        assert!(
+            runtime
+                .begin_request(&serde_json::json!({"action":"filesystem"}))
+                .is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

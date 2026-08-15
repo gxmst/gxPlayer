@@ -164,7 +164,20 @@ export type CacheEntryView = {
 
 export type LyricDocument = {
   instrumental: boolean;
-  lines: Array<{ timestampMs: number | null; text: string }>;
+  lines: Array<{
+    timestampMs: number | null;
+    text: string;
+    translation?: string | null;
+    romanization?: string | null;
+  }>;
+};
+
+export type SourcePlaylist = {
+  id: string;
+  name: string;
+  coverUrl: string | null;
+  creator: string | null;
+  tracks: CatalogTrack[];
 };
 
 export type LibraryTrack = {

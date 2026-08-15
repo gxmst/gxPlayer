@@ -52,6 +52,10 @@ pub struct SearchBatch {
 pub struct LyricLine {
     pub timestamp_ms: Option<u64>,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub romanization: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -751,6 +755,8 @@ fn select_lyrics(candidates: Vec<LrcLibItem>, duration_ms: Option<u64>) -> Optio
                     .map(|line| LyricLine {
                         timestamp_ms: None,
                         text: line.trim().to_owned(),
+                        translation: None,
+                        romanization: None,
                     })
                     .collect(),
             }
@@ -780,6 +786,8 @@ pub fn parse_lrc(input: &str) -> LyricDocument {
             lines.push(LyricLine {
                 timestamp_ms: Some(timestamp_ms),
                 text: text.to_owned(),
+                translation: None,
+                romanization: None,
             });
         }
     }

@@ -87,12 +87,23 @@ function mockResult(command: string, args?: Record<string, unknown>): unknown {
     case "metadata_search":
     case "metadata_chart":
       return demoCatalog;
+    case "player_play_online_track":
+      return {
+        outcome: "started",
+        failureKind: null,
+        attempts: [],
+        track: args?.track,
+        sourceId: "browser-mock",
+        sourceName: "浏览器演示音源",
+        quality: args?.quality ?? "demo",
+        cacheHit: false,
+      };
     case "metadata_lyrics":
       return {
         instrumental: false,
         lines: [
-          { timestampMs: 0, text: "浏览器模式使用演示数据" },
-          { timestampMs: 8_000, text: "桌面端会连接真实曲库与播放引擎" },
+          { timestampMs: 0, text: "浏览器模式使用演示数据", translation: "Browser mode uses demo data." },
+          { timestampMs: 8_000, text: "桌面端会连接真实曲库与播放引擎", romanization: "zhuo mian duan hui lian jie zhen shi qu ku yu bo fang yin qing" },
         ],
       };
     case "source_runtime_status":

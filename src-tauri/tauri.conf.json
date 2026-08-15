@@ -15,6 +15,8 @@
         "title": "GXPlayer",
         "decorations": false,
         "transparent": true,
+        "shadow": false,
+        "backgroundColor": "#00000000",
         "center": true,
         "visible": false,
         "minWidth": 320,

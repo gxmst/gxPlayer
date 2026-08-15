@@ -9,7 +9,8 @@ use gx_audio::engine::LocalAudioEngine;
 use gx_cache::{CacheKey, CacheStore};
 use gx_contracts::{NetworkRoute, ResolvedMediaRequest};
 use gx_metadata::{
-    CatalogTrack, find_replacements, search_all, search_kugou, search_kuwo, search_netease,
+    CatalogTrack, LyricDocument, find_replacements, search_all, search_kugou, search_kuwo,
+    search_netease,
 };
 use gx_source::network_policy::source_route_attempts;
 use gx_source::safe_http::{SafeHttpError, SafeHttpRequest, execute, execute_on_route};
@@ -101,6 +102,16 @@ pub struct OnlinePlaybackResult {
     pub cache_hit: bool,
     pub attempts: Vec<ResolveAttemptDiagnostic>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePlaylist {
+    pub id: String,
+    pub name: String,
+    pub cover_url: Option<String>,
+    pub creator: Option<String>,
+    pub tracks: Vec<CatalogTrack>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -669,6 +680,249 @@ pub async fn source_resolve(
     result
 }
 
+#[tauri::command]
+pub async fn source_search(
+    window: WebviewWindow,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<CatalogTrack>, String> {
+    require_window(&window, "main")?;
+    let query = query.trim().to_owned();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    if query.chars().count() > 256 {
+        return Err("source search query cannot exceed 256 characters".into());
+    }
+    let limit = limit.unwrap_or(20).clamp(1, 50);
+    let app = window.app_handle().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        request_optional_source_action(
+            &app,
+            "search",
+            json!({
+                "action": "search",
+                "info": {
+                    "keyword": query,
+                    "limit": limit,
+                    "offset": 0
+                }
+            }),
+        )
+    })
+    .await
+    .map_err(|error| format!("source search task failed: {error}"))??;
+    let Some(result) = result else {
+        return Ok(Vec::new());
+    };
+    parse_source_tracks(result, limit, "source search")
+}
+
+#[tauri::command]
+pub async fn source_lyric(
+    window: WebviewWindow,
+    track: CatalogTrack,
+) -> Result<Option<LyricDocument>, String> {
+    require_window(&window, "main")?;
+    let app = window.app_handle().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let (source, music_info) = lx_identity(&track)
+            .map(|(source, info)| (source.to_owned(), info.clone()))
+            .unwrap_or_else(|| {
+                (
+                    track.provider_id.clone(),
+                    json!({
+                        "songmid": track.provider_track_id,
+                        "name": track.title,
+                        "singer": track.artist,
+                        "albumName": track.album,
+                    }),
+                )
+            });
+        request_optional_source_action(
+            &app,
+            "lyric",
+            json!({
+                "action": "lyric",
+                "source": source,
+                "info": {
+                    "musicInfo": music_info,
+                    "durationMs": track.duration_ms,
+                }
+            }),
+        )
+    })
+    .await
+    .map_err(|error| format!("source lyric task failed: {error}"))??;
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    if result.is_null() {
+        return Ok(None);
+    }
+    let document: LyricDocument = serde_json::from_value(result)
+        .map_err(|error| format!("source lyric result is invalid: {error}"))?;
+    if document.lines.len() > 20_000 {
+        return Err("source lyric result contains too many lines".into());
+    }
+    Ok((document.instrumental || !document.lines.is_empty()).then_some(document))
+}
+
+#[tauri::command]
+pub async fn source_playlist(
+    window: WebviewWindow,
+    id: String,
+) -> Result<Option<SourcePlaylist>, String> {
+    require_window(&window, "main")?;
+    let id = id.trim().to_owned();
+    if id.is_empty() || id.len() > 160 {
+        return Err("source playlist id must contain 1 to 160 characters".into());
+    }
+    let app = window.app_handle().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        request_optional_source_action(
+            &app,
+            "playlist",
+            json!({
+                "action": "playlist",
+                "source": "wy",
+                "info": { "id": id }
+            }),
+        )
+    })
+    .await
+    .map_err(|error| format!("source playlist task failed: {error}"))??;
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    let playlist: SourcePlaylist = serde_json::from_value(result)
+        .map_err(|error| format!("source playlist result is invalid: {error}"))?;
+    if playlist.tracks.len() > 2_000 {
+        return Err("source playlist contains more than 2000 tracks".into());
+    }
+    Ok(Some(playlist))
+}
+
+fn parse_source_tracks(
+    result: Value,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<CatalogTrack>, String> {
+    let tracks = match result {
+        Value::Array(tracks) => tracks,
+        Value::Object(mut object) => object
+            .remove("tracks")
+            .and_then(|value| value.as_array().cloned())
+            .ok_or_else(|| format!("{label} result must contain a tracks array"))?,
+        _ => return Err(format!("{label} result must be an array or object")),
+    };
+    let mut parsed = Vec::new();
+    for value in tracks.into_iter().take(limit) {
+        let track: CatalogTrack = serde_json::from_value(value)
+            .map_err(|error| format!("{label} track is invalid: {error}"))?;
+        if track.provider_id.trim().is_empty()
+            || track.provider_track_id.trim().is_empty()
+            || track.title.trim().is_empty()
+        {
+            return Err(format!(
+                "{label} tracks require providerId, providerTrackId and title"
+            ));
+        }
+        parsed.push(track);
+    }
+    Ok(parsed)
+}
+
+fn source_supports_action(source: &gx_source::ManagedSource, action: &str) -> bool {
+    capabilities_support_action(&source.capabilities, action)
+}
+
+fn capabilities_support_action(capabilities: &Value, action: &str) -> bool {
+    let protocol = capabilities
+        .get("protocolVersion")
+        .or_else(|| capabilities.get("protocol"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    protocol >= 2
+        && capabilities
+            .get("actions")
+            .and_then(Value::as_array)
+            .is_some_and(|actions| actions.iter().any(|value| value.as_str() == Some(action)))
+}
+
+fn request_optional_source_action(
+    app: &AppHandle,
+    action: &str,
+    payload: Value,
+) -> Result<Option<Value>, String> {
+    let runtime = app.state::<SourceRuntime>();
+    let source_id = runtime
+        .resolution_source_ids(None)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|id| {
+            runtime
+                .source(id)
+                .is_ok_and(|source| source_supports_action(&source, action))
+        });
+    let Some(source_id) = source_id else {
+        return Ok(None);
+    };
+    let preferred_route = runtime
+        .preferred_route(&source_id)
+        .map_err(|error| error.to_string())?;
+    let route = source_route_attempts(preferred_route)
+        .into_iter()
+        .next()
+        .unwrap_or(NetworkRoute::Direct);
+    let result = runtime.serialized(|| {
+        let persistent_active = runtime
+            .list()
+            .into_iter()
+            .find(|source| source.active)
+            .map(|source| source.source.id);
+        let temporary = persistent_active.as_deref() != Some(source_id.as_str());
+        let status = runtime.status();
+        let current_route = runtime
+            .source_id_and_route_for_generation(status.generation)
+            .ok()
+            .filter(|(current_source_id, _)| current_source_id == &source_id)
+            .map(|(_, current_route)| current_route);
+        let needs_launch = status.active_source_id.as_deref() != Some(source_id.as_str())
+            || status.state != crate::source_runtime::RuntimeState::Ready
+            || current_route != Some(route);
+        if needs_launch {
+            let switched = (|| {
+                let launch = runtime
+                    .prepare_reload_for_route(&source_id, route)
+                    .map_err(|error| error.to_string())?;
+                let sandbox = app
+                    .get_webview_window(SANDBOX_LABEL)
+                    .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
+                evaluate_launch(&sandbox, &launch)?;
+                wait_until_ready(&runtime, launch.generation, RUNTIME_INIT_TIMEOUT, None)
+            })();
+            if let Err(error) = switched {
+                if temporary {
+                    let _ = restore_persistent_runtime(app, &runtime);
+                }
+                return Err(error);
+            }
+        }
+        let result = dispatch_raw_and_wait(app, &runtime, &payload, None);
+        if temporary && let Err(restore_error) = restore_persistent_runtime(app, &runtime) {
+            return match result {
+                Ok(_) => Err(restore_error),
+                Err(request_error) => Err(format!(
+                    "{request_error}; additionally failed to restore active source: {restore_error}"
+                )),
+            };
+        }
+        result
+    });
+    result.map(Some)
+}
+
 fn resolve_with_fallback(
     app: &AppHandle,
     payload: Value,
@@ -755,7 +1009,7 @@ fn should_record_terminal_failure(error: &str) -> bool {
 }
 
 fn should_record_http_status(status: u16) -> bool {
-    matches!(status, 401 | 403 | 408 | 429 | 500..=599)
+    matches!(status, 401 | 402 | 403 | 408 | 429 | 500..=599)
 }
 
 fn safe_http_error_code(error: &SafeHttpError) -> &'static str {
@@ -794,7 +1048,11 @@ fn diagnostic_error_code(error: &str) -> &'static str {
         "upstream_auth_rejected"
     } else if error.contains("http 408") {
         "upstream_timeout"
-    } else if error.contains("http 429") || error.contains("rate_limited") {
+    } else if error.contains("http 402")
+        || error.contains("http 429")
+        || error.contains("rate_limited")
+        || error.contains("quota_exhausted")
+    {
         "upstream_rate_limited"
     } else if error.contains("upstream_not_found") || error.contains("http 404") {
         "upstream_not_found"
@@ -1477,8 +1735,11 @@ fn public_attempt_error(stage: &str, error: &str) -> String {
     if error.contains("http 404") {
         return "upstream_not_found".into();
     }
-    if error.contains("http 429") {
+    if error.contains("http 402") || error.contains("http 429") {
         return "upstream_rate_limited".into();
+    }
+    if error.contains("http 503") {
+        return "upstream_server_error".into();
     }
     if error.contains("preview-sized") || error.contains("minimum full-track") {
         return "preview_or_truncated_media".into();
@@ -1501,8 +1762,10 @@ fn should_skip_source(error: &str) -> bool {
     error.contains("timed out")
         || error.contains("timeout")
         || error.contains("http 401")
+        || error.contains("http 402")
         || error.contains("http 403")
         || error.contains("http 429")
+        || error.contains("http 503")
         || error.contains("runtime failed")
         || error.contains("sandbox window is unavailable")
 }
@@ -2701,6 +2964,16 @@ fn dispatch_and_wait(
     quality: Option<&str>,
     cancellation: Option<&ResolveToken>,
 ) -> Result<ResolvedMediaRequest, String> {
+    let raw = dispatch_raw_and_wait(app, runtime, payload, cancellation)?;
+    normalize_media_request(raw, quality)
+}
+
+fn dispatch_raw_and_wait(
+    app: &AppHandle,
+    runtime: &SourceRuntime,
+    payload: &Value,
+    cancellation: Option<&ResolveToken>,
+) -> Result<Value, String> {
     let pending = runtime.begin_request(payload)?;
     let request_id = pending.request_id.clone();
     let generation = pending.generation;
@@ -2746,7 +3019,7 @@ fn dispatch_and_wait(
             }
         }
     };
-    normalize_media_request(raw, quality)
+    Ok(raw)
 }
 
 fn abort_runtime_request(
@@ -3461,5 +3734,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, script);
+    }
+
+    #[test]
+    fn protocol_v2_actions_are_explicit_and_version_gated() {
+        let v2 = json!({
+            "protocolVersion": 2,
+            "actions": ["musicUrl", "search", "lyric", "playlist"]
+        });
+        assert!(capabilities_support_action(&v2, "search"));
+        assert!(capabilities_support_action(&v2, "playlist"));
+        assert!(!capabilities_support_action(&v2, "unknown"));
+        assert!(!capabilities_support_action(
+            &json!({ "actions": ["search"] }),
+            "search"
+        ));
+    }
+
+    #[test]
+    fn source_search_tracks_are_normalized_and_bounded() {
+        let result = json!({
+            "tracks": [
+                {
+                    "providerId": "wy",
+                    "providerTrackId": "42",
+                    "title": "Track",
+                    "artist": "Artist",
+                    "album": "Album",
+                    "durationMs": 180000,
+                    "artworkUrl": null,
+                    "resolverPayload": {
+                        "source": "wy",
+                        "musicInfo": { "songmid": "42" }
+                    },
+                    "preview": null
+                },
+                {
+                    "providerId": "wy",
+                    "providerTrackId": "43",
+                    "title": "Ignored",
+                    "artist": "Artist",
+                    "album": "Album",
+                    "durationMs": null,
+                    "artworkUrl": null,
+                    "resolverPayload": {},
+                    "preview": null
+                }
+            ]
+        });
+        let tracks = parse_source_tracks(result, 1, "test").unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].provider_track_id, "42");
     }
 }

@@ -83,6 +83,7 @@ import {
   type PlaylistSummary,
   type ResolveAttemptDiagnostic,
   type RuntimeStatus,
+  type SourcePlaylist,
   type ViewId,
 } from "./types";
 
@@ -671,6 +672,8 @@ function App() {
   const [sourceConfigDraft, setSourceConfigDraft] = useState<SourceConfigDraft | null>(null);
   const [sourceConfigRevealed, setSourceConfigRevealed] = useState(false);
   const [sourceConfigBusy, setSourceConfigBusy] = useState(false);
+  const [sourcePlaylistId, setSourcePlaylistId] = useState("");
+  const [sourcePlaylistBusy, setSourcePlaylistBusy] = useState(false);
   const [backupText, setBackupText] = useState("");
   const [diagnosticLogStatus, setDiagnosticLogStatus] = useState<DiagnosticLogStatus | null>(null);
   const [diagnosticLogEntries, setDiagnosticLogEntries] = useState<DiagnosticLogEntry[]>([]);
@@ -1548,7 +1551,7 @@ function App() {
     setLyrics(null);
   };
 
-  const loadLyricsFor = async (title: string, artist: string, durationMs: number | null, baseMessage: string) => {
+  const loadLyricsFor = async (track: CatalogTrack, baseMessage: string) => {
     const generation = ++lyricsGenerationRef.current;
     const previousRequestId = activeLyricsRequestRef.current;
     activeLyricsRequestRef.current = null;
@@ -1559,12 +1562,17 @@ function App() {
     activeLyricsRequestRef.current = requestId;
     setLyrics(null);
     try {
-      const lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
-        title,
-        artist,
-        durationMs,
+      let lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
+        title: track.title,
+        artist: track.artist,
+        durationMs: track.durationMs,
         requestId,
       });
+      if (!lyricDocument
+        && generation === lyricsGenerationRef.current
+        && activeLyricsRequestRef.current === requestId) {
+        lyricDocument = await invoke<LyricDocument | null>("source_lyric", { track });
+      }
       if (generation === lyricsGenerationRef.current && activeLyricsRequestRef.current === requestId) setLyrics(lyricDocument);
     } catch (lyricError) {
       if (generation === lyricsGenerationRef.current
@@ -1648,7 +1656,7 @@ function App() {
         ? `已命中本地缓存 · ${online.quality ?? "自动"}，无需再次请求音频直链。`
         : `${sourceLabel} 已解析整首播放${online.quality ? ` · ${online.quality}` : ""}，本次播放会顺手写入缓存。`;
       setMessage(playbackMessage);
-      void loadLyricsFor(online.track.title, online.track.artist, online.track.durationMs, playbackMessage);
+      void loadLyricsFor(online.track, playbackMessage);
       void recordHistory({
         kind: "online",
         title: online.track.title,
@@ -1679,7 +1687,7 @@ function App() {
         clearLyrics();
         const playbackMessage = `LX 整首解析失败，已回退为 ${preview.track.providerId} 官方 30 秒预览。原因：${formatFailureMessage(onlineError)}`;
         setMessage(playbackMessage);
-        void loadLyricsFor(preview.track.title, preview.track.artist, preview.track.durationMs, playbackMessage);
+        void loadLyricsFor(preview.track, playbackMessage);
         void recordHistory({
           kind: "preview",
           title: preview.track.title,
@@ -2627,6 +2635,31 @@ function App() {
       setMessage(String(error), true);
     } finally {
       setSourceImportBusy(null);
+    }
+  };
+
+  const importSourcePlaylist = async () => {
+    const id = sourcePlaylistId.trim();
+    if (!id || sourcePlaylistBusy) return;
+    setSourcePlaylistBusy(true);
+    try {
+      const remote = await invoke<SourcePlaylist | null>("source_playlist", { id });
+      if (!remote || !remote.tracks.length) {
+        setMessage("音源没有返回可导入的歌单曲目。", true);
+        return;
+      }
+      const entries = remote.tracks.map((track) => onlineEntryFromCatalog(track, qualityPreference));
+      setPlaylist(entries);
+      setPlaylistIndex(null);
+      setSourcePlaylistId("");
+      seedResults(remote.tracks, remote.name);
+      setSearchQuery(remote.name);
+      navigateTo("search");
+      setMessage("已读取“" + remote.name + "”的 " + remote.tracks.length + " 首歌曲并加入播放队列。");
+    } catch (error) {
+      setMessage("读取远程歌单失败：" + String(error), true);
+    } finally {
+      setSourcePlaylistBusy(false);
     }
   };
 
@@ -3671,6 +3704,29 @@ function App() {
           <form className="inline-form source-url-form" onSubmit={(event) => { event.preventDefault(); void importSourceUrl(); }}>
             <input type="url" aria-label="音源脚本 URL" placeholder="https://example.com/source.js" autoComplete="off" spellCheck={false} value={sourceUrl} disabled={Boolean(sourceImportBusy)} onChange={(event) => setSourceUrl(event.target.value)} />
             <button type="submit" className="primary" disabled={!sourceUrl.trim() || Boolean(sourceImportBusy)}>{sourceImportBusy === "url" ? "正在导入…" : "导入 URL"}</button>
+          </form>
+        </section>
+        <section className="source-import-band" aria-labelledby="source-playlist-title">
+          <div className="source-import-copy">
+            <p className="eyebrow">PLAYLIST</p>
+            <h2 id="source-playlist-title">读取远程歌单</h2>
+            <p>使用当前协议 v2 音源读取歌单；成功后歌曲会进入当前播放队列和结果页。</p>
+          </div>
+          <form className="inline-form source-url-form" onSubmit={(event) => { event.preventDefault(); void importSourcePlaylist(); }}>
+            <input
+              type="text"
+              inputMode="numeric"
+              aria-label="远程歌单 ID"
+              placeholder="网易云歌单 ID"
+              autoComplete="off"
+              spellCheck={false}
+              value={sourcePlaylistId}
+              disabled={sourcePlaylistBusy}
+              onChange={(event) => setSourcePlaylistId(event.target.value)}
+            />
+            <button type="submit" className="primary" disabled={!sourcePlaylistId.trim() || sourcePlaylistBusy}>
+              {sourcePlaylistBusy ? "正在读取…" : "读取并加入队列"}
+            </button>
           </form>
         </section>
         <section className="source-status-card"><span className={`runtime-dot ${runtime?.state ?? "no_source"}`} /><div><strong>{sourceStatus.title}</strong><p>{sourceStatus.copy}</p></div><code>GEN {runtime?.generation ?? 0}</code></section>

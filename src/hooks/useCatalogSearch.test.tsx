@@ -128,6 +128,55 @@ describe("useCatalogSearch", () => {
     expect(result.current.resultsState).toBe("ready");
   });
 
+  it("uses one source search only after a full built-in search returns no tracks", async () => {
+    vi.mocked(invoke).mockImplementation((command) => {
+      if (command === "metadata_search") return Promise.resolve([]) as never;
+      if (command === "source_search") return Promise.resolve([track("source fallback", "wy")]) as never;
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useCatalogSearch(""));
+
+    await act(async () => {
+      await result.current.search("missing");
+    });
+
+    expect(commandCalls("metadata_search")).toHaveLength(1);
+    expect(commandCalls("source_search")).toHaveLength(1);
+    expect(commandCalls("source_search")[0]?.[1]).toEqual({ query: "missing", limit: 40 });
+    expect(result.current.results.map((item) => item.title)).toEqual(["source fallback"]);
+  });
+
+  it("uses the same single fallback when every built-in provider fails", async () => {
+    vi.mocked(invoke).mockImplementation((command) => {
+      if (command === "metadata_search") return Promise.reject(new Error("all providers failed")) as never;
+      if (command === "source_search") return Promise.resolve([track("source recovery", "wy")]) as never;
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useCatalogSearch(""));
+
+    await act(async () => {
+      await result.current.search("recovery");
+    });
+
+    expect(commandCalls("source_search")).toHaveLength(1);
+    expect(result.current.results.map((item) => item.title)).toEqual(["source recovery"]);
+    expect(result.current.resultsState).toBe("ready");
+  });
+
+  it("never uses the paid source fallback for suggestions", async () => {
+    vi.useFakeTimers();
+    vi.mocked(invoke).mockResolvedValue([] as never);
+    const { result } = renderHook(() => useCatalogSearch("missing"));
+
+    await act(async () => {
+      vi.advanceTimersByTime(210);
+    });
+    await act(async () => undefined);
+
+    expect(result.current.suggestionState).toBe("empty");
+    expect(commandCalls("source_search")).toHaveLength(0);
+  });
+
   it("ignores batches and final responses from an obsolete full search", async () => {
     const older = deferred<CatalogTrack[]>();
     const latest = deferred<CatalogTrack[]>();

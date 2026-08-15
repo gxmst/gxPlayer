@@ -3108,6 +3108,26 @@ select {
   white-space: normal;
 }
 
+.lyric .lyric-text {
+  display: grid;
+  gap: 4px;
+  justify-items: center;
+}
+
+.lyric small {
+  display: block;
+  font-size: 0.68em;
+  font-weight: 500;
+  line-height: 1.35;
+  opacity: 0.78;
+}
+
+.lyric small.romanization {
+  font-family: var(--font-mono);
+  font-size: 0.58em;
+  opacity: 0.58;
+}
+
 .lyric.active {
   color: var(--text-hi);
   font-size: 21px;

@@ -5,7 +5,9 @@
 
 .dsp-preset-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  /* Auto-fill rather than a fixed count: the preset list grew past five, and a hard
+     column count leaves a ragged short row at the end. */
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
   gap: 8px;
 }
 
@@ -172,7 +174,7 @@
 }
 
 .dsp-preset-controls.is-compact .dsp-preset-grid {
-  grid-template-columns: repeat(5, minmax(72px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(78px, 1fr));
 }
 
 .dsp-preset-controls.is-compact .dsp-preset-grid button {
@@ -184,7 +186,7 @@
 @media (max-width: 900.98px) {
   .dsp-preset-grid,
   .dsp-preset-controls.is-compact .dsp-preset-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
   }
 
   .dsp-adjustments {

@@ -185,6 +185,15 @@ pub enum DspPresetId {
     Vocal,
     Bass,
     Spatial,
+    // Voicing presets. Each is an EQ curve over the same chain as `Vocal`/`Bass`;
+    // the identity is carried explicitly so a restart restores what the user picked.
+    Warm,
+    Bright,
+    Classical,
+    Electronic,
+    Rock,
+    Podcast,
+    Jazz,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2556,6 +2565,52 @@ mod tests {
         let error = validate_dsp_control_for_output(&control, Some(32_000)).unwrap_err();
 
         assert!(error.to_string().contains("active 32000 Hz output rate"));
+    }
+
+    #[test]
+    fn voicing_presets_round_trip_and_pass_product_validation() {
+        // The frontend persists these ids verbatim, so a serde mismatch or a rejected
+        // preset would silently lose the user's choice across a restart.
+        for (id, wire) in [
+            (DspPresetId::Warm, "\"warm\""),
+            (DspPresetId::Bright, "\"bright\""),
+            (DspPresetId::Classical, "\"classical\""),
+            (DspPresetId::Electronic, "\"electronic\""),
+            (DspPresetId::Rock, "\"rock\""),
+            (DspPresetId::Podcast, "\"podcast\""),
+            (DspPresetId::Jazz, "\"jazz\""),
+        ] {
+            assert_eq!(serde_json::to_string(&id).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<DspPresetId>(wire).unwrap(), id);
+
+            let control = DspControlState {
+                settings: DspSettings {
+                    enabled: true,
+                    eq_enabled: true,
+                    eq_bands: vec![gx_dsp::EqBand::peak(125.0, 2.5, 1.0)],
+                    limiter: LimiterSettings {
+                        enabled: true,
+                        ..LimiterSettings::default()
+                    },
+                    ..DspSettings::default()
+                },
+                active_preset_id: id,
+                intensity: 1.0,
+                spatial_amount: 0.5,
+            };
+            control.validate_product().unwrap();
+            // Voicing presets are music-mode; only `spatial` maps to cinema.
+            assert_eq!(control.audio_mode(), AudioMode::Music);
+
+            // HRTF stays reserved for `spatial`.
+            let mut with_hrtf = control.clone();
+            with_hrtf.settings.hrtf = HrtfSettings {
+                enabled: true,
+                mix: 0.5,
+                output_gain_db: -6.0,
+            };
+            assert!(with_hrtf.validate_product().is_err());
+        }
     }
 
     #[test]

@@ -245,7 +245,20 @@ export type DspSettings = {
   limiter: { enabled: boolean; ceilingDb: number; releaseMs: number };
 };
 
-export type DspPresetId = "bypass" | "headphone_daily" | "vocal" | "bass" | "spatial";
+/** Mirrors gx_audio::engine::DspPresetId, which serializes snake_case. */
+export type DspPresetId =
+  | "bypass"
+  | "headphone_daily"
+  | "vocal"
+  | "bass"
+  | "spatial"
+  | "warm"
+  | "bright"
+  | "classical"
+  | "electronic"
+  | "rock"
+  | "podcast"
+  | "jazz";
 
 export type DspControlState = {
   settings: DspSettings;

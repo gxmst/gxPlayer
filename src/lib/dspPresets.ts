@@ -29,6 +29,41 @@ export const DSP_PRESETS = [
     label: "空间",
     description: "固定前方 ±30° 音箱感，可能偏闷；建议不与系统杜比耳机虚拟化同时开。",
   },
+  {
+    id: "warm",
+    label: "温暖",
+    description: "抬一点中低频、收一点高频，久听不累。",
+  },
+  {
+    id: "bright",
+    label: "明亮",
+    description: "抬高频细节和空气感，适合闷一点的耳机。",
+  },
+  {
+    id: "classical",
+    label: "古典",
+    description: "两端轻抬、中频略收，还原大编制的层次和厅堂感。",
+  },
+  {
+    id: "electronic",
+    label: "电子",
+    description: "低频下潜配高频亮度，中频退后半步，避免糊成一团。",
+  },
+  {
+    id: "rock",
+    label: "摇滚",
+    description: "低中频力度加高频咬合，250 Hz 让位以免人声被吉他埋掉。",
+  },
+  {
+    id: "podcast",
+    label: "播客",
+    description: "重收低频隆隆声、抬人声清晰度，长时间说话内容不累耳。",
+  },
+  {
+    id: "jazz",
+    label: "爵士",
+    description: "中频温润、保留高频空气感，低频基本不动。",
+  },
 ] as const satisfies ReadonlyArray<{
   id: DspPresetId;
   label: string;
@@ -42,22 +77,31 @@ const EQ_FREQUENCIES = [31, 62, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_00
 const VOCAL_GAINS = [0, 0, -2, -1, 0, 2, 2.5, 0, 0, 0] as const;
 const BASS_GAINS = [2, 3, 2, 0, 0, 0, 0, 0, 0, 0] as const;
 
-// Future-only restrained curves. They intentionally stay outside DSP_PRESETS,
-// so v1 exposes exactly the five product choices above without a hidden editor.
-export const DSP_INTERNAL_EQ_PRESETS = {
-  warm: {
-    label: "温暖",
-    gains: [0, 0.5, 1.25, 0.75, 0, 0, -0.25, -0.5, -0.75, -0.5],
-  },
-  bright: {
-    label: "明亮",
-    gains: [0, 0, 0, -0.25, 0, 0.25, 0.75, 1.25, 1.5, 1],
-  },
-  classical: {
-    label: "古典",
-    gains: [0.5, 0.5, 0, -0.5, -0.25, 0, 0.5, 0.75, 0.75, 0.5],
-  },
-} as const;
+// Restrained voicing curves, ordered 31 Hz -> 16 kHz. Peak gain stays well inside
+// the engine's +-12 dB product limit even after intensityScale's 1.4x ceiling, so a
+// preset at full intensity still validates.
+const WARM_GAINS = [0, 0.5, 1.25, 0.75, 0, 0, -0.25, -0.5, -0.75, -0.5] as const;
+const BRIGHT_GAINS = [0, 0, 0, -0.25, 0, 0.25, 0.75, 1.25, 1.5, 1] as const;
+const CLASSICAL_GAINS = [0.5, 0.5, 0, -0.5, -0.25, 0, 0.5, 0.75, 0.75, 0.5] as const;
+// Sub weight plus air, with the middle stepped back so the mix does not turn muddy.
+const ELECTRONIC_GAINS = [2.5, 2, 1, -0.5, -1, -0.5, 0, 1, 1.75, 1.25] as const;
+// Body and bite together; the 250 Hz dip keeps vocals from being buried by guitars.
+const ROCK_GAINS = [1.5, 1.75, 1, -1, -0.5, 0.5, 1.5, 1.75, 1, 0.25] as const;
+// Speech: cut rumble hard, lift articulation, stay flat on top to avoid sibilance.
+const PODCAST_GAINS = [-3.5, -3, -1.5, 0, 1, 2, 2.25, 1.25, 0, -0.5] as const;
+// Warm midrange with air retained; bass is left essentially untouched.
+const JAZZ_GAINS = [0.5, 0.75, 0.75, 0.25, -0.25, 0.25, 0.5, 0.75, 1, 0.75] as const;
+
+/** Curve per voicing preset. These share one code path; only the gains differ. */
+const VOICING_GAINS = {
+  warm: WARM_GAINS,
+  bright: BRIGHT_GAINS,
+  classical: CLASSICAL_GAINS,
+  electronic: ELECTRONIC_GAINS,
+  rock: ROCK_GAINS,
+  podcast: PODCAST_GAINS,
+  jazz: JAZZ_GAINS,
+} as const satisfies Record<string, readonly number[]>;
 
 const CROSSFEED_LIGHT = 0.13;
 const CROSSFEED_MEDIUM = 0.18;
@@ -215,6 +259,25 @@ export function buildDspSettings(
           HRTF_MEDIUM,
           HRTF_STRONG,
         ),
+        limiterEnabled: true,
+      });
+    case "warm":
+    case "bright":
+    case "classical":
+    case "electronic":
+    case "rock":
+    case "podcast":
+    case "jazz":
+      // Voicing presets differ only by curve: EQ on, light crossfeed to soften the
+      // headphone split, HRTF off because the engine reserves it for `spatial`, and
+      // the limiter on to catch the boosted peaks.
+      return settings({
+        eqEnabled: true,
+        bands: eqBands(VOICING_GAINS[presetId], intensityScale(normalizedIntensity)),
+        crossfeedEnabled: true,
+        crossfeedAmount: CROSSFEED_LIGHT,
+        hrtfEnabled: false,
+        hrtfMix: HRTF_MEDIUM,
         limiterEnabled: true,
       });
     default:

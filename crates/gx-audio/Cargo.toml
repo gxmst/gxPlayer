@@ -20,6 +20,9 @@ symphonia.workspace = true
 
 [dev-dependencies]
 gx-streaming = { path = "../gx-streaming", features = ["test-private-network"] }
+# Asserts the preset wire format the frontend persists, so a serde rename mismatch
+# cannot silently drop a user's preset across a restart.
+serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_System_Threading"] }

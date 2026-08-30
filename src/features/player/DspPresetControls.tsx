@@ -69,10 +69,12 @@ export function DspPresetControls({
   const onAbDryChangeRef = useRef(onAbDryChange);
   onAbDryChangeRef.current = onAbDryChange;
   const activePreset = getDspPreset(value.activePresetId);
-  const showIntensity = value.activePresetId === "headphone_daily"
-    || value.activePresetId === "vocal"
-    || value.activePresetId === "bass";
+  // Every processed preset except `spatial` scales with intensity, so the slider has
+  // to follow that rather than an enumerated list: a preset whose curve responds to
+  // intensity without exposing it would leave a hidden parameter shaping the sound.
+  // `spatial` is driven by its own amount control, and `bypass` processes nothing.
   const showSpatialAmount = value.activePresetId === "spatial";
+  const showIntensity = value.activePresetId !== "bypass" && !showSpatialAmount;
   const showAdjustments = value.activePresetId !== "bypass";
 
   const releaseAb = useCallback(() => {

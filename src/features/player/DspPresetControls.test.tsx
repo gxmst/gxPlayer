@@ -2,13 +2,18 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildDspControlState, DSP_AB_LABEL, DSP_SYSTEM_EFFECTS_HINT } from "../../lib/dspPresets";
+import {
+  buildDspControlState,
+  DSP_AB_LABEL,
+  DSP_PRESETS,
+  DSP_SYSTEM_EFFECTS_HINT,
+} from "../../lib/dspPresets";
 import { DspPresetControls } from "./DspPresetControls";
 
 afterEach(() => cleanup());
 
 describe("DspPresetControls", () => {
-  it("renders the five v1 preset choices and exact guidance copy", () => {
+  it("renders every preset choice and exact guidance copy", () => {
     render(
       <DspPresetControls
         value={buildDspControlState("bypass")}
@@ -17,8 +22,21 @@ describe("DspPresetControls", () => {
       />,
     );
 
-    expect(screen.getAllByRole("radio")).toHaveLength(5);
-    for (const name of ["原声", "耳机日常", "人声", "低音", "空间"]) {
+    expect(screen.getAllByRole("radio")).toHaveLength(DSP_PRESETS.length);
+    for (const name of [
+      "原声",
+      "耳机日常",
+      "人声",
+      "低音",
+      "空间",
+      "温暖",
+      "明亮",
+      "古典",
+      "电子",
+      "摇滚",
+      "播客",
+      "爵士",
+    ]) {
       expect(screen.getByRole("radio", { name: new RegExp(name) })).toBeInTheDocument();
     }
     expect(screen.getByText(DSP_SYSTEM_EFFECTS_HINT)).toBeInTheDocument();
@@ -61,12 +79,17 @@ describe("DspPresetControls", () => {
     expect(bass).toHaveFocus();
     expect(onChange).toHaveBeenLastCalledWith(buildDspControlState("bass", 0.2, 0.8));
 
+    // End lands on the last preset in DSP_PRESETS, whatever that currently is.
+    const last = DSP_PRESETS[DSP_PRESETS.length - 1];
     fireEvent.keyDown(bass, { key: "End" });
-    expect(screen.getByRole("radio", { name: "空间" })).toHaveFocus();
-    expect(onChange).toHaveBeenLastCalledWith(buildDspControlState("spatial", 0.2, 0.8));
+    expect(screen.getByRole("radio", { name: last.label })).toHaveFocus();
+    expect(onChange).toHaveBeenLastCalledWith(buildDspControlState(last.id, 0.2, 0.8));
+
+    fireEvent.keyDown(screen.getByRole("radio", { name: last.label }), { key: "Home" });
+    expect(screen.getByRole("radio", { name: DSP_PRESETS[0].label })).toHaveFocus();
   });
 
-  it("shows strength only for headphone, vocal and bass presets", () => {
+  it("shows strength for every intensity-scaled preset, and spatial amount only for spatial", () => {
     const { rerender } = render(
       <DspPresetControls
         value={buildDspControlState("headphone_daily")}
@@ -78,6 +101,19 @@ describe("DspPresetControls", () => {
     expect(screen.getByRole("slider", { name: "强度" })).toHaveAttribute("aria-valuetext", "标准");
     expect(screen.queryByRole("slider", { name: "空间感" })).not.toBeInTheDocument();
 
+    // Voicing presets scale with intensity, so they must expose the control too.
+    for (const presetId of ["warm", "electronic", "podcast", "jazz"] as const) {
+      rerender(
+        <DspPresetControls
+          value={buildDspControlState(presetId)}
+          onChange={vi.fn()}
+          onAbDryChange={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("slider", { name: "强度" })).toBeInTheDocument();
+      expect(screen.queryByRole("slider", { name: "空间感" })).not.toBeInTheDocument();
+    }
+
     rerender(
       <DspPresetControls
         value={buildDspControlState("spatial")}
@@ -88,6 +124,16 @@ describe("DspPresetControls", () => {
     expect(screen.queryByRole("slider", { name: "强度" })).not.toBeInTheDocument();
     expect(screen.getByRole("slider", { name: "空间感" })).toBeInTheDocument();
     expect(screen.getAllByText("固定前方 ±30° 音箱感，可能偏闷；建议不与系统杜比耳机虚拟化同时开。").length).toBeGreaterThan(0);
+
+    rerender(
+      <DspPresetControls
+        value={buildDspControlState("bypass")}
+        onChange={vi.fn()}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("slider", { name: "强度" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("slider", { name: "空间感" })).not.toBeInTheDocument();
   });
 
   it("keeps pointer range input local and commits the final draft once", () => {

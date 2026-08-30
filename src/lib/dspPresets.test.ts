@@ -1,22 +1,34 @@
 import { describe, expect, it } from "vitest";
-import {
-  buildDspControlState,
-  buildDspSettings,
-  DSP_INTERNAL_EQ_PRESETS,
-  DSP_PRESETS,
-  getDspPreset,
-} from "./dspPresets";
+import { buildDspControlState, buildDspSettings, DSP_PRESETS, getDspPreset } from "./dspPresets";
+import type { DspPresetId } from "../types";
 
 const FREQUENCIES = [31, 62, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000];
 
+const VOICING_PRESETS = [
+  "warm",
+  "bright",
+  "classical",
+  "electronic",
+  "rock",
+  "podcast",
+  "jazz",
+] as const satisfies ReadonlyArray<DspPresetId>;
+
 describe("DSP presets", () => {
-  it("defines the five v1 presets and always emits a complete 10-band peak EQ", () => {
+  it("defines every preset and always emits a complete 10-band peak EQ", () => {
     expect(DSP_PRESETS.map((preset) => preset.id)).toEqual([
       "bypass",
       "headphone_daily",
       "vocal",
       "bass",
       "spatial",
+      "warm",
+      "bright",
+      "classical",
+      "electronic",
+      "rock",
+      "podcast",
+      "jazz",
     ]);
 
     for (const preset of DSP_PRESETS) {
@@ -28,15 +40,34 @@ describe("DSP presets", () => {
     }
   });
 
-  it("keeps future warm, bright and classical curves internal and restrained", () => {
-    expect(Object.keys(DSP_INTERNAL_EQ_PRESETS)).toEqual(["warm", "bright", "classical"]);
-    expect(DSP_PRESETS.map((preset) => preset.label)).not.toContain("温暖");
-    expect(DSP_PRESETS.map((preset) => preset.label)).not.toContain("明亮");
-    expect(DSP_PRESETS.map((preset) => preset.label)).not.toContain("古典");
-    for (const preset of Object.values(DSP_INTERNAL_EQ_PRESETS)) {
-      expect(preset.gains).toHaveLength(10);
-      expect(Math.max(...preset.gains.map(Math.abs))).toBeLessThanOrEqual(3);
+  it("keeps every voicing curve restrained and inside the engine gain limit", () => {
+    for (const presetId of VOICING_PRESETS) {
+      // Full intensity applies the 1.4x ceiling, which is what the engine validates.
+      const boosted = buildDspSettings(presetId, 1);
+      const peak = Math.max(...boosted.eqBands.map((band) => Math.abs(band.gainDb)));
+      expect(peak).toBeLessThanOrEqual(12);
+      // Restraint is a product rule, not just a validity one.
+      expect(peak).toBeLessThanOrEqual(5);
+      expect(boosted.eqEnabled).toBe(true);
+      expect(boosted.hrtf.enabled).toBe(false);
+      expect(boosted.limiter.enabled).toBe(true);
     }
+  });
+
+  it("gives each voicing preset a distinct curve", () => {
+    const curves = VOICING_PRESETS.map((presetId) =>
+      buildDspSettings(presetId).eqBands.map((band) => band.gainDb).join(","),
+    );
+    expect(new Set(curves).size).toBe(VOICING_PRESETS.length);
+  });
+
+  it("shapes podcast for speech: rumble cut, articulation lifted", () => {
+    const podcast = buildDspSettings("podcast", 0.5);
+    // 31 Hz and 62 Hz cut, 1 kHz and 2 kHz lifted.
+    expect(podcast.eqBands[0].gainDb).toBeLessThan(-2);
+    expect(podcast.eqBands[1].gainDb).toBeLessThan(-2);
+    expect(podcast.eqBands[5].gainDb).toBeGreaterThan(1);
+    expect(podcast.eqBands[6].gainDb).toBeGreaterThan(1);
   });
 
   it("keeps bypass as a true disabled chain", () => {

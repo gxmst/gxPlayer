@@ -1513,6 +1513,7 @@ dependencies = [
  "ringbuf",
  "rubato",
  "serde",
+ "serde_json",
  "symphonia",
  "windows 0.61.3",
 ]

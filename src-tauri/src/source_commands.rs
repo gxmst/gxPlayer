@@ -264,6 +264,52 @@ impl ResolveCancellationRegistry {
     }
 }
 
+/// Lets playback take the source runtime back from an in-flight optional action.
+///
+/// Optional actions (search fallback, lyrics, playlist reads) share one sandbox and
+/// one operation lock with playback resolution. Audio is what the user is waiting
+/// for, so an optional action never gets to hold that lock across a playback
+/// request: playback calls [`OptionalActionGate::preempt`] before it queues for the
+/// lock, and the optional action's wait loops observe the cancelled token within one
+/// poll interval and release it.
+#[derive(Default)]
+pub struct OptionalActionGate {
+    active: Mutex<Option<Arc<AtomicU8>>>,
+}
+
+impl OptionalActionGate {
+    /// Register an optional action, superseding any previous one, and hand back the
+    /// token its wait loops must poll.
+    fn begin(&self, action: &str) -> ResolveToken {
+        let state = Arc::new(AtomicU8::new(RESOLVE_ACTIVE));
+        let mut active = self.active.lock().unwrap();
+        if let Some(previous) = active.replace(state.clone()) {
+            previous.store(RESOLVE_STALE, Ordering::Release);
+        }
+        ResolveToken {
+            request_id: format!("optional:{action}"),
+            state,
+        }
+    }
+
+    fn finish(&self, token: &ResolveToken) {
+        let mut active = self.active.lock().unwrap();
+        if active
+            .as_ref()
+            .is_some_and(|state| Arc::ptr_eq(state, &token.state))
+        {
+            *active = None;
+        }
+    }
+
+    /// Cancel whatever optional action is running so playback can proceed.
+    pub(crate) fn preempt(&self) {
+        if let Some(state) = self.active.lock().unwrap().take() {
+            state.store(RESOLVE_CANCELLED, Ordering::Release);
+        }
+    }
+}
+
 #[tauri::command]
 pub fn source_list(
     window: WebviewWindow,
@@ -652,6 +698,7 @@ pub async fn source_resolve(
 ) -> Result<ResolvedMediaRequest, String> {
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
+    app.state::<OptionalActionGate>().preempt();
     let diagnostic_source_id = source_id.clone();
     let app_for_worker = app.clone();
     let worker_result = tauri::async_runtime::spawn_blocking(move || {
@@ -876,16 +923,32 @@ fn request_optional_source_action(
     build_payload: impl FnOnce(&Value) -> Value,
 ) -> Result<Option<Value>, String> {
     let runtime = app.state::<SourceRuntime>();
-    let selected = runtime
+    let candidates = runtime
         .resolution_source_ids(None)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find_map(|id| {
-            runtime
-                .source(&id)
-                .ok()
-                .filter(|source| source_supports_action(source, action))
-                .map(|source| (id, source.capabilities.clone()))
+        .map_err(|error| error.to_string())?;
+    let supported = |id: &str| {
+        runtime
+            .source(id)
+            .ok()
+            .filter(|source| source_supports_action(source, action))
+            .map(|source| source.capabilities.clone())
+    };
+    // Prefer the source already loaded in the sandbox. Reloading the realm for an
+    // optional action would cost two runtime initializations per request while the
+    // user is listening, so a ready source that advertises the action always wins.
+    let status = runtime.status();
+    let selected = status
+        .active_source_id
+        .as_deref()
+        .filter(|active| {
+            status.state == crate::source_runtime::RuntimeState::Ready
+                && candidates.iter().any(|id| id == active)
+        })
+        .and_then(|active| supported(active).map(|caps| (active.to_owned(), caps)))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find_map(|id| supported(id).map(|caps| (id.clone(), caps)))
         });
     let Some((source_id, capabilities)) = selected else {
         return Ok(None);
@@ -898,7 +961,13 @@ fn request_optional_source_action(
         .into_iter()
         .next()
         .unwrap_or(NetworkRoute::Direct);
+    let gate = app.state::<OptionalActionGate>();
+    let token = gate.begin(action);
     let result = runtime.serialized(|| {
+        // Playback may have preempted us while we queued for the lock.
+        if token.outcome().is_some() {
+            return Err(OPTIONAL_ACTION_PREEMPTED.to_owned());
+        }
         let persistent_active = runtime
             .list()
             .into_iter()
@@ -923,17 +992,26 @@ fn request_optional_source_action(
                     .get_webview_window(SANDBOX_LABEL)
                     .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
                 evaluate_launch(&sandbox, &launch)?;
-                wait_until_ready(&runtime, launch.generation, RUNTIME_INIT_TIMEOUT, None)
+                wait_until_ready(
+                    &runtime,
+                    launch.generation,
+                    RUNTIME_INIT_TIMEOUT,
+                    Some(&token),
+                )
             })();
             if let Err(error) = switched {
                 if temporary {
-                    let _ = restore_persistent_runtime(app, &runtime);
+                    let _ = restore_persistent_runtime_background(app, &runtime);
                 }
                 return Err(error);
             }
         }
-        let result = dispatch_raw_and_wait(app, &runtime, &payload, None);
-        if temporary && let Err(restore_error) = restore_persistent_runtime(app, &runtime) {
+        let result = dispatch_raw_and_wait(app, &runtime, &payload, Some(&token));
+        // Restore in the background: holding the operation lock through another
+        // initialization would put a playback request behind this optional one.
+        if temporary
+            && let Err(restore_error) = restore_persistent_runtime_background(app, &runtime)
+        {
             return match result {
                 Ok(_) => Err(restore_error),
                 Err(request_error) => Err(format!(
@@ -943,7 +1021,29 @@ fn request_optional_source_action(
         }
         result
     });
-    result.map(Some)
+    gate.finish(&token);
+    match result {
+        Ok(value) => Ok(Some(value)),
+        // A preempted optional action is not a failure the user needs to see.
+        Err(error) if is_optional_action_preempted(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+const OPTIONAL_ACTION_PREEMPTED: &str = "optional source action preempted by playback";
+
+/// The exact terminal messages a preempted optional action can surface: the pre-lock
+/// check plus the two wait loops that poll the gate token. Matching these instead of
+/// scanning for "cancelled" keeps real upstream failures visible.
+fn is_optional_action_preempted(error: &str) -> bool {
+    matches!(
+        error,
+        OPTIONAL_ACTION_PREEMPTED
+            | "LX resolver request cancelled"
+            | "LX resolver request superseded"
+            | "LX runtime initialization cancelled"
+            | "LX runtime initialization superseded"
+    )
 }
 
 fn resolve_with_fallback(
@@ -1197,6 +1297,9 @@ pub async fn player_play_online_track(
 ) -> Result<OnlinePlaybackResult, String> {
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
+    // Audio outranks enrichment: drop any in-flight optional action before queueing
+    // for the shared source runtime lock.
+    app.state::<OptionalActionGate>().preempt();
     let token = request_id
         .map(|request_id| {
             app.state::<ResolveCancellationRegistry>()
@@ -3757,6 +3860,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, script);
+    }
+
+    #[test]
+    fn playback_preempts_an_in_flight_optional_action() {
+        let gate = OptionalActionGate::default();
+        let token = gate.begin("lyric");
+        assert!(token.outcome().is_none());
+
+        // Playback arrives: the optional action's wait loops must see a terminal
+        // outcome so they abort and release the shared operation lock.
+        gate.preempt();
+        assert_eq!(token.outcome(), Some(ResolveOutcome::Cancelled));
+        assert!(is_optional_action_preempted(
+            "LX resolver request cancelled"
+        ));
+        assert!(is_optional_action_preempted(OPTIONAL_ACTION_PREEMPTED));
+        assert!(!is_optional_action_preempted("upstream_rate_limited"));
+
+        // A newer optional action supersedes the older one, and finishing a token
+        // that no longer owns the slot must not clear the newer registration.
+        let first = gate.begin("search");
+        let second = gate.begin("search");
+        assert_eq!(first.outcome(), Some(ResolveOutcome::Stale));
+        assert!(second.outcome().is_none());
+        gate.finish(&first);
+        gate.preempt();
+        assert_eq!(second.outcome(), Some(ResolveOutcome::Cancelled));
     }
 
     #[test]

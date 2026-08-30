@@ -58,6 +58,18 @@ and one network route. The host does not fan a search out across imported
 sources. Search suggestions remain on the built-in metadata path; `search` is
 used only when a completed built-in search returned no tracks.
 
+Optional actions never delay audio. They share one sandbox and one operation
+lock with playback resolution, so the host holds that lock as briefly as it can:
+
+- A source already loaded and ready is preferred, even when a higher-ordered
+  source also advertises the action, because reloading the realm would cost two
+  initializations while the user is listening.
+- When a switch is unavoidable, the previous source is restored in the
+  background instead of under the lock.
+- Any playback request preempts the in-flight optional action, which observes
+  the cancelled token within one poll interval and releases the lock. A
+  preempted optional action reports no result rather than an error.
+
 - `search` receives `{ action, info: { keyword, limit, offset } }` and returns
   either an array of normalized `CatalogTrack` objects or `{ tracks }`.
 - `lyric` receives the selected platform and `musicInfo` and returns a

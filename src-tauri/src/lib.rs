@@ -63,13 +63,13 @@ use product_commands::{
     window_set_always_on_top, window_set_mini_mode,
 };
 use source_commands::{
-    LxHttpConcurrencyLimiter, ResolveCancellationRegistry, lx_http_request, lx_runtime_failure,
-    lx_runtime_result, lx_send, player_cancel_resolve, player_play_online_track, source_activate,
-    source_export_backup, source_get_config, source_get_fallback_config, source_import_file,
-    source_import_url, source_list, source_lyric, source_playlist, source_reimport, source_reload,
-    source_remove, source_resolve, source_restore_backup, source_search, source_set_config,
-    source_set_enabled, source_set_fallback_config, source_set_order, source_set_updates_enabled,
-    source_status,
+    LxHttpConcurrencyLimiter, OptionalActionGate, ResolveCancellationRegistry, lx_http_request,
+    lx_runtime_failure, lx_runtime_result, lx_send, player_cancel_resolve,
+    player_play_online_track, source_activate, source_export_backup, source_get_config,
+    source_get_fallback_config, source_import_file, source_import_url, source_list, source_lyric,
+    source_playlist, source_reimport, source_reload, source_remove, source_resolve,
+    source_restore_backup, source_search, source_set_config, source_set_enabled,
+    source_set_fallback_config, source_set_order, source_set_updates_enabled, source_status,
 };
 use source_runtime::SourceRuntime;
 
@@ -1258,6 +1258,7 @@ pub fn run() {
         .manage(audio_engine)
         .manage(LxHttpConcurrencyLimiter::default())
         .manage(ResolveCancellationRegistry::default())
+        .manage(OptionalActionGate::default())
         .manage(MetadataClient::default())
         .manage(MetadataCancellationRegistry::default())
         .manage(media_session::MediaSessionState::default())

@@ -704,10 +704,37 @@ fn map_deezer_response(response: DeezerResponse) -> Vec<CatalogTrack> {
         .collect()
 }
 
-pub fn apple_chart(limit: usize) -> Result<Vec<CatalogTrack>, MetadataError> {
+/// Storefronts offered for the public chart feed, as ISO 3166-1 alpha-2 codes.
+///
+/// The feed is Apple's unauthenticated marketing RSS, so this is a plain public
+/// endpoint rather than a platform integration.
+pub const CHART_REGIONS: &[&str] = &[
+    "cn", "hk", "tw", "jp", "kr", "us", "gb", "de", "fr", "sg", "my", "au", "ca",
+];
+
+pub const DEFAULT_CHART_REGION: &str = "cn";
+
+/// Normalize a caller-supplied region to a supported storefront.
+///
+/// The region reaches the URL path, so it is matched against the allow-list rather
+/// than escaped: an unknown value falls back instead of being interpolated.
+pub fn normalize_chart_region(region: Option<&str>) -> &'static str {
+    let requested = region
+        .unwrap_or(DEFAULT_CHART_REGION)
+        .trim()
+        .to_ascii_lowercase();
+    CHART_REGIONS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == requested)
+        .unwrap_or(DEFAULT_CHART_REGION)
+}
+
+pub fn apple_chart(limit: usize, region: Option<&str>) -> Result<Vec<CatalogTrack>, MetadataError> {
     let limit = limit.clamp(1, 100);
+    let region = normalize_chart_region(region);
     let url = Url::parse(&format!(
-        "https://rss.marketingtools.apple.com/api/v2/cn/music/most-played/{limit}/songs.json"
+        "https://rss.marketingtools.apple.com/api/v2/{region}/music/most-played/{limit}/songs.json"
     ))?;
     let response: AppleChartResponse = request_json(url)?;
     Ok(response
@@ -1484,6 +1511,52 @@ struct LrcLibItem {
     instrumental: bool,
     plain_lyrics: Option<String>,
     synced_lyrics: Option<String>,
+}
+
+#[cfg(test)]
+mod chart_region_tests {
+    use super::*;
+
+    #[test]
+    fn chart_region_falls_back_instead_of_reaching_the_url() {
+        assert_eq!(normalize_chart_region(Some("jp")), "jp");
+        assert_eq!(normalize_chart_region(Some("  US  ")), "us");
+        assert_eq!(normalize_chart_region(None), DEFAULT_CHART_REGION);
+
+        // The region is interpolated into a URL path, so anything not on the
+        // allow-list has to fall back rather than travel.
+        for hostile in [
+            "../../etc/passwd",
+            "cn/music/most-played/1/songs.json?x=",
+            "zz",
+            "",
+            "cn ",
+            "%2e%2e",
+            "cn\nx",
+        ] {
+            let resolved = normalize_chart_region(Some(hostile));
+            assert!(
+                CHART_REGIONS.contains(&resolved),
+                "{hostile:?} resolved to {resolved:?}, which is not an allowed storefront"
+            );
+        }
+        assert_eq!(
+            normalize_chart_region(Some("../../etc/passwd")),
+            DEFAULT_CHART_REGION
+        );
+    }
+
+    #[test]
+    fn chart_regions_are_lowercase_two_letter_codes() {
+        assert!(CHART_REGIONS.contains(&DEFAULT_CHART_REGION));
+        for region in CHART_REGIONS {
+            assert_eq!(region.len(), 2, "{region:?} is not a two-letter code");
+            assert!(
+                region.chars().all(|c| c.is_ascii_lowercase()),
+                "{region:?} must be lowercase ascii"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -49,6 +49,8 @@ const demoCatalog = [
 
 let demoDspControl = buildDspControlState("bypass");
 let demoCustomEqPresets: Array<{ name: string; gainsDb: number[] }> = [];
+let demoChartRegion = "cn";
+let demoChartAutoLoad = true;
 
 function demoPreferences() {
   return {
@@ -59,6 +61,8 @@ function demoPreferences() {
     outputDevice: null,
     dspControl: demoDspControl,
     customEqPresets: demoCustomEqPresets,
+    chartRegion: demoChartRegion,
+    chartAutoLoad: demoChartAutoLoad,
   };
 }
 
@@ -131,6 +135,14 @@ function mockResult(command: string, args?: Record<string, unknown>): unknown {
     }
     case "player_delete_custom_eq_preset":
       demoCustomEqPresets = demoCustomEqPresets.filter((entry) => entry.name !== args?.name);
+      return demoPreferences();
+    case "metadata_chart_regions":
+      return ["cn", "hk", "tw", "jp", "kr", "us", "gb", "de", "fr", "sg", "my", "au", "ca"];
+    case "app_preferences_set_chart_region":
+      demoChartRegion = typeof args?.region === "string" ? args.region : demoChartRegion;
+      return demoPreferences();
+    case "app_preferences_set_chart_auto_load":
+      demoChartAutoLoad = args?.enabled === true;
       return demoPreferences();
     case "player_set_ab_dry":
       return undefined;

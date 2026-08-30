@@ -44,6 +44,10 @@ pub struct AppPreferences {
     pub output_device: Option<String>,
     pub dsp_control: DspControlState,
     pub custom_eq_presets: Vec<CustomEqPreset>,
+    /// Storefront for the public chart feed, validated against the supported list.
+    pub chart_region: String,
+    /// Whether opening the home view may fetch the chart without being asked.
+    pub chart_auto_load: bool,
 }
 
 impl Default for AppPreferences {
@@ -56,6 +60,8 @@ impl Default for AppPreferences {
             output_device: None,
             dsp_control: DspControlState::default(),
             custom_eq_presets: Vec::new(),
+            chart_region: gx_metadata::DEFAULT_CHART_REGION.to_owned(),
+            chart_auto_load: true,
         }
     }
 }
@@ -71,6 +77,8 @@ struct RawAppPreferences {
     dsp_control: Option<serde_json::Value>,
     audio_mode: Option<serde_json::Value>,
     custom_eq_presets: Option<Vec<serde_json::Value>>,
+    chart_region: Option<String>,
+    chart_auto_load: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +176,18 @@ impl AppPreferencesState {
                 None => preferences.custom_eq_presets.push(preset),
             }
         })
+    }
+
+    pub fn set_chart_region(&self, region: &str) -> Result<AppPreferences, String> {
+        let normalized = gx_metadata::normalize_chart_region(Some(region));
+        if normalized != region.trim().to_ascii_lowercase() {
+            return Err("unsupported chart region".into());
+        }
+        self.update(|preferences| preferences.chart_region = normalized.to_owned())
+    }
+
+    pub fn set_chart_auto_load(&self, enabled: bool) -> Result<AppPreferences, String> {
+        self.update(|preferences| preferences.chart_auto_load = enabled)
     }
 
     pub fn delete_custom_eq_preset(&self, name: &str) -> Result<AppPreferences, String> {
@@ -294,6 +314,8 @@ fn read_preferences(path: &Path) -> ReadPreferences {
         output_device: raw.output_device,
         dsp_control: load_dsp_control(raw.dsp_control, raw.audio_mode),
         custom_eq_presets: load_custom_eq_presets(raw.custom_eq_presets),
+        chart_region: gx_metadata::normalize_chart_region(raw.chart_region.as_deref()).to_owned(),
+        chart_auto_load: raw.chart_auto_load.unwrap_or(true),
     };
     normalize_preferences(&mut preferences);
     ReadPreferences::Loaded(preferences)
@@ -320,6 +342,9 @@ fn normalize_preferences(preferences: &mut AppPreferences) {
         1.0
     };
     preferences.output_device = normalize_device_name(preferences.output_device.take());
+    // Re-validate on every load and save: the region reaches a URL path.
+    preferences.chart_region =
+        gx_metadata::normalize_chart_region(Some(&preferences.chart_region)).to_owned();
 }
 
 fn load_dsp_control(

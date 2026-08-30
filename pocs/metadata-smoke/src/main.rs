@@ -41,7 +41,7 @@ fn main() -> Result<()> {
         "GX_PHASE3_LYRICS_OK lines={}",
         lyrics.as_ref().map_or(0, |lyrics| lyrics.lines.len())
     );
-    let chart = apple_chart(10).context("real chart query failed")?;
+    let chart = apple_chart(10, None).context("real chart query failed")?;
     if chart.is_empty() {
         bail!("real chart query returned no tracks");
     }

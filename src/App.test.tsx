@@ -55,6 +55,9 @@ function appPreferences(dspControl = defaultDspControl) {
     volume: 0.7,
     outputDevice: null,
     dspControl,
+    customEqPresets: [],
+    chartRegion: "cn",
+    chartAutoLoad: false,
   };
 }
 
@@ -89,6 +92,8 @@ beforeEach(() => {
       case "source_runtime_status": return { state: "ready", generation: 1, detail: null };
       case "cache_status": return { directory: "mock", totalBytes: 0, entryCount: 0, pinnedCount: 0, limitBytes: 5 * 1024 ** 3 };
       case "app_preferences_get": return appPreferences();
+      case "metadata_chart_regions": return ["cn", "us", "jp"];
+      case "metadata_chart": return [];
       case "player_set_dsp_settings": return appPreferences(args?.control as ReturnType<typeof buildDspControlState>);
       case "player_set_ab_dry": return undefined;
       case "player_refresh_output_devices": return { devices: [], defaultDevice: null, selectedDevice: null };
@@ -147,6 +152,23 @@ describe("App shell", () => {
       ]);
     });
     expect(runtime.invoke.mock.calls.some(([command]) => command === "player_set_dsp_settings")).toBe(false);
+  });
+
+  it("persists a chart region change and refetches only that region", async () => {
+    render(<App />);
+    // Auto-load is off in the mock preferences, so nothing has hit the network yet.
+    await waitFor(() => expect(screen.getByRole("heading", { name: "正在流行" })).toBeInTheDocument());
+    expect(runtime.invoke.mock.calls.some(([command]) => command === "metadata_chart")).toBe(false);
+
+    runtime.invoke.mockClear();
+    const picker = await screen.findByRole("combobox", { name: "榜单地区" });
+    fireEvent.change(picker, { target: { value: "jp" } });
+
+    await waitFor(() => {
+      expect(runtime.invoke).toHaveBeenCalledWith("app_preferences_set_chart_region", { region: "jp" });
+    });
+    const chartCalls = runtime.invoke.mock.calls.filter(([command]) => command === "metadata_chart");
+    expect(chartCalls).toEqual([["metadata_chart", { limit: 12, region: "jp" }]]);
   });
 
   it("exports a restorable v2 backup envelope", async () => {

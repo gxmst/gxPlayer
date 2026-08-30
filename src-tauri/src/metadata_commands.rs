@@ -226,12 +226,25 @@ pub fn metadata_cancel_request(
 pub async fn metadata_chart(
     window: WebviewWindow,
     limit: Option<usize>,
+    region: Option<String>,
 ) -> Result<Vec<CatalogTrack>, String> {
     require_window(&window, "main")?;
-    tauri::async_runtime::spawn_blocking(move || apple_chart(limit.unwrap_or(25)))
-        .await
-        .map_err(|error| format!("metadata chart task failed: {error}"))?
-        .map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        apple_chart(limit.unwrap_or(25), region.as_deref())
+    })
+    .await
+    .map_err(|error| format!("metadata chart task failed: {error}"))?
+    .map_err(|error| error.to_string())
+}
+
+/// Storefronts the chart can be read from, for populating the region picker.
+#[tauri::command]
+pub fn metadata_chart_regions(window: WebviewWindow) -> Result<Vec<String>, String> {
+    require_window(&window, "main")?;
+    Ok(gx_metadata::CHART_REGIONS
+        .iter()
+        .map(|region| (*region).to_owned())
+        .collect())
 }
 
 #[tauri::command]

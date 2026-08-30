@@ -89,6 +89,31 @@ import {
 } from "./types";
 
 type CloseBehavior = "hide_to_tray" | "exit";
+
+/** Mirrors DEFAULT_CHART_REGION in gx-metadata. */
+const DEFAULT_CHART_REGION = "cn";
+
+/** Readable names for the chart storefronts. Unknown codes show as-is. */
+const CHART_REGION_LABELS: Record<string, string> = {
+  cn: "中国",
+  hk: "香港",
+  tw: "台湾",
+  jp: "日本",
+  kr: "韩国",
+  us: "美国",
+  gb: "英国",
+  de: "德国",
+  fr: "法国",
+  sg: "新加坡",
+  my: "马来西亚",
+  au: "澳大利亚",
+  ca: "加拿大",
+};
+
+function chartRegionLabel(region: string): string {
+  return CHART_REGION_LABELS[region] ?? region.toUpperCase();
+}
+
 type AppPreferences = {
   version: number;
   closeBehavior: CloseBehavior;
@@ -97,6 +122,8 @@ type AppPreferences = {
   outputDevice: string | null;
   dspControl: DspControlState;
   customEqPresets: CustomEqPreset[];
+  chartRegion: string;
+  chartAutoLoad: boolean;
 };
 type OutputDeviceStatus = {
   devices: string[];
@@ -740,6 +767,13 @@ function App() {
   } = useLibraryView(library, searchQuery, resultsQuery);
   const [chartTracks, setChartTracks] = useState<CatalogTrack[]>([]);
   const [chartLoading, setChartLoading] = useState(false);
+  const [chartRegions, setChartRegions] = useState<string[]>([]);
+  /** Region the current chartTracks came from, so a region change forces a refetch. */
+  const loadedChartRegionRef = useRef<string | null>(null);
+  // Preferences arrive asynchronously; fall back to the same defaults Rust uses.
+  const chartRegion = appPreferences?.chartRegion ?? DEFAULT_CHART_REGION;
+  const chartAutoLoad = appPreferences?.chartAutoLoad ?? true;
+  const chartHeadlineLabel = `${chartRegionLabel(chartRegion)}区热门`;
   const [suggestionOpen, setSuggestionOpen] = useState(false);
   const [suggestionIndex, setSuggestionIndex] = useState(-1);
   const [playingCatalogKey, setPlayingCatalogKey] = useState<string | null>(null);
@@ -855,17 +889,46 @@ function App() {
     return tracks;
   };
 
-  const loadChart = async () => {
-    if (chartLoading || chartTracks.length > 0) return;
+  const loadChart = async (options?: { region?: string; force?: boolean }) => {
+    const region = options?.region ?? chartRegion;
+    if (chartLoading) return;
+    // A region switch has to refetch; otherwise an already-populated chart is kept.
+    if (!options?.force && chartTracks.length > 0 && region === loadedChartRegionRef.current) {
+      return;
+    }
     setChartLoading(true);
     try {
-      setChartTracks(await invoke<CatalogTrack[]>("metadata_chart", { limit: 12 }));
+      const tracks = await invoke<CatalogTrack[]>("metadata_chart", { limit: 12, region });
+      loadedChartRegionRef.current = region;
+      setChartTracks(tracks);
     } catch (error) {
       setChartTracks([]);
+      loadedChartRegionRef.current = null;
       setMessage(`在线榜单暂时不可用：${String(error)}`, true);
     } finally {
       setChartLoading(false);
     }
+  };
+
+  const changeChartRegion = (region: string) => {
+    if (region === chartRegion) return;
+    setChartTracks([]);
+    setAppPreferences((preferences) =>
+      preferences ? { ...preferences, chartRegion: region } : preferences,
+    );
+    void invoke<AppPreferences>("app_preferences_set_chart_region", { region })
+      .then(setAppPreferences)
+      .catch((error) => setMessage(`切换榜单地区失败：${String(error)}`, true));
+    void loadChart({ region, force: true });
+  };
+
+  const changeChartAutoLoad = (enabled: boolean) => {
+    setAppPreferences((preferences) =>
+      preferences ? { ...preferences, chartAutoLoad: enabled } : preferences,
+    );
+    void invoke<AppPreferences>("app_preferences_set_chart_auto_load", { enabled })
+      .then(setAppPreferences)
+      .catch((error) => setMessage(`保存榜单设置失败：${String(error)}`, true));
   };
 
   const refreshSources = async () => {
@@ -1026,6 +1089,13 @@ function App() {
     void invoke<AppPreferences>("app_preferences_get")
       .then(setAppPreferences)
       .catch((error) => setMessage(String(error), true));
+    // Region list is static in Rust; a failure just leaves the picker on the saved region.
+    void invoke<string[]>("metadata_chart_regions")
+      .then((regions) => {
+        // A malformed response must not empty the picker or crash the render.
+        if (!disposed && Array.isArray(regions)) setChartRegions(regions);
+      })
+      .catch((error) => console.warn("[GXPlayer] chart regions unavailable", error));
 
     void refreshLibrary(true).catch((error) => {
       console.warn("[GXPlayer] initial library scan failed", error);
@@ -1442,6 +1512,13 @@ function App() {
   useEffect(() => {
     if (queuePanelOpen && sidebarDrawerOpen) setSidebarDrawerOpen(false);
   }, [queuePanelOpen, sidebarDrawerOpen]);
+
+  // Opt-in only: the chart reaches the network, so it waits for the home view and
+  // the saved preference. loadChart() itself skips a fetch when the region is unchanged.
+  useEffect(() => {
+    if (view !== "discovery" || !chartAutoLoad || !appPreferences) return;
+    void loadChart();
+  }, [view, chartAutoLoad, appPreferences, chartRegion]);
 
   const navigateTo = (next: ViewId) => {
     setSidebarDrawerOpen(false);
@@ -3473,15 +3550,29 @@ function App() {
         <section className="section-block panel-enter delay-2">
           <div className="section-heading">
             <div><p className="eyebrow">DISCOVER</p><h2>正在流行</h2></div>
-            {chartTracks.length > 0 && <button onClick={() => { seedResults(chartTracks, "中国区热门"); setSearchQuery("中国区热门"); navigateTo("search"); }}>查看全部 →</button>}
+            <div className="section-heading-actions">
+              <label className="chart-region-picker">
+                <span className="sr-only">榜单地区</span>
+                <select
+                  value={chartRegion}
+                  disabled={chartLoading || !appPreferences}
+                  onChange={(event) => changeChartRegion(event.target.value)}
+                >
+                  {(chartRegions.length > 0 ? chartRegions : [chartRegion]).map((region) => (
+                    <option key={region} value={region}>{chartRegionLabel(region)}</option>
+                  ))}
+                </select>
+              </label>
+              {chartTracks.length > 0 && <button onClick={() => { seedResults(chartTracks, chartHeadlineLabel); setSearchQuery(chartHeadlineLabel); navigateTo("search"); }}>查看全部 →</button>}
+            </div>
           </div>
           {chartTracks.length > 0
             ? renderCatalogRows(chartTracks.slice(0, 6))
             : <EmptyState
                 title={chartLoading ? "正在加载在线榜单" : "在线榜单尚未加载"}
-                copy="为了保持启动安静，在线内容会在你明确需要时再联网获取。"
+                copy={chartAutoLoad ? "换个地区或稍后重试；榜单只在你打开首页时联网获取。" : "为了保持启动安静，在线内容会在你明确需要时再联网获取。"}
                 action={chartLoading ? undefined : "加载在线榜单"}
-                onAction={() => void loadChart()}
+                onAction={() => void loadChart({ force: true })}
               />}
         </section>
       </div>
@@ -3831,6 +3922,20 @@ function App() {
               <button type="button" className={alwaysOnTop ? "primary" : ""} onClick={() => void toggleAlwaysOnTop()}>{alwaysOnTop ? "取消置顶" : "窗口置顶"}</button>
               <button type="button" className={miniMode ? "primary" : ""} onClick={() => void toggleMiniMode()}>{miniMode ? "退出迷你" : "迷你模式"}</button>
             </div>
+          </section>}
+          {!advancedSettings && <section className="settings-card">
+            <h3>热门推荐</h3>
+            <p>首页「正在流行」的榜单地区与联网时机。地区列表来自公开的榜单地区代码。</p>
+            <label className="settings-toggle">
+              <span><strong>打开首页时自动加载</strong><small>关闭后首页只显示一个按钮，完全不联网，直到你点它。</small></span>
+              <input
+                type="checkbox"
+                checked={chartAutoLoad}
+                disabled={!appPreferences}
+                onChange={(event) => changeChartAutoLoad(event.target.checked)}
+              />
+            </label>
+            <label><span>榜单地区</span><select value={chartRegion} disabled={!appPreferences} onChange={(event) => changeChartRegion(event.target.value)}>{(chartRegions.length > 0 ? chartRegions : [chartRegion]).map((region) => <option key={region} value={region}>{chartRegionLabel(region)}</option>)}</select></label>
           </section>}
           {advancedSettings && <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。批量管理请到「曲库」页的在线缓存分区。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => { cacheLimitDirtyRef.current = true; setCacheLimitGiB(event.target.value); }} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={() => requestClearCache(false)}>清未收藏</button><button className="danger" onClick={() => requestClearCache(true)}>清空全部</button></div></section>}
           {advancedSettings && <section className="settings-card diagnostic-log-settings">

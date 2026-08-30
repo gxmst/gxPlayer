@@ -53,8 +53,8 @@ use diagnostic_log::{
 use library_commands::{library_import_folders, library_relink_tracks, library_remove_tracks};
 use metadata_commands::{
     MetadataCancellationRegistry, maybe_start_phase3_smoke, metadata_cancel_request,
-    metadata_chart, metadata_find_replacements, metadata_lyrics, metadata_play_preview,
-    metadata_read_local_lyrics, metadata_search,
+    metadata_chart, metadata_chart_regions, metadata_find_replacements, metadata_lyrics,
+    metadata_play_preview, metadata_read_local_lyrics, metadata_search,
 };
 use network_settings::{network_proxy_status, network_set_proxy_mode};
 use product_commands::{
@@ -679,6 +679,26 @@ fn player_delete_custom_eq_preset(
 ) -> Result<AppPreferences, String> {
     require_window(&window, "main")?;
     preferences.delete_custom_eq_preset(&name)
+}
+
+#[tauri::command]
+fn app_preferences_set_chart_region(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    region: String,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    preferences.set_chart_region(&region)
+}
+
+#[tauri::command]
+fn app_preferences_set_chart_auto_load(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    enabled: bool,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    preferences.set_chart_auto_load(enabled)
 }
 
 #[tauri::command]
@@ -1528,6 +1548,9 @@ pub fn run() {
             metadata_search,
             metadata_cancel_request,
             metadata_chart,
+            metadata_chart_regions,
+            app_preferences_set_chart_region,
+            app_preferences_set_chart_auto_load,
             metadata_lyrics,
             metadata_read_local_lyrics,
             metadata_find_replacements,

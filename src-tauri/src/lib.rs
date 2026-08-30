@@ -33,6 +33,7 @@ mod source_commands;
 mod source_runtime;
 mod taskbar_toolbar;
 mod transport;
+mod window_corners;
 mod window_state;
 mod windows_identity;
 
@@ -1393,6 +1394,8 @@ pub fn run() {
             }
 
             if let Some(main) = app.get_webview_window("main") {
+                // Round before the first paint so no square-cornered frame is shown.
+                window_corners::apply_rounded(&main);
                 // Fail soft: still show with tauri.conf fallback size if monitor probe fails.
                 if let Err(error) = place_and_show_main_window(&main, &app_data) {
                     eprintln!("main window placement failed: {error}");

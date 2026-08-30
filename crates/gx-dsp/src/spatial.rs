@@ -31,6 +31,34 @@ impl Default for CrossfeedSettings {
     }
 }
 
+/// Early reflections, the cue that separates "outside my head" from "in a room".
+///
+/// Pure HRTF convolution places a source outside the head but in an anechoic
+/// space, which reads as dry and unnatural: the ear judges distance largely from
+/// the ratio of direct sound to its first reflections. A handful of delayed,
+/// attenuated, damped taps supplies that ratio far more cheaply than a full
+/// reverb, and because this runs ahead of the HRTF each reflection is spatialised
+/// by the same head model as the direct sound.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomSettings {
+    pub enabled: bool,
+    /// Reflection level relative to direct sound. 0 is anechoic.
+    pub amount: f32,
+    /// Scales the tap delays: small values read as a booth, large as a hall.
+    pub size: f32,
+}
+
+impl Default for RoomSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            amount: 0.22,
+            size: 0.45,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HrtfSettings {
@@ -111,6 +139,104 @@ impl CrossfeedProcessor {
             self.right_lowpass += self.lowpass_alpha * (delayed_right - self.right_lowpass);
             frame[0] = left * self.direct_gain + self.right_lowpass * self.amount;
             frame[1] = right * self.direct_gain + self.left_lowpass * self.amount;
+        }
+    }
+}
+
+/// Tap layout in milliseconds at `size` = 1, with its gain and which ear leads.
+///
+/// The two sides are deliberately unequal. A symmetric set of reflections is not
+/// something a real room produces, and identical delays on both ears comb-filter
+/// into an audible metallic ring.
+const REFLECTION_TAPS: [(f32, f32, bool); 6] = [
+    (11.0, 0.70, true),
+    (14.5, 0.62, false),
+    (19.0, 0.50, false),
+    (23.5, 0.42, true),
+    (29.0, 0.32, true),
+    (37.0, 0.24, false),
+];
+
+/// Shortest delay any tap may collapse to. Below roughly 8 ms a reflection stops
+/// reading as a room and starts colouring the direct sound.
+const MIN_REFLECTION_MS: f32 = 8.0;
+
+pub(crate) struct EarlyReflections {
+    /// Interleaved stereo history, long enough for the longest tap.
+    buffer: Vec<f32>,
+    write_index: usize,
+    frames: usize,
+    /// Per tap: frame offset, left gain, right gain.
+    taps: Vec<(usize, f32, f32)>,
+    /// One-pole low-pass state per ear: reflections lose treble on every bounce.
+    damping_alpha: f32,
+    left_damped: f32,
+    right_damped: f32,
+}
+
+impl EarlyReflections {
+    pub(crate) fn new(sample_rate: u32, settings: &RoomSettings) -> Result<Self, DspError> {
+        validate_room(settings)?;
+        let per_ms = sample_rate as f32 / 1000.0;
+        let mut taps = Vec::with_capacity(REFLECTION_TAPS.len());
+        let mut longest = 1usize;
+        for (delay_ms, gain, left_leads) in REFLECTION_TAPS {
+            // `size` shortens the room rather than lengthening it, so the longest
+            // tap stays put and the buffer never has to grow with the setting.
+            let scaled = (delay_ms * (0.45 + 0.55 * settings.size)).max(MIN_REFLECTION_MS);
+            let frames = ((scaled * per_ms).round() as usize).max(1);
+            longest = longest.max(frames);
+            // The far ear hears the same reflection later and quieter; the HRTF
+            // supplies the timing, so here it is only a level difference.
+            let (left, right) = if left_leads {
+                (gain, gain * 0.72)
+            } else {
+                (gain * 0.72, gain)
+            };
+            taps.push((frames, left * settings.amount, right * settings.amount));
+        }
+
+        let frames = longest + 1;
+        Ok(Self {
+            buffer: vec![0.0; frames * 2],
+            write_index: 0,
+            frames,
+            taps,
+            // Fixed 4.5 kHz corner: enough to take the edge off without dulling.
+            damping_alpha: 1.0 - (-2.0 * PI * 4_500.0 / sample_rate as f32).exp(),
+            left_damped: 0.0,
+            right_damped: 0.0,
+        })
+    }
+
+    pub(crate) fn process(&mut self, pcm: &mut [f32]) {
+        for frame in pcm.chunks_exact_mut(2) {
+            let left = frame[0];
+            let right = frame[1];
+            self.buffer[self.write_index * 2] = left;
+            self.buffer[self.write_index * 2 + 1] = right;
+
+            let mut wet_left = 0.0;
+            let mut wet_right = 0.0;
+            for &(delay, gain_left, gain_right) in &self.taps {
+                let index = (self.write_index + self.frames - delay) % self.frames;
+                // Reflections arrive crossed: a bounce off the left wall reaches the
+                // right ear too, which is what widens the image rather than just
+                // echoing each channel back onto itself.
+                wet_left += self.buffer[index * 2 + 1] * gain_left;
+                wet_right += self.buffer[index * 2] * gain_right;
+            }
+
+            self.left_damped += self.damping_alpha * (wet_left - self.left_damped);
+            self.right_damped += self.damping_alpha * (wet_right - self.right_damped);
+
+            frame[0] = left + self.left_damped;
+            frame[1] = right + self.right_damped;
+
+            self.write_index += 1;
+            if self.write_index == self.frames {
+                self.write_index = 0;
+            }
         }
     }
 }
@@ -400,6 +526,16 @@ fn validate_crossfeed(sample_rate: u32, settings: &CrossfeedSettings) -> Result<
         || settings.cutoff_hz > max_cutoff
     {
         return Err(DspError::InvalidCrossfeedCutoff(settings.cutoff_hz));
+    }
+    Ok(())
+}
+
+fn validate_room(settings: &RoomSettings) -> Result<(), DspError> {
+    if !settings.amount.is_finite() || !(0.0..=1.0).contains(&settings.amount) {
+        return Err(DspError::InvalidRoomAmount(settings.amount));
+    }
+    if !settings.size.is_finite() || !(0.0..=1.0).contains(&settings.size) {
+        return Err(DspError::InvalidRoomSize(settings.size));
     }
     Ok(())
 }

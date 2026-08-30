@@ -281,10 +281,19 @@ impl DspControlState {
             _ if self.settings.hrtf.enabled => {
                 bail!("only the spatial preset may enable HRTF")
             }
+            // Reflections without a head model are just an echo, so they belong to
+            // the same preset as the HRTF rather than being separately switchable.
+            _ if self.settings.room.enabled => {
+                bail!("only the spatial preset may enable early reflections")
+            }
             _ => {}
         }
         if self.settings.hrtf.enabled && !self.settings.limiter.enabled {
             bail!("HRTF requires the limiter to remain enabled");
+        }
+        // Reflections add to the direct signal, so they raise peaks the same way.
+        if self.settings.room.enabled && !self.settings.limiter.enabled {
+            bail!("early reflections require the limiter to remain enabled");
         }
         DspChain::new(48_000, 2, self.settings.clone())?;
         Ok(())

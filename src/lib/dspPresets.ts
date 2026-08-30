@@ -114,6 +114,23 @@ const HRTF_MEDIUM = 0.55;
 const HRTF_STRONG = 0.72;
 const HRTF_OUTPUT_GAIN_DB = -6;
 
+/**
+ * Early reflections are tuned for headphones, which is the only case where
+ * virtualising a room makes sense: over speakers your own head already applies
+ * the real thing and the two fight.
+ *
+ * The amounts are held well below the HRTF's: reflections are a supporting cue,
+ * and open-back headphones already have a wide, airy presentation that turns
+ * muddy long before a closed-back pair would. Size stays in the small-room range
+ * because long pre-delays start reading as an effect rather than a space.
+ */
+const ROOM_LIGHT = 0.12;
+const ROOM_MEDIUM = 0.2;
+const ROOM_STRONG = 0.3;
+const ROOM_SIZE_LIGHT = 0.3;
+const ROOM_SIZE_MEDIUM = 0.42;
+const ROOM_SIZE_STRONG = 0.55;
+
 const LIMITER_CEILING_DB = -1;
 const LIMITER_RELEASE_MS = 80;
 
@@ -183,6 +200,9 @@ function settings({
   bands,
   crossfeedEnabled,
   crossfeedAmount,
+  roomEnabled = false,
+  roomAmount = 0,
+  roomSize = ROOM_SIZE_MEDIUM,
   hrtfEnabled,
   hrtfMix,
   limiterEnabled,
@@ -191,11 +211,14 @@ function settings({
   bands: EqBand[];
   crossfeedEnabled: boolean;
   crossfeedAmount: number;
+  roomEnabled?: boolean;
+  roomAmount?: number;
+  roomSize?: number;
   hrtfEnabled: boolean;
   hrtfMix: number;
   limiterEnabled: boolean;
 }): DspSettings {
-  const enabled = eqEnabled || crossfeedEnabled || hrtfEnabled || limiterEnabled;
+  const enabled = eqEnabled || crossfeedEnabled || roomEnabled || hrtfEnabled || limiterEnabled;
   return {
     enabled,
     eqEnabled,
@@ -205,6 +228,11 @@ function settings({
       amount: crossfeedAmount,
       delayMs: CROSSFEED_DELAY_MS,
       cutoffHz: CROSSFEED_CUTOFF_HZ,
+    },
+    room: {
+      enabled: roomEnabled,
+      amount: roomAmount,
+      size: roomSize,
     },
     hrtf: {
       enabled: hrtfEnabled,
@@ -292,6 +320,21 @@ export function buildDspSettings(
         bands: zeroEqBands(),
         crossfeedEnabled: true,
         crossfeedAmount: CROSSFEED_MEDIUM,
+        // Reflections track the same slider as the head model: raising one without
+        // the other gives either a dry head or a room with nothing placed in it.
+        roomEnabled: true,
+        roomAmount: interpolateThreeAnchors(
+          normalizedSpatialAmount,
+          ROOM_LIGHT,
+          ROOM_MEDIUM,
+          ROOM_STRONG,
+        ),
+        roomSize: interpolateThreeAnchors(
+          normalizedSpatialAmount,
+          ROOM_SIZE_LIGHT,
+          ROOM_SIZE_MEDIUM,
+          ROOM_SIZE_STRONG,
+        ),
         hrtfEnabled: true,
         hrtfMix: interpolateThreeAnchors(
           normalizedSpatialAmount,

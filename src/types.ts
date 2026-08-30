@@ -250,6 +250,8 @@ export type DspSettings = {
   eqEnabled: boolean;
   eqBands: EqBand[];
   crossfeed: { enabled: boolean; amount: number; delayMs: number; cutoffHz: number };
+  /** Early reflections, applied before the HRTF so they are spatialised too. */
+  room: { enabled: boolean; amount: number; size: number };
   hrtf: { enabled: boolean; mix: number; outputGainDb: number };
   limiter: { enabled: boolean; ceilingDb: number; releaseMs: number };
 };
@@ -334,6 +336,7 @@ export const EMPTY_ENGINE: EngineSnapshot = {
     eqEnabled: false,
     eqBands: [{ enabled: true, kind: "peak", frequencyHz: 1000, gainDb: 0, q: 1 }],
     crossfeed: { enabled: false, amount: 0.18, delayMs: 0.28, cutoffHz: 700 },
+    room: { enabled: false, amount: 0.22, size: 0.45 },
     hrtf: { enabled: false, mix: 0.72, outputGainDb: -6 },
     limiter: { enabled: false, ceilingDb: -1, releaseMs: 80 },
   },

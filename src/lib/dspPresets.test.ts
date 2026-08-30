@@ -128,6 +128,9 @@ describe("DSP presets", () => {
       const result = buildDspSettings(presetId);
       expect(result.enabled).toBe(true);
       expect(result.hrtf.enabled).toBe(false);
+      // Reflections belong to the spatial preset: without a head model in front of
+      // them they are an echo, and the host rejects that combination outright.
+      expect(result.room.enabled).toBe(false);
       expect(result.limiter.enabled).toBe(true);
     }
 
@@ -144,6 +147,26 @@ describe("DSP presets", () => {
     expect(dense.crossfeed.amount).toBeCloseTo(0.18);
     expect(dense.hrtf.outputGainDb).toBe(-6);
     expect(dense.limiter.enabled).toBe(true);
+  });
+
+  it("grows the room alongside the head model, and keeps it a supporting cue", () => {
+    const sparse = buildDspSettings("spatial", 0, 0);
+    const middle = buildDspSettings("spatial", 0, 0.5);
+    const dense = buildDspSettings("spatial", 0, 1);
+
+    for (const result of [sparse, middle, dense]) {
+      expect(result.room.enabled).toBe(true);
+      // Reflections must stay under the head model, or the space swallows the source.
+      expect(result.room.amount).toBeLessThan(result.hrtf.mix);
+      // Small-room sizes only: longer pre-delays read as an effect, not a space.
+      expect(result.room.size).toBeLessThanOrEqual(0.55);
+    }
+
+    // Both cues move together with the one slider the user actually sees.
+    expect(sparse.room.amount).toBeCloseTo(0.12);
+    expect(middle.room.amount).toBeCloseTo(0.2);
+    expect(dense.room.amount).toBeCloseTo(0.3);
+    expect(sparse.room.size).toBeLessThan(dense.room.size);
   });
 
   it("builds a custom curve as authored, without intensity rescaling", () => {

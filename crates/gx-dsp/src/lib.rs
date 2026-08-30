@@ -13,8 +13,8 @@ use thiserror::Error;
 mod kemar;
 mod spatial;
 
-use spatial::{CrossfeedProcessor, LinkedLimiter, StereoHrtf};
-pub use spatial::{CrossfeedSettings, HrtfSettings, LimiterSettings};
+use spatial::{CrossfeedProcessor, EarlyReflections, LinkedLimiter, StereoHrtf};
+pub use spatial::{CrossfeedSettings, HrtfSettings, LimiterSettings, RoomSettings};
 
 /// Length of the crossfade that masks a `set_settings` swap. Long enough to hide the HRTF
 /// 0<->128-frame latency step and the zeroed filter state of a freshly built generation, short
@@ -104,6 +104,9 @@ pub struct DspSettings {
     pub eq_bands: Vec<EqBand>,
     #[serde(default)]
     pub crossfeed: CrossfeedSettings,
+    /// Runs ahead of the HRTF so reflections are spatialised with the direct sound.
+    #[serde(default)]
+    pub room: RoomSettings,
     #[serde(default)]
     pub hrtf: HrtfSettings,
     #[serde(default)]
@@ -117,6 +120,7 @@ impl Default for DspSettings {
             eq_enabled: false,
             eq_bands: vec![EqBand::peak(1_000.0, 0.0, 1.0)],
             crossfeed: CrossfeedSettings::default(),
+            room: RoomSettings::default(),
             hrtf: HrtfSettings::default(),
             limiter: LimiterSettings::default(),
         }
@@ -180,6 +184,10 @@ pub enum DspError {
     InvalidHrtfMix(f32),
     #[error("HRTF output gain {0} dB must be in the range -24..=6")]
     InvalidHrtfGain(f32),
+    #[error("room amount {0} must be in the range 0..=1")]
+    InvalidRoomAmount(f32),
+    #[error("room size {0} must be in the range 0..=1")]
+    InvalidRoomSize(f32),
     #[error("limiter ceiling {0} dB must be in the range -12..=0")]
     InvalidLimiterCeiling(f32),
     #[error("limiter release {0} ms must be in the range 10..=1000")]
@@ -192,6 +200,7 @@ pub enum DspError {
 struct Processors {
     equalizer: ParametricEq,
     crossfeed: Option<CrossfeedProcessor>,
+    room: Option<EarlyReflections>,
     hrtf: Option<StereoHrtf>,
     limiter: Option<LinkedLimiter>,
 }
@@ -206,6 +215,9 @@ impl Processors {
         }
         if let Some(crossfeed) = &mut self.crossfeed {
             crossfeed.process(pcm);
+        }
+        if let Some(room) = &mut self.room {
+            room.process(pcm);
         }
         if let Some(hrtf) = &mut self.hrtf {
             hrtf.process(pcm);
@@ -231,6 +243,9 @@ impl Processors {
         }
         if let Some(crossfeed) = &mut self.crossfeed {
             crossfeed.process(pcm);
+        }
+        if let Some(room) = &mut self.room {
+            room.process(pcm);
         }
         if let Some(hrtf) = &mut self.hrtf {
             hrtf.process_with_ab_dry(pcm, ab_dry);
@@ -430,7 +445,9 @@ fn build_processors(
     channels: usize,
     settings: &DspSettings,
 ) -> Result<Processors, DspError> {
-    if (settings.crossfeed.enabled || settings.hrtf.enabled) && channels != 2 {
+    if (settings.crossfeed.enabled || settings.room.enabled || settings.hrtf.enabled)
+        && channels != 2
+    {
         return Err(DspError::UnsupportedSpatialChannels(channels));
     }
     let equalizer = ParametricEq::new(sample_rate, channels, &settings.eq_bands)?;
@@ -438,6 +455,11 @@ fn build_processors(
         .crossfeed
         .enabled
         .then(|| CrossfeedProcessor::new(sample_rate, &settings.crossfeed))
+        .transpose()?;
+    let room = settings
+        .room
+        .enabled
+        .then(|| EarlyReflections::new(sample_rate, &settings.room))
         .transpose()?;
     let hrtf = settings
         .hrtf
@@ -452,6 +474,7 @@ fn build_processors(
     Ok(Processors {
         equalizer,
         crossfeed,
+        room,
         hrtf,
         limiter,
     })
@@ -658,6 +681,10 @@ mod tests {
                 crossfeed: CrossfeedSettings {
                     enabled: true,
                     ..CrossfeedSettings::default()
+                },
+                room: RoomSettings {
+                    enabled: true,
+                    ..RoomSettings::default()
                 },
                 hrtf: HrtfSettings {
                     enabled: true,
@@ -901,6 +928,115 @@ mod tests {
         assert_eq!(impulse[(delayed_frame - 1) * 2], 0.0);
         assert!(impulse[delayed_frame * 2] > 0.0);
         assert!(impulse.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn early_reflections_arrive_crossed_after_the_direct_sound() {
+        let settings = DspSettings {
+            enabled: true,
+            room: RoomSettings {
+                enabled: true,
+                amount: 0.5,
+                size: 1.0,
+            },
+            ..DspSettings::default()
+        };
+        let mut chain = DspChain::new(48_000, 2, settings).unwrap();
+        // Left-only impulse: every reflection of it must appear on the right.
+        let mut pcm = vec![0.0f32; 48_000 * 2];
+        pcm[0] = 1.0;
+        chain.process_interleaved_in_place(&mut pcm).unwrap();
+
+        // The direct sound is untouched and nothing precedes it.
+        assert!((pcm[0] - 1.0).abs() < 1.0e-6);
+
+        let per_ms = 48.0;
+        let first_tap = (11.0 * per_ms) as usize;
+        // Nothing may arrive before the first reflection: an earlier arrival would
+        // colour the direct sound instead of reading as a room.
+        let early_energy: f32 = (1..first_tap - 1)
+            .map(|frame| pcm[frame * 2].abs() + pcm[frame * 2 + 1].abs())
+            .sum();
+        assert!(
+            early_energy < 1.0e-4,
+            "energy before the first tap: {early_energy}"
+        );
+
+        // A left impulse reflects onto the right ear.
+        let right_energy: f32 = (first_tap..(60.0 * per_ms) as usize)
+            .map(|frame| pcm[frame * 2 + 1].abs())
+            .sum();
+        assert!(right_energy > 0.01, "no crossed reflection: {right_energy}");
+
+        // Reflections decay: the late window is quieter than the early one.
+        let window = |from_ms: f32, to_ms: f32| -> f32 {
+            ((from_ms * per_ms) as usize..(to_ms * per_ms) as usize)
+                .map(|frame| pcm[frame * 2].abs() + pcm[frame * 2 + 1].abs())
+                .sum()
+        };
+        assert!(window(10.0, 22.0) > window(30.0, 42.0));
+
+        // And they stop: nothing lingers a second later, so this is not a reverb tail.
+        assert!(window(500.0, 999.0) < 1.0e-6);
+        assert!(pcm.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn early_reflections_stay_bounded_and_are_skipped_when_silent() {
+        // amount = 0 must be inaudible rather than merely quiet, so the preset's
+        // lowest setting is honestly "off".
+        let silent = DspSettings {
+            enabled: true,
+            room: RoomSettings {
+                enabled: true,
+                amount: 0.0,
+                size: 0.5,
+            },
+            ..DspSettings::default()
+        };
+        let mut chain = DspChain::new(48_000, 2, silent).unwrap();
+        let mut pcm = vec![0.0f32; 4_096];
+        pcm[0] = 1.0;
+        pcm[1] = 1.0;
+        chain.process_interleaved_in_place(&mut pcm).unwrap();
+        assert!((pcm[0] - 1.0).abs() < 1.0e-6);
+        assert!(pcm[2..].iter().all(|sample| sample.abs() < 1.0e-6));
+
+        // Full-scale sustained input with the strongest room must not run away.
+        let loud = DspSettings {
+            enabled: true,
+            room: RoomSettings {
+                enabled: true,
+                amount: 1.0,
+                size: 1.0,
+            },
+            ..DspSettings::default()
+        };
+        let mut chain = DspChain::new(48_000, 2, loud).unwrap();
+        let mut pcm = vec![1.0f32; 48_000 * 2];
+        chain.process_interleaved_in_place(&mut pcm).unwrap();
+        let peak = pcm.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+        // Taps sum to a finite gain; there is no feedback path, so this is bounded.
+        assert!(peak.is_finite() && peak < 4.0, "peak {peak}");
+    }
+
+    #[test]
+    fn room_rejects_out_of_range_settings() {
+        for (amount, size) in [(1.5, 0.5), (-0.1, 0.5), (f32::NAN, 0.5), (0.5, 2.0)] {
+            let settings = DspSettings {
+                enabled: true,
+                room: RoomSettings {
+                    enabled: true,
+                    amount,
+                    size,
+                },
+                ..DspSettings::default()
+            };
+            assert!(
+                DspChain::new(48_000, 2, settings).is_err(),
+                "accepted amount={amount} size={size}"
+            );
+        }
     }
 
     #[test]

@@ -862,19 +862,23 @@ fn parse_source_tracks(
             .ok_or_else(|| format!("{label} result must contain a tracks array"))?,
         _ => return Err(format!("{label} result must be an array or object")),
     };
-    let mut parsed = Vec::new();
-    for value in tracks.into_iter().take(limit) {
-        let track: CatalogTrack = serde_json::from_value(value)
-            .map_err(|error| format!("{label} track is invalid: {error}"))?;
-        if track.provider_id.trim().is_empty()
-            || track.provider_track_id.trim().is_empty()
-            || track.title.trim().is_empty()
-        {
-            return Err(format!(
-                "{label} tracks require providerId, providerTrackId and title"
-            ));
-        }
-        parsed.push(track);
+    let offered = tracks.len();
+    // Skip malformed entries instead of discarding the batch: one unusable row in a
+    // page of results should not cost the user every other result on the page.
+    let parsed: Vec<CatalogTrack> = tracks
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<CatalogTrack>(value).ok())
+        .filter(|track| {
+            !track.provider_id.trim().is_empty()
+                && !track.provider_track_id.trim().is_empty()
+                && !track.title.trim().is_empty()
+        })
+        .take(limit)
+        .collect();
+    if parsed.is_empty() && offered > 0 {
+        return Err(format!(
+            "{label} returned {offered} tracks but none had usable providerId, providerTrackId and title"
+        ));
     }
     Ok(parsed)
 }
@@ -1026,7 +1030,19 @@ fn request_optional_source_action(
         Ok(value) => Ok(Some(value)),
         // A preempted optional action is not a failure the user needs to see.
         Err(error) if is_optional_action_preempted(&error) => Ok(None),
-        Err(error) => Err(error),
+        Err(error) => {
+            // Optional actions deliberately stay out of the health window: that window
+            // ranks sources for resolution, and a source whose paid search is out of
+            // quota can still play audio. Failures land in diagnostics instead, so an
+            // exhausted key is visible without demoting a working source.
+            record_diagnostic(
+                app,
+                "source_optional_action_failed",
+                Some(&source_id),
+                format!("action={action} code={}", diagnostic_error_code(&error)),
+            );
+            Err(error)
+        }
     }
 }
 
@@ -3960,5 +3976,41 @@ mod tests {
         let tracks = parse_source_tracks(result, 1, "test").unwrap();
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].provider_track_id, "42");
+    }
+
+    #[test]
+    fn source_search_skips_unusable_tracks_instead_of_losing_the_page() {
+        let usable = json!({
+            "providerId": "wy",
+            "providerTrackId": "42",
+            "title": "Track",
+            "artist": "Artist",
+            "album": "Album",
+            "durationMs": 180000,
+            "artworkUrl": null,
+            "resolverPayload": { "source": "wy", "musicInfo": { "songmid": "42" } },
+            "preview": null
+        });
+        let result = json!({
+            "tracks": [
+                { "providerId": "wy", "providerTrackId": "1" },
+                { "providerId": "wy", "providerTrackId": "", "title": "Blank id" },
+                usable,
+                "not an object"
+            ]
+        });
+        let tracks = parse_source_tracks(result, 40, "test").unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].provider_track_id, "42");
+
+        // A page where nothing is usable is still an error worth surfacing.
+        let unusable = json!({ "tracks": [{ "providerId": "wy", "providerTrackId": "" }] });
+        assert!(parse_source_tracks(unusable, 40, "test").is_err());
+        // An empty page is a legitimate "no results", not a failure.
+        assert!(
+            parse_source_tracks(json!({ "tracks": [] }), 40, "test")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

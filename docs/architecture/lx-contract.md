@@ -83,7 +83,16 @@ lock with playback resolution, so the host holds that lock as briefly as it can:
 
 The normalized contracts are size-limited and validated again in Rust. A
 source may cache results or coalesce identical in-flight requests, but must not
-hide additional provider fan-out behind one action.
+hide additional provider fan-out behind one action. Unusable rows in a returned
+page are skipped rather than failing the page; a page where nothing is usable is
+reported as an error. A source should keep its own request timeout below the
+host's 8s runtime budget so its transport errors stay visible.
+
+Optional-action failures do not enter the source health window. That window
+ranks sources for resolution, and a source whose optional action is rejected —
+an exhausted search quota, say — can still resolve and play audio, so demoting
+it would be wrong. These failures are written to the diagnostic log under
+`source_optional_action_failed` instead.
 
 ## Security boundary
 

@@ -2,6 +2,20 @@
 
 The runtime targets the factual `window.lx` contract used by community LX source scripts and is checked against Sollin Music Desktop.
 
+## Adapters live outside this repository
+
+This repository implements the host side of the contract only. The host knows
+nothing about any specific platform, endpoint, or quality table: every platform
+name, quality label, and provider identifier reaches it at runtime through a
+source's `inited` capability report.
+
+Source scripts themselves are user-owned and are never committed here. `/sources/`
+is git-ignored so an imported adapter and its local test can sit next to each
+other on disk without entering version control. Do not add an adapter, its API
+host, its quality mapping, or platform-specific field parsing to project code —
+that would move the project from consuming the contract to publishing a
+platform integration.
+
 ## Sandbox-only synchronous APIs
 
 - `lx.utils.crypto.aesEncrypt`

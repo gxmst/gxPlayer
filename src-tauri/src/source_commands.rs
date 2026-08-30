@@ -697,9 +697,7 @@ pub async fn source_search(
     let limit = limit.unwrap_or(20).clamp(1, 50);
     let app = window.app_handle().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        request_optional_source_action(
-            &app,
-            "search",
+        request_optional_source_action(&app, "search", |_| {
             json!({
                 "action": "search",
                 "info": {
@@ -707,8 +705,8 @@ pub async fn source_search(
                     "limit": limit,
                     "offset": 0
                 }
-            }),
-        )
+            })
+        })
     })
     .await
     .map_err(|error| format!("source search task failed: {error}"))??;
@@ -739,9 +737,7 @@ pub async fn source_lyric(
                     }),
                 )
             });
-        request_optional_source_action(
-            &app,
-            "lyric",
+        request_optional_source_action(&app, "lyric", |_| {
             json!({
                 "action": "lyric",
                 "source": source,
@@ -749,8 +745,8 @@ pub async fn source_lyric(
                     "musicInfo": music_info,
                     "durationMs": track.duration_ms,
                 }
-            }),
-        )
+            })
+        })
     })
     .await
     .map_err(|error| format!("source lyric task failed: {error}"))??;
@@ -780,15 +776,18 @@ pub async fn source_playlist(
     }
     let app = window.app_handle().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        request_optional_source_action(
-            &app,
-            "playlist",
-            json!({
+        request_optional_source_action(&app, "playlist", |capabilities| {
+            let mut payload = json!({
                 "action": "playlist",
-                "source": "wy",
                 "info": { "id": id }
-            }),
-        )
+            });
+            // The platform is whatever the source advertised for this action; the
+            // host never assumes one. Sources that ignore the field are unaffected.
+            if let Some(platform) = advertised_platform_for_action(capabilities, "playlist") {
+                payload["source"] = Value::String(platform);
+            }
+            payload
+        })
     })
     .await
     .map_err(|error| format!("source playlist task failed: {error}"))??;
@@ -837,6 +836,27 @@ fn source_supports_action(source: &gx_source::ManagedSource, action: &str) -> bo
     capabilities_support_action(&source.capabilities, action)
 }
 
+/// Pick the platform key a source advertised for `action` in its `inited` report.
+///
+/// The host keeps no platform table of its own: keys, names and quality labels all
+/// originate from the source's own capability report. Returns `None` when nothing
+/// was advertised, in which case the payload carries no platform at all.
+fn advertised_platform_for_action(capabilities: &Value, action: &str) -> Option<String> {
+    let sources = capabilities.get("sources")?.as_object()?;
+    let mut advertised: Vec<&String> = sources
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .get("actions")
+                .and_then(Value::as_array)
+                .is_some_and(|actions| actions.iter().any(|value| value.as_str() == Some(action)))
+        })
+        .map(|(key, _)| key)
+        .collect();
+    advertised.sort();
+    advertised.first().map(|key| (*key).to_owned())
+}
+
 fn capabilities_support_action(capabilities: &Value, action: &str) -> bool {
     let protocol = capabilities
         .get("protocolVersion")
@@ -853,21 +873,24 @@ fn capabilities_support_action(capabilities: &Value, action: &str) -> bool {
 fn request_optional_source_action(
     app: &AppHandle,
     action: &str,
-    payload: Value,
+    build_payload: impl FnOnce(&Value) -> Value,
 ) -> Result<Option<Value>, String> {
     let runtime = app.state::<SourceRuntime>();
-    let source_id = runtime
+    let selected = runtime
         .resolution_source_ids(None)
         .map_err(|error| error.to_string())?
         .into_iter()
-        .find(|id| {
+        .find_map(|id| {
             runtime
-                .source(id)
-                .is_ok_and(|source| source_supports_action(&source, action))
+                .source(&id)
+                .ok()
+                .filter(|source| source_supports_action(source, action))
+                .map(|source| (id, source.capabilities.clone()))
         });
-    let Some(source_id) = source_id else {
+    let Some((source_id, capabilities)) = selected else {
         return Ok(None);
     };
+    let payload = build_payload(&capabilities);
     let preferred_route = runtime
         .preferred_route(&source_id)
         .map_err(|error| error.to_string())?;
@@ -3734,6 +3757,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, script);
+    }
+
+    #[test]
+    fn advertised_platform_comes_only_from_the_capability_report() {
+        let capabilities = json!({
+            "protocolVersion": 2,
+            "actions": ["musicUrl", "playlist"],
+            "sources": {
+                "zz": { "actions": ["musicUrl", "playlist"] },
+                "aa": { "actions": ["musicUrl"] }
+            }
+        });
+        assert_eq!(
+            advertised_platform_for_action(&capabilities, "playlist").as_deref(),
+            Some("zz")
+        );
+        assert_eq!(advertised_platform_for_action(&capabilities, "lyric"), None);
+        // Nothing advertised at all means the payload carries no platform.
+        assert_eq!(
+            advertised_platform_for_action(&json!({ "protocolVersion": 2 }), "playlist"),
+            None
+        );
     }
 
     #[test]

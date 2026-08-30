@@ -62,8 +62,11 @@ used only when a completed built-in search returned no tracks.
   either an array of normalized `CatalogTrack` objects or `{ tracks }`.
 - `lyric` receives the selected platform and `musicInfo` and returns a
   normalized `LyricDocument` or `null`.
-- `playlist` receives `{ action, source, info: { id } }` and returns playlist
-  metadata plus normalized `CatalogTrack` objects.
+- `playlist` receives `{ action, info: { id } }` and returns playlist metadata
+  plus normalized `CatalogTrack` objects. `source` is added only when the
+  capability report named a platform for this action, and the id format is
+  whatever that source accepts. The host has no platform table and never
+  defaults to one.
 - `musicUrl` keeps the existing LX payload and URL result contract.
 
 The normalized contracts are size-limited and validated again in Rust. A

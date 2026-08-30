@@ -3710,14 +3710,13 @@ function App() {
           <div className="source-import-copy">
             <p className="eyebrow">PLAYLIST</p>
             <h2 id="source-playlist-title">读取远程歌单</h2>
-            <p>使用当前协议 v2 音源读取歌单；成功后歌曲会进入当前播放队列和结果页。</p>
+            <p>使用当前协议 v2 音源读取歌单；ID 的格式由音源自己决定。成功后歌曲会进入当前播放队列和结果页。</p>
           </div>
           <form className="inline-form source-url-form" onSubmit={(event) => { event.preventDefault(); void importSourcePlaylist(); }}>
             <input
               type="text"
-              inputMode="numeric"
               aria-label="远程歌单 ID"
-              placeholder="网易云歌单 ID"
+              placeholder="歌单 ID"
               autoComplete="off"
               spellCheck={false}
               value={sourcePlaylistId}

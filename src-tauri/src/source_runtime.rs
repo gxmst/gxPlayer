@@ -750,16 +750,18 @@ fn reject_all_pending(inner: &mut RuntimeInner, reason: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
 
     fn runtime() -> (SourceRuntime, std::path::PathBuf) {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("gx-runtime-test-{nanos}"));
+        // A wall-clock timestamp is not unique: on Windows the clock is coarse
+        // enough that two parallel tests can read the same value and then share
+        // a directory. A per-process counter cannot collide.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "gx-runtime-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let store = SourceStore::open(&root).unwrap();
         (SourceRuntime::new(store), root)
     }

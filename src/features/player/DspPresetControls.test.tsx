@@ -136,6 +136,86 @@ describe("DspPresetControls", () => {
     expect(screen.queryByRole("slider", { name: "空间感" })).not.toBeInTheDocument();
   });
 
+  it("renders the advanced editor only when save and delete are both wired", () => {
+    const { rerender } = render(
+      <DspPresetControls
+        value={buildDspControlState("bypass")}
+        onChange={vi.fn()}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText("高级：自定义均衡")).not.toBeInTheDocument();
+
+    rerender(
+      <DspPresetControls
+        value={buildDspControlState("bypass")}
+        onChange={vi.fn()}
+        onAbDryChange={vi.fn()}
+        onSaveCustomPreset={vi.fn()}
+        onDeleteCustomPreset={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("高级：自定义均衡")).toBeInTheDocument();
+    // Collapsed by default: presets stay the product surface. `details` keeps its
+    // content in the DOM either way, so the open state is what actually matters.
+    expect(screen.getByText("高级：自定义均衡").closest("details")).not.toHaveAttribute("open");
+
+    // The compact strip never shows it, regardless of the handlers.
+    rerender(
+      <DspPresetControls
+        value={buildDspControlState("bypass")}
+        onChange={vi.fn()}
+        onAbDryChange={vi.fn()}
+        compact
+        onSaveCustomPreset={vi.fn()}
+        onDeleteCustomPreset={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText("高级：自定义均衡")).not.toBeInTheDocument();
+  });
+
+  it("hides intensity for a custom curve so hand-set gains are never rescaled", () => {
+    const custom = buildDspControlState("custom", 0.5, 0.5, [3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    render(
+      <DspPresetControls
+        value={custom}
+        onChange={vi.fn()}
+        onAbDryChange={vi.fn()}
+        onSaveCustomPreset={vi.fn()}
+        onDeleteCustomPreset={vi.fn()}
+      />,
+    );
+    expect(custom.settings.eqBands[0].gainDb).toBe(3);
+    expect(screen.queryByRole("slider", { name: "强度" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("slider", { name: "空间感" })).not.toBeInTheDocument();
+    expect(screen.getByText("自定义")).toBeInTheDocument();
+  });
+
+  it("carries the live curve when another slider commits", () => {
+    // Regression: rebuilding the control state without the current gains flattened a
+    // hand-edited curve as a side effect of moving an unrelated slider.
+    const onChange = vi.fn();
+    render(
+      <DspPresetControls
+        value={buildDspControlState("spatial", 0.5, 0.4, [0, 0, 5, 0, 0, 0, 0, 0, 0, 0])}
+        onChange={onChange}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+
+    const spatial = screen.getByRole("slider", { name: "空间感" });
+    fireEvent.change(spatial, { target: { value: "0.9" } });
+    fireEvent.pointerUp(spatial);
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const next = onChange.mock.calls[0][0];
+    expect(next.spatialAmount).toBeCloseTo(0.9);
+    // spatial itself does not use the EQ, but the curve must survive the rebuild.
+    expect(next.settings.eqBands.map((band: { gainDb: number }) => band.gainDb)).toEqual(
+      buildDspControlState("spatial", 0.5, 0.9).settings.eqBands.map((band) => band.gainDb),
+    );
+  });
+
   it("keeps pointer range input local and commits the final draft once", () => {
     const onChange = vi.fn();
     render(

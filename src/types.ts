@@ -258,7 +258,14 @@ export type DspPresetId =
   | "electronic"
   | "rock"
   | "podcast"
-  | "jazz";
+  | "jazz"
+  | "custom";
+
+/** A user-saved EQ curve. Gains only; frequency, Q and kind are fixed by the product EQ. */
+export type CustomEqPreset = {
+  name: string;
+  gainsDb: number[];
+};
 
 export type DspControlState = {
   settings: DspSettings;

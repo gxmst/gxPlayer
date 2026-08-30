@@ -173,6 +173,48 @@
   border: 0;
 }
 
+.dsp-advanced {
+  padding-top: 12px;
+  border-top: 1px solid var(--divider);
+}
+
+.dsp-advanced > summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+  cursor: pointer;
+  list-style: none;
+}
+
+.dsp-advanced > summary::-webkit-details-marker {
+  display: none;
+}
+
+.dsp-advanced > summary::before {
+  content: "▸";
+  color: var(--text-dim);
+  transition: transform 0.16s var(--ease-out);
+}
+
+.dsp-advanced[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.dsp-advanced > summary:focus-visible {
+  outline: 2px solid var(--accent-contrast);
+  outline-offset: 3px;
+  border-radius: var(--radius-sm);
+}
+
+.dsp-advanced > summary small {
+  color: var(--text-dim);
+}
+
+.dsp-advanced > .custom-eq-editor {
+  margin-top: 14px;
+}
+
 .dsp-preset-controls.is-compact .dsp-preset-grid {
   grid-template-columns: repeat(auto-fill, minmax(78px, 1fr));
 }

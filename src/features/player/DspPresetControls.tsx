@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { ChangeEvent, CSSProperties, KeyboardEvent, PointerEvent } from "react";
-import type { DspControlState, DspPresetId } from "../../types";
+import type { CustomEqPreset, DspControlState, DspPresetId } from "../../types";
 import {
   buildDspControlState,
+  clampCustomGains,
   DSP_AB_LABEL,
   DSP_PRESETS,
   DSP_SYSTEM_EFFECTS_HINT,
+  gainsFromSettings,
   getDspPreset,
 } from "../../lib/dspPresets";
+import { CustomEqEditor } from "./CustomEqEditor";
 import "./DspPresetControls.css";
 
 export type DspPresetControlsProps = {
@@ -17,6 +20,10 @@ export type DspPresetControlsProps = {
   disabled?: boolean;
   compact?: boolean;
   showSystemEffectsHint?: boolean;
+  /** Saved curves. The advanced editor only renders when the save/delete pair is given. */
+  customPresets?: readonly CustomEqPreset[];
+  onSaveCustomPreset?: (name: string, gains: readonly number[]) => void;
+  onDeleteCustomPreset?: (name: string) => void;
 };
 
 type RangeFillStyle = CSSProperties & { "--fill": string };
@@ -51,6 +58,9 @@ export function DspPresetControls({
   disabled = false,
   compact = false,
   showSystemEffectsHint = true,
+  customPresets = [],
+  onSaveCustomPreset,
+  onDeleteCustomPreset,
 }: DspPresetControlsProps) {
   const idPrefix = useId();
   const abHeldRef = useRef(false);
@@ -74,7 +84,19 @@ export function DspPresetControls({
   // intensity without exposing it would leave a hidden parameter shaping the sound.
   // `spatial` is driven by its own amount control, and `bypass` processes nothing.
   const showSpatialAmount = value.activePresetId === "spatial";
-  const showIntensity = value.activePresetId !== "bypass" && !showSpatialAmount;
+  // `custom` is excluded: its curve is used as authored, so an intensity control would
+  // either do nothing or silently rescale gains the user set by hand.
+  const showIntensity =
+    value.activePresetId !== "bypass" && value.activePresetId !== "custom" && !showSpatialAmount;
+  // Seed the editor from whatever is playing, so opening it on a stock preset starts
+  // from that preset's curve rather than from flat.
+  const currentGains = gainsFromSettings(value.settings);
+  const matchingCustomPresetName =
+    customPresets.find((preset) =>
+      clampCustomGains(preset.gainsDb).every(
+        (gain, index) => Math.abs(gain - currentGains[index]) < 0.001,
+      ),
+    )?.name ?? null;
   const showAdjustments = value.activePresetId !== "bypass";
 
   const releaseAb = useCallback(() => {
@@ -133,6 +155,19 @@ export function DspPresetControls({
     );
   };
 
+  const applyCustomGains = (gains: readonly number[]) => {
+    if (disabled) return;
+    releaseAb();
+    onChangeRef.current(
+      buildDspControlState(
+        "custom",
+        draftIntensityRef.current,
+        draftSpatialAmountRef.current,
+        gains,
+      ),
+    );
+  };
+
   const updateIntensityDraft = (event: ChangeEvent<HTMLInputElement>) => {
     const intensity = Number(event.currentTarget.value);
     if (!Number.isFinite(intensity)) return;
@@ -161,6 +196,9 @@ export function DspPresetControls({
         valueRef.current.activePresetId,
         intensity,
         draftSpatialAmountRef.current,
+        // Carry the live curve: rebuilding a custom preset without it would flatten
+        // the user's edit as a side effect of moving an unrelated slider.
+        gainsFromSettings(valueRef.current.settings),
       ),
     );
   }, []);
@@ -175,6 +213,7 @@ export function DspPresetControls({
         valueRef.current.activePresetId,
         draftIntensityRef.current,
         spatialAmount,
+        gainsFromSettings(valueRef.current.settings),
       ),
     );
   }, []);
@@ -378,6 +417,31 @@ export function DspPresetControls({
             持续按住时生效，松开即恢复当前音效预设。
           </span>
         </div>
+      )}
+
+      {/* Advanced, and collapsed by default: presets are the product surface, the
+          band editor is for people who want to go past them. */}
+      {!compact && onSaveCustomPreset && onDeleteCustomPreset && (
+        <details className="dsp-advanced">
+          <summary>
+            <span>高级：自定义均衡</span>
+            <small>逐段手调，可存成自己的预设</small>
+          </summary>
+          <CustomEqEditor
+            gains={currentGains}
+            savedPresets={customPresets}
+            disabled={disabled}
+            matchingPresetName={matchingCustomPresetName}
+            onGainsChange={applyCustomGains}
+            onApplyPreset={applyCustomGains}
+            onSavePreset={(name, gains) => {
+              // Saving also switches to the curve, so what you hear is what you stored.
+              applyCustomGains(gains);
+              onSaveCustomPreset(name, gains);
+            }}
+            onDeletePreset={onDeleteCustomPreset}
+          />
+        </details>
       )}
 
       {showSystemEffectsHint && <p className="dsp-system-effects-hint">{DSP_SYSTEM_EFFECTS_HINT}</p>}

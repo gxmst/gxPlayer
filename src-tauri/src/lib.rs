@@ -662,6 +662,26 @@ fn player_set_dsp_settings(
 }
 
 #[tauri::command]
+fn player_save_custom_eq_preset(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    preset: app_preferences::CustomEqPreset,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    preferences.save_custom_eq_preset(preset)
+}
+
+#[tauri::command]
+fn player_delete_custom_eq_preset(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    name: String,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    preferences.delete_custom_eq_preset(&name)
+}
+
+#[tauri::command]
 fn player_set_audio_mode(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
@@ -1430,6 +1450,8 @@ pub fn run() {
             player_set_audio_mode,
             player_set_play_mode,
             player_set_dsp_settings,
+            player_save_custom_eq_preset,
+            player_delete_custom_eq_preset,
             player_set_ab_dry,
             player_next,
             player_previous,

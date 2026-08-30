@@ -194,6 +194,9 @@ pub enum DspPresetId {
     Rock,
     Podcast,
     Jazz,
+    /// A user-edited curve. The bands travel in `DspSettings` like any other preset,
+    /// so this only marks the origin: nothing here bypasses `validate_product`.
+    Custom,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

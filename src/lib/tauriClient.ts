@@ -48,6 +48,7 @@ const demoCatalog = [
 ];
 
 let demoDspControl = buildDspControlState("bypass");
+let demoCustomEqPresets: Array<{ name: string; gainsDb: number[] }> = [];
 
 function demoPreferences() {
   return {
@@ -57,6 +58,7 @@ function demoPreferences() {
     volume: 0.72,
     outputDevice: null,
     dspControl: demoDspControl,
+    customEqPresets: demoCustomEqPresets,
   };
 }
 
@@ -116,6 +118,19 @@ function mockResult(command: string, args?: Record<string, unknown>): unknown {
       return demoPreferences();
     case "player_set_dsp_settings":
       demoDspControl = (args?.control as DspControlState | undefined) ?? demoDspControl;
+      return demoPreferences();
+    case "player_save_custom_eq_preset": {
+      const preset = args?.preset as { name: string; gainsDb: number[] } | undefined;
+      if (preset) {
+        demoCustomEqPresets = [
+          ...demoCustomEqPresets.filter((entry) => entry.name !== preset.name),
+          preset,
+        ];
+      }
+      return demoPreferences();
+    }
+    case "player_delete_custom_eq_preset":
+      demoCustomEqPresets = demoCustomEqPresets.filter((entry) => entry.name !== args?.name);
       return demoPreferences();
     case "player_set_ab_dry":
       return undefined;

@@ -67,6 +67,7 @@ import {
   type CacheEntryView,
   type CacheStatus,
   type CatalogTrack,
+  type CustomEqPreset,
   type DiagnosticLogEntry,
   type DiagnosticLogExportResult,
   type DiagnosticLogStatus,
@@ -95,6 +96,7 @@ type AppPreferences = {
   volume: number;
   outputDevice: string | null;
   dspControl: DspControlState;
+  customEqPresets: CustomEqPreset[];
 };
 type OutputDeviceStatus = {
   devices: string[];
@@ -2915,6 +2917,26 @@ function App() {
     void flushPendingDspControl();
   };
 
+  const saveCustomEqPreset = (name: string, gainsDb: readonly number[]) => {
+    void invoke<AppPreferences>("player_save_custom_eq_preset", {
+      preset: { name, gainsDb: [...gainsDb] },
+    })
+      .then((preferences) => {
+        setAppPreferences(preferences);
+        setMessage(`已保存均衡预设“${name}”。`);
+      })
+      .catch((error) => setMessage(`保存均衡预设失败：${String(error)}`, true));
+  };
+
+  const deleteCustomEqPreset = (name: string) => {
+    void invoke<AppPreferences>("player_delete_custom_eq_preset", { name })
+      .then((preferences) => {
+        setAppPreferences(preferences);
+        setMessage(`已删除均衡预设“${name}”。`);
+      })
+      .catch((error) => setMessage(`删除均衡预设失败：${String(error)}`, true));
+  };
+
   const setAbDry = (enabled: boolean) => {
     abDryCommandRef.current = abDryCommandRef.current
       .catch(() => undefined)
@@ -3772,7 +3794,14 @@ function App() {
           {!advancedSettings && <section className="settings-card dsp-settings-card">
             <h3>音效预设</h3>
             <p>预设与微调会自动保存；原声会关闭整条 DSP 链并保持零 DSP 延迟。</p>
-            <DspPresetControls value={dspControl} onChange={applyDspControl} onAbDryChange={setAbDry} />
+            <DspPresetControls
+              value={dspControl}
+              onChange={applyDspControl}
+              onAbDryChange={setAbDry}
+              customPresets={appPreferences?.customEqPresets ?? []}
+              onSaveCustomPreset={saveCustomEqPreset}
+              onDeleteCustomPreset={deleteCustomEqPreset}
+            />
           </section>}
           {!advancedSettings && <section className="settings-card"><h3>主题</h3><p>切换整体色调；动态强调色仍会随封面自然变化。</p><select value={theme} onChange={(event) => setTheme(event.target.value as ThemeId)}>{THEME_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label} · {option.description}</option>)}</select></section>}
           {advancedSettings && <section className="settings-card proxy-settings">

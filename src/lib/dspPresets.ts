@@ -148,7 +148,34 @@ function eqBands(gains: readonly number[], scale = 1): EqBand[] {
 }
 
 function zeroEqBands(): EqBand[] {
-  return eqBands(EQ_FREQUENCIES.map(() => 0));
+  return eqBands(zeroGains());
+}
+
+/** Band centre frequencies of the fixed product EQ, low to high. */
+export const DSP_EQ_FREQUENCIES = EQ_FREQUENCIES;
+/** Engine limit from `DspControlState::validate_product`; the editor clamps to it. */
+export const DSP_EQ_MAX_GAIN_DB = 12;
+
+export function zeroGains(): number[] {
+  return EQ_FREQUENCIES.map(() => 0);
+}
+
+/**
+ * Force a curve into the shape the engine accepts: exactly one gain per band, finite,
+ * within +-12 dB. The editor clamps as you drag, but a curve can also arrive from
+ * stored preferences, so it is normalized on the way in too.
+ */
+export function clampCustomGains(gains: readonly number[]): number[] {
+  return EQ_FREQUENCIES.map((_, index) => {
+    const gain = gains[index];
+    if (typeof gain !== "number" || !Number.isFinite(gain)) return 0;
+    return Math.min(DSP_EQ_MAX_GAIN_DB, Math.max(-DSP_EQ_MAX_GAIN_DB, gain));
+  });
+}
+
+/** Read the curve back off a control state, for seeding the editor from any preset. */
+export function gainsFromSettings(settings: DspSettings): number[] {
+  return clampCustomGains(settings.eqBands.map((band) => band.gainDb));
 }
 
 function settings({
@@ -196,11 +223,24 @@ export function buildDspSettings(
   presetId: DspPresetId,
   intensity = DSP_DEFAULT_INTENSITY,
   spatialAmount = DSP_DEFAULT_SPATIAL_AMOUNT,
+  customGains: readonly number[] = zeroGains(),
 ): DspSettings {
   const normalizedIntensity = clampDspAmount(intensity);
   const normalizedSpatialAmount = clampDspAmount(spatialAmount);
 
   switch (presetId) {
+    case "custom":
+      // A hand-edited curve is used as authored: intensity would silently rescale
+      // gains the user set by hand, so it is deliberately not applied here.
+      return settings({
+        eqEnabled: true,
+        bands: eqBands(clampCustomGains(customGains)),
+        crossfeedEnabled: true,
+        crossfeedAmount: CROSSFEED_LIGHT,
+        hrtfEnabled: false,
+        hrtfMix: HRTF_MEDIUM,
+        limiterEnabled: true,
+      });
     case "bypass":
       return settings({
         eqEnabled: false,
@@ -289,17 +329,35 @@ export function buildDspControlState(
   activePresetId: DspPresetId,
   intensity = DSP_DEFAULT_INTENSITY,
   spatialAmount = DSP_DEFAULT_SPATIAL_AMOUNT,
+  customGains: readonly number[] = zeroGains(),
 ): DspControlState {
   const normalizedIntensity = clampDspAmount(intensity);
   const normalizedSpatialAmount = clampDspAmount(spatialAmount);
   return {
-    settings: buildDspSettings(activePresetId, normalizedIntensity, normalizedSpatialAmount),
+    settings: buildDspSettings(
+      activePresetId,
+      normalizedIntensity,
+      normalizedSpatialAmount,
+      customGains,
+    ),
     activePresetId,
     intensity: normalizedIntensity,
     spatialAmount: normalizedSpatialAmount,
   };
 }
 
+/**
+ * The custom curve is reachable from the advanced editor rather than the preset shelf,
+ * so it is described here instead of in DSP_PRESETS. Without an entry, lookups would
+ * fall back to the first preset and the summary would name the wrong thing.
+ */
+export const DSP_CUSTOM_PRESET = {
+  id: "custom",
+  label: "自定义",
+  description: "你自己调的曲线，强度不再二次缩放，所听即所调。",
+} as const satisfies { id: DspPresetId; label: string; description: string };
+
 export function getDspPreset(presetId: DspPresetId) {
+  if (presetId === "custom") return DSP_CUSTOM_PRESET;
   return DSP_PRESETS.find((preset) => preset.id === presetId) ?? DSP_PRESETS[0];
 }

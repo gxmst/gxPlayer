@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { buildDspControlState, buildDspSettings, DSP_PRESETS, getDspPreset } from "./dspPresets";
+import {
+  buildDspControlState,
+  buildDspSettings,
+  clampCustomGains,
+  DSP_EQ_MAX_GAIN_DB,
+  DSP_PRESETS,
+  gainsFromSettings,
+  getDspPreset,
+  zeroGains,
+} from "./dspPresets";
 import type { DspPresetId } from "../types";
 
 const FREQUENCIES = [31, 62, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000];
@@ -135,6 +144,43 @@ describe("DSP presets", () => {
     expect(dense.crossfeed.amount).toBeCloseTo(0.18);
     expect(dense.hrtf.outputGainDb).toBe(-6);
     expect(dense.limiter.enabled).toBe(true);
+  });
+
+  it("builds a custom curve as authored, without intensity rescaling", () => {
+    const gains = [1, -2, 3, 0, 0, 0, 0, 0, 4, 0];
+    // Same curve at both intensity extremes: a hand-set gain must not be rescaled.
+    for (const intensity of [0, 0.5, 1]) {
+      const result = buildDspSettings("custom", intensity, 0.5, gains);
+      expect(result.eqBands.map((band) => band.gainDb)).toEqual(gains);
+      expect(result.eqEnabled).toBe(true);
+      expect(result.hrtf.enabled).toBe(false);
+      expect(result.limiter.enabled).toBe(true);
+    }
+  });
+
+  it("clamps a custom curve to the shape the engine accepts", () => {
+    // Too short, too long, non-finite and out-of-range all normalize rather than throw.
+    expect(clampCustomGains([1, 2])).toEqual([1, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(clampCustomGains(new Array(14).fill(1))).toHaveLength(10);
+    expect(clampCustomGains([Number.NaN, Number.POSITIVE_INFINITY])[0]).toBe(0);
+    expect(clampCustomGains([99, -99])[0]).toBe(DSP_EQ_MAX_GAIN_DB);
+    expect(clampCustomGains([99, -99])[1]).toBe(-DSP_EQ_MAX_GAIN_DB);
+
+    const built = buildDspSettings("custom", 0.5, 0.5, [99, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(built.eqBands[0].gainDb).toBe(DSP_EQ_MAX_GAIN_DB);
+    expect(built.eqBands).toHaveLength(10);
+  });
+
+  it("names the custom curve instead of falling back to the first preset", () => {
+    // `custom` is not on the shelf, so a plain list lookup would return 原声.
+    expect(getDspPreset("custom").label).toBe("自定义");
+    expect(DSP_PRESETS.map((preset) => preset.id)).not.toContain("custom");
+  });
+
+  it("reads a curve back off any preset for seeding the editor", () => {
+    const bass = buildDspSettings("bass", 1);
+    expect(gainsFromSettings(bass)).toEqual(bass.eqBands.map((band) => band.gainDb));
+    expect(gainsFromSettings(buildDspSettings("bypass"))).toEqual(zeroGains());
   });
 
   it("clamps normalized controls and preserves complete authoritative state", () => {

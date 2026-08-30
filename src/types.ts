@@ -126,6 +126,15 @@ export type DiagnosticLogExportResult = {
   entryCount: number;
 };
 
+/** Per-track export result. `fileName` is a basename, never a full path. */
+export type CacheExportOutcome = {
+  providerId: string;
+  providerTrackId: string;
+  quality: string;
+  fileName: string | null;
+  error: string | null;
+};
+
 export type CacheStatus = {
   revision: number;
   directory: string;

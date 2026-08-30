@@ -138,6 +138,14 @@ function mockResult(command: string, args?: Record<string, unknown>): unknown {
       return demoPreferences();
     case "metadata_chart_regions":
       return ["cn", "hk", "tw", "jp", "kr", "us", "gb", "de", "fr", "sg", "my", "au", "ca"];
+    case "cache_export_entries":
+      return (args?.keys as Array<Record<string, string>> | undefined ?? []).map((key) => ({
+        providerId: key.providerId,
+        providerTrackId: key.providerTrackId,
+        quality: key.quality,
+        fileName: `演示歌手 - 演示歌曲.mp3`,
+        error: null,
+      }));
     case "playlist_read_file":
       return "#EXTM3U\n#EXTINF:213,演示歌手 - 演示歌曲\n演示歌手 - 演示歌曲\n";
     case "playlist_write_file":

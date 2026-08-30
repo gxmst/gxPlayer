@@ -22,6 +22,7 @@ mod app_preferences;
 mod artwork;
 mod backup_commands;
 mod cache_commands;
+mod cache_export;
 mod diagnostic_log;
 mod library_commands;
 mod media_session;
@@ -41,10 +42,10 @@ use app_preferences::{AppPreferences, AppPreferencesState, CloseAction, CloseBeh
 use artwork::artwork_get;
 use backup_commands::{backup_preview_restore, backup_restore_atomic};
 use cache_commands::{
-    cache_clear, cache_list_entries, cache_online_favorites, cache_remove_by_quality,
-    cache_remove_entries, cache_remove_entry, cache_reset_directory, cache_set_directory,
-    cache_set_limit, cache_set_online_favorite, cache_status, player_play_cache_entry,
-    player_play_history_cache, preview_cache_clear, preview_cache_status,
+    cache_clear, cache_export_entries, cache_list_entries, cache_online_favorites,
+    cache_remove_by_quality, cache_remove_entries, cache_remove_entry, cache_reset_directory,
+    cache_set_directory, cache_set_limit, cache_set_online_favorite, cache_status,
+    player_play_cache_entry, player_play_history_cache, preview_cache_clear, preview_cache_status,
 };
 use diagnostic_log::{
     DiagnosticLogState, diagnostic_log_clear, diagnostic_log_export, diagnostic_log_recent,
@@ -1579,6 +1580,7 @@ pub fn run() {
             cache_list_entries,
             cache_remove_entry,
             cache_remove_entries,
+            cache_export_entries,
             cache_remove_by_quality,
             cache_online_favorites,
             cache_set_online_favorite,

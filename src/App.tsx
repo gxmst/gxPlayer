@@ -66,6 +66,7 @@ import {
 } from "./lib/transport";
 import {
   type CacheEntryView,
+  type CacheExportOutcome,
   type CacheStatus,
   type CatalogTrack,
   type CustomEqPreset,
@@ -727,6 +728,7 @@ function App() {
   );
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
   const [selectedCacheKeys, setSelectedCacheKeys] = useState<string[]>([]);
+  const [cacheExportBusy, setCacheExportBusy] = useState(false);
   const [coverCache, setCoverCache] = useState<Record<string, string>>({});
   const [resolveBanner, setResolveBanner] = useState<{ title: string; detail: string } | null>(null);
   const resolveGenerationRef = useRef(0);
@@ -2654,6 +2656,53 @@ function App() {
     });
   };
 
+  /**
+   * Copy already-cached audio out under readable names. Nothing is fetched: an
+   * entry that is not fully cached comes back reported, not downloaded.
+   */
+  const exportCacheEntries = async (entries: CacheEntryView[]) => {
+    if (!entries.length || cacheExportBusy) return;
+    const directory = await open({ multiple: false, directory: true });
+    if (!directory || Array.isArray(directory)) return;
+    const keys = entries.map((entry) => ({
+      providerId: entry.providerId,
+      providerTrackId: entry.providerTrackId,
+      quality: entry.quality,
+    }));
+
+    setCacheExportBusy(true);
+    try {
+      const outcomes = await invoke<CacheExportOutcome[]>("cache_export_entries", {
+        keys,
+        directory,
+      });
+      const written = outcomes.filter((outcome) => outcome.fileName).length;
+      const failed = outcomes.length - written;
+      if (!written) {
+        const reason = outcomes.find((outcome) => outcome.error)?.error;
+        setMessage(`导出失败：${reason ?? "没有可导出的歌曲"}`, true);
+        return;
+      }
+      // Name the first failure rather than only counting it, so the cause is actionable.
+      const firstFailure = outcomes.find((outcome) => outcome.error);
+      const failureNote = failed
+        ? `，${failed} 首未导出（${firstFailure?.error ?? "原因未知"}）`
+        : "";
+      setMessage(`已导出 ${written} 首到 ${directory}${failureNote}`, failed > 0);
+    } catch (error) {
+      setMessage(`导出失败：${String(error)}`, true);
+    } finally {
+      setCacheExportBusy(false);
+    }
+  };
+
+  const exportSelectedCache = () => {
+    const selected = new Set(selectedCacheKeys);
+    const entries = cacheEntries.filter((entry) =>
+      selected.has(cachedIdentityKey(entry.providerId, entry.providerTrackId, entry.quality)));
+    return exportCacheEntries(entries);
+  };
+
   const removeCacheByQuality = (quality: string) => {
     actionDialog.openAction({
       title: `清理 ${quality} 缓存`,
@@ -3749,6 +3798,16 @@ function App() {
               {cacheEntries.length > 0 ? (
                 <div className="cache-bulk-actions">
                   <button type="button" className="primary" onClick={() => enqueueCacheEntries(cacheEntries)}>全部入队</button>
+                  <button
+                    type="button"
+                    disabled={cacheExportBusy || !selectedCacheKeys.length}
+                    onClick={() => void exportSelectedCache()}
+                  >
+                    {cacheExportBusy ? "正在导出…" : `导出所选 (${selectedCacheKeys.length})`}
+                  </button>
+                  <button type="button" disabled={cacheExportBusy || !cacheEntries.length} onClick={() => void exportCacheEntries(cacheEntries)}>
+                    导出全部
+                  </button>
                   <button type="button" disabled={!selectedCacheKeys.length} onClick={() => void removeSelectedCache()}>
                     删除所选 ({selectedCacheKeys.length})
                   </button>

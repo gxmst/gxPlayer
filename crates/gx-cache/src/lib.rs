@@ -111,6 +111,16 @@ pub struct CacheEntryView {
     pub file_name: String,
 }
 
+/// What an export needs: where the bytes are, and what to call them.
+#[derive(Debug, Clone)]
+pub struct CacheExportPlan {
+    pub source_path: PathBuf,
+    /// Readable base name without extension, already stripped of path syntax.
+    pub file_stem: String,
+    pub extension: String,
+    pub byte_len: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheStatus {
@@ -404,6 +414,24 @@ impl CacheStore {
             .collect::<Vec<_>>();
         views.sort_by_key(|entry| std::cmp::Reverse(entry.last_accessed_at_ms));
         views
+    }
+
+    /// Details needed to export one entry, resolved under the store's lock.
+    ///
+    /// Only fully cached entries are exportable: the caller gets `None` when the
+    /// key is unknown, so exporting never reaches the network or completes a
+    /// partial download.
+    pub fn export_plan(&self, key: &CacheKey) -> Option<CacheExportPlan> {
+        let state = self.inner.lock().unwrap();
+        let entry = state.manifest.entries.get(&cache_id(key))?;
+        let favorites = &state.settings.online_favorites;
+        let view = entry_to_view(entry, favorites);
+        Some(CacheExportPlan {
+            source_path: entry.audio_path.clone(),
+            file_stem: export_file_stem(&view.artist, &view.title, &entry.key),
+            extension: media_extension(&entry.media_type).to_owned(),
+            byte_len: entry.byte_len,
+        })
     }
 
     /// Remove one cache entry: audio file + sidecar + manifest row.
@@ -1079,6 +1107,75 @@ fn cache_id(key: &CacheKey) -> String {
 
 fn favorite_id(provider_id: &str, provider_track_id: &str) -> String {
     format!("{provider_id}\0{provider_track_id}")
+}
+
+/// Longest base name we will produce, in characters. Well inside the usual 255
+/// byte limit even after multi-byte encoding, with room for the extension.
+const MAX_EXPORT_STEM_CHARS: usize = 120;
+
+/// Build `Artist - Title` as a file name.
+///
+/// Track metadata comes from a source, so it is untrusted: it may contain path
+/// separators, `..`, reserved device names, or control characters. Rather than
+/// escaping, every character that carries meaning to a filesystem is replaced,
+/// and the result is checked for the Windows reserved names. A record with no
+/// usable text falls back to its identifier so the export is still traceable.
+fn export_file_stem(artist: &str, title: &str, key: &CacheKey) -> String {
+    let joined = match (sanitize_name_part(artist), sanitize_name_part(title)) {
+        (Some(artist), Some(title)) => format!("{artist} - {title}"),
+        (None, Some(title)) => title,
+        (Some(artist), None) => artist,
+        (None, None) => format!("{}-{}", key.provider_id, key.provider_track_id),
+    };
+
+    let truncated: String = joined.chars().take(MAX_EXPORT_STEM_CHARS).collect();
+    // A trailing dot or space is silently dropped by Windows, which would make the
+    // written name differ from the one reported back to the user.
+    let trimmed = truncated.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() || is_reserved_device_name(trimmed) {
+        return format!("{}-{}", key.provider_id, key.provider_track_id);
+    }
+    trimmed.to_owned()
+}
+
+fn sanitize_name_part(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut last_was_space = false;
+    for character in value.chars() {
+        let replacement = match character {
+            // Path syntax and the Windows-invalid set.
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            // Control characters, including the newlines that would split a name.
+            c if c.is_control() => ' ',
+            c => c,
+        };
+        if replacement == ' ' {
+            if !last_was_space && !out.is_empty() {
+                out.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            out.push(replacement);
+            last_was_space = false;
+        }
+    }
+    let trimmed = out.trim();
+    // "." and ".." survive the character filter but are directory references.
+    if trimmed.is_empty() || trimmed.chars().all(|c| c == '.') {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// CON, PRN, AUX, NUL, COM1-9, LPT1-9 — reserved on Windows with any extension.
+fn is_reserved_device_name(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    let base = upper.split('.').next().unwrap_or(&upper);
+    matches!(base, "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && base.as_bytes()[3].is_ascii_digit()
+            && base.as_bytes()[3] != b'0')
 }
 
 fn media_extension(media_type: &MediaType) -> &'static str {
@@ -1847,6 +1944,96 @@ mod tests {
         fs::remove_file(&manifest).unwrap();
         let _ = fs::remove_file(json_backup_path(&manifest));
         (app_data, cache_root, entry_key)
+    }
+
+    #[test]
+    fn export_names_neutralise_path_syntax_from_source_metadata() {
+        let probe = key("probe", "320k");
+
+        // Separators and traversal must not survive into a file name.
+        let escaped = export_file_stem("../../etc", "passwd", &probe);
+        assert!(
+            !escaped.contains('/') && !escaped.contains('\\'),
+            "{escaped}"
+        );
+        assert!(!escaped.contains(".."), "{escaped}");
+
+        let windows = export_file_stem("C:\\Windows", "System32\\cmd", &probe);
+        assert!(
+            !windows.contains(':') && !windows.contains('\\'),
+            "{windows}"
+        );
+
+        // A newline would otherwise split the name or forge a second one.
+        let multiline = export_file_stem("Artist\nEvil", "Title\r\nMore", &probe);
+        assert!(
+            !multiline.contains('\n') && !multiline.contains('\r'),
+            "{multiline}"
+        );
+
+        // Reserved device names are refused whatever case they arrive in.
+        assert_eq!(export_file_stem("", "nul", &probe), "kg-probe");
+        assert_eq!(export_file_stem("", "CoM1", &probe), "kg-probe");
+        // COM0 is not reserved, so it stays.
+        assert_eq!(export_file_stem("", "COM0", &probe), "COM0");
+
+        // Nothing usable at all still yields a traceable name.
+        assert_eq!(export_file_stem("   ", "...", &probe), "kg-probe");
+        assert_eq!(export_file_stem("", "", &probe), "kg-probe");
+
+        // Trailing dots and spaces are dropped by Windows, so drop them ourselves
+        // rather than report a name that differs from what lands on disk.
+        assert_eq!(export_file_stem("Band", "Song. ", &probe), "Band - Song");
+
+        // Ordinary names, including non-Latin script, pass through intact.
+        assert_eq!(export_file_stem("周杰伦", "花海", &probe), "周杰伦 - 花海");
+        assert_eq!(
+            export_file_stem("A&B", "C'D (Live)", &probe),
+            "A&B - C'D (Live)"
+        );
+    }
+
+    #[test]
+    fn export_names_stay_within_a_filesystem_safe_length() {
+        let probe = key("probe", "320k");
+        let stem = export_file_stem(&"歌".repeat(200), &"名".repeat(200), &probe);
+
+        assert!(
+            stem.chars().count() <= MAX_EXPORT_STEM_CHARS,
+            "{}",
+            stem.chars().count()
+        );
+        // Multi-byte truncation must not split a character.
+        assert!(
+            stem.chars()
+                .all(|c| c == '歌' || c == '名' || c == ' ' || c == '-')
+        );
+    }
+
+    #[test]
+    fn export_plan_resolves_only_fully_cached_entries() {
+        let app_data = temporary_root();
+        let store = CacheStore::open(&app_data, None).unwrap();
+        let cached = key("exportable", "320k");
+
+        // Nothing cached yet: there is no plan, so export cannot reach the network.
+        assert!(store.export_plan(&cached).is_none());
+
+        let plan = store.prepare(cached.clone(), MediaType::Mp3);
+        let mut writer = plan.begin().unwrap();
+        writer.append(b"audio payload");
+        writer.finish(Some(13));
+        // Still uncommitted, so still not exportable.
+        assert!(store.export_plan(&cached).is_none());
+        plan.commit().unwrap();
+
+        let resolved = store
+            .export_plan(&cached)
+            .expect("committed entry is exportable");
+        assert_eq!(resolved.extension, "mp3");
+        assert_eq!(resolved.byte_len, 13);
+        assert_eq!(fs::read(&resolved.source_path).unwrap(), b"audio payload");
+        fs::remove_dir_all(app_data).unwrap();
     }
 
     #[test]

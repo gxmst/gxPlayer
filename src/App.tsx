@@ -29,6 +29,7 @@ import { splitArtistNames } from "./lib/artistNames";
 import { diagnosticEntryDisplay } from "./lib/diagnosticDisplay";
 import { createApplicationBackup } from "./lib/backupRestore";
 import { getDspPreset } from "./lib/dspPresets";
+import { buildM3u8 } from "./lib/playlistFormats";
 import { groupConsecutiveHistory } from "./lib/historyGrouping";
 import {
   engineMatchesLocalQueue,
@@ -92,6 +93,12 @@ type CloseBehavior = "hide_to_tray" | "exit";
 
 /** Mirrors DEFAULT_CHART_REGION in gx-metadata. */
 const DEFAULT_CHART_REGION = "cn";
+
+/** Keep a user-chosen playlist name usable as a default file name. */
+function safeFileStem(name: string): string {
+  const cleaned = name.replace(/[\\/:*?"<>|\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+  return cleaned.slice(0, 80) || "playlist";
+}
 
 /** Readable names for the chart storefronts. Unknown codes show as-is. */
 const CHART_REGION_LABELS: Record<string, string> = {
@@ -686,6 +693,7 @@ function App() {
   const [playlists, setPlaylists] = useState<PlaylistSummary[]>([]);
   const [activePlaylist, setActivePlaylist] = useState<PlaylistSummary | null>(null);
   const [playlistItems, setPlaylistItems] = useState<LibraryPlaylistItem[]>([]);
+  const [playlistExportBusy, setPlaylistExportBusy] = useState(false);
   const [newPlaylistName, setNewPlaylistName] = useState("");
   const [libraryImportBusy, setLibraryImportBusy] = useState<"files" | "folder" | "relink" | null>(null);
   const [advancedSettings, setAdvancedSettings] = useState(false);
@@ -2045,6 +2053,62 @@ function App() {
     } finally {
       setLibraryImportBusy(null);
     }
+  };
+
+  /**
+   * Write the open playlist as m3u8. Local tracks carry their path so other
+   * players can open them directly; cached online tracks are recorded by text
+   * only, since there is no file to point at.
+   */
+  const exportActivePlaylist = async () => {
+    if (!activePlaylist || !playlistItems.length || playlistExportBusy) return;
+    setPlaylistExportBusy(true);
+    try {
+      const tracks = playlistItems.map((item) => item.kind === "local"
+        ? {
+            title: item.track.title,
+            artist: item.track.artist,
+            durationMs: item.track.durationSeconds === null ? null : item.track.durationSeconds * 1000,
+            path: item.track.path,
+          }
+        : { title: item.title, artist: item.artist, durationMs: null, path: null });
+      const content = buildM3u8(tracks, activePlaylist.name);
+      const path = await save({
+        defaultPath: `${safeFileStem(activePlaylist.name)}.m3u8`,
+        filters: [{ name: "M3U8 歌单", extensions: ["m3u8"] }],
+      });
+      if (!path || Array.isArray(path)) return;
+      await invoke("playlist_write_file", { path, content });
+      const onlineCount = playlistItems.filter((item) => item.kind !== "local").length;
+      const onlineNote = onlineCount ? `，其中 ${onlineCount} 首在线歌曲仅记录歌名` : "";
+      setMessage(`歌单已导出到 ${path}${onlineNote}`);
+    } catch (error) {
+      setMessage(`歌单导出失败：${String(error)}`, true);
+    } finally {
+      setPlaylistExportBusy(false);
+    }
+  };
+
+  /** Read a playlist file the user picks. Parsing happens in the dialog. */
+  const openPlaylistFile = async (): Promise<{ name: string; text: string } | null> => {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [
+        { name: "歌单", extensions: ["m3u", "m3u8", "csv", "tsv", "txt"] },
+        { name: "所有文件", extensions: ["*"] },
+      ],
+    });
+    if (!selected || Array.isArray(selected)) return null;
+    const text = await invoke<string>("playlist_read_file", { path: selected });
+    return { name: selected.split(/[\\/]/).pop() || selected, text };
+  };
+
+  /** Import local files an m3u referenced, so their own tags win over list text. */
+  const importPlaylistLocalPaths = async (paths: string[]): Promise<number> => {
+    const result = await invoke<LibraryImportResult>("library_import_files", { paths });
+    await refreshLibrary();
+    return result.imported.length;
   };
 
   const relinkMissingTracks = async () => {
@@ -3544,6 +3608,7 @@ function App() {
           <div className="section-heading"><div><p className="eyebrow">PLAYLISTS</p><h2>你的歌单</h2></div></div>
           <div className="playlist-cards">
             {playlists.map((playlist) => <button className="playlist-card" key={playlist.id} onClick={() => void openPlaylist(playlist)}><span>♫</span><strong>{playlist.name}</strong><small>{playlist.trackCount} 首</small></button>)}
+            <button className="playlist-card import-card" type="button" onClick={() => setTextPlaylistDialogOpen(true)}><span>↓</span><strong>导入歌单</strong><small>m3u / CSV / 文本</small></button>
             <label className="playlist-card create-card"><span>＋</span><input aria-label="新歌单名称" placeholder="新歌单" value={newPlaylistName} onChange={(event) => setNewPlaylistName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createPlaylist(); }} /><button onClick={() => void createPlaylist()} disabled={!newPlaylistName.trim()}>创建</button></label>
           </div>
         </section>
@@ -3803,7 +3868,7 @@ function App() {
     }
 
     if (view === "playlist") return (
-      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistItems.length} 首音乐 · 支持本地与已缓存歌曲`} action={activePlaylist ? <button className="danger" onClick={requestDeleteActivePlaylist}>删除歌单</button> : undefined} />{playlistItems.length && activePlaylist ? renderLibraryPlaylistItems(playlistItems, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把本地音乐或已缓存歌曲加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
+      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistItems.length} 首音乐 · 支持本地与已缓存歌曲`} action={activePlaylist ? <div className="page-heading-actions"><button type="button" disabled={!playlistItems.length || playlistExportBusy} onClick={() => void exportActivePlaylist()}>{playlistExportBusy ? "正在导出…" : "导出为 m3u8"}</button><button className="danger" onClick={requestDeleteActivePlaylist}>删除歌单</button></div> : undefined} />{playlistItems.length && activePlaylist ? renderLibraryPlaylistItems(playlistItems, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把本地音乐或已缓存歌曲加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
     );
 
     if (view === "sources") return (
@@ -4410,6 +4475,8 @@ function App() {
         open={textPlaylistDialogOpen}
         onClose={() => setTextPlaylistDialogOpen(false)}
         onEnqueue={enqueueCatalogTracks}
+        onOpenFile={openPlaylistFile}
+        onImportLocalPaths={importPlaylistLocalPaths}
         invoke={invoke}
       />
 

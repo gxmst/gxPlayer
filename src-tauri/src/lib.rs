@@ -60,8 +60,8 @@ use network_settings::{network_proxy_status, network_set_proxy_mode};
 use product_commands::{
     backup_read_file, backup_write_file, library_check_local_paths, library_clear_history,
     library_embedded_cover, library_history, library_record_history, library_scan_missing,
-    player_media_action, window_force_show, window_get_state, window_save_state,
-    window_set_always_on_top, window_set_mini_mode,
+    player_media_action, playlist_read_file, playlist_write_file, window_force_show,
+    window_get_state, window_save_state, window_set_always_on_top, window_set_mini_mode,
 };
 use source_commands::{
     LxHttpConcurrencyLimiter, OptionalActionGate, ResolveCancellationRegistry, lx_http_request,
@@ -1521,6 +1521,8 @@ pub fn run() {
             window_set_mini_mode,
             backup_write_file,
             backup_read_file,
+            playlist_read_file,
+            playlist_write_file,
             backup_preview_restore,
             backup_restore_atomic,
             sandbox_ready,

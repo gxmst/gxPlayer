@@ -220,4 +220,102 @@ describe("TextPlaylistImportDialog", () => {
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "关闭对话框" })).toBeEnabled();
   });
+
+  it("reports the detected format for pasted text", async () => {
+    render(
+      <TextPlaylistImportDialog
+        open
+        onClose={() => undefined}
+        onEnqueue={() => undefined}
+        search={async () => []}
+        delayMs={0}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("歌曲列表"), {
+      target: { value: "Title,Artist\nCreep,Radiohead\nSong 2,Blur" },
+    });
+
+    const banner = await screen.findByRole("status");
+    expect(banner).toHaveTextContent("CSV / TSV 表格");
+    expect(banner).toHaveTextContent("2 条");
+  });
+
+  it("sends m3u local files to the library and only searches the rest", async () => {
+    const search = vi.fn(async (query: string) => [track(query)]);
+    const onImportLocalPaths = vi.fn(async () => 1);
+    render(
+      <TextPlaylistImportDialog
+        open
+        onClose={() => undefined}
+        onEnqueue={() => undefined}
+        onImportLocalPaths={onImportLocalPaths}
+        search={search}
+        delayMs={0}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("歌曲列表"), {
+      target: {
+        value: [
+          "#EXTM3U",
+          "#EXTINF:213,Local - Song",
+          "C:\\Music\\local.flac",
+          "#EXTINF:180,Online Only - Artist",
+          "Online Only - Artist",
+        ].join("\n"),
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "开始匹配" }));
+
+    await waitFor(() => expect(screen.getByText("匹配完成")).toBeInTheDocument());
+    expect(onImportLocalPaths).toHaveBeenCalledWith(["C:\\Music\\local.flac"]);
+    // The local entry must not also be searched online.
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(search.mock.calls[0][0]).toBe("Online Only Artist");
+    expect(screen.getByText("已从本地文件导入 1 首到曲库。")).toBeInTheDocument();
+  });
+
+  it("loads a picked file and shows its name", async () => {
+    const onOpenFile = vi.fn(async () => ({
+      name: "road-trip.m3u8",
+      text: "#EXTM3U\n#EXTINF:1,A - B\nC:\\Music\\a.flac",
+    }));
+    render(
+      <TextPlaylistImportDialog
+        open
+        onClose={() => undefined}
+        onEnqueue={() => undefined}
+        onOpenFile={onOpenFile}
+        search={async () => []}
+        delayMs={0}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "打开歌单文件…" }));
+
+    await waitFor(() => expect(screen.getByLabelText("歌曲列表")).toHaveValue(
+      "#EXTM3U\n#EXTINF:1,A - B\nC:\\Music\\a.flac",
+    ));
+    expect(await screen.findByText(/road-trip\.m3u8/)).toBeInTheDocument();
+  });
+
+  it("surfaces a file read failure without wedging the dialog", async () => {
+    const onOpenFile = vi.fn(async () => { throw new Error("歌单文件过大"); });
+    render(
+      <TextPlaylistImportDialog
+        open
+        onClose={() => undefined}
+        onEnqueue={() => undefined}
+        onOpenFile={onOpenFile}
+        search={async () => []}
+        delayMs={0}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "打开歌单文件…" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("歌单文件过大");
+    expect(screen.getByRole("button", { name: "打开歌单文件…" })).toBeEnabled();
+  });
 });

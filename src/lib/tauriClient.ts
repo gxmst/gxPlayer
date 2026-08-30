@@ -138,6 +138,10 @@ function mockResult(command: string, args?: Record<string, unknown>): unknown {
       return demoPreferences();
     case "metadata_chart_regions":
       return ["cn", "hk", "tw", "jp", "kr", "us", "gb", "de", "fr", "sg", "my", "au", "ca"];
+    case "playlist_read_file":
+      return "#EXTM3U\n#EXTINF:213,演示歌手 - 演示歌曲\n演示歌手 - 演示歌曲\n";
+    case "playlist_write_file":
+      return undefined;
     case "app_preferences_set_chart_region":
       demoChartRegion = typeof args?.region === "string" ? args.region : demoChartRegion;
       return demoPreferences();

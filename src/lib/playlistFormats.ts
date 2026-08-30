@@ -378,13 +378,24 @@ export function toImportableText(entries: readonly NormalizedPlaylistEntry[]): s
   return entries.filter((entry) => !entry.localPath).map((entry) => entry.text).join("\n");
 }
 
+/**
+ * Dedup key matching local_path_key in the Rust host: Windows paths compare
+ * case-insensitively with separators normalised, POSIX paths compare exactly.
+ * The style is read from the path rather than the running platform, because a
+ * playlist may have been written on a different OS than the one opening it.
+ */
+function localPathKey(path: string): string {
+  const windowsStyle = /^[a-z]:[\\/]/i.test(path) || path.startsWith("\\\\");
+  return windowsStyle ? path.replace(/\//g, "\\").toLowerCase() : path;
+}
+
 /** Local paths an m3u referenced, in input order and de-duplicated. */
 export function toLocalPaths(entries: readonly NormalizedPlaylistEntry[]): string[] {
   const seen = new Set<string>();
   const paths: string[] = [];
   for (const entry of entries) {
     if (!entry.localPath) continue;
-    const key = entry.localPath.toLowerCase();
+    const key = localPathKey(entry.localPath);
     if (seen.has(key)) continue;
     seen.add(key);
     paths.push(entry.localPath);

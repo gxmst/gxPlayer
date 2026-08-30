@@ -92,6 +92,29 @@ describe("normalizePlaylistText", () => {
     expect(result.notes.some((note) => note.includes("相对路径"))).toBe(true);
   });
 
+  it("dedups by the host's path rules, not by lowercasing everything", () => {
+    const result = normalizePlaylistText(
+      [
+        "#EXTM3U",
+        "#EXTINF:1,A - B",
+        "C:\\Music\\Song.flac",
+        "#EXTINF:1,A - B",
+        "c:/music/song.flac",
+        "#EXTINF:1,C - D",
+        "/home/u/Song.flac",
+        "#EXTINF:1,C - D",
+        "/home/u/song.flac",
+      ].join("\n"),
+    );
+
+    // The two Windows spellings are one file; the two POSIX ones are not.
+    expect(toLocalPaths(result.entries)).toEqual([
+      "C:\\Music\\Song.flac",
+      "/home/u/Song.flac",
+      "/home/u/song.flac",
+    ]);
+  });
+
   it("still accepts ordinary absolute paths", () => {
     const result = normalizePlaylistText(
       ["#EXTM3U", "#EXTINF:1,A - B", "C:\\Music\\a.flac", "#EXTINF:1,C - D", "/home/u/b.mp3"].join("\n"),

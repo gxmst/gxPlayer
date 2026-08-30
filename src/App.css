@@ -13,15 +13,15 @@
   --shell-end: #0b0c12;
   --ambient-secondary: rgba(90, 100, 170, 0.045);
   --chrome-bg: rgba(10, 10, 15, 0.55);
-  /* Depth ladder. A dark translucent fill over a dark base composites to within one
-     8-bit step of its backdrop, so the old dark-on-dark surfaces all measured flat
-     (adjacent contrast 1.0004-1.0076). Each layer now lifts toward the theme tint
-     instead, solved for ~1.075 contrast per step:
-       shell/sidebar/top bar -> content -> list container -> card.
-     Verify with scripts/_surface_contrast.mjs if these are ever retuned. */
+  /* Depth ladder: shell/sidebar/top bar -> content -> list container -> card.
+     A dark translucent fill over a dark base composites to within one 8-bit step
+     of its backdrop, so the old dark-on-dark surfaces all measured flat (adjacent
+     contrast 1.0004-1.0076). Each layer lifts toward the theme tint instead.
+     These are composited alphas, not colours you can compare by eye — retune them
+     against src/lib/surfaceLadder.test.ts, which fails if any rung goes flat. */
   --content-bg: rgba(255, 255, 255, 0.035);
   --sidebar-bg: rgba(12, 13, 19, 0.66);
-  --list-bg: rgba(255, 255, 255, 0.029);
+  --list-bg: rgba(255, 255, 255, 0.0455);
   --panel-bg: rgba(255, 255, 255, 0.055);
   --panel-strong: rgba(18, 18, 26, 0.94);
   --field-bg: rgba(20, 20, 28, 0.85);
@@ -199,7 +199,7 @@
   /* Warm lift keeps the rose cast; a neutral white would desaturate the theme. */
   --content-bg: rgba(255, 236, 244, 0.034);
   --sidebar-bg: rgba(22, 14, 20, 0.72);
-  --list-bg: rgba(255, 236, 244, 0.03);
+  --list-bg: rgba(255, 236, 244, 0.046);
   --panel-bg: rgba(255, 236, 244, 0.057);
   --panel-strong: rgba(30, 20, 28, 0.95);
   --field-bg: rgba(29, 20, 28, 0.9);
@@ -233,7 +233,7 @@
   /* Cool lift keeps the cyan cast, same reason as warm. */
   --content-bg: rgba(230, 250, 255, 0.031);
   --sidebar-bg: rgba(9, 23, 26, 0.72);
-  --list-bg: rgba(230, 250, 255, 0.028);
+  --list-bg: rgba(230, 250, 255, 0.043);
   --panel-bg: rgba(230, 250, 255, 0.054);
   --panel-strong: rgba(14, 31, 34, 0.95);
   --field-bg: rgba(14, 32, 35, 0.9);
@@ -277,7 +277,12 @@ html, body, #root {
   height: 100%;
   margin: 0;
   overflow: hidden;
-  background: transparent;
+  /* The window is opaque and is shown before React paints, so a transparent
+     value here would flash webview white on the first frame. This is the dark
+     theme's base, matching "backgroundColor" in tauri.conf.json; .app-shell
+     covers it entirely once painted, so a light-theme user sees this for the
+     same single frame rather than a mismatched surface. */
+  background: #0f1016;
 }
 button, input, select, textarea { font: inherit; }
 button { color: inherit; }

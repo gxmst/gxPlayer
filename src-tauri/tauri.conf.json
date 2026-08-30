@@ -17,6 +17,7 @@
         "shadow": true,
         "center": true,
         "visible": false,
+        "backgroundColor": "#0f1016",
         "minWidth": 320,
         "minHeight": 120,
         "width": 1024,

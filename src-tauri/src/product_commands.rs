@@ -49,7 +49,9 @@ pub struct LocalPathAvailability {
     pub available: bool,
 }
 
-fn validate_local_path_batch(paths: &[String]) -> Result<(), String> {
+/// Bound a caller-supplied path batch. Paths can come from a playlist file the
+/// user opened, not only from the native picker, so every entry is checked.
+pub(crate) fn validate_local_path_batch(paths: &[String]) -> Result<(), String> {
     if paths.len() > MAX_LOCAL_PATH_CHECKS {
         return Err(format!("单次最多检查 {MAX_LOCAL_PATH_CHECKS} 个本地路径"));
     }

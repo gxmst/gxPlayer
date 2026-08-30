@@ -60,8 +60,9 @@ use network_settings::{network_proxy_status, network_set_proxy_mode};
 use product_commands::{
     backup_read_file, backup_write_file, library_check_local_paths, library_clear_history,
     library_embedded_cover, library_history, library_record_history, library_scan_missing,
-    player_media_action, playlist_read_file, playlist_write_file, window_force_show,
-    window_get_state, window_save_state, window_set_always_on_top, window_set_mini_mode,
+    player_media_action, playlist_read_file, playlist_write_file, validate_local_path_batch,
+    window_force_show, window_get_state, window_save_state, window_set_always_on_top,
+    window_set_mini_mode,
 };
 use source_commands::{
     LxHttpConcurrencyLimiter, OptionalActionGate, ResolveCancellationRegistry, lx_http_request,
@@ -233,6 +234,9 @@ async fn library_import_files(
     if paths.len() > MAX_LIBRARY_TRACKS {
         return Err(format!("单次最多导入 {MAX_LIBRARY_TRACKS} 个本地音频文件"));
     }
+    // Paths may originate from an opened playlist file rather than the native
+    // picker, so bound each entry's length and the batch total as well.
+    validate_local_path_batch(&paths)?;
     let app = window.app_handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let library = app.state::<LibraryStore>();

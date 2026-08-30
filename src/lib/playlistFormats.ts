@@ -59,20 +59,55 @@ function isRemoteUrl(value: string): boolean {
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
 }
 
-/**
- * A local reference rather than a stream URL. Windows drive letters, UNC paths,
- * POSIX absolute paths and relative paths all count; anything with a scheme
- * does not.
- */
-function looksLikeLocalPath(value: string): boolean {
-  // file:// is a local reference despite having a scheme, so it is checked first.
+/** Any path-shaped entry, used only to tell an m3u apart from a plain list. */
+function looksLikePathEntry(value: string): boolean {
   if (/^file:\/\//i.test(value)) return true;
   if (isRemoteUrl(value)) return false;
   if (/^[a-z]:[\\/]/i.test(value)) return true;
   if (/^\\\\/.test(value)) return true;
   if (value.startsWith("/")) return true;
-  // Relative path with a directory separator and an audio-ish extension.
   return /[\\/]/.test(value) && /\.[a-z0-9]{2,5}$/i.test(value);
+}
+
+/** A UNC path, including the file:// form that decodes to one. */
+function isUncPath(value: string): boolean {
+  if (/^\\\\/.test(value)) return true;
+  if (!/^file:\/\//i.test(value)) return false;
+  try {
+    return new URL(value).hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+export type LocalPathVerdict =
+  | { kind: "import"; path: string }
+  | { kind: "skip"; reason: string }
+  | { kind: "not_a_path" };
+
+/**
+ * Decide whether an entry may be handed to the library for tag reading.
+ *
+ * Only unambiguous local files qualify. Two categories are deliberately refused
+ * even though they look like paths:
+ *
+ * - UNC and file://host paths, because opening one makes an outbound SMB
+ *   connection to a host the playlist chose, which on Windows also offers up
+ *   credentials. A playlist is untrusted input.
+ * - Relative paths, because m3u defines them against the playlist file's own
+ *   directory and we do not resolve them that way; importing one would read a
+ *   file relative to whatever the process CWD happens to be.
+ *
+ * A refused entry is not lost: its text still goes to the online matcher.
+ */
+export function classifyLocalPath(value: string): LocalPathVerdict {
+  if (!looksLikePathEntry(value)) return { kind: "not_a_path" };
+  if (isUncPath(value)) return { kind: "skip", reason: "跳过网络共享路径" };
+
+  const decoded = decodeFileUrl(value);
+  const absolute = /^[a-z]:[\\/]/i.test(decoded) || decoded.startsWith("/") || decoded.startsWith("\\");
+  if (!absolute) return { kind: "skip", reason: "跳过相对路径，将按歌名联网匹配" };
+  return { kind: "import", path: decoded };
 }
 
 function decodeFileUrl(value: string): string {
@@ -99,7 +134,7 @@ function detectFormat(lines: readonly string[]): { format: PlaylistTextFormat; c
     return { format: "m3u", confidence: 0.92 };
   }
 
-  const pathLike = meaningful.filter((line) => !line.startsWith("#") && looksLikeLocalPath(line)).length;
+  const pathLike = meaningful.filter((line) => !line.startsWith("#") && looksLikePathEntry(line)).length;
   if (pathLike >= Math.max(2, Math.ceil(meaningful.length * 0.6))) {
     // A bare path list is what many players export when metadata is omitted.
     return { format: "m3u", confidence: 0.78 };
@@ -170,6 +205,8 @@ function normalizeM3u(lines: readonly string[]): NormalizedPlaylist {
   const notes: string[] = [];
   let pendingTitle: string | null = null;
   let remoteEntries = 0;
+  /** Path-shaped entries refused for auto-import but still matched by text. */
+  const refusedPaths: SkippedPlaylistLine[] = [];
 
   lines.forEach((rawLine, index) => {
     const lineNumber = index + 1;
@@ -196,9 +233,14 @@ function normalizeM3u(lines: readonly string[]): NormalizedPlaylist {
       return;
     }
 
-    const localPath = looksLikeLocalPath(value) ? decodeFileUrl(value) : null;
+    const verdict = classifyLocalPath(value);
     // With a real file we prefer its own tags; EXTINF text is only a fallback.
     const text = pendingTitle ?? fileNameStem(value);
+    if (verdict.kind === "skip") {
+      // Still importable by text, so it stays an entry and is also reported.
+      refusedPaths.push({ lineNumber, raw: value, reason: verdict.reason });
+    }
+    const localPath = verdict.kind === "import" ? verdict.path : null;
     if (!localPath && !text) {
       skipped.push({ lineNumber, raw: value, reason: "无法识别的条目" });
       pendingTitle = null;
@@ -211,6 +253,10 @@ function normalizeM3u(lines: readonly string[]): NormalizedPlaylist {
   if (remoteEntries) notes.push(`已跳过 ${remoteEntries} 条流媒体地址。`);
   const localCount = entries.filter((entry) => entry.localPath).length;
   if (localCount) notes.push(`${localCount} 条指向本地文件，将直接读取文件标签导入。`);
+  for (const reason of new Set(refusedPaths.map((entry) => entry.reason))) {
+    const count = refusedPaths.filter((entry) => entry.reason === reason).length;
+    notes.push(`${reason}（${count} 条），这些条目改为按歌名匹配。`);
+  }
   return { format: "m3u", confidence: 1, entries, skipped, notes };
 }
 

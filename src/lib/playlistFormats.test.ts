@@ -65,6 +65,41 @@ describe("normalizePlaylistText", () => {
     expect(toLocalPaths(result.entries)).toEqual(["C:/Music/a b.flac", "/home/u/c d.mp3"]);
   });
 
+  it("refuses UNC paths for auto-import but keeps them matchable by text", () => {
+    const result = normalizePlaylistText(
+      [
+        "#EXTM3U",
+        "#EXTINF:1,Shared - Song",
+        String.raw`\\evil.host\share\x.flac`,
+        "#EXTINF:1,Url Form - Song",
+        "file://evil.host/share/y.flac",
+      ].join("\n"),
+    );
+
+    // Probing a UNC path opens an SMB connection to a host the playlist chose.
+    expect(toLocalPaths(result.entries)).toEqual([]);
+    expect(result.entries.map((entry) => entry.text)).toEqual(["Shared - Song", "Url Form - Song"]);
+    expect(result.notes.some((note) => note.includes("网络共享路径") && note.includes("2 条"))).toBe(true);
+  });
+
+  it("refuses relative paths, which m3u defines against the file's own folder", () => {
+    const result = normalizePlaylistText(
+      ["#EXTM3U", "#EXTINF:1,A - B", String.raw`..\..\..\Windows\win.ini`, "#EXTINF:1,C - D", "sub/dir/song.flac"].join("\n"),
+    );
+
+    expect(toLocalPaths(result.entries)).toEqual([]);
+    expect(result.entries).toHaveLength(2);
+    expect(result.notes.some((note) => note.includes("相对路径"))).toBe(true);
+  });
+
+  it("still accepts ordinary absolute paths", () => {
+    const result = normalizePlaylistText(
+      ["#EXTM3U", "#EXTINF:1,A - B", "C:\\Music\\a.flac", "#EXTINF:1,C - D", "/home/u/b.mp3"].join("\n"),
+    );
+
+    expect(toLocalPaths(result.entries)).toEqual(["C:\\Music\\a.flac", "/home/u/b.mp3"]);
+  });
+
   it("uses a CSV header to find the columns regardless of order", () => {
     const result = normalizePlaylistText(
       ["Artist,Title,Album", "Daft Punk,Around the World,Homework", "Air,La Femme d'Argent,Moon Safari"].join("\n"),

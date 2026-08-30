@@ -236,9 +236,31 @@ describe("TextPlaylistImportDialog", () => {
       target: { value: "Title,Artist\nCreep,Radiohead\nSong 2,Blur" },
     });
 
-    const banner = await screen.findByRole("status");
+    const banner = await screen.findByLabelText("已识别的歌单格式");
     expect(banner).toHaveTextContent("CSV / TSV 表格");
     expect(banner).toHaveTextContent("2 条");
+  });
+
+  it("keeps one live region while matching so announcements do not collide", async () => {
+    render(
+      <TextPlaylistImportDialog
+        open
+        onClose={() => undefined}
+        onEnqueue={() => undefined}
+        search={async (query) => [track(query)]}
+        delayMs={0}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("歌曲列表"), { target: { value: "一首歌" } });
+    // The detection summary is present but must not be announced.
+    expect(screen.getByLabelText("已识别的歌单格式")).toBeInTheDocument();
+    expect(screen.queryAllByRole("status")).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始匹配" }));
+    await waitFor(() => expect(screen.getByText("匹配完成")).toBeInTheDocument());
+
+    expect(screen.getAllByRole("status")).toHaveLength(1);
   });
 
   it("sends m3u local files to the library and only searches the rest", async () => {
@@ -297,7 +319,7 @@ describe("TextPlaylistImportDialog", () => {
     await waitFor(() => expect(screen.getByLabelText("歌曲列表")).toHaveValue(
       "#EXTM3U\n#EXTINF:1,A - B\nC:\\Music\\a.flac",
     ));
-    expect(await screen.findByText(/road-trip\.m3u8/)).toBeInTheDocument();
+    expect(await screen.findByLabelText("已识别的歌单格式")).toHaveTextContent("road-trip.m3u8");
   });
 
   it("surfaces a file read failure without wedging the dialog", async () => {

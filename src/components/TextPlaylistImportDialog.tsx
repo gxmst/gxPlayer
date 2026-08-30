@@ -287,8 +287,11 @@ export function TextPlaylistImportDialog({
         rows={8}
       />
 
+        {/* The detection summary is deliberately not a live region: it changes on
+            every keystroke, and announcing each edit would drown out the progress
+            region during matching. */}
         {normalized && normalized.entries.length > 0 && (
-          <div className="text-playlist-detection" role="status" aria-live="polite">
+          <div className="text-playlist-detection" aria-label="已识别的歌单格式">
             <strong>{fileName ? `${fileName}：` : "已识别："}</strong>
             <span>
               {normalized.confidence >= PLAYLIST_DETECTION_CONFIDENCE_THRESHOLD

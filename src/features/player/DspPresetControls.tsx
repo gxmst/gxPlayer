@@ -196,8 +196,11 @@ export function DspPresetControls({
         valueRef.current.activePresetId,
         intensity,
         draftSpatialAmountRef.current,
-        // Carry the live curve: rebuilding a custom preset without it would flatten
-        // the user's edit as a side effect of moving an unrelated slider.
+        // Only `custom` reads these gains, and its editor owns the curve rather
+        // than these sliders — so this is belt-and-braces, not load-bearing. It
+        // keeps the rebuild faithful if a curve-carrying preset ever gains a
+        // slider. The draft reset in the layout effect above is what actually
+        // stops a stale drag from reaching the wrong preset.
         gainsFromSettings(valueRef.current.settings),
       ),
     );

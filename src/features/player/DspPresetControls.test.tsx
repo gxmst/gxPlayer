@@ -216,6 +216,32 @@ describe("DspPresetControls", () => {
     );
   });
 
+  it("discards a dirty slider draft when the preset changes from elsewhere", () => {
+    // This is what protects a custom curve: an external change resets the drafts,
+    // so a half-finished drag cannot commit against a preset it was never aimed at.
+    const onChange = vi.fn();
+    const curve = [0, 0, 6, 0, 0, 0, -3, 0, 0, 0];
+    const { rerender } = render(
+      <DspPresetControls
+        value={buildDspControlState("bass", 0.5, 0.5)}
+        onChange={onChange}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByRole("slider", { name: "强度" }), { target: { value: "0.8" } });
+    rerender(
+      <DspPresetControls
+        value={buildDspControlState("custom", 0.5, 0.5, curve)}
+        onChange={onChange}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+    fireEvent(window, new Event("blur"));
+
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
   it("keeps pointer range input local and commits the final draft once", () => {
     const onChange = vi.fn();
     render(

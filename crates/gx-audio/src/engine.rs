@@ -231,6 +231,7 @@ pub enum DspPresetId {
     Rock,
     Podcast,
     Jazz,
+    PianoVocal,
     /// A user-edited curve. The bands travel in `DspSettings` like any other preset,
     /// so this only marks the origin: nothing here bypasses `validate_product`.
     Custom,

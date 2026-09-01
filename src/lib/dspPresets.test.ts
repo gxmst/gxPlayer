@@ -21,6 +21,7 @@ const VOICING_PRESETS = [
   "rock",
   "podcast",
   "jazz",
+  "piano_vocal",
 ] as const satisfies ReadonlyArray<DspPresetId>;
 
 describe("DSP presets", () => {
@@ -38,6 +39,7 @@ describe("DSP presets", () => {
       "rock",
       "podcast",
       "jazz",
+      "piano_vocal",
     ]);
 
     for (const preset of DSP_PRESETS) {

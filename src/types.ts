@@ -270,6 +270,7 @@ export type DspPresetId =
   | "rock"
   | "podcast"
   | "jazz"
+  | "piano_vocal"
   | "custom";
 
 /** A user-saved EQ curve. Gains only; frequency, Q and kind are fixed by the product EQ. */

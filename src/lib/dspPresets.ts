@@ -64,6 +64,11 @@ export const DSP_PRESETS = [
     label: "爵士",
     description: "中频温润、保留高频空气感，低频基本不动。",
   },
+  {
+    id: "piano_vocal",
+    label: "钢琴人声",
+    description: "纯减法，收低频和高频刺激，适合开放式耳机听钢琴曲和女声。",
+  },
 ] as const satisfies ReadonlyArray<{
   id: DspPresetId;
   label: string;
@@ -91,6 +96,9 @@ const ROCK_GAINS = [1.5, 1.75, 1, -1, -0.5, 0.5, 1.5, 1.75, 1, 0.25] as const;
 const PODCAST_GAINS = [-3.5, -3, -1.5, 0, 1, 2, 2.25, 1.25, 0, -0.5] as const;
 // Warm midrange with air retained; bass is left essentially untouched.
 const JAZZ_GAINS = [0.5, 0.75, 0.75, 0.25, -0.25, 0.25, 0.5, 0.75, 1, 0.75] as const;
+// Subtractive only: tame the sub-bass rumble on open-backs and ease treble fatigue,
+// leaving presence untouched so piano attack and vocal clarity stay intact.
+const PIANO_VOCAL_GAINS = [0, 0, -2.5, -1.5, 0, 0, 0, 0, -0.5, 0] as const;
 
 /** Curve per voicing preset. These share one code path; only the gains differ. */
 const VOICING_GAINS = {
@@ -101,6 +109,7 @@ const VOICING_GAINS = {
   rock: ROCK_GAINS,
   podcast: PODCAST_GAINS,
   jazz: JAZZ_GAINS,
+  piano_vocal: PIANO_VOCAL_GAINS,
 } as const satisfies Record<string, readonly number[]>;
 
 const CROSSFEED_LIGHT = 0.13;
@@ -354,6 +363,7 @@ export function buildDspSettings(
     case "rock":
     case "podcast":
     case "jazz":
+    case "piano_vocal":
       // Voicing presets differ only by curve: EQ on, light crossfeed to soften the
       // headphone split, HRTF off because the engine reserves it for `spatial`, and
       // the limiter on to catch the boosted peaks.

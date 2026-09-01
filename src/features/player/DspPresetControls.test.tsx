@@ -26,7 +26,7 @@ describe("DspPresetControls", () => {
     for (const name of [
       "原声",
       "耳机日常",
-      "人声",
+      /^人声$/,
       "低音",
       "空间",
       "温暖",
@@ -36,8 +36,9 @@ describe("DspPresetControls", () => {
       "摇滚",
       "播客",
       "爵士",
+      "钢琴人声",
     ]) {
-      expect(screen.getByRole("radio", { name: new RegExp(name) })).toBeInTheDocument();
+      expect(screen.getByRole("radio", { name: typeof name === 'string' ? new RegExp(name) : name })).toBeInTheDocument();
     }
     expect(screen.getByText(DSP_SYSTEM_EFFECTS_HINT)).toBeInTheDocument();
     expect(screen.queryByRole("slider")).not.toBeInTheDocument();
@@ -54,7 +55,7 @@ describe("DspPresetControls", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("radio", { name: /人声/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /^人声$/ }));
     expect(onChange).toHaveBeenCalledWith(buildDspControlState("vocal", 0.2, 0.8));
     expect(onChange.mock.calls[0][0].settings.eqBands).toHaveLength(10);
   });
@@ -69,8 +70,8 @@ describe("DspPresetControls", () => {
       />,
     );
 
-    const vocal = screen.getByRole("radio", { name: "人声" });
-    const bass = screen.getByRole("radio", { name: "低音" });
+    const vocal = screen.getByRole("radio", { name: /^人声$/ });
+    const bass = screen.getByRole("radio", { name: /^低音$/ });
     expect(vocal).toHaveAttribute("tabindex", "0");
     expect(bass).toHaveAttribute("tabindex", "-1");
 
@@ -102,7 +103,7 @@ describe("DspPresetControls", () => {
     expect(screen.queryByRole("slider", { name: "空间感" })).not.toBeInTheDocument();
 
     // Voicing presets scale with intensity, so they must expose the control too.
-    for (const presetId of ["warm", "electronic", "podcast", "jazz"] as const) {
+    for (const presetId of ["warm", "electronic", "podcast", "jazz", "piano_vocal"] as const) {
       rerender(
         <DspPresetControls
           value={buildDspControlState(presetId)}

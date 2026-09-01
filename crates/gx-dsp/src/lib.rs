@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod kemar;
+pub mod quality;
 mod spatial;
 
 use spatial::{CrossfeedProcessor, EarlyReflections, LinkedLimiter, StereoHrtf};
@@ -359,12 +360,20 @@ impl DspChain {
         Ok(())
     }
 
+    /// Frames of delay the chain adds, for the caller's A/V alignment.
+    ///
+    /// The head model contributes the convolver's block delay plus the arrival time
+    /// inside the impulse response itself, so this asks the processor rather than
+    /// assuming the block delay is all of it.
     pub fn latency_frames(&self) -> usize {
-        if self.settings.enabled && self.settings.hrtf.enabled {
-            128
-        } else {
-            0
+        if !self.settings.enabled {
+            return 0;
         }
+        self.processors
+            .hrtf
+            .as_ref()
+            .map(StereoHrtf::latency_frames)
+            .unwrap_or(0)
     }
 
     pub fn process_interleaved_in_place(&mut self, pcm: &mut [f32]) -> Result<(), DspError> {
@@ -1051,13 +1060,26 @@ mod tests {
             ..DspSettings::default()
         };
         let mut chain = DspChain::new(44_100, 2, settings).unwrap();
-        assert_eq!(chain.latency_frames(), 128);
+        let latency = chain.latency_frames();
+        // Block delay plus the arrival inside the response, not the block alone.
+        assert!(
+            (128..192).contains(&latency),
+            "latency {latency} should be the block delay plus a short onset"
+        );
         let mut impulse = vec![0.0f32; 512 * 2];
         impulse[0] = 1.0;
         chain.process_interleaved_in_place(&mut impulse).unwrap();
-        let first = 128 * 2;
-        assert!((impulse[first] - kemar::NEAR_EAR_30[0] as f32 / 32768.0).abs() < 1.0e-5);
-        assert!((impulse[first + 1] - kemar::FAR_EAR_30[0] as f32 / 32768.0).abs() < 1.0e-5);
+        // The reported figure is where the main arrival lands, which is what a caller
+        // aligning an unprocessed reference against this output needs. Energy does
+        // start before it: the response has a leading edge ahead of its peak, as any
+        // real arrival does, so "first non-zero sample" would be the wrong contract.
+        let arrival = (0..384)
+            .max_by(|left, right| impulse[left * 2].abs().total_cmp(&impulse[right * 2].abs()))
+            .unwrap();
+        assert_eq!(
+            arrival, latency,
+            "main arrival should land at the reported latency"
+        );
         let left_energy = impulse
             .iter()
             .step_by(2)
@@ -1070,32 +1092,39 @@ mod tests {
             .map(|sample| sample * sample)
             .sum::<f32>();
         assert!(left_energy > right_energy * 4.0);
-        let near_impulse = (0..128)
-            .map(|index| impulse[(128 + index) * 2])
-            .collect::<Vec<_>>();
-        for (frequency, expected_db) in [
-            (250.0, -4.316_937),
-            (1_000.0, -1.542_039),
-            (8_000.0, -7.298_68),
-        ] {
-            let measured_db = response_db(&near_impulse, frequency, 44_100.0);
-            assert!((measured_db - expected_db).abs() < 0.02);
-        }
-        let near_peak = near_impulse
-            .iter()
-            .enumerate()
-            .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
-            .unwrap()
-            .0;
-        let far_peak = (0..128)
-            .max_by(|left, right| {
-                impulse[(128 + *left) * 2 + 1]
-                    .abs()
-                    .total_cmp(&impulse[(128 + *right) * 2 + 1].abs())
+
+        // A centred source meets both paths into one ear at once. That combination is
+        // what must stay flat; the individual ears are shaped, and should be.
+        //
+        // The window opens at the convolver's block delay, not at the reported
+        // arrival: the response's leading edge sits ahead of its peak and carries the
+        // treble, so starting later would measure a high-frequency loss that is an
+        // artefact of the window rather than of the filter.
+        const BLOCK_DELAY: usize = 128;
+        let centred = (0..320)
+            .map(|index| {
+                impulse[(BLOCK_DELAY + index) * 2] + impulse[(BLOCK_DELAY + index) * 2 + 1]
             })
-            .unwrap();
+            .collect::<Vec<_>>();
+        for frequency in [100.0, 250.0, 1_000.0, 4_000.0, 8_000.0] {
+            let level = response_db(&centred, frequency, 44_100.0);
+            assert!(
+                level.abs() <= 4.0,
+                "{frequency} Hz sits at {level:.1} dB, outside +-4 dB"
+            );
+        }
+
+        let peak_of = |channel: usize| {
+            (0..256)
+                .max_by(|left, right| {
+                    impulse[(latency + *left) * 2 + channel]
+                        .abs()
+                        .total_cmp(&impulse[(latency + *right) * 2 + channel].abs())
+                })
+                .unwrap()
+        };
         assert!(
-            near_peak < far_peak,
+            peak_of(0) < peak_of(1),
             "near ear should receive the impulse before the far ear"
         );
     }
@@ -1122,14 +1151,39 @@ mod tests {
             (processed, ab_dry)
         }
 
+        let latency = {
+            let settings = DspSettings {
+                enabled: true,
+                hrtf: HrtfSettings {
+                    enabled: true,
+                    mix: 1.0,
+                    output_gain_db: -6.0,
+                },
+                ..DspSettings::default()
+            };
+            DspChain::new(48_000, 2, settings).unwrap().latency_frames()
+        };
+
         let (fully_dry, reference_ab_dry) = render(0.0);
         let (fully_wet, wet_ab_dry) = render(1.0);
         let mut expected_delayed_input = vec![0.0f32; reference_ab_dry.len()];
-        expected_delayed_input[128 * 2] = 1.0;
+        expected_delayed_input[latency * 2] = 1.0;
         assert_eq!(reference_ab_dry, expected_delayed_input);
         assert_eq!(reference_ab_dry, wet_ab_dry);
-        assert_eq!(fully_dry, reference_ab_dry);
+        // At mix 0 the head model reduces to a plain delay. It reaches that through
+        // the convolver rather than around it, so agreement is to float precision
+        // rather than bit-exact; true bypass is the chain's `enabled` flag, which
+        // `disabled_chain_is_bitwise_transparent` pins separately.
+        for (processed, delayed) in fully_dry.iter().zip(&reference_ab_dry) {
+            assert!(
+                (processed - delayed).abs() < 1.0e-6,
+                "mix 0 should pass the input through unchanged"
+            );
+        }
+        // Silent until the convolver's block delay. Output starts there rather than at
+        // the reported arrival, because the response's leading edge precedes its peak.
         assert!(fully_wet[..128 * 2].iter().all(|sample| *sample == 0.0));
+        assert!(latency >= 128, "arrival cannot precede the block delay");
 
         for mix in [0.3, 0.55, 0.72] {
             let (mixed, ab_dry) = render(mix);
@@ -1160,6 +1214,7 @@ mod tests {
             ..DspSettings::default()
         };
         let mut chain = DspChain::new(48_000, 2, settings).unwrap();
+        let latency = chain.latency_frames();
         let mut processed = (0..512 * 2)
             .map(|index| (index as f32 * 0.013).sin() * 0.2)
             .collect::<Vec<_>>();
@@ -1173,15 +1228,18 @@ mod tests {
         for frame in 0..512 {
             for channel in 0..2 {
                 let actual = ab_dry[frame * 2 + channel].to_bits();
-                let expected = if frame < 128 {
+                let expected = if frame < latency {
                     0.0f32.to_bits()
                 } else {
-                    original[(frame - 128) * 2 + channel].to_bits()
+                    original[(frame - latency) * 2 + channel].to_bits()
                 };
-                assert_eq!(actual, expected);
+                assert_eq!(actual, expected, "frame {frame} channel {channel}");
             }
         }
-        assert_ne!(processed[128 * 2].to_bits(), ab_dry[128 * 2].to_bits());
+        assert_ne!(
+            processed[latency * 2].to_bits(),
+            ab_dry[latency * 2].to_bits()
+        );
     }
 
     #[test]

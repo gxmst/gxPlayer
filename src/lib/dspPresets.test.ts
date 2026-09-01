@@ -95,7 +95,7 @@ describe("DSP presets", () => {
       const result = buildDspSettings(preset.id);
       expect(result.crossfeed.delayMs).toBeCloseTo(0.28);
       expect(result.crossfeed.cutoffHz).toBe(700);
-      expect(result.hrtf.outputGainDb).toBe(-6);
+      expect(result.hrtf.outputGainDb).toBe(0);
       expect(result.limiter.ceilingDb).toBe(-1);
       expect(result.limiter.releaseMs).toBe(80);
     }
@@ -145,7 +145,7 @@ describe("DSP presets", () => {
     const dense = buildDspSettings("spatial", 0, 1);
     expect(dense.hrtf.mix).toBeCloseTo(0.72);
     expect(dense.crossfeed.amount).toBeCloseTo(0.18);
-    expect(dense.hrtf.outputGainDb).toBe(-6);
+    expect(dense.hrtf.outputGainDb).toBe(0);
     expect(dense.limiter.enabled).toBe(true);
   });
 

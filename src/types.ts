@@ -337,7 +337,7 @@ export const EMPTY_ENGINE: EngineSnapshot = {
     eqBands: [{ enabled: true, kind: "peak", frequencyHz: 1000, gainDb: 0, q: 1 }],
     crossfeed: { enabled: false, amount: 0.18, delayMs: 0.28, cutoffHz: 700 },
     room: { enabled: false, amount: 0.22, size: 0.45 },
-    hrtf: { enabled: false, mix: 0.72, outputGainDb: -6 },
+    hrtf: { enabled: false, mix: 0.72, outputGainDb: 0 },
     limiter: { enabled: false, ceilingDb: -1, releaseMs: 80 },
   },
   activePresetId: "bypass",

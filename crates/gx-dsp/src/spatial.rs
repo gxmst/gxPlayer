@@ -72,7 +72,10 @@ impl Default for HrtfSettings {
         Self {
             enabled: false,
             mix: 0.72,
-            output_gain_db: -6.0,
+            // Unity. The equalised pair already has flat broadband gain, so there is
+            // no loss left to compensate; the headroom trim this used to carry only
+            // made the preset quieter than bypass and invited turning it up.
+            output_gain_db: 0.0,
         }
     }
 }
@@ -246,38 +249,56 @@ pub(crate) struct StereoHrtf {
     left_to_right: PartitionedConvolver,
     right_to_left: PartitionedConvolver,
     right_to_right: PartitionedConvolver,
-    dry_left: VecDeque<DelayedDrySample>,
-    dry_right: VecDeque<DelayedDrySample>,
-    mix: f32,
-    wet_gain: f32,
-}
-
-#[derive(Clone, Copy, Default)]
-struct DelayedDrySample {
-    processed: f32,
-    untreated: f32,
+    /// Untreated copy for the A/B lane, delayed to match the processed path.
+    dry_left: VecDeque<f32>,
+    dry_right: VecDeque<f32>,
+    latency: usize,
 }
 
 impl StereoHrtf {
+    /// Strength is folded into the filters rather than applied as a dry/wet blend.
+    ///
+    /// Blending would sum two paths whose group delays differ by the HRIR's onset,
+    /// and two delayed copies of one signal are a comb filter: a fixed pattern of
+    /// cancellation notches that no gain setting can remove. The measured pair also
+    /// inverts polarity below roughly 200 Hz, so at higher mixes the notch near
+    /// 100 Hz deepened toward total cancellation. Convolving with one filter that
+    /// already contains the unspatialised part cannot interfere with itself.
     pub(crate) fn new(sample_rate: u32, settings: &HrtfSettings) -> Result<Self, DspError> {
         validate_hrtf(settings)?;
-        let far = resample_hrir(&kemar::FAR_EAR_30, sample_rate);
-        let near = resample_hrir(&kemar::NEAR_EAR_30, sample_rate);
-        let mut dry_left = VecDeque::with_capacity(PARTITION_SIZE * 2);
-        let mut dry_right = VecDeque::with_capacity(PARTITION_SIZE * 2);
-        dry_left.resize(PARTITION_SIZE, DelayedDrySample::default());
-        dry_right.resize(PARTITION_SIZE, DelayedDrySample::default());
+        let (near, far, onset) = prepare_hrir_pair(sample_rate);
+        let gain = settings.mix * 10.0f32.powf(settings.output_gain_db / 20.0);
+        let direct = 1.0 - settings.mix;
+
+        // The direct term sits at `onset` so it coincides with the spatialised
+        // arrival. Placing it at tap 0 would reintroduce the delay mismatch.
+        let mut same_ear = near.iter().map(|tap| tap * gain).collect::<Vec<_>>();
+        if let Some(slot) = same_ear.get_mut(onset) {
+            *slot += direct;
+        }
+        let cross_ear = far.iter().map(|tap| tap * gain).collect::<Vec<_>>();
+
+        let latency = PARTITION_SIZE + onset;
+        let mut dry_left = VecDeque::with_capacity(latency * 2);
+        let mut dry_right = VecDeque::with_capacity(latency * 2);
+        dry_left.resize(latency, 0.0);
+        dry_right.resize(latency, 0.0);
         Ok(Self {
             // Left virtual speaker at -30° is the mirror of the measured +30° response.
-            left_to_left: PartitionedConvolver::new(&near),
-            left_to_right: PartitionedConvolver::new(&far),
-            right_to_left: PartitionedConvolver::new(&far),
-            right_to_right: PartitionedConvolver::new(&near),
+            left_to_left: PartitionedConvolver::new(&same_ear),
+            left_to_right: PartitionedConvolver::new(&cross_ear),
+            right_to_left: PartitionedConvolver::new(&cross_ear),
+            right_to_right: PartitionedConvolver::new(&same_ear),
             dry_left,
             dry_right,
-            mix: settings.mix,
-            wet_gain: 10.0f32.powf(settings.output_gain_db / 20.0),
+            latency,
         })
+    }
+
+    /// Total delay through this processor: the convolver's block latency plus the
+    /// arrival inside the impulse response.
+    pub(crate) fn latency_frames(&self) -> usize {
+        self.latency
     }
 
     pub(crate) fn process(&mut self, pcm: &mut [f32]) {
@@ -311,25 +332,19 @@ impl StereoHrtf {
         untreated_left: f32,
         untreated_right: f32,
     ) -> (f32, f32, f32, f32) {
-        let wet_left =
+        // One filter per ear pair carries both the spatialised and direct parts, so
+        // there is nothing left here to mix and nothing that can comb-filter.
+        let out_left =
             self.left_to_left.process_sample(left) + self.right_to_left.process_sample(right);
-        let wet_right =
+        let out_right =
             self.left_to_right.process_sample(left) + self.right_to_right.process_sample(right);
-        self.dry_left.push_back(DelayedDrySample {
-            processed: left,
-            untreated: untreated_left,
-        });
-        self.dry_right.push_back(DelayedDrySample {
-            processed: right,
-            untreated: untreated_right,
-        });
-        let dry_left = self.dry_left.pop_front().unwrap_or_default();
-        let dry_right = self.dry_right.pop_front().unwrap_or_default();
+        self.dry_left.push_back(untreated_left);
+        self.dry_right.push_back(untreated_right);
         (
-            dry_left.processed * (1.0 - self.mix) + wet_left * self.mix * self.wet_gain,
-            dry_right.processed * (1.0 - self.mix) + wet_right * self.mix * self.wet_gain,
-            dry_left.untreated,
-            dry_right.untreated,
+            out_left,
+            out_right,
+            self.dry_left.pop_front().unwrap_or(0.0),
+            self.dry_right.pop_front().unwrap_or(0.0),
         )
     }
 }
@@ -508,6 +523,205 @@ fn resample_hrir(source: &[i16], target_sample_rate: u32) -> Vec<f32> {
     output
 }
 
+/// Safety bound on the equalised response length. The useful tail decays inside
+/// ~170 taps at 44.1 kHz, so this never truncates anything audible at any rate the
+/// engine accepts; it only stops a bogus rate from allocating without limit.
+const HRIR_MAX_TAPS: usize = 512;
+
+/// Transform length for designing the correction: comfortably longer than the
+/// impulse, so the response is resolved rather than smeared by wraparound.
+const EQ_FFT_SIZE: usize = 512;
+
+/// Taps kept from the correction filter.
+const EQ_CORRECTION_TAPS: usize = 96;
+
+/// Bound on the correction, so a narrow measurement null cannot become huge gain.
+const EQ_MAX_CORRECTION_DB: f32 = 9.0;
+
+/// Region worth correcting. Below it `restore_low_end` has already made the
+/// response flat by construction; above it the 1994 measurement is unreliable.
+const EQ_RANGE_HZ: (f32, f32) = (120.0, 17_000.0);
+
+/// Resample the measured pair, then make it usable as a headphone filter.
+///
+/// Returns both equalised responses and the sample at which the near ear's energy
+/// arrives — where an unspatialised copy must be placed to stay time-aligned.
+///
+/// Three defects of using raw measured data as a filter are corrected here:
+///
+/// * The 1994 measurement used a speaker that rolled off below roughly 200 Hz, so
+///   the raw response has *negative* DC gain. Convolving with it does not merely
+///   lose bass, it inverts it, and the inverted copy then cancels against anything
+///   unprocessed it is mixed with.
+/// * The measurement contains the dummy head's own concha and ear-canal resonance
+///   near 3-4 kHz. Whoever is wearing the headphones still has those ears, so
+///   applying it again counts them twice — the familiar honk of unequalised HRTF.
+/// * Direction is carried by the *difference* between the ears, never by the
+///   colouration they share, so flattening the shared part costs no localisation.
+fn prepare_hrir_pair(sample_rate: u32) -> (Vec<f32>, Vec<f32>, usize) {
+    let mut near = resample_hrir(&kemar::NEAR_EAR_30, sample_rate);
+    let mut far = resample_hrir(&kemar::FAR_EAR_30, sample_rate);
+    restore_low_end(&mut near, &mut far);
+
+    let correction = free_field_correction(&near, &far, sample_rate);
+    let near = convolve_bounded(&near, &correction, HRIR_MAX_TAPS);
+    let far = convolve_bounded(&far, &correction, HRIR_MAX_TAPS);
+
+    let onset = near
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    (near, far, onset)
+}
+
+/// Give the pair unity gain at DC, restoring what the measurement speaker lacked.
+///
+/// The deficit is added through a unit-sum window, so it lands only below roughly
+/// `sample_rate / len` and nothing above that moves. Splitting it evenly is right
+/// because a head is acoustically transparent at these wavelengths: both ears hear
+/// a low frequency essentially equally, and the timing difference that does the
+/// localising down here lives in the phase the taps already carry.
+fn restore_low_end(near: &mut [f32], far: &mut [f32]) {
+    let present: f32 = near.iter().sum::<f32>() + far.iter().sum::<f32>();
+    let deficit = 1.0 - present;
+    if !deficit.is_finite() || near.is_empty() {
+        return;
+    }
+    let len = near.len();
+    let window: Vec<f32> = (0..len)
+        .map(|index| {
+            let phase = 2.0 * PI * index as f32 / (len as f32 - 1.0).max(1.0);
+            0.5 - 0.5 * phase.cos()
+        })
+        .collect();
+    let total: f32 = window.iter().sum();
+    if total <= 0.0 {
+        return;
+    }
+    for (index, weight) in window.iter().enumerate() {
+        let share = weight / total * deficit / 2.0;
+        near[index] += share;
+        if index < far.len() {
+            far[index] += share;
+        }
+    }
+}
+
+/// Minimum-phase filter that flattens the colouration the two ears share.
+///
+/// Minimum phase rather than zero phase is the whole point: a zero-phase inverse
+/// spreads energy symmetrically about its peak, which places ringing *before* each
+/// transient. On piano that is audible as a softened hammer strike, and the attack
+/// is most of what identifies the instrument. Minimum phase puts every bit of the
+/// same magnitude correction after the onset instead.
+fn free_field_correction(near: &[f32], far: &[f32], sample_rate: u32) -> Vec<f32> {
+    let mut planner = FftPlanner::<f32>::new();
+    let forward = planner.plan_fft_forward(EQ_FFT_SIZE);
+    let inverse = planner.plan_fft_inverse(EQ_FFT_SIZE);
+
+    // A centred source reaches one ear by both paths at once, so their sum is the
+    // response a mono voice or a piano actually meets.
+    let mut spectrum = vec![Complex32::default(); EQ_FFT_SIZE];
+    for (index, slot) in spectrum.iter_mut().enumerate() {
+        let sum = near.get(index).copied().unwrap_or(0.0) + far.get(index).copied().unwrap_or(0.0);
+        slot.re = sum;
+    }
+    forward.process(&mut spectrum);
+
+    let bins = EQ_FFT_SIZE / 2;
+    let bin_hz = sample_rate as f32 / EQ_FFT_SIZE as f32;
+    let ceiling = 10.0f32.powf(EQ_MAX_CORRECTION_DB / 20.0);
+
+    // Third-octave power average: correct the broad tilt, leave fine structure. The
+    // fine structure is partly real interaural detail, and inverting it exactly
+    // would need a far longer filter to no audible benefit.
+    let mut target = vec![1.0f32; bins + 1];
+    for (bin, slot) in target.iter_mut().enumerate() {
+        let hz = bin as f32 * bin_hz;
+        if hz < EQ_RANGE_HZ.0 || hz > EQ_RANGE_HZ.1 {
+            continue;
+        }
+        let low = ((hz / 1.12) / bin_hz).floor().max(1.0) as usize;
+        let high = (((hz * 1.12) / bin_hz).ceil() as usize).min(bins);
+        let band = &spectrum[low..=high];
+        if band.is_empty() {
+            continue;
+        }
+        let power: f32 = band.iter().map(Complex32::norm_sqr).sum();
+        let magnitude = (power / band.len() as f32).sqrt();
+        *slot = if magnitude > 1.0e-6 {
+            (1.0 / magnitude).clamp(1.0 / ceiling, ceiling)
+        } else {
+            ceiling
+        };
+    }
+
+    minimum_phase(&target, &forward, &inverse)
+}
+
+/// Impulse response with the requested magnitude and no energy before its onset.
+///
+/// Standard real-cepstrum construction: the log spectrum is transformed to the
+/// cepstral domain, the anticausal half folded onto the causal half, and the result
+/// exponentiated back. Folding is what moves the ringing after the onset.
+fn minimum_phase(
+    magnitude: &[f32],
+    forward: &Arc<dyn Fft<f32>>,
+    inverse: &Arc<dyn Fft<f32>>,
+) -> Vec<f32> {
+    let bins = EQ_FFT_SIZE / 2;
+    let mut log_spectrum = vec![Complex32::default(); EQ_FFT_SIZE];
+    for (bin, slot) in log_spectrum.iter_mut().enumerate() {
+        let mirrored = if bin <= bins { bin } else { EQ_FFT_SIZE - bin };
+        let value = magnitude.get(mirrored).copied().unwrap_or(1.0).max(1.0e-9);
+        slot.re = value.ln();
+    }
+    inverse.process(&mut log_spectrum);
+    let scale = 1.0 / EQ_FFT_SIZE as f32;
+
+    let mut cepstrum = vec![Complex32::default(); EQ_FFT_SIZE];
+    cepstrum[0].re = log_spectrum[0].re * scale;
+    cepstrum[bins].re = log_spectrum[bins].re * scale;
+    for index in 1..bins {
+        cepstrum[index].re = 2.0 * log_spectrum[index].re * scale;
+    }
+    forward.process(&mut cepstrum);
+
+    for slot in cepstrum.iter_mut() {
+        let gain = slot.re.exp();
+        *slot = Complex32::new(gain * slot.im.cos(), gain * slot.im.sin());
+    }
+    inverse.process(&mut cepstrum);
+
+    cepstrum
+        .iter()
+        .take(EQ_CORRECTION_TAPS)
+        .map(|value| value.re * scale)
+        .collect()
+}
+
+fn convolve_bounded(signal: &[f32], kernel: &[f32], limit: usize) -> Vec<f32> {
+    let len = (signal.len() + kernel.len() - 1).min(limit);
+    let mut out = vec![0.0f32; len];
+    for (offset, &tap) in signal.iter().enumerate() {
+        if offset >= len {
+            break;
+        }
+        if tap == 0.0 {
+            continue;
+        }
+        for (index, &coefficient) in kernel.iter().enumerate() {
+            match out.get_mut(offset + index) {
+                Some(slot) => *slot += tap * coefficient,
+                None => break,
+            }
+        }
+    }
+    out
+}
+
 /// Highest crossfeed cutoff accepted by `CrossfeedProcessor::new` at `sample_rate`.
 pub(crate) fn max_crossfeed_cutoff_hz(sample_rate: u32) -> f32 {
     sample_rate as f32 * 0.45
@@ -582,6 +796,166 @@ mod tests {
         let hrir = resample_hrir(&kemar::NEAR_EAR_30, 48_000);
         assert_eq!(hrir.len(), 139);
         assert!(hrir.iter().all(|sample| sample.is_finite()));
+    }
+
+    /// Magnitude of `taps` at `hz`, in dB.
+    fn response_db(taps: &[f32], hz: f32, sample_rate: u32) -> f32 {
+        let mut re = 0.0f64;
+        let mut im = 0.0f64;
+        for (index, tap) in taps.iter().enumerate() {
+            let angle = -2.0 * std::f64::consts::PI * hz as f64 * index as f64 / sample_rate as f64;
+            re += *tap as f64 * angle.cos();
+            im += *tap as f64 * angle.sin();
+        }
+        20.0 * re.hypot(im).max(1.0e-12).log10() as f32
+    }
+
+    /// What a centred voice or piano meets: both paths into one ear at once.
+    fn centred_response_db(sample_rate: u32, hz: f32) -> f32 {
+        let (near, far, onset) = prepare_hrir_pair(sample_rate);
+        let gain = 0.72;
+        let mut summed: Vec<f32> = near
+            .iter()
+            .zip(&far)
+            .map(|(near, far)| (near + far) * gain)
+            .collect();
+        summed[onset] += 1.0 - gain;
+        response_db(&summed, hz, sample_rate)
+    }
+
+    #[test]
+    fn a_centred_source_passes_through_the_head_model_without_a_hole() {
+        // Before the pair was equalised this dipped 26 dB at 100 Hz: the measured
+        // response is polarity-inverted down there, so the unspatialised copy it was
+        // blended with cancelled it. Bass fundamentals are most of a piano's body
+        // and a voice's chest, which made the preset sound thin and boxy.
+        for hz in [31.0, 62.0, 100.0, 160.0, 250.0, 400.0, 630.0, 1_000.0] {
+            let level = centred_response_db(48_000, hz);
+            assert!(
+                level.abs() <= 4.0,
+                "{hz} Hz sits at {level:.1} dB, outside +-4 dB"
+            );
+        }
+    }
+
+    #[test]
+    fn the_presence_region_is_not_boosted_by_the_dummy_heads_own_ears() {
+        // Raw KEMAR carries the measurement head's concha and ear-canal resonance,
+        // about +10 dB near 4 kHz. The listener has those resonances already, so
+        // reapplying them counts them twice and turns female vocals harsh.
+        for hz in [2_000.0, 2_500.0, 3_150.0, 4_000.0, 5_000.0, 6_300.0] {
+            let level = centred_response_db(48_000, hz);
+            assert!(
+                level.abs() <= 4.0,
+                "{hz} Hz sits at {level:.1} dB, outside +-4 dB"
+            );
+        }
+    }
+
+    #[test]
+    fn equalisation_preserves_the_level_difference_that_carries_direction() {
+        // Flattening what the ears share must not touch how they differ: the whole
+        // spatial impression is that difference. A "fix" that removed it would
+        // measure beautifully and collapse the image to mono.
+        let (near, far, _) = prepare_hrir_pair(48_000);
+        for (hz, minimum) in [(1_000.0, 4.0), (2_000.0, 4.0), (4_000.0, 6.0), (8_000.0, 10.0)] {
+            let difference =
+                response_db(&near, hz, 48_000) - response_db(&far, hz, 48_000);
+            assert!(
+                difference >= minimum,
+                "{hz} Hz interaural difference fell to {difference:.1} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn the_correction_places_no_energy_before_the_onset() {
+        // Zero-phase inversion rings symmetrically about its peak, which puts that
+        // ringing ahead of every transient. A piano is identified by its hammer
+        // strike, so pre-ringing is exactly the artefact to refuse here.
+        let mut planner = FftPlanner::<f32>::new();
+        let forward = planner.plan_fft_forward(EQ_FFT_SIZE);
+        let inverse = planner.plan_fft_inverse(EQ_FFT_SIZE);
+        let near = resample_hrir(&kemar::NEAR_EAR_30, 48_000);
+        let far = resample_hrir(&kemar::FAR_EAR_30, 48_000);
+        let correction = free_field_correction(&near, &far, 48_000);
+
+        let peak = correction
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))
+            .map(|(index, _)| index)
+            .expect("correction is not empty");
+        assert_eq!(peak, 0, "minimum phase puts the peak at the first tap");
+
+        // Round-trip the design so the helpers above are exercised, not just reachable.
+        let magnitude = vec![1.0f32; EQ_FFT_SIZE / 2 + 1];
+        let flat = minimum_phase(&magnitude, &forward, &inverse);
+        assert!((flat[0] - 1.0).abs() < 1.0e-3, "flat target is a unit impulse");
+        assert!(flat[1..].iter().all(|tap| tap.abs() < 1.0e-3));
+    }
+
+    #[test]
+    fn restoring_the_low_end_leaves_the_rest_of_the_spectrum_alone() {
+        let mut near = resample_hrir(&kemar::NEAR_EAR_30, 48_000);
+        let mut far = resample_hrir(&kemar::FAR_EAR_30, 48_000);
+        let before: Vec<f32> = near.iter().zip(&far).map(|(n, f)| n + f).collect();
+        let dc_before: f32 = before.iter().sum();
+        assert!(dc_before < 0.0, "measured pair starts polarity-inverted at DC");
+
+        restore_low_end(&mut near, &mut far);
+        let after: Vec<f32> = near.iter().zip(&far).map(|(n, f)| n + f).collect();
+        assert!(
+            (after.iter().sum::<f32>() - 1.0).abs() < 1.0e-3,
+            "DC gain should land on unity"
+        );
+
+        // The correction is applied through a unit-sum window, so it is confined to
+        // the region the 1994 measurement could not reach.
+        for hz in [2_000.0, 4_000.0, 8_000.0, 12_000.0] {
+            let moved = (response_db(&after, hz, 48_000) - response_db(&before, hz, 48_000)).abs();
+            assert!(moved < 1.0, "{hz} Hz moved {moved:.2} dB");
+        }
+    }
+
+    #[test]
+    fn unity_output_gain_leaves_headroom_on_dense_material() {
+        // Unity gain is only defensible if the filter does not inflate real peaks.
+        // The bound worth testing is what dense music does, not the L1 norm: that
+        // describes a signal built to align with every tap at once, which is not
+        // audio, and it would condemn any filter with a long tail.
+        let settings = HrtfSettings {
+            enabled: true,
+            mix: 0.72,
+            output_gain_db: 0.0,
+        };
+        let mut hrtf = StereoHrtf::new(48_000, &settings).unwrap();
+        // Dense partials near full scale: harder on a convolver than a single tone,
+        // because many components can align in phase.
+        let mut pcm = Vec::with_capacity(8_192 * 2);
+        for frame in 0..8_192 {
+            let time = frame as f32 / 48_000.0;
+            let mut value = 0.0;
+            for harmonic in 1..=12 {
+                value += (2.0 * PI * 110.0 * harmonic as f32 * time).sin() / harmonic as f32;
+            }
+            let scaled = value * 0.28;
+            pcm.push(scaled);
+            pcm.push(scaled);
+        }
+        let input_peak = pcm.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+        hrtf.process(&mut pcm);
+        let output_peak = pcm.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+
+        let growth_db = 20.0 * (output_peak / input_peak).log10();
+        assert!(
+            growth_db < 6.0,
+            "peak grew {growth_db:.1} dB, more than the limiter should have to absorb"
+        );
+        assert!(
+            growth_db > -6.0,
+            "peak fell {growth_db:.1} dB, so the preset would sit quieter than bypass"
+        );
     }
 
     #[test]

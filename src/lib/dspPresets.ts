@@ -27,7 +27,7 @@ export const DSP_PRESETS = [
   {
     id: "spatial",
     label: "空间",
-    description: "固定前方 ±30° 音箱感，可能偏闷；建议不与系统杜比耳机虚拟化同时开。",
+    description: "固定前方 ±30° 音箱感，声场向头外展开；建议不与系统杜比耳机虚拟化同时开。",
   },
   {
     id: "warm",
@@ -112,7 +112,10 @@ const CROSSFEED_CUTOFF_HZ = 700;
 const HRTF_LIGHT = 0.3;
 const HRTF_MEDIUM = 0.55;
 const HRTF_STRONG = 0.72;
-const HRTF_OUTPUT_GAIN_DB = -6;
+// Unity: the engine equalises the head model to flat broadband gain, so a trim here
+// would only make the spatial preset quieter than bypass and invite compensating
+// with the volume control.
+const HRTF_OUTPUT_GAIN_DB = 0;
 
 /**
  * Early reflections are tuned for headphones, which is the only case where

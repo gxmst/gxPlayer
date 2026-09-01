@@ -12,6 +12,7 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use gx_cache::CacheWritePlan;
 use gx_contracts::{MediaType, PlaybackStatus, ResolvedMediaRequest};
+use gx_dsp::quality::{QualityAnalyzer, QualityReport};
 use gx_dsp::{CrossfeedSettings, DspChain, DspSettings, HrtfSettings, LimiterSettings};
 use gx_streaming::{
     HttpMediaSource, StreamInterruption, StreamInterruptionGuard, StreamingDiagnosticQueue,
@@ -1730,6 +1731,11 @@ struct PlaybackSession {
     output_channels: usize,
     source_sample_rate: u32,
     source_bit_depth: Option<u32>,
+    /// Measures what the decoded stream actually contains, so a mislabelled
+    /// transcode can be told from an honest file. Fed the source PCM before
+    /// resampling or DSP, and dropped once it has seen enough.
+    quality: Option<QualityAnalyzer>,
+    quality_report: Option<QualityReport>,
     output_sample_rate: u32,
     start_seconds: f64,
     duration_seconds: Option<f64>,
@@ -1901,6 +1907,11 @@ impl PlaybackSession {
             output_channels,
             source_sample_rate: sample_rate,
             source_bit_depth,
+            // Seeking mid-track would leave a spectrum stitched from unrelated
+            // places, so only a playthrough from the start is measured.
+            quality: (seek_discard_frames == 0 && start_seconds == 0.0)
+                .then(|| QualityAnalyzer::new(sample_rate, channels)),
+            quality_report: None,
             output_sample_rate,
             start_seconds,
             duration_seconds,
@@ -1999,6 +2010,15 @@ impl PlaybackSession {
             self.seek_discard_frames -= discard;
             if samples.is_empty() {
                 return Ok(PumpResult::Progress);
+            }
+        }
+        // Measure the source, before the rate adapter or DSP touch it: resampling
+        // moves the very band limit being looked for, and the DSP would add its own.
+        if let Some(analyzer) = &mut self.quality {
+            analyzer.push(samples);
+            if analyzer.is_saturated() {
+                // Publish once and release the FFT state; further audio adds nothing.
+                self.quality_report = self.quality.take().map(QualityAnalyzer::finish);
             }
         }
         self.pending = self.rate_adapter.process(samples)?;

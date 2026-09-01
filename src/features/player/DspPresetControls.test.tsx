@@ -123,7 +123,7 @@ describe("DspPresetControls", () => {
     );
     expect(screen.queryByRole("slider", { name: "强度" })).not.toBeInTheDocument();
     expect(screen.getByRole("slider", { name: "空间感" })).toBeInTheDocument();
-    expect(screen.getAllByText("固定前方 ±30° 音箱感，可能偏闷；建议不与系统杜比耳机虚拟化同时开。").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("固定前方 ±30° 音箱感，声场向头外展开；建议不与系统杜比耳机虚拟化同时开。").length).toBeGreaterThan(0);
 
     rerender(
       <DspPresetControls

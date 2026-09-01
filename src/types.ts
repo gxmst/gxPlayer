@@ -135,6 +135,13 @@ export type CacheExportOutcome = {
   error: string | null;
 };
 
+/** Progress emitted while cached audio is copied to a user-selected directory. */
+export type CacheExportProgress = {
+  completed: number;
+  total: number;
+  current: string;
+};
+
 export type CacheStatus = {
   revision: number;
   directory: string;

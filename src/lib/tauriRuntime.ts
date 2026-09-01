@@ -18,7 +18,6 @@ type TauriGlobal = typeof globalThis & {
  */
 export function hasTauriWindowRuntime(): boolean {
   const runtime = globalThis as TauriGlobal;
-  return runtime.isTauri === true
-    && typeof runtime.__TAURI_INTERNALS__?.invoke === "function"
+  return typeof runtime.__TAURI_INTERNALS__?.invoke === "function"
     && typeof runtime.__TAURI_INTERNALS__.metadata?.currentWindow?.label === "string";
 }

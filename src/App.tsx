@@ -67,6 +67,7 @@ import {
 import {
   type CacheEntryView,
   type CacheExportOutcome,
+  type CacheExportProgress,
   type CacheStatus,
   type CatalogTrack,
   type CustomEqPreset,
@@ -693,6 +694,7 @@ function App() {
   const [library, setLibrary] = useState<LibraryTrack[]>([]);
   const [favorites, setFavorites] = useState<LibraryTrack[]>([]);
   const [playlists, setPlaylists] = useState<PlaylistSummary[]>([]);
+  const [libraryLoadState, setLibraryLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [activePlaylist, setActivePlaylist] = useState<PlaylistSummary | null>(null);
   const [playlistItems, setPlaylistItems] = useState<LibraryPlaylistItem[]>([]);
   const [playlistExportBusy, setPlaylistExportBusy] = useState(false);
@@ -702,6 +704,7 @@ function App() {
 
   const [sources, setSources] = useState<ListedSource[]>([]);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [sourceLoadState, setSourceLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [draggedSource, setDraggedSource] = useState<string | null>(null);
   const [sourceOrderBusy, setSourceOrderBusy] = useState(false);
   const [sourceActionBusy, setSourceActionBusy] = useState<{ id: string; kind: "toggle" | "reimport" | "remove" } | null>(null);
@@ -719,6 +722,7 @@ function App() {
   const [diagnosticLogBusy, setDiagnosticLogBusy] = useState<"refresh" | "toggle" | "export" | "clear" | null>(null);
   const diagnosticLogGenerationRef = useRef(0);
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
+  const [cacheLoadState, setCacheLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [cacheLimitGiB, setCacheLimitGiB] = useState("5");
   const cacheLimitDirtyRef = useRef(false);
   const [onlineFavorites, setOnlineFavorites] = useState<CatalogTrack[]>([]);
@@ -730,6 +734,7 @@ function App() {
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
   const [selectedCacheKeys, setSelectedCacheKeys] = useState<string[]>([]);
   const [cacheExportBusy, setCacheExportBusy] = useState(false);
+  const [cacheExportProgress, setCacheExportProgress] = useState<CacheExportProgress | null>(null);
   const [coverCache, setCoverCache] = useState<Record<string, string>>({});
   const [resolveBanner, setResolveBanner] = useState<{ title: string; detail: string } | null>(null);
   const resolveGenerationRef = useRef(0);
@@ -893,15 +898,25 @@ function App() {
   };
 
   const refreshLibrary = async (scanMissing = false): Promise<LibraryTrack[]> => {
-    const [tracks, favoriteTracks, nextPlaylists] = await Promise.all([
-      invoke<LibraryTrack[]>(scanMissing ? "library_scan_missing" : "library_tracks"),
-      invoke<LibraryTrack[]>("library_favorites"),
-      invoke<PlaylistSummary[]>("library_playlists"),
-    ]);
-    setLibrary(tracks);
-    setFavorites(favoriteTracks);
-    setPlaylists(nextPlaylists);
-    return tracks;
+    setLibraryLoadState((state) => state === "ready" ? state : "loading");
+    try {
+      const [tracks, favoriteTracks, nextPlaylists] = await Promise.all([
+        invoke<LibraryTrack[]>(scanMissing ? "library_scan_missing" : "library_tracks"),
+        invoke<LibraryTrack[]>("library_favorites"),
+        invoke<PlaylistSummary[]>("library_playlists"),
+      ]);
+      if (!Array.isArray(tracks) || !Array.isArray(favoriteTracks) || !Array.isArray(nextPlaylists)) {
+        throw new Error("曲库返回了无效数据");
+      }
+      setLibrary(tracks);
+      setFavorites(favoriteTracks);
+      setPlaylists(nextPlaylists);
+      setLibraryLoadState("ready");
+      return tracks;
+    } catch (error) {
+      setLibraryLoadState((state) => state === "ready" ? state : "error");
+      throw error;
+    }
   };
 
   const loadChart = async (options?: { region?: string; force?: boolean }) => {
@@ -947,26 +962,46 @@ function App() {
   };
 
   const refreshSources = async () => {
-    const [nextSources, nextRuntime] = await Promise.all([
-      invoke<ListedSource[]>("source_list"),
-      invoke<RuntimeStatus>("source_status"),
-    ]);
-    setSources(nextSources);
-    setRuntime(nextRuntime);
+    setSourceLoadState((state) => state === "ready" ? state : "loading");
+    try {
+      const [nextSources, nextRuntime] = await Promise.all([
+        invoke<ListedSource[]>("source_list"),
+        invoke<RuntimeStatus>("source_status"),
+      ]);
+      if (!Array.isArray(nextSources) || !nextRuntime || typeof nextRuntime !== "object") {
+        throw new Error("音源返回了无效数据");
+      }
+      setSources(nextSources);
+      setRuntime(nextRuntime);
+      setSourceLoadState("ready");
+    } catch (error) {
+      setSourceLoadState((state) => state === "ready" ? state : "error");
+      throw error;
+    }
   };
 
   const refreshCache = async () => {
-    const [status, favoriteTracks, entries] = await Promise.all([
-      invoke<CacheStatus>("cache_status"),
-      invoke<CatalogTrack[]>("cache_online_favorites"),
-      invoke<CacheEntryView[]>("cache_list_entries"),
-    ]);
-    setCacheStatus(status);
-    if (!cacheLimitDirtyRef.current) {
-      setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
+    setCacheLoadState((state) => state === "ready" ? state : "loading");
+    try {
+      const [status, favoriteTracks, entries] = await Promise.all([
+        invoke<CacheStatus>("cache_status"),
+        invoke<CatalogTrack[]>("cache_online_favorites"),
+        invoke<CacheEntryView[]>("cache_list_entries"),
+      ]);
+      if (!status || typeof status !== "object" || !Array.isArray(favoriteTracks) || !Array.isArray(entries)) {
+        throw new Error("缓存与收藏返回了无效数据");
+      }
+      setCacheStatus(status);
+      if (!cacheLimitDirtyRef.current) {
+        setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
+      }
+      setOnlineFavorites(favoriteTracks);
+      setCacheEntries(entries);
+      setCacheLoadState("ready");
+    } catch (error) {
+      setCacheLoadState((state) => state === "ready" ? state : "error");
+      throw error;
     }
-    setOnlineFavorites(favoriteTracks);
-    setCacheEntries(entries);
   };
 
   const refreshHistory = async () => {
@@ -1520,6 +1555,12 @@ function App() {
     ?? orderedSources.find((source) => source.preferred)
     ?? null;
   const sourceStatus = (() => {
+    if (sourceLoadState === "loading") {
+      return { title: "正在读取音源", copy: "正在连接桌面运行时并读取已导入音源。" };
+    }
+    if (sourceLoadState === "error") {
+      return { title: "音源读取失败", copy: "音源文件没有被清空；请重新读取或彻底退出应用后再打开。" };
+    }
     switch (runtime?.state) {
       case "ready":
         return {
@@ -2709,7 +2750,20 @@ function App() {
     }));
 
     setCacheExportBusy(true);
+    // Seeded before the first tick arrives, so a large batch shows its size immediately
+    // rather than only once the first file is done.
+    setCacheExportProgress({ completed: 0, total: keys.length, current: "" });
+    let stopProgress: (() => void) | null = null;
     try {
+      // Subscribe before invoking the command. A one-file export can finish before an
+      // effect scheduled from `cacheExportBusy` gets a chance to install its listener.
+      try {
+        stopProgress = await listen<CacheExportProgress>("gx-cache-export-progress", (event) => {
+          setCacheExportProgress(event.payload);
+        });
+      } catch {
+        // Progress is optional; failure to install a listener must not block the copy.
+      }
       const outcomes = await invoke<CacheExportOutcome[]>("cache_export_entries", {
         keys,
         directory,
@@ -2730,7 +2784,9 @@ function App() {
     } catch (error) {
       setMessage(`导出失败：${String(error)}`, true);
     } finally {
+      stopProgress?.();
       setCacheExportBusy(false);
+      setCacheExportProgress(null);
     }
   };
 
@@ -3866,6 +3922,22 @@ function App() {
                 </div>
               ) : null}
             </div>
+            {cacheExportProgress ? (
+              <div className="cache-export-progress">
+                <div className="cache-export-progress-copy">
+                  <strong>正在导出 {cacheExportProgress.completed} / {cacheExportProgress.total}</strong>
+                  <span title={cacheExportProgress.current || undefined}>
+                    {cacheExportProgress.current ? `正在写入 ${cacheExportProgress.current}` : "正在准备缓存文件"}
+                  </span>
+                </div>
+                <progress
+                  aria-label="缓存导出进度"
+                  aria-valuetext={`${cacheExportProgress.completed} / ${cacheExportProgress.total}`}
+                  max={Math.max(cacheExportProgress.total, 1)}
+                  value={Math.min(cacheExportProgress.completed, cacheExportProgress.total)}
+                />
+              </div>
+            ) : null}
             <div className="tip-banner" role="note">
               <strong>缓存说明</strong>
               <span>
@@ -3884,6 +3956,10 @@ function App() {
 
     if (view === "favorites") {
       const tracks = favorites;
+      const favoritesLoading = tracks.length === 0 && onlineFavorites.length === 0
+        && (libraryLoadState === "loading" || cacheLoadState === "loading");
+      const favoritesFailed = tracks.length === 0 && onlineFavorites.length === 0
+        && (libraryLoadState === "error" || cacheLoadState === "error");
       return (
         <div className="page">
           <PageHeading
@@ -3897,7 +3973,11 @@ function App() {
               {renderCatalogRows(onlineFavorites)}
             </section>
           )}
-          {tracks.length ? (
+          {favoritesLoading ? (
+            <EmptyState title="正在读取收藏" copy="正在读取本地收藏与在线收藏。" />
+          ) : favoritesFailed ? (
+            <EmptyState title="收藏读取失败" copy="保存的数据没有被清空；请重新读取。" action="重新读取" onAction={() => void Promise.all([refreshLibrary(true), refreshCache()]).catch((error) => setMessage(String(error), true))} />
+          ) : tracks.length ? (
             <section className="section-block">
               <div className="section-heading"><div><h3>本地收藏</h3></div></div>
               {renderTrackRows(tracks)}
@@ -4006,10 +4086,14 @@ function App() {
         <section className="source-status-card"><span className={`runtime-dot ${runtime?.state ?? "no_source"}`} /><div><strong>{sourceStatus.title}</strong><p>{sourceStatus.copy}</p></div><code>GEN {runtime?.generation ?? 0}</code></section>
         <div className="source-list-heading">
           <div><h2>音源优先序</h2><p>绿灯优先于黄灯、红灯；同一健康档位内按这里的顺序降级。</p></div>
-          <span>{orderedSources.filter((source) => source.enabled).length} / {orderedSources.length} 已启用</span>
+          <span>{sourceLoadState === "loading" ? "正在读取" : sourceLoadState === "error" ? "读取失败" : `${orderedSources.filter((source) => source.enabled).length} / ${orderedSources.length} 已启用`}</span>
         </div>
         <p className="source-health-note">健康度只记录真实解析调用结果，不会主动探测。双击卡片可编辑完整设置。</p>
-        {orderedSources.length ? (
+        {sourceLoadState === "loading" ? (
+          <EmptyState title="正在读取音源" copy="请稍候，正在读取本机保存的音源配置。" />
+        ) : sourceLoadState === "error" ? (
+          <EmptyState title="音源读取失败" copy="保存的数据没有被清空；请重试桌面运行时连接。" action="重新读取" onAction={() => void refreshSources().catch((error) => setMessage(String(error), true))} />
+        ) : orderedSources.length ? (
           <div className="source-list">
             {orderedSources.map((source, index) => (
               <SourceCard

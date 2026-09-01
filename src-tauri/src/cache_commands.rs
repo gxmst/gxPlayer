@@ -1,7 +1,7 @@
 use gx_audio::engine::LocalAudioEngine;
 use gx_cache::{CacheEntryView, CacheKey, CacheStatus, CacheStore};
 use gx_metadata::CatalogTrack;
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 use crate::diagnostic_log::record_diagnostic;
 use crate::preview_cache::{PreviewCacheStatus, PreviewCacheStore};
@@ -255,6 +255,17 @@ pub struct CacheExportOutcome {
     pub error: Option<String>,
 }
 
+/// Progress tick for a running export, so a large batch is not a frozen button.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheExportProgressEvent {
+    completed: usize,
+    total: usize,
+    /// Readable name of the track about to be written; empty on the final tick and for
+    /// entries that have no cached file to name.
+    current: String,
+}
+
 const MAX_EXPORT_BATCH: usize = 2_000;
 
 /// Copy already-cached audio into a directory the user picked, under a readable
@@ -288,8 +299,20 @@ pub async fn cache_export_entries(
 
     let directory = std::path::PathBuf::from(directory);
     let app = window.app_handle().clone();
+    let progress_app = app.clone();
     let outcomes = tauri::async_runtime::spawn_blocking(move || {
-        crate::cache_export::write_exports(&directory, planned)
+        crate::cache_export::write_exports(&directory, planned, |progress| {
+            // Best-effort: a listener that has gone away must not fail the export that is
+            // already writing files.
+            let _ = progress_app.emit(
+                "gx-cache-export-progress",
+                CacheExportProgressEvent {
+                    completed: progress.completed,
+                    total: progress.total,
+                    current: progress.current.to_owned(),
+                },
+            );
+        })
     })
     .await
     .map_err(|error| format!("导出任务失败: {error}"))?;

@@ -1885,7 +1885,10 @@ mod tests {
         for orphan in &orphans {
             assert!(!orphan.exists(), "{} survived startup", orphan.display());
         }
-        assert!(unrelated.is_file(), "swept a file outside the cache's naming");
+        assert!(
+            unrelated.is_file(),
+            "swept a file outside the cache's naming"
+        );
         assert!(finished.is_file(), "swept a completed download");
         drop(store);
         fs::remove_dir_all(app_data).unwrap();

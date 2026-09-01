@@ -49,7 +49,11 @@ fn band_limited(seconds: f32, top_hz: f32, rolloff: Rolloff) -> Vec<f32> {
                 // Smooth decay through `top_hz` and beyond, never reaching zero
                 // abruptly: about 6 dB per octave above the corner.
                 let reach = partial_hz / top_hz;
-                let taper = if reach <= 1.0 { 1.0 } else { 1.0 / (reach * reach) };
+                let taper = if reach <= 1.0 {
+                    1.0
+                } else {
+                    1.0 / (reach * reach)
+                };
                 taper / (1.0 + index as f32 * 0.05)
             }
         };
@@ -195,7 +199,10 @@ fn loudness_statistics_describe_the_material() {
     assert!((report.peak_dbfs - -4.4).abs() < 1.0, "{report:?}");
     assert_eq!(report.clipped_ratio, 0.0, "{report:?}");
     // Dense partials give a modest crest; the point is that it is measured at all.
-    assert!(report.crest_db > 0.0 && report.crest_db < 40.0, "{report:?}");
+    assert!(
+        report.crest_db > 0.0 && report.crest_db < 40.0,
+        "{report:?}"
+    );
     // Both channels carry the same signal here.
     let correlation = report.channel_correlation.expect("stereo correlation");
     assert!(correlation > 0.99, "{correlation}");
@@ -224,8 +231,14 @@ fn lossless_labels_carry_no_expected_band_limit() {
     // Nothing to contradict: lossless has no band limit to fall short of.
     assert_eq!(QualityReport::expected_cutoff_for_label("flac"), None);
     assert_eq!(QualityReport::expected_cutoff_for_label("flac24bit"), None);
-    assert_eq!(QualityReport::expected_cutoff_for_label("320k"), Some(20_000));
-    assert_eq!(QualityReport::expected_cutoff_for_label("128k"), Some(16_000));
+    assert_eq!(
+        QualityReport::expected_cutoff_for_label("320k"),
+        Some(20_000)
+    );
+    assert_eq!(
+        QualityReport::expected_cutoff_for_label("128k"),
+        Some(16_000)
+    );
     // An unfamiliar label is not guessed at.
     assert_eq!(QualityReport::expected_cutoff_for_label("mystery"), None);
 }

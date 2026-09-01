@@ -20,16 +20,39 @@ const COPY_CHUNK_BYTES: usize = 256 * 1024;
 /// Give up before the filesystem does when a name keeps colliding.
 const MAX_NAME_ATTEMPTS: u32 = 999;
 
+/// What the caller is told before each track is copied: how far along the batch is,
+/// and which title is about to be written.
+///
+/// Reported before the copy rather than after, because the copy is the slow part and a
+/// label that appears only once a file is finished always names the wrong track.
+pub(crate) struct ExportProgress<'a> {
+    pub completed: usize,
+    pub total: usize,
+    pub current: &'a str,
+}
+
 pub(crate) fn write_exports(
     directory: &Path,
     planned: Vec<(CacheKey, Option<CacheExportPlan>)>,
+    mut on_progress: impl FnMut(ExportProgress<'_>),
 ) -> Vec<CacheExportOutcome> {
-    let mut outcomes = Vec::with_capacity(planned.len());
+    let total = planned.len();
+    let mut outcomes = Vec::with_capacity(total);
     // One check for the whole batch: if the directory is unusable, every entry
     // fails for the same reason and saying so once per track is still accurate.
     let directory_error = prepare_directory(directory).err();
 
-    for (key, plan) in planned {
+    for (completed, (key, plan)) in planned.into_iter().enumerate() {
+        on_progress(ExportProgress {
+            completed,
+            total,
+            // The readable stem is what the user is about to see on disk. Entries with no
+            // plan have no name to show, and reporting the key would leak an internal id.
+            current: plan
+                .as_ref()
+                .map(|plan| plan.file_stem.as_str())
+                .unwrap_or(""),
+        });
         let outcome = match (&directory_error, plan) {
             (Some(error), _) => failure(&key, error.clone()),
             (None, None) => failure(&key, "这首歌还没有完整缓存，播放一遍后再导出".to_owned()),
@@ -46,6 +69,13 @@ pub(crate) fn write_exports(
         };
         outcomes.push(outcome);
     }
+    // A final tick, so a listener that draws from `completed` reaches the end of the bar
+    // instead of stopping one track short.
+    on_progress(ExportProgress {
+        completed: total,
+        total,
+        current: "",
+    });
     outcomes
 }
 
@@ -184,6 +214,14 @@ mod tests {
         }
     }
 
+    /// For the tests that are about what lands on disk, not about reporting.
+    fn export(
+        directory: &Path,
+        planned: Vec<(CacheKey, Option<CacheExportPlan>)>,
+    ) -> Vec<CacheExportOutcome> {
+        write_exports(directory, planned, |_| {})
+    }
+
     #[test]
     fn copies_bytes_verbatim_under_a_readable_name() {
         let root = temp_dir("verbatim");
@@ -193,7 +231,7 @@ mod tests {
         fs::write(&source, &bytes).unwrap();
         let out = temp_dir("verbatim-out");
 
-        let outcomes = write_exports(
+        let outcomes = export(
             &out,
             vec![(
                 cache_key("a"),
@@ -216,7 +254,7 @@ mod tests {
         let out = temp_dir("collide-out");
         fs::write(out.join("Band - Song.mp3"), b"PRECIOUS").unwrap();
 
-        let outcomes = write_exports(
+        let outcomes = export(
             &out,
             vec![
                 (cache_key("a"), Some(plan(&source, "Band - Song", "mp3", 9))),
@@ -242,7 +280,7 @@ mod tests {
     fn an_uncached_entry_is_reported_without_touching_the_network() {
         let out = temp_dir("uncached");
 
-        let outcomes = write_exports(&out, vec![(cache_key("missing"), None)]);
+        let outcomes = export(&out, vec![(cache_key("missing"), None)]);
 
         assert!(outcomes[0].file_name.is_none());
         assert!(
@@ -262,7 +300,7 @@ mod tests {
         let missing = root.join("gone.media");
         let out = temp_dir("partial-out");
 
-        let outcomes = write_exports(
+        let outcomes = export(
             &out,
             vec![
                 (cache_key("gone"), Some(plan(&missing, "Missing", "mp3", 4))),
@@ -285,7 +323,7 @@ mod tests {
         let blocker = root.join("not-a-directory");
         fs::write(&blocker, b"i am a file").unwrap();
 
-        let outcomes = write_exports(
+        let outcomes = export(
             &blocker,
             vec![(cache_key("a"), Some(plan(&source, "Song", "mp3", 5)))],
         );
@@ -307,13 +345,80 @@ mod tests {
         fs::write(&source, b"bytes").unwrap();
         let out = root.join("nested").join("export target");
 
-        let outcomes = write_exports(
+        let outcomes = export(
             &out,
             vec![(cache_key("a"), Some(plan(&source, "Song", "mp3", 5)))],
         );
 
         assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
         assert!(destination_for(&out, &plan(&source, "Song", "mp3", 5)).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn progress_names_each_track_before_writing_it_and_reaches_the_end() {
+        let root = temp_dir("progress");
+        let source = root.join("payload.media");
+        fs::write(&source, b"bytes").unwrap();
+        let out = temp_dir("progress-out");
+
+        let mut ticks = Vec::new();
+        let outcomes = write_exports(
+            &out,
+            vec![
+                (cache_key("a"), Some(plan(&source, "First", "mp3", 5))),
+                // No plan: nothing cached to name, and no internal id may leak out.
+                (cache_key("b"), None),
+                (cache_key("c"), Some(plan(&source, "Third", "flac", 5))),
+            ],
+            |progress| {
+                ticks.push((
+                    progress.completed,
+                    progress.total,
+                    progress.current.to_owned(),
+                ));
+            },
+        );
+
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(
+            ticks,
+            vec![
+                (0, 3, "First".to_owned()),
+                (1, 3, String::new()),
+                (2, 3, "Third".to_owned()),
+                // The closing tick, so a bar drawn from `completed` finishes full.
+                (3, 3, String::new()),
+            ]
+        );
+        // The id of the uncached entry never appears in anything the user is shown.
+        assert!(ticks.iter().all(|(_, _, current)| !current.contains('b')));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn progress_reports_the_batch_even_when_the_directory_is_unusable() {
+        // The label still has to advance: the interface shows the same progress UI, and a
+        // batch that fails wholesale must not leave it stuck at the first track.
+        let root = temp_dir("progress-notdir");
+        let source = root.join("payload.media");
+        fs::write(&source, b"bytes").unwrap();
+        let blocker = root.join("not-a-directory");
+        fs::write(&blocker, b"i am a file").unwrap();
+
+        let mut ticks = Vec::new();
+        let outcomes = write_exports(
+            &blocker,
+            vec![
+                (cache_key("a"), Some(plan(&source, "First", "mp3", 5))),
+                (cache_key("b"), Some(plan(&source, "Second", "mp3", 5))),
+            ],
+            |progress| ticks.push(progress.completed),
+        );
+
+        assert!(outcomes.iter().all(|outcome| outcome.error.is_some()));
+        assert_eq!(ticks, vec![0, 1, 2]);
         fs::remove_dir_all(root).unwrap();
     }
 }

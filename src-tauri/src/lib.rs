@@ -1347,6 +1347,9 @@ pub fn run() {
     windows_identity::initialize();
     let audio_engine = LocalAudioEngine::new().expect("failed to create local audio engine");
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(audio_engine)
         .manage(LxHttpConcurrencyLimiter::default())

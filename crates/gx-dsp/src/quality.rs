@@ -152,8 +152,7 @@ impl QualityAnalyzer {
         let fft = FftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE);
         let hann = (0..FFT_SIZE)
             .map(|index| {
-                let phase =
-                    2.0 * std::f32::consts::PI * index as f32 / (FFT_SIZE as f32 - 1.0);
+                let phase = 2.0 * std::f32::consts::PI * index as f32 / (FFT_SIZE as f32 - 1.0);
                 0.5 - 0.5 * phase.cos()
             })
             .collect();
@@ -337,7 +336,11 @@ fn analyze_spectrum(
     // Content reaching the top of the representable range was never band-limited.
     let nyquist = sample_rate as f32 / 2.0;
     if cutoff_hz >= nyquist - CLIFF_SPAN_HZ {
-        return (Some(cutoff_hz.round() as u32), Some(BandLimit::FullBand), None);
+        return (
+            Some(cutoff_hz.round() as u32),
+            Some(BandLimit::FullBand),
+            None,
+        );
     }
 
     // Compare the level just below the cutoff with the level just above it: a

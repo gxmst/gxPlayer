@@ -568,12 +568,14 @@ impl LocalAudioEngine {
                 run_worker(
                     receiver,
                     snapshot_for_worker,
-                    diagnostics_for_worker,
-                    streaming_diagnostics_for_worker,
-                    interruption_for_worker,
-                    output_device_events_for_worker,
-                    quality_reports_for_worker,
-                    ab_dry_active_for_worker,
+                    WorkerRuntime {
+                        diagnostics: diagnostics_for_worker,
+                        streaming_diagnostics: streaming_diagnostics_for_worker,
+                        stream_interruption: interruption_for_worker,
+                        output_device_events: output_device_events_for_worker,
+                        quality_reports: quality_reports_for_worker,
+                        ab_dry_active: ab_dry_active_for_worker,
+                    },
                 )
             })
             .context("failed to spawn local audio engine worker")?;
@@ -1089,16 +1091,28 @@ fn request_track_change(
     *session = None;
 }
 
-fn run_worker(
-    commands: Receiver<QueuedEngineCommand>,
-    shared_snapshot: Arc<Mutex<EngineSnapshot>>,
+struct WorkerRuntime {
     diagnostics: EngineDiagnosticQueue,
     streaming_diagnostics: StreamingDiagnosticQueue,
     stream_interruption: StreamInterruption,
     output_device_events: OutputDeviceEventQueue,
     quality_reports: QualityReportQueue,
     ab_dry_active: Arc<AtomicBool>,
+}
+
+fn run_worker(
+    commands: Receiver<QueuedEngineCommand>,
+    shared_snapshot: Arc<Mutex<EngineSnapshot>>,
+    runtime: WorkerRuntime,
 ) {
+    let WorkerRuntime {
+        diagnostics,
+        streaming_diagnostics,
+        stream_interruption,
+        output_device_events,
+        quality_reports,
+        ab_dry_active,
+    } = runtime;
     let mut model = WorkerModel::default();
     let mut session: Option<PlaybackSession> = None;
 

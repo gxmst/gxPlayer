@@ -898,9 +898,13 @@ mod tests {
         // spatial impression is that difference. A "fix" that removed it would
         // measure beautifully and collapse the image to mono.
         let (near, far, _) = prepare_hrir_pair(48_000);
-        for (hz, minimum) in [(1_000.0, 4.0), (2_000.0, 4.0), (4_000.0, 6.0), (8_000.0, 10.0)] {
-            let difference =
-                response_db(&near, hz, 48_000) - response_db(&far, hz, 48_000);
+        for (hz, minimum) in [
+            (1_000.0, 4.0),
+            (2_000.0, 4.0),
+            (4_000.0, 6.0),
+            (8_000.0, 10.0),
+        ] {
+            let difference = response_db(&near, hz, 48_000) - response_db(&far, hz, 48_000);
             assert!(
                 difference >= minimum,
                 "{hz} Hz interaural difference fell to {difference:.1} dB"
@@ -931,7 +935,10 @@ mod tests {
         // Round-trip the design so the helpers above are exercised, not just reachable.
         let magnitude = vec![1.0f32; EQ_FFT_SIZE / 2 + 1];
         let flat = minimum_phase(&magnitude, &forward, &inverse);
-        assert!((flat[0] - 1.0).abs() < 1.0e-3, "flat target is a unit impulse");
+        assert!(
+            (flat[0] - 1.0).abs() < 1.0e-3,
+            "flat target is a unit impulse"
+        );
         assert!(flat[1..].iter().all(|tap| tap.abs() < 1.0e-3));
     }
 
@@ -941,7 +948,10 @@ mod tests {
         let mut far = resample_hrir(&kemar::FAR_EAR_30, 48_000);
         let before: Vec<f32> = near.iter().zip(&far).map(|(n, f)| n + f).collect();
         let dc_before: f32 = before.iter().sum();
-        assert!(dc_before < 0.0, "measured pair starts polarity-inverted at DC");
+        assert!(
+            dc_before < 0.0,
+            "measured pair starts polarity-inverted at DC"
+        );
 
         restore_low_end(&mut near, &mut far);
         let after: Vec<f32> = near.iter().zip(&far).map(|(n, f)| n + f).collect();
@@ -1043,7 +1053,11 @@ mod tests {
 
         limiter.process_with_ab_dry(&mut quiet_processed, &mut loud_reference, 2);
 
-        assert_eq!(quiet_processed, [0.25, -0.25], "processed lane was untouched");
+        assert_eq!(
+            quiet_processed,
+            [0.25, -0.25],
+            "processed lane was untouched"
+        );
         for sample in loud_reference {
             assert!(
                 sample.abs() <= ceiling + 1.0e-6,

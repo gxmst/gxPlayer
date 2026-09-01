@@ -201,6 +201,12 @@ impl CacheStore {
                 default_root.clone()
             });
         ensure_writable_directory(&root)?;
+        // Writer tokens live in memory, so nothing that survived the last process can be
+        // in flight now: a `.part` or `.ready` file here is the remains of a download that
+        // was interrupted, and it will never be completed or committed. Startup is the one
+        // moment that can be said for certain, which is why the sweep belongs here as well
+        // as on a directory change.
+        cleanup_part_files(&root);
         let (manifest, initial_diagnostics) = load_manifest(&root);
         let diagnostics = initial_diagnostics
             .into_iter()
@@ -1849,6 +1855,40 @@ mod tests {
 
         fs::remove_dir_all(app_data).unwrap();
         fs::remove_dir_all(selected).unwrap();
+    }
+
+    #[test]
+    fn opening_clears_intermediates_a_killed_process_left_behind() {
+        // A download that was interrupted leaves its `.part` behind, and a commit that was
+        // interrupted between the rename and the manifest write leaves a `.ready`. Neither
+        // can be resumed, so both are dead weight until something removes them — and only
+        // startup can be sure no writer owns them.
+        let app_data = temporary_root();
+        let root = app_data.join("cache");
+        fs::create_dir_all(&root).unwrap();
+        let orphans = [
+            root.join(format!("{CACHE_FILE_PREFIX}abc-1-1.part")),
+            root.join(format!("{CACHE_FILE_PREFIX}abc-1-1.ready")),
+            root.join(format!("{CACHE_FILE_PREFIX}def-2-2.gxpart")),
+        ];
+        for orphan in &orphans {
+            fs::write(orphan, b"interrupted").unwrap();
+        }
+        // Files that are not ours, and finished cache files, must survive.
+        let unrelated = root.join("someone-elses.part");
+        let finished = root.join(format!("{CACHE_FILE_PREFIX}abc-1-1.mp3"));
+        fs::write(&unrelated, b"not ours").unwrap();
+        fs::write(&finished, b"a complete download").unwrap();
+
+        let store = CacheStore::open(&app_data, None).unwrap();
+
+        for orphan in &orphans {
+            assert!(!orphan.exists(), "{} survived startup", orphan.display());
+        }
+        assert!(unrelated.is_file(), "swept a file outside the cache's naming");
+        assert!(finished.is_file(), "swept a completed download");
+        drop(store);
+        fs::remove_dir_all(app_data).unwrap();
     }
 
     #[test]

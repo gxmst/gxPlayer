@@ -203,7 +203,18 @@ impl LibraryStore {
                provider_track_id TEXT,
                quality TEXT
              );
-             CREATE INDEX IF NOT EXISTS idx_play_history_played_at ON play_history(played_at_ms DESC);",
+             CREATE INDEX IF NOT EXISTS idx_play_history_played_at ON play_history(played_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS quality_measurements (
+               id INTEGER PRIMARY KEY,
+               measured_at_ms INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               path TEXT,
+               provider_id TEXT,
+               provider_track_id TEXT,
+               quality TEXT,
+               report_json TEXT NOT NULL,
+               UNIQUE(kind, path, provider_id, provider_track_id, quality)
+             );",
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1105,6 +1116,48 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+impl LibraryStore {
+    pub fn upsert_quality_measurement(
+        &self,
+        kind: &str,
+        path: Option<&str>,
+        provider_id: Option<&str>,
+        provider_track_id: Option<&str>,
+        quality: Option<&str>,
+        report_json: &str,
+    ) -> Result<()> {
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "INSERT OR REPLACE INTO quality_measurements(measured_at_ms, kind, path, provider_id, provider_track_id, quality, report_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![now_ms(), kind, path, provider_id, provider_track_id, quality, report_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_quality_measurement(
+        &self,
+        kind: &str,
+        path: Option<&str>,
+        provider_id: Option<&str>,
+        provider_track_id: Option<&str>,
+        quality: Option<&str>,
+    ) -> Result<Option<String>> {
+        let connection = self.connection.lock().unwrap();
+        let result = connection.query_row(
+            "SELECT report_json FROM quality_measurements
+             WHERE kind = ?1 AND path IS ?2 AND provider_id IS ?3 AND provider_track_id IS ?4 AND quality IS ?5",
+            params![kind, path, provider_id, provider_track_id, quality],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(json) => Ok(Some(json)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 #[cfg(test)]

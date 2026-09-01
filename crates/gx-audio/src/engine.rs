@@ -111,6 +111,42 @@ impl OutputDeviceEventQueue {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct QualityReportReady {
+    pub location: String,
+    pub report: QualityReport,
+}
+
+#[derive(Clone)]
+struct QualityReportQueue {
+    inner: Arc<Mutex<VecDeque<QualityReportReady>>>,
+}
+
+const QUALITY_REPORT_CAPACITY: usize = 32;
+
+impl Default for QualityReportQueue {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::with_capacity(QUALITY_REPORT_CAPACITY))),
+        }
+    }
+}
+
+impl QualityReportQueue {
+    fn push(&self, event: QualityReportReady) {
+        let mut events = self.inner.lock().unwrap();
+        if events.len() == QUALITY_REPORT_CAPACITY {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    fn drain(&self) -> Vec<QualityReportReady> {
+        self.inner.lock().unwrap().drain(..).collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueItem {
     pub location: String,
     pub title: String,
@@ -503,6 +539,7 @@ pub struct LocalAudioEngine {
     diagnostics: EngineDiagnosticQueue,
     streaming_diagnostics: StreamingDiagnosticQueue,
     output_device_events: OutputDeviceEventQueue,
+    quality_reports: QualityReportQueue,
     ab_dry_active: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -520,6 +557,8 @@ impl LocalAudioEngine {
         let interruption_for_worker = stream_interruption.clone();
         let output_device_events = OutputDeviceEventQueue::default();
         let output_device_events_for_worker = output_device_events.clone();
+        let quality_reports = QualityReportQueue::default();
+        let quality_reports_for_worker = quality_reports.clone();
         let ab_dry_active = Arc::new(AtomicBool::new(false));
         let ab_dry_active_for_worker = Arc::clone(&ab_dry_active);
         let worker = thread::Builder::new()
@@ -532,6 +571,7 @@ impl LocalAudioEngine {
                     streaming_diagnostics_for_worker,
                     interruption_for_worker,
                     output_device_events_for_worker,
+                    quality_reports_for_worker,
                     ab_dry_active_for_worker,
                 )
             })
@@ -543,6 +583,7 @@ impl LocalAudioEngine {
             diagnostics,
             streaming_diagnostics,
             output_device_events,
+            quality_reports,
             ab_dry_active,
             worker: Mutex::new(Some(worker)),
         })
@@ -769,6 +810,10 @@ impl LocalAudioEngine {
 
     pub fn drain_output_device_events(&self) -> Vec<OutputDeviceFallbackEvent> {
         self.output_device_events.drain()
+    }
+
+    pub fn drain_quality_reports(&self) -> Vec<QualityReportReady> {
+        self.quality_reports.drain()
     }
 
     pub fn output_devices(&self) -> Result<Vec<String>> {
@@ -1050,6 +1095,7 @@ fn run_worker(
     streaming_diagnostics: StreamingDiagnosticQueue,
     stream_interruption: StreamInterruption,
     output_device_events: OutputDeviceEventQueue,
+    quality_reports: QualityReportQueue,
     ab_dry_active: Arc<AtomicBool>,
 ) {
     let mut model = WorkerModel::default();
@@ -1084,6 +1130,7 @@ fn run_worker(
                 model.status = PlaybackStatus::Loading;
                 publish_snapshot(&model, None, &shared_snapshot);
                 match PlaybackSession::new(
+                    item.public.location.clone(),
                     &item.source,
                     model.start_seconds,
                     model.volume,
@@ -1092,6 +1139,7 @@ fn run_worker(
                     PlaybackSessionRuntime {
                         streaming_diagnostics: streaming_diagnostics.clone(),
                         stream_interruption: stream_interruption.clone(),
+                        quality_reports: quality_reports.clone(),
                         ab_dry_active: Arc::clone(&ab_dry_active),
                     },
                 ) {
@@ -1701,6 +1749,7 @@ struct AbSample {
 struct PlaybackSessionRuntime {
     streaming_diagnostics: StreamingDiagnosticQueue,
     stream_interruption: StreamInterruption,
+    quality_reports: QualityReportQueue,
     ab_dry_active: Arc<AtomicBool>,
 }
 
@@ -1735,7 +1784,11 @@ struct PlaybackSession {
     /// transcode can be told from an honest file. Fed the source PCM before
     /// resampling or DSP, and dropped once it has seen enough.
     quality: Option<QualityAnalyzer>,
-    quality_report: Option<QualityReport>,
+    /// Where finished measurements go. Reports outlive this session so the app can
+    /// still persist them after the track ends and the session is torn down.
+    quality_reports: QualityReportQueue,
+    /// Queue item location that identifies this track for persistence.
+    location: String,
     output_sample_rate: u32,
     start_seconds: f64,
     duration_seconds: Option<f64>,
@@ -1755,6 +1808,7 @@ struct PlaybackSession {
 
 impl PlaybackSession {
     fn new(
+        location: String,
         source: &PlaybackSource,
         start_seconds: f64,
         volume: f32,
@@ -1911,7 +1965,8 @@ impl PlaybackSession {
             // places, so only a playthrough from the start is measured.
             quality: (seek_discard_frames == 0 && start_seconds == 0.0)
                 .then(|| QualityAnalyzer::new(sample_rate, channels)),
-            quality_report: None,
+            quality_reports: runtime.quality_reports,
+            location,
             output_sample_rate,
             start_seconds,
             duration_seconds,
@@ -1969,6 +2024,14 @@ impl PlaybackSession {
             }
             self.maybe_start()?;
             if self.producer.is_empty() {
+                // Stream has ended; finalize any remaining quality measurement so short
+                // tracks and skips also yield reports, not just saturated long tracks.
+                if let Some(report) = self.quality.take().map(QualityAnalyzer::finish) {
+                    self.quality_reports.push(QualityReportReady {
+                        location: self.location.clone(),
+                        report,
+                    });
+                }
                 return Ok(PumpResult::Ended);
             }
             return Ok(PumpResult::Backpressure);
@@ -2018,7 +2081,12 @@ impl PlaybackSession {
             analyzer.push(samples);
             if analyzer.is_saturated() {
                 // Publish once and release the FFT state; further audio adds nothing.
-                self.quality_report = self.quality.take().map(QualityAnalyzer::finish);
+                if let Some(report) = self.quality.take().map(QualityAnalyzer::finish) {
+                    self.quality_reports.push(QualityReportReady {
+                        location: self.location.clone(),
+                        report,
+                    });
+                }
             }
         }
         self.pending = self.rate_adapter.process(samples)?;

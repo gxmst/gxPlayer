@@ -310,6 +310,17 @@ export type EngineSnapshot = {
   outputDevice?: string | null;
 };
 
+export type QualityReport = {
+  peakFrequencyHz: number;
+  effectiveBandwidthHz: number;
+  avgMagnitudeDbfs: number;
+};
+
+export type QualityReportReady = {
+  location: string;
+  report: QualityReport;
+};
+
 export type ViewId =
   | "discovery"
   | "search"

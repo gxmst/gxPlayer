@@ -84,6 +84,7 @@ import {
   type OnlinePlaybackResult,
   type PlayMode,
   type PlaylistSummary,
+  type QualityReportReady,
   type ResolveAttemptDiagnostic,
   type RuntimeStatus,
   type SourcePlaylist,
@@ -817,12 +818,16 @@ function App() {
   const playlistRef = useRef(playlist);
   const playlistIndexRef = useRef(playlistIndex);
   const snapshotRef = useRef(snapshot);
+  const selectedCatalogTrackRef = useRef(selectedCatalogTrack);
+  const currentQualityRef = useRef(currentQuality);
   const mediaActionHandlerRef = useRef<(action: TransportAction) => void>(() => undefined);
   const transportCapabilitiesRef = useRef({ signature: "", revision: 0 });
   const localQueueAvailabilityGenerationRef = useRef(0);
   playlistRef.current = playlist;
   playlistIndexRef.current = playlistIndex;
   snapshotRef.current = snapshot;
+  selectedCatalogTrackRef.current = selectedCatalogTrack;
+  currentQualityRef.current = currentQuality;
   const dspControl = useMemo<DspControlState>(() => ({
     settings: snapshot.dspSettings,
     activePresetId: snapshot.activePresetId,
@@ -1228,10 +1233,43 @@ function App() {
       setOutputDeviceStatus((status) => status ? { ...status, selectedDevice: null } : status);
       setAppPreferences((preferences) => preferences ? { ...preferences, outputDevice: null } : preferences);
     });
+    const qualityUnlisten = listen<QualityReportReady>("gx-quality-report", (event) => {
+      if (disposed) return;
+      const { location, report } = event.payload;
+      const currentSnapshot = snapshotRef.current;
+      const currentItem = currentSnapshot.queue[currentSnapshot.queueIndex ?? -1];
+      // The engine stamps each report with the queue location it measured. Only the
+      // frontend knows the provider identity behind an online location, so a report
+      // that no longer matches the current track cannot be attributed and is dropped.
+      if (!currentItem || currentItem.location !== location) return;
+      const reportJson = JSON.stringify(report);
+      if (currentItem.online) {
+        const catalogTrack = selectedCatalogTrackRef.current;
+        if (!catalogTrack) return;
+        void invoke("library_upsert_quality_measurement", {
+          kind: "online",
+          path: null,
+          providerId: catalogTrack.providerId,
+          providerTrackId: catalogTrack.providerTrackId,
+          quality: currentQualityRef.current,
+          reportJson,
+        }).catch((error) => console.error("质量测量落库失败:", error));
+      } else {
+        void invoke("library_upsert_quality_measurement", {
+          kind: "local",
+          path: location,
+          providerId: null,
+          providerTrackId: null,
+          quality: null,
+          reportJson,
+        }).catch((error) => console.error("质量测量落库失败:", error));
+      }
+    });
     return () => {
       disposed = true;
       void closeUnlisten.then((stop) => stop());
       void fallbackUnlisten.then((stop) => stop());
+      void qualityUnlisten.then((stop) => stop());
     };
   }, []);
 

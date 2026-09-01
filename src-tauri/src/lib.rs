@@ -584,6 +584,52 @@ fn library_restore_backup(
 }
 
 #[tauri::command]
+fn library_upsert_quality_measurement(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    kind: String,
+    path: Option<String>,
+    provider_id: Option<String>,
+    provider_track_id: Option<String>,
+    quality: Option<String>,
+    report_json: String,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .upsert_quality_measurement(
+            &kind,
+            path.as_deref(),
+            provider_id.as_deref(),
+            provider_track_id.as_deref(),
+            quality.as_deref(),
+            &report_json,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_get_quality_measurement(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    kind: String,
+    path: Option<String>,
+    provider_id: Option<String>,
+    provider_track_id: Option<String>,
+    quality: Option<String>,
+) -> Result<Option<String>, String> {
+    require_window(&window, "main")?;
+    library
+        .get_quality_measurement(
+            &kind,
+            path.as_deref(),
+            provider_id.as_deref(),
+            provider_track_id.as_deref(),
+            quality.as_deref(),
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn player_load_resolved(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
@@ -1513,6 +1559,8 @@ pub fn run() {
             library_remove_cached_from_playlist,
             library_export_backup,
             library_restore_backup,
+            library_upsert_quality_measurement,
+            library_get_quality_measurement,
             library_scan_missing,
             library_check_local_paths,
             library_history,

@@ -204,6 +204,10 @@ struct Processors {
     room: Option<EarlyReflections>,
     hrtf: Option<StereoHrtf>,
     limiter: Option<LinkedLimiter>,
+    /// Gain applied to the A/B reference lane so it matches the processed lane's
+    /// loudness. Derived from the settings at build time; 1.0 when nothing shifts
+    /// the broadband level.
+    ab_dry_gain: f32,
 }
 
 impl Processors {
@@ -253,6 +257,15 @@ impl Processors {
         }
         if let Some(limiter) = &mut self.limiter {
             limiter.process_with_ab_dry(pcm, ab_dry, channels);
+        }
+        // Level-match the reference lane so the A/B answers "does this sound better"
+        // rather than "which one is louder". The factor is fixed by the settings, so
+        // the lane stays chunk-invariant and free of the pumping an adaptive matcher
+        // would add on transients.
+        if self.ab_dry_gain != 1.0 {
+            for sample in ab_dry.iter_mut() {
+                *sample *= self.ab_dry_gain;
+            }
         }
     }
 }
@@ -449,6 +462,76 @@ impl DspChain {
     }
 }
 
+/// Probe points for the level estimate, and how much of a mix's energy each stands
+/// for. Music is not flat: the weights follow the broad shape of a pink-ish spectrum,
+/// so a 60 Hz shelf lift does not get credited with the same loudness change as the
+/// same lift across the vocal range.
+const AB_MATCH_PROBES: [(f32, f32); 10] = [
+    (40.0, 0.06),
+    (80.0, 0.10),
+    (160.0, 0.13),
+    (320.0, 0.15),
+    (640.0, 0.15),
+    (1_280.0, 0.13),
+    (2_560.0, 0.11),
+    (5_120.0, 0.08),
+    (10_240.0, 0.06),
+    (16_000.0, 0.03),
+];
+
+/// Gain that brings the untreated lane up (or down) to the EQ'd lane's loudness.
+///
+/// The EQ is the only stage that moves the broadband level by design: the head model
+/// is equalised to unity, crossfeed redistributes energy between ears rather than
+/// adding it, and the limiter already shares its gain reduction with both lanes. So
+/// the estimate is the EQ's weighted mean magnitude, evaluated from the same biquad
+/// coefficients the filters run.
+///
+/// Bands above the sample rate's guard cannot build and are skipped, matching what
+/// `ParametricEq` actually instantiates.
+fn ab_dry_match_gain(sample_rate: u32, bands: &[EqBand]) -> f32 {
+    let coefficients = bands
+        .iter()
+        .copied()
+        .filter(|band| band.enabled)
+        .filter_map(|band| BiquadCoefficients::from_band(sample_rate, band).ok())
+        .collect::<Vec<_>>();
+    if coefficients.is_empty() {
+        return 1.0;
+    }
+
+    // Summed as power, not as decibels. Loudness follows the energy sum, so a weighted
+    // mean of dB values would under-correct every boost: one band lifted 8 dB moves the
+    // total level by more than its share of a logarithmic average.
+    let mut weighted_power = 0.0f64;
+    let mut total_weight = 0.0f64;
+    for (frequency, weight) in AB_MATCH_PROBES {
+        // A probe above the usable band says nothing about this device's output.
+        if frequency >= sample_rate as f32 * 0.5 {
+            continue;
+        }
+        let mut magnitude_db = 0.0f32;
+        for coefficient in &coefficients {
+            magnitude_db += coefficient.magnitude_db_at(sample_rate, frequency);
+        }
+        let magnitude = 10.0f64.powf(magnitude_db as f64 / 20.0);
+        weighted_power += weight as f64 * magnitude * magnitude;
+        total_weight += weight as f64;
+    }
+    if total_weight <= 0.0 {
+        return 1.0;
+    }
+
+    let gain = (weighted_power / total_weight).sqrt() as f32;
+    if !gain.is_finite() || gain <= 0.0 {
+        return 1.0;
+    }
+    // Kept inside +-6 dB: past that the reference is no longer the same recording at a
+    // matched level, and a runaway curve should not be able to make the A/B lane the
+    // loud one.
+    gain.clamp(10.0f32.powf(-6.0 / 20.0), 10.0f32.powf(6.0 / 20.0))
+}
+
 fn build_processors(
     sample_rate: u32,
     channels: usize,
@@ -480,12 +563,18 @@ fn build_processors(
         .enabled
         .then(|| LinkedLimiter::new(sample_rate, &settings.limiter))
         .transpose()?;
+    let ab_dry_gain = if settings.enabled && settings.eq_enabled {
+        ab_dry_match_gain(sample_rate, &settings.eq_bands)
+    } else {
+        1.0
+    };
     Ok(Processors {
         equalizer,
         crossfeed,
         room,
         hrtf,
         limiter,
+        ab_dry_gain,
     })
 }
 
@@ -629,6 +718,25 @@ impl BiquadCoefficients {
         a1: 0.0,
         a2: 0.0,
     };
+
+    /// Magnitude response at one frequency, in dB. Evaluates `H(z)` on the unit circle
+    /// directly from the coefficients, so it reports what the running filter does rather
+    /// than what the band asked for.
+    fn magnitude_db_at(self, sample_rate: u32, frequency_hz: f32) -> f32 {
+        let omega = 2.0 * PI * frequency_hz as f64 / sample_rate as f64;
+        let (cos1, sin1) = (omega.cos(), omega.sin());
+        let (cos2, sin2) = ((2.0 * omega).cos(), (2.0 * omega).sin());
+        let numerator_real = self.b0 as f64 + self.b1 as f64 * cos1 + self.b2 as f64 * cos2;
+        let numerator_imaginary = -(self.b1 as f64 * sin1 + self.b2 as f64 * sin2);
+        let denominator_real = 1.0 + self.a1 as f64 * cos1 + self.a2 as f64 * cos2;
+        let denominator_imaginary = -(self.a1 as f64 * sin1 + self.a2 as f64 * sin2);
+        let numerator = numerator_real.hypot(numerator_imaginary);
+        let denominator = denominator_real.hypot(denominator_imaginary);
+        if denominator <= f64::MIN_POSITIVE || numerator <= 0.0 {
+            return 0.0;
+        }
+        (20.0 * (numerator / denominator).log10()) as f32
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1225,15 +1333,29 @@ mod tests {
             .process_interleaved_with_ab_dry(&mut processed, &mut ab_dry)
             .unwrap();
 
+        // The lane carries the untreated input, delayed to meet the head model and scaled
+        // by the level-match factor. Recovering that one factor and finding it holds for
+        // every sample is what separates "the input, matched" from "the EQ'd signal".
+        let scale = (0..512 - latency)
+            .flat_map(|frame| [0, 1].map(move |channel| (frame, channel)))
+            .find_map(|(frame, channel)| {
+                let input = original[frame * 2 + channel];
+                (input.abs() > 0.05).then(|| ab_dry[(frame + latency) * 2 + channel] / input)
+            })
+            .expect("the probe signal must reach a usable amplitude");
+        assert!(scale.is_finite() && scale > 0.0);
         for frame in 0..512 {
             for channel in 0..2 {
-                let actual = ab_dry[frame * 2 + channel].to_bits();
+                let actual = ab_dry[frame * 2 + channel];
                 let expected = if frame < latency {
-                    0.0f32.to_bits()
+                    0.0
                 } else {
-                    original[(frame - latency) * 2 + channel].to_bits()
+                    original[(frame - latency) * 2 + channel] * scale
                 };
-                assert_eq!(actual, expected, "frame {frame} channel {channel}");
+                assert!(
+                    (actual - expected).abs() < 1.0e-5,
+                    "frame {frame} channel {channel}: {actual} vs {expected}"
+                );
             }
         }
         assert_ne!(
@@ -1485,17 +1607,22 @@ mod tests {
             .process_interleaved_with_ab_dry(&mut pcm, &mut ab_dry)
             .unwrap();
 
-        // Without HRTF the A/B lane is an exact input copy — the crossfade must not touch it.
-        assert_eq!(
-            ab_dry
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            original
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>()
-        );
+        // Without HRTF the A/B lane is the input scaled by one level-match factor and
+        // nothing else: the crossfade must not filter, delay or smear it. Recovering a
+        // single constant from every sample is what rules that out.
+        let ratios = ab_dry
+            .iter()
+            .zip(&original)
+            .filter(|(_, input)| input.abs() > 1.0e-3)
+            .map(|(lane, input)| lane / input)
+            .collect::<Vec<_>>();
+        assert!(!ratios.is_empty());
+        for ratio in &ratios {
+            assert!(
+                (ratio - ratios[0]).abs() < 1.0e-5,
+                "A/B lane is not a plain scaling of the input"
+            );
+        }
         assert_ne!(pcm, original);
     }
 
@@ -1536,6 +1663,274 @@ mod tests {
         chain.process_interleaved_in_place(&mut pcm).unwrap();
         assert!(pcm.iter().all(|sample| sample.is_finite()));
     }
+
+    /// A probe built at the probe points the estimator assumes, with each partial's
+    /// amplitude set so its share of the total power is that point's weight. This is the
+    /// spectrum the matcher is designed for, so what the test measures is whether the
+    /// matcher gets its own case right rather than how the two spectra differ.
+    fn broadband_probe(frames: usize) -> Vec<f32> {
+        let partials = AB_MATCH_PROBES
+            .iter()
+            .map(|&(frequency, weight)| (frequency, weight.sqrt()))
+            .collect::<Vec<_>>();
+        // Scaled to leave headroom for a +6 dB match on top of a +12 dB band.
+        let normalisation = 0.2 / partials.iter().map(|(_, amplitude)| amplitude).sum::<f32>();
+        (0..frames * 2)
+            .map(|index| {
+                let frame = (index / 2) as f32;
+                partials
+                    .iter()
+                    .map(|&(frequency, amplitude)| {
+                        amplitude * (frame * frequency * TAU_OVER_48K).sin()
+                    })
+                    .sum::<f32>()
+                    * normalisation
+            })
+            .collect()
+    }
+
+    const TAU_OVER_48K: f32 = std::f32::consts::TAU / 48_000.0;
+
+    fn level_matched_lanes(bands: Vec<EqBand>) -> (f32, f32) {
+        let mut chain = DspChain::new(
+            48_000,
+            2,
+            DspSettings {
+                enabled: true,
+                eq_enabled: true,
+                eq_bands: bands,
+                ..DspSettings::default()
+            },
+        )
+        .unwrap();
+        let mut pcm = broadband_probe(48_000);
+        let mut ab_dry = vec![0.0f32; pcm.len()];
+        chain
+            .process_interleaved_with_ab_dry(&mut pcm, &mut ab_dry)
+            .unwrap();
+        (rms(&pcm), rms(&ab_dry))
+    }
+
+    #[test]
+    fn ab_reference_lane_is_level_matched_to_the_processed_lane() {
+        // Lifts and cuts alike leave the two lanes level, so pressing the A/B button is a
+        // tone comparison rather than a loudness one. The unmatched figure is asserted
+        // alongside it: without that, a matcher that returned unity would also pass.
+        for bands in [
+            vec![EqBand::peak(1_000.0, 8.0, 0.7)],
+            vec![EqBand::peak(1_000.0, -8.0, 0.7)],
+            vec![
+                EqBand {
+                    enabled: true,
+                    kind: FilterKind::LowShelf,
+                    frequency_hz: 200.0,
+                    gain_db: 6.0,
+                    q: 0.7,
+                },
+                EqBand::peak(3_000.0, 4.0, 1.0),
+            ],
+        ] {
+            let gain = ab_dry_match_gain(48_000, &bands);
+            let (processed, reference) = level_matched_lanes(bands);
+            let matched_db = 20.0 * (processed / reference).log10();
+            let unmatched_db = 20.0 * (processed / (reference / gain)).log10();
+            assert!(
+                matched_db.abs() <= 0.3,
+                "lanes still differ by {matched_db:.2} dB after matching"
+            );
+            assert!(
+                unmatched_db.abs() >= 1.5,
+                "the unmatched gap is only {unmatched_db:.2} dB, so this case proves nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn matching_still_shrinks_the_gap_on_a_spectrum_it_did_not_assume() {
+        // Real music is not the assumed weighting. The estimate is a model, so the claim
+        // it has to earn is "much closer", not "exact": equal-amplitude partials at
+        // different frequencies from the probe points are the awkward case for it.
+        let mut chain = DspChain::new(
+            48_000,
+            2,
+            DspSettings {
+                enabled: true,
+                eq_enabled: true,
+                eq_bands: vec![EqBand::peak(1_000.0, 8.0, 0.7)],
+                ..DspSettings::default()
+            },
+        )
+        .unwrap();
+        let mut pcm = (0..48_000 * 2)
+            .map(|index| {
+                let frame = (index / 2) as f32;
+                let tone = |hz: f32| (frame * hz * TAU_OVER_48K).sin();
+                (tone(70.0) + tone(220.0) + tone(700.0) + tone(2_200.0) + tone(7_000.0)) * 0.12
+            })
+            .collect::<Vec<_>>();
+        let mut ab_dry = vec![0.0f32; pcm.len()];
+        chain
+            .process_interleaved_with_ab_dry(&mut pcm, &mut ab_dry)
+            .unwrap();
+
+        let gain = ab_dry_match_gain(48_000, &[EqBand::peak(1_000.0, 8.0, 0.7)]);
+        let matched_db = 20.0 * (rms(&pcm) / rms(&ab_dry)).log10();
+        let unmatched_db = 20.0 * (rms(&pcm) / (rms(&ab_dry) / gain)).log10();
+        assert!(
+            matched_db.abs() < unmatched_db.abs() * 0.6,
+            "matching left {matched_db:.2} dB of a {unmatched_db:.2} dB gap"
+        );
+        // Still inside the range where level stops driving the verdict.
+        assert!(matched_db.abs() <= 1.5, "residual {matched_db:.2} dB");
+    }
+
+    #[test]
+    fn a_flat_eq_leaves_the_reference_lane_bit_exact() {
+        // Nothing to match means nothing to touch: presets like 耳机日常 carry a flat
+        // curve, and the reference must stay the caller's samples rather than the
+        // caller's samples times 0.999.
+        let mut chain = DspChain::new(
+            48_000,
+            2,
+            DspSettings {
+                enabled: true,
+                eq_enabled: true,
+                eq_bands: vec![EqBand::peak(1_000.0, 0.0, 1.0)],
+                crossfeed: CrossfeedSettings {
+                    enabled: true,
+                    ..CrossfeedSettings::default()
+                },
+                ..DspSettings::default()
+            },
+        )
+        .unwrap();
+        let mut pcm = broadband_probe(512);
+        let original = pcm.clone();
+        let mut ab_dry = vec![0.0f32; pcm.len()];
+        chain
+            .process_interleaved_with_ab_dry(&mut pcm, &mut ab_dry)
+            .unwrap();
+        assert_eq!(
+            ab_dry
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            original
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn level_matching_is_chunk_invariant_and_bounded() {
+        // One factor fixed by the settings, so splitting the stream cannot move it. An
+        // adaptive matcher would drift here, and drift is what pumps.
+        let settings = DspSettings {
+            enabled: true,
+            eq_enabled: true,
+            eq_bands: vec![EqBand::peak(1_000.0, 9.0, 0.7)],
+            ..DspSettings::default()
+        };
+        let mut whole = DspChain::new(48_000, 2, settings.clone()).unwrap();
+        let mut chunked = DspChain::new(48_000, 2, settings).unwrap();
+
+        let input = broadband_probe(4_096);
+        let mut whole_pcm = input.clone();
+        let mut whole_dry = vec![0.0f32; input.len()];
+        whole
+            .process_interleaved_with_ab_dry(&mut whole_pcm, &mut whole_dry)
+            .unwrap();
+
+        let mut chunked_dry = Vec::with_capacity(input.len());
+        for chunk in input.chunks(256 * 2) {
+            let mut pcm = chunk.to_vec();
+            let mut dry = vec![0.0f32; pcm.len()];
+            chunked
+                .process_interleaved_with_ab_dry(&mut pcm, &mut dry)
+                .unwrap();
+            chunked_dry.extend_from_slice(&dry);
+        }
+
+        assert_eq!(
+            whole_dry
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            chunked_dry
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        // Headroom: a matched reference must not be the one that clips.
+        assert!(whole_dry.iter().all(|sample| sample.abs() <= 1.0));
+    }
+
+    #[test]
+    fn a_runaway_curve_cannot_drive_the_reference_lane_past_6_db() {
+        // Every band pinned to +12 dB is a curve no preset ships, but the editor can
+        // reach it. The reference tracks it only as far as the clamp allows.
+        let bands = DSP_PROBE_FREQUENCIES
+            .iter()
+            .map(|&frequency| EqBand::peak(frequency, 12.0, 0.7))
+            .collect::<Vec<_>>();
+        let gain = ab_dry_match_gain(48_000, &bands);
+        assert!(
+            gain <= 10.0f32.powf(6.0 / 20.0) + 1.0e-4,
+            "clamp let the reference lane reach {gain}x"
+        );
+        let cut = DSP_PROBE_FREQUENCIES
+            .iter()
+            .map(|&frequency| EqBand::peak(frequency, -12.0, 0.7))
+            .collect::<Vec<_>>();
+        assert!(ab_dry_match_gain(48_000, &cut) >= 10.0f32.powf(-6.0 / 20.0) - 1.0e-4);
+    }
+
+    #[test]
+    fn the_shipped_curves_need_only_a_gentle_match() {
+        // The product's voicing curves, 31 Hz -> 16 kHz, as the frontend authors them.
+        // They are deliberately restrained, so the reference lane should need a nudge
+        // rather than a shove: a curve that demanded several dB here would be one worth
+        // re-examining rather than compensating for.
+        let curves: [(&str, [f32; 10]); 8] = [
+            ("warm", [0.0, 0.5, 1.25, 0.75, 0.0, 0.0, -0.25, -0.5, -0.75, -0.5]),
+            ("bright", [0.0, 0.0, 0.0, -0.25, 0.0, 0.25, 0.75, 1.25, 1.5, 1.0]),
+            ("classical", [0.5, 0.5, 0.0, -0.5, -0.25, 0.0, 0.5, 0.75, 0.75, 0.5]),
+            ("electronic", [2.5, 2.0, 1.0, -0.5, -1.0, -0.5, 0.0, 1.0, 1.75, 1.25]),
+            ("rock", [1.5, 1.75, 1.0, -1.0, -0.5, 0.5, 1.5, 1.75, 1.0, 0.25]),
+            ("podcast", [-3.5, -3.0, -1.5, 0.0, 1.0, 2.0, 2.25, 1.25, 0.0, -0.5]),
+            ("jazz", [0.5, 0.75, 0.75, 0.25, -0.25, 0.25, 0.5, 0.75, 1.0, 0.75]),
+            ("piano_vocal", [0.0, 0.0, -2.5, -1.5, 0.0, 0.0, 0.0, 0.0, -0.5, 0.0]),
+        ];
+        for (name, gains) in curves {
+            // 1.4x is the ceiling the intensity slider applies at full strength.
+            let bands = DSP_PROBE_FREQUENCIES
+                .iter()
+                .zip(gains)
+                .filter(|(_, gain)| *gain != 0.0)
+                .map(|(&frequency, gain)| EqBand::peak(frequency, gain * 1.4, 1.0))
+                .collect::<Vec<_>>();
+            let match_db = 20.0 * ab_dry_match_gain(48_000, &bands).log10();
+            assert!(
+                match_db.abs() <= 3.0,
+                "{name} asks the reference lane for {match_db:.2} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn bands_the_device_cannot_build_are_left_out_of_the_estimate() {
+        // A 16 kHz band cannot exist on a 32 kHz device. It must not be counted as a
+        // level change there, or the reference lane would compensate for a filter that
+        // is not running.
+        let bands = vec![EqBand::peak(16_000.0, 12.0, 0.7)];
+        assert!((ab_dry_match_gain(32_000, &bands) - 1.0).abs() < 1.0e-6);
+        assert!(ab_dry_match_gain(48_000, &bands) > 1.0);
+    }
+
+    const DSP_PROBE_FREQUENCIES: [f32; 10] = [
+        31.0, 62.0, 125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0, 16_000.0,
+    ];
 
     fn enabled_spatial_settings() -> DspSettings {
         DspSettings {

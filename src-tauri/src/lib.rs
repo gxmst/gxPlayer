@@ -584,6 +584,7 @@ fn library_restore_backup(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn library_upsert_quality_measurement(
     window: WebviewWindow,
     library: tauri::State<LibraryStore>,

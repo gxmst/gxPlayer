@@ -4,13 +4,13 @@ import { hasTauriWindowRuntime } from "./tauriRuntime";
 afterEach(() => vi.unstubAllGlobals());
 
 describe("hasTauriWindowRuntime", () => {
-  it("requires usable window internals without trusting the legacy marker", () => {
+  it("requires usable IPC internals without trusting the legacy marker", () => {
     vi.stubGlobal("isTauri", false);
     vi.stubGlobal("__TAURI_INTERNALS__", undefined);
     expect(hasTauriWindowRuntime()).toBe(false);
 
     vi.stubGlobal("__TAURI_INTERNALS__", { invoke: vi.fn() });
-    expect(hasTauriWindowRuntime()).toBe(false);
+    expect(hasTauriWindowRuntime()).toBe(true);
 
     vi.stubGlobal("__TAURI_INTERNALS__", {
       invoke: vi.fn(),

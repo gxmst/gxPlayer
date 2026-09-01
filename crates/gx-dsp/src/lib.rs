@@ -255,17 +255,20 @@ impl Processors {
         if let Some(hrtf) = &mut self.hrtf {
             hrtf.process_with_ab_dry(pcm, ab_dry);
         }
-        if let Some(limiter) = &mut self.limiter {
-            limiter.process_with_ab_dry(pcm, ab_dry, channels);
-        }
         // Level-match the reference lane so the A/B answers "does this sound better"
-        // rather than "which one is louder". The factor is fixed by the settings, so
-        // the lane stays chunk-invariant and free of the pumping an adaptive matcher
-        // would add on transients.
+        // rather than "which one is louder". The factor is fixed by the settings, so the
+        // lane stays chunk-invariant and free of the pumping an adaptive matcher would
+        // add on transients.
+        //
+        // Ahead of the limiter, so the ceiling covers a matched-up reference rather than
+        // being applied before the gain that could push it over.
         if self.ab_dry_gain != 1.0 {
             for sample in ab_dry.iter_mut() {
                 *sample *= self.ab_dry_gain;
             }
+        }
+        if let Some(limiter) = &mut self.limiter {
+            limiter.process_with_ab_dry(pcm, ab_dry, channels);
         }
     }
 }
@@ -526,11 +529,22 @@ fn ab_dry_match_gain(sample_rate: u32, bands: &[EqBand]) -> f32 {
     if !gain.is_finite() || gain <= 0.0 {
         return 1.0;
     }
-    // Kept inside +-6 dB: past that the reference is no longer the same recording at a
-    // matched level, and a runaway curve should not be able to make the A/B lane the
-    // loud one.
-    gain.clamp(10.0f32.powf(-6.0 / 20.0), 10.0f32.powf(6.0 / 20.0))
+    gain.clamp(AB_MATCH_MIN_GAIN, AB_MATCH_MAX_GAIN)
 }
+
+/// The two directions are not symmetric, because their risks are not.
+///
+/// Attenuating the reference can never clip it, and the limit has to clear what real
+/// curves ask for: ten bands at the editor's -12 dB floor stack into roughly -19 dB of
+/// broadband cut, and a match that stopped at -6 dB would leave the rest of that as an
+/// audible level difference — exactly the confound this is here to remove.
+///
+/// Boosting is capped much tighter, because a boosted reference is one that can clip.
+/// The cap is what keeps a curve that lifts where the recording has nothing to lift from
+/// making the reference the hot lane; past it the match is deliberately incomplete, and
+/// the limiter holds the ceiling for whatever is left.
+const AB_MATCH_MIN_GAIN: f32 = 0.063_095_73; // -24 dB
+const AB_MATCH_MAX_GAIN: f32 = 1.995_262_3; // +6 dB
 
 fn build_processors(
     sample_rate: u32,
@@ -1867,23 +1881,103 @@ mod tests {
     }
 
     #[test]
-    fn a_runaway_curve_cannot_drive_the_reference_lane_past_6_db() {
+    fn a_runaway_boost_cannot_make_the_reference_the_hot_lane() {
         // Every band pinned to +12 dB is a curve no preset ships, but the editor can
-        // reach it. The reference tracks it only as far as the clamp allows.
+        // reach it. The reference tracks it only as far as the cap allows.
         let bands = DSP_PROBE_FREQUENCIES
             .iter()
             .map(|&frequency| EqBand::peak(frequency, 12.0, 0.7))
             .collect::<Vec<_>>();
         let gain = ab_dry_match_gain(48_000, &bands);
         assert!(
-            gain <= 10.0f32.powf(6.0 / 20.0) + 1.0e-4,
-            "clamp let the reference lane reach {gain}x"
+            gain <= AB_MATCH_MAX_GAIN + 1.0e-4,
+            "cap let the reference lane reach {gain}x"
         );
-        let cut = DSP_PROBE_FREQUENCIES
+    }
+
+    #[test]
+    fn a_full_depth_cut_is_matched_rather_than_left_on_the_clamp() {
+        // The case a symmetric +-6 dB clamp got wrong. Ten bands at the editor's floor
+        // stack into far more than 6 dB of broadband cut, and stopping the match there
+        // would leave the rest audible as exactly the level difference A/B removes.
+        let bands = DSP_PROBE_FREQUENCIES
             .iter()
-            .map(|&frequency| EqBand::peak(frequency, -12.0, 0.7))
+            .map(|&frequency| EqBand::peak(frequency, -12.0, 1.0))
             .collect::<Vec<_>>();
-        assert!(ab_dry_match_gain(48_000, &cut) >= 10.0f32.powf(-6.0 / 20.0) - 1.0e-4);
+        let mut chain = DspChain::new(
+            48_000,
+            2,
+            DspSettings {
+                enabled: true,
+                eq_enabled: true,
+                eq_bands: bands,
+                ..DspSettings::default()
+            },
+        )
+        .unwrap();
+        let mut pcm = broadband_probe(48_000);
+        let input_rms = rms(&pcm);
+        let mut ab_dry = vec![0.0f32; pcm.len()];
+        chain
+            .process_interleaved_with_ab_dry(&mut pcm, &mut ab_dry)
+            .unwrap();
+
+        // The curve really does cut this hard: unmatched, the lanes would sit that far
+        // apart, which is what makes the residual below worth asserting.
+        let eq_db = 20.0 * (rms(&pcm) / input_rms).log10();
+        assert!(eq_db < -12.0, "curve only cut {eq_db:.2} dB");
+        let residual_db = 20.0 * (rms(&pcm) / rms(&ab_dry)).log10();
+        assert!(
+            residual_db.abs() <= 1.5,
+            "{residual_db:.2} dB left between the lanes"
+        );
+    }
+
+    #[test]
+    fn the_matched_reference_lane_respects_the_limiter_ceiling() {
+        // A hot source plus a boosting curve is where a post-limiter match would clip. The
+        // match runs ahead of the limiter and the limiter holds the reference to the same
+        // ceiling on its own peak, so the lane the listener switches to cannot overshoot.
+        let ceiling_db = -1.0;
+        let mut chain = DspChain::new(
+            48_000,
+            2,
+            DspSettings {
+                enabled: true,
+                eq_enabled: true,
+                eq_bands: vec![EqBand::peak(1_000.0, 10.0, 0.7)],
+                limiter: LimiterSettings {
+                    enabled: true,
+                    ceiling_db,
+                    release_ms: 80.0,
+                },
+                ..DspSettings::default()
+            },
+        )
+        .unwrap();
+        // Normalised to just under full scale before anything is applied.
+        let raw = broadband_probe(48_000);
+        let raw_peak = raw
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        let mut pcm = raw
+            .into_iter()
+            .map(|sample| sample * 0.98 / raw_peak)
+            .collect::<Vec<_>>();
+        assert!(pcm.iter().any(|sample| sample.abs() > 0.9));
+        let mut ab_dry = vec![0.0f32; pcm.len()];
+        chain
+            .process_interleaved_with_ab_dry(&mut pcm, &mut ab_dry)
+            .unwrap();
+
+        let ceiling = 10.0f32.powf(ceiling_db / 20.0);
+        let reference_peak = ab_dry
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        assert!(
+            reference_peak <= ceiling + 1.0e-4,
+            "reference lane peaked at {reference_peak}, over the {ceiling} ceiling"
+        );
     }
 
     #[test]

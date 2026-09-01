@@ -353,6 +353,18 @@ pub(crate) struct LinkedLimiter {
     ceiling: f32,
     release_coefficient: f32,
     gain: f32,
+    /// Second gain, applied to the A/B reference lane on top of the shared one.
+    ///
+    /// The shared gain is derived from the processed lane and applied to both, which is
+    /// what keeps the A/B switch from jumping in level when the limiter engages. It
+    /// cannot protect the reference on its own: level matching can leave that lane the
+    /// taller of the two, so a curve that boosts where the recording is thin raises the
+    /// reference above the ceiling while the processed peak barely moves.
+    ///
+    /// This stage only leaves unity in that case. The lanes then diverge by however much
+    /// the reference had to give up, which is the right trade: the alternative is clipping
+    /// the lane the listener is holding the button to hear.
+    reference_gain: f32,
 }
 
 impl LinkedLimiter {
@@ -362,6 +374,7 @@ impl LinkedLimiter {
             ceiling: 10.0f32.powf(settings.ceiling_db / 20.0),
             release_coefficient: (-1.0 / (sample_rate as f32 * settings.release_ms / 1000.0)).exp(),
             gain: 1.0,
+            reference_gain: 1.0,
         })
     }
 
@@ -389,8 +402,14 @@ impl LinkedLimiter {
             for sample in frame {
                 *sample *= gain;
             }
-            for sample in ab_frame {
+            for sample in &mut *ab_frame {
                 *sample *= gain;
+            }
+            let reference_gain = self.next_reference_gain(ab_frame);
+            if reference_gain != 1.0 {
+                for sample in ab_frame {
+                    *sample *= reference_gain;
+                }
             }
         }
     }
@@ -411,6 +430,27 @@ impl LinkedLimiter {
             self.gain = 1.0 - (1.0 - self.gain) * self.release_coefficient;
         }
         self.gain
+    }
+
+    /// Same envelope as `next_gain`, tracked separately so the reference lane's own peaks
+    /// drive it. Reads the frame after the shared gain, so it only has the overshoot the
+    /// shared gain did not already remove to deal with.
+    #[inline]
+    fn next_reference_gain(&mut self, frame: &[f32]) -> f32 {
+        let peak = frame
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        let target = if peak > self.ceiling {
+            self.ceiling / peak
+        } else {
+            1.0
+        };
+        if target <= self.reference_gain {
+            self.reference_gain = target;
+        } else {
+            self.reference_gain = 1.0 - (1.0 - self.reference_gain) * self.release_coefficient;
+        }
+        self.reference_gain
     }
 }
 
@@ -958,23 +998,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn linked_limiter_applies_the_processed_gain_to_the_ab_lane() {
-        let settings = LimiterSettings {
+    fn test_limiter_settings() -> LimiterSettings {
+        LimiterSettings {
             enabled: true,
             ceiling_db: -6.0,
             release_ms: 80.0,
-        };
-        let mut limiter = LinkedLimiter::new(48_000, &settings).unwrap();
-        let mut below_ceiling = [0.25, -0.25];
-        let mut loud_ab_dry = [2.0, -2.0];
-        limiter.process_with_ab_dry(&mut below_ceiling, &mut loud_ab_dry, 2);
-        assert_eq!(below_ceiling, [0.25, -0.25]);
-        assert_eq!(loud_ab_dry, [2.0, -2.0]);
+        }
+    }
 
+    #[test]
+    fn linked_limiter_applies_the_processed_gain_to_the_ab_lane() {
+        // Both lanes move by one gain, so releasing the A/B button is not a level change.
+        // The reference here stays well under the ceiling, which is the ordinary case:
+        // level matching nudges it, it does not double it.
+        let mut limiter = LinkedLimiter::new(48_000, &test_limiter_settings()).unwrap();
         let mut processed = [2.0, -1.0, 0.5, -0.25];
         let processed_before = processed;
-        let mut ab_dry = [0.4, -0.2, 0.75, -0.375];
+        let mut ab_dry = [0.4, -0.2, 0.3, -0.15];
         let ab_before = ab_dry;
 
         limiter.process_with_ab_dry(&mut processed, &mut ab_dry, 2);
@@ -988,5 +1028,27 @@ mod tests {
         }
         assert!(processed.iter().all(|sample| sample.is_finite()));
         assert!(ab_dry.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn a_reference_lane_over_the_ceiling_is_brought_down_on_its_own() {
+        // The shared gain is derived from the processed lane, so it does nothing here: the
+        // processed lane is already quiet. Level matching is what can leave the reference
+        // the taller lane, and it is the lane the listener is holding the button to hear,
+        // so it gets the ceiling enforced on its own peak.
+        let mut limiter = LinkedLimiter::new(48_000, &test_limiter_settings()).unwrap();
+        let ceiling = 10.0f32.powf(-6.0 / 20.0);
+        let mut quiet_processed = [0.25, -0.25];
+        let mut loud_reference = [2.0, -2.0];
+
+        limiter.process_with_ab_dry(&mut quiet_processed, &mut loud_reference, 2);
+
+        assert_eq!(quiet_processed, [0.25, -0.25], "processed lane was untouched");
+        for sample in loud_reference {
+            assert!(
+                sample.abs() <= ceiling + 1.0e-6,
+                "reference lane left at {sample}, over the {ceiling} ceiling"
+            );
+        }
     }
 }

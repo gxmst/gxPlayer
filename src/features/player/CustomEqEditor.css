@@ -36,15 +36,32 @@
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  width: 34px;
+  flex: 0 0 34px;
+  padding: 4px 0;
+  text-align: right;
   color: var(--text-dim);
   font-size: var(--text-micro);
   font-variant-numeric: tabular-nums;
 }
 
+.custom-eq-bands-wrapper {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
 .custom-eq-bands {
+  flex: 1 1 auto;
+  min-width: 0;
   display: grid;
   grid-template-columns: repeat(10, minmax(0, 1fr));
   gap: 4px;
+}
+
+.custom-eq-scale-spacer {
+  width: 34px;
+  flex: 0 0 34px;
 }
 
 .custom-eq-band {
@@ -59,9 +76,10 @@
   writing-mode: vertical-lr;
   direction: rtl;
   width: 20px;
-  height: 104px;
+  height: 108px;
   margin: 0;
   accent-color: var(--accent-contrast);
+  cursor: pointer;
 }
 
 .custom-eq-band-gain,

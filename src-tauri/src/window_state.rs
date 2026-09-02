@@ -19,8 +19,8 @@ pub const MINI_MIN_WIDTH: f64 = 320.0;
 pub const MINI_MIN_HEIGHT: f64 = 120.0;
 pub const MINI_DEFAULT_WIDTH: f64 = 380.0;
 pub const MINI_DEFAULT_HEIGHT: f64 = 140.0;
-pub const DEFAULT_WIDTH: f64 = 1024.0;
-pub const DEFAULT_HEIGHT: f64 = 640.0;
+pub const DEFAULT_WIDTH: f64 = 960.0;
+pub const DEFAULT_HEIGHT: f64 = 600.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -356,8 +356,8 @@ mod tests {
     #[test]
     fn first_launch_default_scales_down_to_fit_a_short_monitor() {
         assert_eq!(
-            default_size_for_monitor(1280.0, 720.0),
-            LogicalSize::new(990.0, 619.0)
+            default_size_for_monitor(1100.0, 680.0),
+            LogicalSize::new(935.0, 584.0)
         );
     }
 }

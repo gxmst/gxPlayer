@@ -1157,7 +1157,7 @@ fn safe_http_error_code(error: &SafeHttpError) -> &'static str {
         | SafeHttpError::CredentialsDenied
         | SafeHttpError::MissingHost
         | SafeHttpError::InvalidHeader(_) => "invalid_request",
-        SafeHttpError::PrivateDestination => "blocked_destination",
+        SafeHttpError::DisallowedPort(_) | SafeHttpError::PrivateDestination => "blocked_destination",
         SafeHttpError::Dns(_) => "dns_failed",
         SafeHttpError::Request(message) => diagnostic_error_code(message),
         SafeHttpError::Cancelled => "cancelled",

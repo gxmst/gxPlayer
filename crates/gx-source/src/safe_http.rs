@@ -18,6 +18,11 @@ use crate::network_policy::{
 
 const MAX_REDIRECTS: usize = 10;
 
+/// Ports a destination may use. LX scripts only ever talk to plain web
+/// endpoints; any other port is a scanning or cross-service probing signal and
+/// is rejected before DNS resolution runs.
+const ALLOWED_DESTINATION_PORTS: [u16; 4] = [80, 443, 8080, 8443];
+
 #[derive(Debug, Clone)]
 pub struct SafeHttpRequest {
     pub url: Url,
@@ -67,6 +72,8 @@ pub enum SafeHttpError {
     MissingHost,
     #[error("destination resolves to a loopback, link-local, or private address")]
     PrivateDestination,
+    #[error("destination port {0} is not allowed")]
+    DisallowedPort(u16),
     #[error("failed to resolve destination: {0}")]
     Dns(String),
     #[error("invalid request header: {0}")]
@@ -274,6 +281,9 @@ pub fn validate_and_resolve(url: &Url) -> Result<SocketAddr, SafeHttpError> {
     let port = url
         .port_or_known_default()
         .ok_or(SafeHttpError::MissingHost)?;
+    if !ALLOWED_DESTINATION_PORTS.contains(&port) {
+        return Err(SafeHttpError::DisallowedPort(port));
+    }
     let addresses = (host, port)
         .to_socket_addrs()
         .map_err(|error| SafeHttpError::Dns(error.to_string()))?
@@ -437,6 +447,27 @@ mod tests {
         assert!(matches!(
             validate_and_resolve(&Url::parse("https://user:pass@example.com/").unwrap()),
             Err(SafeHttpError::CredentialsDenied)
+        ));
+    }
+
+    #[test]
+    fn rejects_destination_ports_outside_the_web_allowlist() {
+        for url in [
+            "http://example.com:25/",
+            "https://example.com:9200/",
+            "http://[2001:db8::1]:22/",
+            "http://127.0.0.1:8081/",
+        ] {
+            assert!(matches!(
+                validate_and_resolve(&Url::parse(url).unwrap()),
+                Err(SafeHttpError::DisallowedPort(_))
+            ));
+        }
+        // Allowed ports pass the gate and continue to the private-address check
+        // (127.0.0.1 keeps this offline-deterministic).
+        assert!(matches!(
+            validate_and_resolve(&Url::parse("http://127.0.0.1:8080/").unwrap()),
+            Err(SafeHttpError::PrivateDestination)
         ));
     }
 

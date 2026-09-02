@@ -96,4 +96,10 @@ it would be wrong. These failures are written to the diagnostic log under
 
 ## Security boundary
 
-The sandbox window has a dedicated capability with no filesystem, shell, clipboard, opener, dialog, or main-window commands. Host HTTP accepts only HTTP(S), rejects credentials in URLs, limits redirects/body size/time, and denies loopback, link-local, and private-network destinations by default. Every IPC message is size-limited and accepted only from the sandbox label.
+The sandbox window has a dedicated capability with no filesystem, shell, clipboard, opener, dialog, or main-window commands. Host HTTP accepts only HTTP(S), rejects credentials in URLs, limits redirects/body size/time, denies loopback, link-local, and private-network destinations by default, and allows only web ports (80, 443, 8080, 8443). Every IPC message is size-limited and accepted only from the sandbox label.
+
+The global CSP in `tauri.conf.json` applies to every webview — Tauri v2 has no
+per-window CSP — so `script-src 'unsafe-eval'` there is load-bearing: the
+sandbox worker evaluates user scripts with `eval` (`sourceRealm.worker.ts`).
+Do not remove it globally; `sandbox.html`'s own meta CSP adds the tighter
+per-page limits on top of that baseline.

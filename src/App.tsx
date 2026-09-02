@@ -4,6 +4,33 @@ import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
 import gxplayerIcon from "./assets/gxplayer-icon.png";
 import "./App.css";
+import {
+  IconDiscovery,
+  IconLibrary,
+  IconHistory,
+  IconFavorites,
+  IconSources,
+  IconSettings,
+  IconPlay,
+  IconPause,
+  IconPrev,
+  IconNext,
+  IconModeSeq,
+  IconModeAll,
+  IconModeOne,
+  IconModeShuf,
+  IconVolume,
+  IconQueue,
+  IconBack,
+  IconSearch,
+  IconMenu,
+  IconTheme,
+  IconWindowMinimize,
+  IconWindowMaximize,
+  IconWindowRestore,
+  IconWindowClose,
+  type IconProps,
+} from "./components/Icons";
 import { useActionDialog, type ActionErrorClassifier } from "./components/ActionDialog";
 import { QueuePanel, type QueueAvailabilityStatus } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
@@ -214,12 +241,27 @@ function catalogKey(track: CatalogTrack): string {
   return `${track.providerId}:${track.providerTrackId}`;
 }
 
-function entryKey(entry: PlaylistEntry, index: number): string {
-  if (entry.kind === "local") return `local:${entry.path}:${index}`;
+function entryIdentity(entry: PlaylistEntry): string {
+  if (entry.kind === "local") return `local:${entry.path}`;
   if (entry.kind === "cached") {
-    return `cached:${entry.providerId}:${entry.providerTrackId}:${entry.quality}:${index}`;
+    return `cached:${entry.providerId}:${entry.providerTrackId}:${entry.quality}`;
   }
-  return `online:${catalogKey(entry.track)}:${index}`;
+  return `online:${catalogKey(entry.track)}`;
+}
+
+/**
+ * Position-stable React keys: identity plus an occurrence counter for
+ * duplicates. Index-based keys would remount every row after a removal or
+ * drag-reorder, breaking focus and transition state.
+ */
+function playlistEntryKeys(entries: PlaylistEntry[]): string[] {
+  const occurrences = new Map<string, number>();
+  return entries.map((entry) => {
+    const identity = entryIdentity(entry);
+    const seen = occurrences.get(identity) ?? 0;
+    occurrences.set(identity, seen + 1);
+    return seen === 0 ? identity : `${identity}#${seen}`;
+  });
 }
 
 function entryTitle(entry: PlaylistEntry): string {
@@ -310,28 +352,19 @@ const QUALITY_OPTIONS: Array<{ value: QualityPreference; label: string }> = [
   { value: "flac24bit", label: "24-bit FLAC" },
 ];
 
-/** Premium rose — clean on dark glass; used when there is no artwork. */
-const FALLBACK_ACCENT = "#e85a71";
-/** Curated accents only — never raw hash hues that land on muddy yellow-green. */
-const PREMIUM_PALETTE = [
-  "#e85a71",
-  "#7b8cff",
-  "#5ec8c8",
-  "#c77dff",
-  "#ff8e6e",
-  "#6ec8ff",
-  "#f0a0c0",
-  "#8ad4a0",
-  "#d4a06a",
-  "#a78bfa",
-] as const;
-const NAV_ITEMS: Array<{ id: ViewId; icon: string; label: string }> = [
-  { id: "discovery", icon: "⌂", label: "探索" },
-  { id: "library", icon: "♫", label: "曲库" },
-  { id: "history", icon: "◷", label: "播放历史" },
-  { id: "favorites", icon: "♥", label: "收藏" },
-  { id: "sources", icon: "◈", label: "音源管理" },
-  { id: "settings", icon: "⚙", label: "设置与备份" },
+const NAV_DISCOVERY: Array<{ id: ViewId; icon: (props: IconProps) => ReactNode; label: string }> = [
+  { id: "discovery", icon: IconDiscovery, label: "探索" },
+];
+
+const NAV_LIBRARY: Array<{ id: ViewId; icon: (props: IconProps) => ReactNode; label: string }> = [
+  { id: "library", icon: IconLibrary, label: "曲库" },
+  { id: "history", icon: IconHistory, label: "播放历史" },
+  { id: "favorites", icon: IconFavorites, label: "收藏" },
+];
+
+const NAV_SYSTEM: Array<{ id: ViewId; icon: (props: IconProps) => ReactNode; label: string }> = [
+  { id: "sources", icon: IconSources, label: "音源管理" },
+  { id: "settings", icon: IconSettings, label: "设置与备份" },
 ];
 
 function initialView(): ViewId {
@@ -398,6 +431,22 @@ function isSuspiciousQuality(quality: string | null, snapshot: EngineSnapshot): 
 function initials(title: string): string {
   return [...(title.trim() || "GX")].slice(0, 2).join("").toUpperCase();
 }
+
+/** Premium rose — clean on dark glass; used when there is no artwork. */
+const FALLBACK_ACCENT = "#e85a71";
+/** Curated accents only — never raw hash hues that land on muddy yellow-green. */
+const PREMIUM_PALETTE = [
+  "#e85a71",
+  "#7b8cff",
+  "#5ec8c8",
+  "#c77dff",
+  "#ff8e6e",
+  "#6ec8ff",
+  "#f0a0c0",
+  "#8ad4a0",
+  "#d4a06a",
+  "#a78bfa",
+] as const;
 
 function hashString(key: string): number {
   let hash = 0;
@@ -786,6 +835,10 @@ function App() {
   const [chartRegions, setChartRegions] = useState<string[]>([]);
   /** Region the current chartTracks came from, so a region change forces a refetch. */
   const loadedChartRegionRef = useRef<string | null>(null);
+  // Render state is stale inside rapid consecutive calls; the refs serialize
+  // in-flight fetches and let superseded responses drop instead of clobbering.
+  const chartLoadingRef = useRef(false);
+  const chartGenerationRef = useRef(0);
   // Preferences arrive asynchronously; fall back to the same defaults Rust uses.
   const chartRegion = appPreferences?.chartRegion ?? DEFAULT_CHART_REGION;
   const chartAutoLoad = appPreferences?.chartAutoLoad ?? true;
@@ -803,6 +856,19 @@ function App() {
   const [nowPlayingLayout, setNowPlayingLayout] = useState<NowPlayingLayout>(() =>
     window.localStorage.getItem("gxplayer.nowPlayingLayout") === "immersive" ? "immersive" : "lyrics",
   );
+  const [nowPlayingDspOpen, setNowPlayingDspOpen] = useState(false);
+  const dspPopoverRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!nowPlayingDspOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (dspPopoverRef.current && !dspPopoverRef.current.contains(event.target as Node)) {
+        setNowPlayingDspOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => window.removeEventListener("pointerdown", onPointerDown);
+  }, [nowPlayingDspOpen]);
 
   /** Logical playlist (local paths + online CatalogTrack metadata). Online never pre-resolved. */
   const [playlist, setPlaylist] = useState<PlaylistEntry[]>(restoredPlaylistSession.playlist);
@@ -826,6 +892,9 @@ function App() {
   const selectedCatalogTrackRef = useRef(selectedCatalogTrack);
   const currentQualityRef = useRef(currentQuality);
   const mediaActionHandlerRef = useRef<(action: TransportAction) => void>(() => undefined);
+  // Latest-value ref: the drag-drop listener lives in a mount-only effect, so it
+  // must dispatch through the current render's import closures, not stale ones.
+  const dragDropImportRef = useRef<(paths: string[]) => void>(() => undefined);
   const transportCapabilitiesRef = useRef({ signature: "", revision: 0 });
   const localQueueAvailabilityGenerationRef = useRef(0);
   playlistRef.current = playlist;
@@ -921,22 +990,30 @@ function App() {
 
   const loadChart = async (options?: { region?: string; force?: boolean }) => {
     const region = options?.region ?? chartRegion;
-    if (chartLoading) return;
+    if (chartLoadingRef.current) return;
     // A region switch has to refetch; otherwise an already-populated chart is kept.
     if (!options?.force && chartTracks.length > 0 && region === loadedChartRegionRef.current) {
       return;
     }
+    chartLoadingRef.current = true;
+    const generation = ++chartGenerationRef.current;
     setChartLoading(true);
     try {
       const tracks = await invoke<CatalogTrack[]>("metadata_chart", { limit: 12, region });
+      if (generation !== chartGenerationRef.current) return;
+      if (!Array.isArray(tracks)) throw new Error("榜单返回了无效数据");
       loadedChartRegionRef.current = region;
       setChartTracks(tracks);
     } catch (error) {
+      if (generation !== chartGenerationRef.current) return;
       setChartTracks([]);
       loadedChartRegionRef.current = null;
       setMessage(`在线榜单暂时不可用：${String(error)}`, true);
     } finally {
-      setChartLoading(false);
+      if (generation === chartGenerationRef.current) {
+        chartLoadingRef.current = false;
+        setChartLoading(false);
+      }
     }
   };
 
@@ -1190,20 +1267,7 @@ function App() {
   useEffect(() => {
     const unlisten = listen<{ paths: string[] }>("tauri://drag-drop", (event) => {
       const paths = event.payload?.paths ?? [];
-      if (!paths.length) return;
-      const folders = paths.filter((path) => !/\.(?:mp3|flac|wav|m4a|aac|ogg|oga)$/i.test(path));
-      const files = paths.filter((path) => /\.(?:mp3|flac|wav|m4a|aac|ogg|oga)$/i.test(path));
-      if (folders.length) void importFolders(folders);
-      if (files.length) {
-        setLibraryImportBusy("files");
-        void invoke<LibraryImportResult>("library_import_files", { paths: files })
-          .then(async (result) => {
-            await refreshLibrary(true);
-            setMessage(`拖放导入 ${result.imported.length} 首${result.failures.length ? `，${result.failures.length} 首失败` : ""}`);
-          })
-          .catch((error) => setMessage(`拖放导入失败：${String(error)}`, true))
-          .finally(() => setLibraryImportBusy(null));
-      }
+      if (paths.length) dragDropImportRef.current(paths);
     });
     return () => { void unlisten.then((stop) => stop()); };
   }, []);
@@ -1541,6 +1605,12 @@ function App() {
     (volume) => invoke<AppPreferences>("player_commit_volume", { volume }).then(setAppPreferences),
     (error) => setMessage(String(error), true),
   );
+  const lastNonZeroVolumeRef = useRef(0.7);
+  useEffect(() => {
+    if (shownVolume > 0.02) {
+      lastNonZeroVolumeRef.current = shownVolume;
+    }
+  }, [shownVolume]);
   const measuredSourceSpec = formatSourceSpec(snapshot);
   const suspiciousQuality = isSuspiciousQuality(currentQuality, snapshot);
   const selectedOnlineFavorite = selectedCatalogTrack
@@ -2133,6 +2203,22 @@ function App() {
       setMessage(`文件夹导入失败：${String(error)}`, true);
     } finally {
       setLibraryImportBusy(null);
+    }
+  };
+
+  dragDropImportRef.current = (paths: string[]) => {
+    const folders = paths.filter((path) => !/\.(?:mp3|flac|wav|m4a|aac|ogg|oga)$/i.test(path));
+    const files = paths.filter((path) => /\.(?:mp3|flac|wav|m4a|aac|ogg|oga)$/i.test(path));
+    if (folders.length) void importFolders(folders);
+    if (files.length) {
+      setLibraryImportBusy("files");
+      void invoke<LibraryImportResult>("library_import_files", { paths: files })
+        .then(async (result) => {
+          await refreshLibrary(true);
+          setMessage(`拖放导入 ${result.imported.length} 首${result.failures.length ? `，${result.failures.length} 首失败` : ""}`);
+        })
+        .catch((error) => setMessage(`拖放导入失败：${String(error)}`, true))
+        .finally(() => setLibraryImportBusy(null));
     }
   };
 
@@ -3690,9 +3776,24 @@ function App() {
 
   const displayPlaylist = playlist;
   const displayIndex = playlistIndex;
+  const playlistKeys = useMemo(() => playlistEntryKeys(displayPlaylist), [displayPlaylist]);
   const upNext = displayPlaylist.length && displayIndex !== null
     ? displayPlaylist.slice(displayIndex + 1, displayIndex + 6)
     : [];
+  // The snapshot push re-renders the whole app every 250 ms while playing; the
+  // closed panel must not keep re-mapping thousands of rows each time.
+  const queueRows = useMemo(() => (
+    queuePanelOpen
+      ? displayPlaylist.map((entry, index) => ({
+          key: playlistKeys[index],
+          title: entryTitle(entry),
+          subtitle: `${entryArtist(entry)} · ${entrySourceLabel(entry)}${entry.kind === "online" && index !== displayIndex ? " · 待解析" : ""}${entry.kind === "local" && localQueueAvailability.unavailablePaths.has(entry.path) ? " · 暂不可用" : ""}`,
+          active: index === displayIndex,
+          unavailable: entry.kind === "local" && localQueueAvailability.unavailablePaths.has(entry.path),
+          relinking: index === relinkingQueueIndex,
+        }))
+      : []
+  ), [queuePanelOpen, displayPlaylist, playlistKeys, displayIndex, localQueueAvailability, relinkingQueueIndex]);
 
   const updateLyricOffset = (next: number) => {
     const clamped = Math.max(-5_000, Math.min(5_000, next));
@@ -4196,6 +4297,10 @@ function App() {
                 <button type="button" className="danger" disabled={Boolean(diagnosticLogBusy) || diagnosticLogEntries.length === 0} onClick={() => void clearDiagnosticLog()}>{diagnosticLogBusy === "clear" ? "正在清空…" : "清空"}</button>
               </div>
             </div>
+            <div className="engine-health-diagnostic">
+              <span className={`engine-health-dot ${snapshot.status === "failed" ? "bad" : "ok"}`} />
+              <span><strong>Rust Audio Engine：</strong>{snapshot.status === "failed" ? "引擎异常（需要处理）" : "运行正常"} · {snapshot.underrunCallbacks} 次缓冲区欠载 (underrun)</span>
+            </div>
             <label className="settings-toggle diagnostic-log-toggle">
               <span>
                 <strong>{diagnosticLogStatus ? (diagnosticLogStatus.enabled ? "日志已开启" : "日志已关闭") : "正在读取日志状态"}</strong>
@@ -4239,7 +4344,7 @@ function App() {
               <button type="button" disabled={Boolean(backupRestoreBusy)} onClick={() => void exportBackupFile()}>存为文件…</button>
               <button type="button" disabled={Boolean(backupRestoreBusy)} onClick={() => void importBackupFile()}>从文件读入…</button>
               {backupRestorePreview ? (
-                <button type="button" className="primary" disabled={Boolean(backupRestoreBusy)} onClick={() => void restoreBackup()}>
+                <button type="button" className="primary" disabled={Boolean(backupRestoreBusy)} onClick={() => restoreBackup().catch((error) => setMessage(String(error), true))}>
                   {backupRestoreBusy === "restore" ? "正在恢复…" : "确认覆盖并恢复"}
                 </button>
               ) : (
@@ -4272,18 +4377,42 @@ function App() {
 
     return (
       <div className={`page now-playing-page layout-${nowPlayingLayout}`}>
-        <div className="now-playing-layout-switch" role="tablist" aria-label="播放页布局">
-          <button type="button" role="tab" aria-selected={nowPlayingLayout === "lyrics"} className={nowPlayingLayout === "lyrics" ? "active" : ""} onClick={() => changeNowPlayingLayout("lyrics")}>歌词优先</button>
-          <button type="button" role="tab" aria-selected={nowPlayingLayout === "immersive"} className={nowPlayingLayout === "immersive" ? "active" : ""} onClick={() => changeNowPlayingLayout("immersive")}>沉浸模式</button>
-        </div>
-        <div className="now-playing-dsp-strip panel-enter">
-          <DspPresetControls
-            value={dspControl}
-            onChange={applyDspControl}
-            onAbDryChange={setAbDry}
-            compact
-            showSystemEffectsHint={false}
-          />
+        <div className="now-playing-header">
+          <div className="now-playing-layout-switch" role="tablist" aria-label="播放页布局">
+            <button type="button" role="tab" aria-selected={nowPlayingLayout === "lyrics"} className={nowPlayingLayout === "lyrics" ? "active" : ""} onClick={() => changeNowPlayingLayout("lyrics")}>歌词优先</button>
+            <button type="button" role="tab" aria-selected={nowPlayingLayout === "immersive"} className={nowPlayingLayout === "immersive" ? "active" : ""} onClick={() => changeNowPlayingLayout("immersive")}>沉浸声场</button>
+          </div>
+          <div className="now-playing-dsp-anchor" ref={dspPopoverRef}>
+            <button
+              type="button"
+              className={`now-playing-dsp-pill ${nowPlayingDspOpen ? "active" : ""} ${snapshot.activePresetId !== "bypass" ? "has-preset" : ""}`}
+              onClick={() => setNowPlayingDspOpen((open) => !open)}
+              aria-expanded={nowPlayingDspOpen}
+              title="调节音效预设与空间渲染"
+            >
+              <span className="dsp-pill-dot" aria-hidden="true" />
+              <span className="dsp-pill-label">音效：{activeDspPreset.label}</span>
+              <span className="dsp-pill-arrow" aria-hidden="true">{nowPlayingDspOpen ? "▴" : "▾"}</span>
+            </button>
+            {nowPlayingDspOpen && (
+              <div className="now-playing-dsp-popover panel-enter" role="dialog" aria-label="音效预设控制">
+                <div className="now-playing-dsp-popover-header">
+                  <div>
+                    <strong>音效与空间渲染</strong>
+                    <small>硬件级零延迟 DSP 链与个性化频响均衡</small>
+                  </div>
+                  <button type="button" className="close-btn" onClick={() => setNowPlayingDspOpen(false)} aria-label="关闭">×</button>
+                </div>
+                <DspPresetControls
+                  value={dspControl}
+                  onChange={applyDspControl}
+                  onAbDryChange={setAbDry}
+                  compact
+                  showSystemEffectsHint={false}
+                />
+              </div>
+            )}
+          </div>
         </div>
         <div className="now-grid">
           <section className={`record-column ${animatePlayback ? "is-playing" : ""}`}>
@@ -4293,22 +4422,28 @@ function App() {
                 <Cover artwork={currentArtwork} title={currentTitle} className="record-cover" eager />
                 <span className="record-hole" />
               </div>
-              <div className={`eq-bars ${animatePlayback ? "active" : ""}`} aria-hidden="true">
-                <i /><i /><i /><i /><i />
-              </div>
             </div>
-            <p className="eyebrow">NOW PLAYING</p>
-            <h1 className={animatePlayback ? "title-live" : ""}>{currentTitle}</h1>
-            {displayedCatalogTrack?.artist ? (
-              <ArtistLinks artist={displayedCatalogTrack.artist} onSelect={openArtistPage} className="artist-line artist-line-links" />
-            ) : <p className="artist-line">{currentArtist}</p>}
-            {measuredSourceSpec && (
-              <p className={`source-spec ${suspiciousQuality ? "suspicious" : ""}`}>
-                {currentQuality && currentQueueItem?.online ? <><span>{currentQuality}（自报）</span><b>·</b></> : null}
-                <span>实测 {measuredSourceSpec}</span>
-                {suspiciousQuality && <em title="自报高解析音质与解码规格不一致">⚠ 疑似虚标</em>}
-              </p>
-            )}
+            <div className="record-meta">
+              <p className="eyebrow">NOW PLAYING</p>
+              <h1 className={animatePlayback ? "title-live" : ""}>{currentTitle}</h1>
+              {displayedCatalogTrack?.artist ? (
+                <ArtistLinks artist={displayedCatalogTrack.artist} onSelect={openArtistPage} className="artist-line artist-line-links" />
+              ) : <p className="artist-line">{currentArtist}</p>}
+              {measuredSourceSpec && (
+                <div className={`source-spec-wrap ${suspiciousQuality ? "suspicious" : ""}`}>
+                  {animatePlayback && (
+                    <div className="eq-bars active" aria-hidden="true">
+                      <i /><i /><i /><i />
+                    </div>
+                  )}
+                  <p className="source-spec">
+                    {currentQuality && currentQueueItem?.online ? <><span>{currentQuality}（自报）</span><b>·</b></> : null}
+                    <span>实测 {measuredSourceSpec}</span>
+                    {suspiciousQuality && <em title="自报高解析音质与解码规格不一致">⚠ 疑似虚标</em>}
+                  </p>
+                </div>
+              )}
+            </div>
           </section>
           {nowPlayingLayout === "lyrics" ? lyricsPanel : <section className="stage-panel">
             <div className={`sound-stage ${snapshot.activePresetId === "bypass" ? "bypassed" : "enabled"} ${animatePlayback ? "is-playing" : ""}`} aria-label={`当前音效预设：${activeDspPreset.label}`}>
@@ -4317,9 +4452,18 @@ function App() {
               <div className="orbit orbit-one" />
               <div className="orbit orbit-two" />
               <div className="stage-ring stage-ring-core" aria-hidden="true" />
-              <span className="listener">你</span>
-              <i className="stage-speaker front-left"><b>FL</b></i>
-              <i className="stage-speaker front-right"><b>FR</b></i>
+              <div className="listener-core" aria-label="听者中心">
+                <span className="listener-pulse" />
+                <span className="listener-dot" />
+              </div>
+              <div className="stage-speaker front-left" aria-label="左声道">
+                <span className="speaker-wave" />
+                <b>L</b>
+              </div>
+              <div className="stage-speaker front-right" aria-label="右声道">
+                <span className="speaker-wave" />
+                <b>R</b>
+              </div>
               <span className="stage-mode-chip">{activeDspPreset.label}</span>
             </div>
             <div className="mode-copy">
@@ -4343,7 +4487,7 @@ function App() {
               {upNext.map((entry, offset) => {
                 const absolute = (displayIndex ?? 0) + 1 + offset;
                 return (
-                  <li key={entryKey(entry, absolute)}>
+                  <li key={playlistKeys[absolute]}>
                     <button type="button" onClick={() => void jumpToPlaylistIndex(absolute)}>
                       <span>{String(absolute + 1).padStart(2, "0")}</span>
                       <strong>{entryTitle(entry)}</strong>
@@ -4383,13 +4527,13 @@ function App() {
             aria-label={narrowLayout
               ? sidebarDrawerOpen ? "关闭导航抽屉" : "打开导航抽屉"
               : sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
-          >☰</button>
+          ><IconMenu size={16} /></button>
           <button className="logo" onClick={() => navigateTo("discovery")} aria-label="返回探索页"><img src={gxplayerIcon} alt="" /></button>
-          <button className="history-back" onClick={navigateBack} disabled={!viewHistory.length} aria-label="返回上一页" title="返回上一页">‹</button>
+          <button className="history-back" onClick={navigateBack} disabled={!viewHistory.length} aria-label="返回上一页" title="返回上一页"><IconBack size={15} /></button>
           <button className="mini-mode-exit" type="button" onClick={() => void toggleMiniMode()}>退出迷你</button>
         </div>
         <div className="global-search" ref={searchShellRef}>
-          <span aria-hidden="true">⌕</span>
+          <IconSearch size={15} className="search-icon" aria-hidden="true" />
           <input
             ref={searchInputRef}
             role="combobox"
@@ -4535,7 +4679,7 @@ function App() {
               title="切换皮肤"
               onClick={() => setThemePickerOpen((open) => !open)}
             >
-              <span aria-hidden="true">◐</span>
+              <IconTheme size={15} aria-hidden="true" />
               <span className="theme-trigger-label">换肤</span>
             </button>
             {themePickerOpen && (
@@ -4564,7 +4708,17 @@ function App() {
             )}
           </div>
         </div>
-        <div className="window-controls"><button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">─</button><button className="maximize-control" onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">□</button><button className="close" onClick={() => void getCurrentWindow().close()} aria-label={appPreferences?.closeBehavior === "exit" ? "退出应用" : "隐藏到系统托盘"} title={appPreferences?.closeBehavior === "exit" ? "退出应用" : "隐藏到系统托盘"}>×</button></div>
+        <div className="window-controls">
+          <button onClick={() => void getCurrentWindow().minimize()} aria-label="最小化">
+            <IconWindowMinimize />
+          </button>
+          <button className="maximize-control" onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="最大化">
+            {isMaximized ? <IconWindowRestore /> : <IconWindowMaximize />}
+          </button>
+          <button className="close" onClick={() => void getCurrentWindow().close()} aria-label={appPreferences?.closeBehavior === "exit" ? "退出应用" : "隐藏到系统托盘"} title={appPreferences?.closeBehavior === "exit" ? "退出应用" : "隐藏到系统托盘"}>
+            <IconWindowClose />
+          </button>
+        </div>
       </header>
 
       {browserMock && <div className="browser-mock-banner" role="status">浏览器演示模式 · 使用 Mock 数据，播放与文件选择请在 Tauri 桌面端验证</div>}
@@ -4588,9 +4742,68 @@ function App() {
           className={`sidebar ${narrowLayout ? "sidebar-drawer" : ""}`}
           aria-label="主导航"
         >
-          <nav>{NAV_ITEMS.map((item) => <button className={view === item.id ? "active" : ""} onClick={() => navigateTo(item.id)} key={item.id} title={item.label} data-tooltip={item.label}><span>{item.icon}</span><strong>{item.label}</strong></button>)}</nav>
-          <div className="sidebar-playlists"><p><span>创建的歌单</span><small>{playlists.length}</small></p>{playlists.slice(0, 8).map((playlist) => <button key={playlist.id} className={activePlaylist?.id === playlist.id && view === "playlist" ? "active" : ""} onClick={() => void openPlaylist(playlist)} title={playlist.name} data-tooltip={playlist.name}><span>♬</span><strong>{playlist.name}</strong></button>)}</div>
-          <div className="engine-health"><i className={snapshot.status === "failed" ? "bad" : ""} /><span><strong>Rust Engine</strong><small>{snapshot.status === "failed" ? "需要处理" : `${snapshot.underrunCallbacks} underrun`}</small></span></div>
+          <nav>
+            <div className="sidebar-group">
+              <span className="sidebar-group-title">发现</span>
+              {NAV_DISCOVERY.map((item) => (
+                <button
+                  className={view === item.id ? "active" : ""}
+                  onClick={() => navigateTo(item.id)}
+                  key={item.id}
+                  title={item.label}
+                  data-tooltip={item.label}
+                >
+                  <span><item.icon size={17} /></span>
+                  <strong>{item.label}</strong>
+                </button>
+              ))}
+            </div>
+            <div className="sidebar-group">
+              <span className="sidebar-group-title">我的音乐</span>
+              {NAV_LIBRARY.map((item) => (
+                <button
+                  className={view === item.id ? "active" : ""}
+                  onClick={() => navigateTo(item.id)}
+                  key={item.id}
+                  title={item.label}
+                  data-tooltip={item.label}
+                >
+                  <span><item.icon size={17} /></span>
+                  <strong>{item.label}</strong>
+                </button>
+              ))}
+            </div>
+            <div className="sidebar-group">
+              <span className="sidebar-group-title">管理</span>
+              {NAV_SYSTEM.map((item) => (
+                <button
+                  className={view === item.id ? "active" : ""}
+                  onClick={() => navigateTo(item.id)}
+                  key={item.id}
+                  title={item.label}
+                  data-tooltip={item.label}
+                >
+                  <span><item.icon size={17} /></span>
+                  <strong>{item.label}</strong>
+                </button>
+              ))}
+            </div>
+          </nav>
+          <div className="sidebar-playlists">
+            <p><span>创建的歌单</span><small>{playlists.length}</small></p>
+            {playlists.slice(0, 8).map((playlist) => (
+              <button
+                key={playlist.id}
+                className={activePlaylist?.id === playlist.id && view === "playlist" ? "active" : ""}
+                onClick={() => void openPlaylist(playlist)}
+                title={playlist.name}
+                data-tooltip={playlist.name}
+              >
+                <span><IconLibrary size={15} /></span>
+                <strong>{playlist.name}</strong>
+              </button>
+            ))}
+          </div>
         </aside>
       )}
 
@@ -4726,16 +4939,24 @@ function App() {
               aria-label={PLAY_MODE_META[snapshot.playMode ?? "sequential"].label}
               title={PLAY_MODE_META[snapshot.playMode ?? "sequential"].label}
             >
-              <span className={`glyph-mode glyph-mode-${PLAY_MODE_META[snapshot.playMode ?? "sequential"].glyph}`} aria-hidden="true" />
+              {snapshot.playMode === "shuffle" ? (
+                <IconModeShuf size={16} />
+              ) : snapshot.playMode === "repeat_one" ? (
+                <IconModeOne size={16} />
+              ) : snapshot.playMode === "repeat_all" ? (
+                <IconModeAll size={16} />
+              ) : (
+                <IconModeSeq size={16} />
+              )}
             </button>
-            <button type="button" className="transport-btn" onClick={() => void handleTransportPrevious()} aria-label="上一首">
-              <span className="glyph-prev" aria-hidden="true" />
+            <button type="button" className="transport-btn" onClick={() => void handleTransportPrevious()} aria-label="上一首" title="上一首">
+              <IconPrev size={16} />
             </button>
             <button type="button" className="play-button" onClick={() => void handlePlayPause()} disabled={!currentQueueItem && !displayPlaylist.length} aria-label={isPlaying ? "暂停" : "播放"}>
-              <span className={isPlaying ? "glyph-pause" : "glyph-play"} aria-hidden="true" />
+              {isPlaying ? <IconPause size={17} /> : <IconPlay size={17} style={{ marginLeft: "2px" }} />}
             </button>
-            <button type="button" className="transport-btn" onClick={() => void handleTransportNext()} aria-label="下一首">
-              <span className="glyph-next" aria-hidden="true" />
+            <button type="button" className="transport-btn" onClick={() => void handleTransportNext()} aria-label="下一首" title="下一首">
+              <IconNext size={16} />
             </button>
           </div>
           <div className="timeline player-time-row">
@@ -4745,7 +4966,11 @@ function App() {
           </div>
         </div>
         <div className="player-tools">
-          {selectedCatalogTrack && currentQueueItem?.online && <button className={`online-favorite ${selectedOnlineFavorite ? "active" : ""}`} onClick={() => void toggleOnlineFavorite(selectedCatalogTrack)} aria-label={selectedOnlineFavorite ? "取消在线收藏" : "收藏在线歌曲"} title={selectedOnlineFavorite ? "取消收藏" : "收藏并钉住缓存"}>{selectedOnlineFavorite ? "♥" : "♡"}</button>}
+          {selectedCatalogTrack && currentQueueItem?.online && (
+            <button className={`online-favorite ${selectedOnlineFavorite ? "active" : ""}`} onClick={() => void toggleOnlineFavorite(selectedCatalogTrack)} aria-label={selectedOnlineFavorite ? "取消在线收藏" : "收藏在线歌曲"} title={selectedOnlineFavorite ? "取消收藏" : "收藏并钉住缓存"}>
+              <IconFavorites size={16} filled={Boolean(selectedOnlineFavorite)} />
+            </button>
+          )}
           <span
             className={`measured-quality ${suspiciousQuality ? "suspicious" : ""} ${measuredSourceSpec ? "" : "is-placeholder"}`}
             role={measuredSourceSpec ? "img" : undefined}
@@ -4758,7 +4983,22 @@ function App() {
           </span>
           {selectedCatalogTrack && currentQueueItem?.online && <select className="quality-select" aria-label="音源自报音质" title={`音源自报档位：${currentQuality ?? "自动"}`} value={QUALITY_OPTIONS.some((option) => option.value === currentQuality) ? currentQuality ?? "auto" : "auto"} disabled={qualitySwitching || Boolean(resolveBanner)} onChange={(event) => void switchOnlineQuality(event.target.value as QualityPreference)}>{QUALITY_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.value === "auto" ? `自动${currentQuality ? ` · ${currentQuality}` : ""}` : option.label}</option>)}</select>}
           <div className="volume-cluster">
-            <span className="volume-icon" aria-hidden="true" />
+            <button
+              type="button"
+              className="volume-mute-btn"
+              aria-label={shownVolume > 0.001 ? "静音" : "取消静音"}
+              title={shownVolume > 0.001 ? "点击静音" : "点击恢复音量"}
+              onClick={() => {
+                if (shownVolume > 0.001) {
+                  lastNonZeroVolumeRef.current = shownVolume;
+                  commitVolume(0);
+                } else {
+                  commitVolume(lastNonZeroVolumeRef.current || 0.7);
+                }
+              }}
+            >
+              <IconVolume size={16} volume={shownVolume} />
+            </button>
             <input
               aria-label="音量"
               type="range"
@@ -4803,14 +5043,10 @@ function App() {
             aria-label="播放队列"
             title={`播放队列${displayPlaylist.length ? ` · ${displayPlaylist.length}` : ""}`}
           >
-            <span className="glyph-queue" aria-hidden="true" />
+            <IconQueue size={16} />
           </button>
           <button type="button" className="tool-btn more-btn" onClick={() => navigateTo("settings")} aria-label="更多设置" title="设置与备份">
-            <span className="more-dots" aria-hidden="true">
-              <i />
-              <i />
-              <i />
-            </span>
+            <IconSettings size={16} />
           </button>
         </div>
       </footer>
@@ -4819,14 +5055,7 @@ function App() {
         open={queuePanelOpen}
         playMode={snapshot.playMode ?? "sequential"}
         availabilityStatus={localQueueAvailability.status}
-        rows={displayPlaylist.map((entry, index) => ({
-          key: entryKey(entry, index),
-          title: entryTitle(entry),
-          subtitle: `${entryArtist(entry)} · ${entrySourceLabel(entry)}${entry.kind === "online" && index !== displayIndex ? " · 待解析" : ""}${entry.kind === "local" && localQueueAvailability.unavailablePaths.has(entry.path) ? " · 暂不可用" : ""}`,
-          active: index === displayIndex,
-          unavailable: entry.kind === "local" && localQueueAvailability.unavailablePaths.has(entry.path),
-          relinking: index === relinkingQueueIndex,
-        }))}
+        rows={queueRows}
         onClose={() => setQueuePanelOpen(false)}
         onClear={() => void clearPlaylist()}
         onJump={(index) => void jumpToPlaylistIndex(index)}

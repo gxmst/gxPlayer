@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 .phase1-cache/
+/cache/
 /js/
 /icon/
 

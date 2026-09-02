@@ -19,15 +19,21 @@ export function useEngineSnapshot(
   useEffect(() => {
     let disposed = false;
     const lastPushAt = { value: 0 };
+    // Start time of the most recent poll whose response was applied. A poll that
+    // started earlier must not apply after a later poll already did, or a hung
+    // request would overwrite fresher data with stale state.
+    const lastAppliedPollAt = { value: 0 };
     const update = async () => {
       const startedAt = performance.now();
       try {
         const next = await invoke<EngineSnapshot>("player_snapshot");
+        if (disposed) return;
+        if (lastAppliedPollAt.value > startedAt) return;
         if (
-          !disposed
-          && lastPushAt.value <= startedAt
+          lastPushAt.value <= startedAt
           && performance.now() - lastPushAt.value >= 500
         ) {
+          lastAppliedPollAt.value = startedAt;
           setSnapshot((current) => (mergeRef.current ? mergeRef.current(next, current) : next));
         }
       } catch (error) {

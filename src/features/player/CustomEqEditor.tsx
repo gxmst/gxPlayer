@@ -144,28 +144,31 @@ export function CustomEqEditor({
         </div>
       </div>
 
-      <div className="custom-eq-bands">
-        {DSP_EQ_FREQUENCIES.map((frequency, index) => (
-          <label className="custom-eq-band" key={frequency}>
-            <input
-              type="range"
-              className="custom-eq-range"
-              min={-DSP_EQ_MAX_GAIN_DB}
-              max={DSP_EQ_MAX_GAIN_DB}
-              step={GAIN_STEP}
-              value={draftGains[index]}
-              disabled={disabled}
-              aria-label={`${formatFrequency(frequency)} Hz`}
-              aria-valuetext={`${formatGain(draftGains[index])} dB`}
-              onChange={updateBand(index)}
-              onPointerUp={commit}
-              onKeyUp={commit}
-              onBlur={commit}
-            />
-            <span className="custom-eq-band-gain">{formatGain(draftGains[index])}</span>
-            <span className="custom-eq-band-frequency">{formatFrequency(frequency)}</span>
-          </label>
-        ))}
+      <div className="custom-eq-bands-wrapper">
+        <div className="custom-eq-bands">
+          {DSP_EQ_FREQUENCIES.map((frequency, index) => (
+            <label className="custom-eq-band" key={frequency}>
+              <input
+                type="range"
+                className="custom-eq-range"
+                min={-DSP_EQ_MAX_GAIN_DB}
+                max={DSP_EQ_MAX_GAIN_DB}
+                step={GAIN_STEP}
+                value={draftGains[index]}
+                disabled={disabled}
+                aria-label={`${formatFrequency(frequency)} Hz`}
+                aria-valuetext={`${formatGain(draftGains[index])} dB`}
+                onChange={updateBand(index)}
+                onPointerUp={commit}
+                onKeyUp={commit}
+                onBlur={commit}
+              />
+              <span className="custom-eq-band-gain">{formatGain(draftGains[index])}</span>
+              <span className="custom-eq-band-frequency">{formatFrequency(frequency)}</span>
+            </label>
+          ))}
+        </div>
+        <div className="custom-eq-scale-spacer" aria-hidden="true" />
       </div>
 
       <div className="custom-eq-actions">

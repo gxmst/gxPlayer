@@ -29,6 +29,7 @@ import { splitArtistNames } from "./lib/artistNames";
 import { diagnosticEntryDisplay } from "./lib/diagnosticDisplay";
 import { createApplicationBackup } from "./lib/backupRestore";
 import { getDspPreset } from "./lib/dspPresets";
+import { buildM3u8 } from "./lib/playlistFormats";
 import { groupConsecutiveHistory } from "./lib/historyGrouping";
 import {
   engineMatchesLocalQueue,
@@ -65,8 +66,11 @@ import {
 } from "./lib/transport";
 import {
   type CacheEntryView,
+  type CacheExportOutcome,
+  type CacheExportProgress,
   type CacheStatus,
   type CatalogTrack,
+  type CustomEqPreset,
   type DiagnosticLogEntry,
   type DiagnosticLogExportResult,
   type DiagnosticLogStatus,
@@ -81,12 +85,45 @@ import {
   type OnlinePlaybackResult,
   type PlayMode,
   type PlaylistSummary,
+  type QualityReportReady,
   type ResolveAttemptDiagnostic,
   type RuntimeStatus,
+  type SourcePlaylist,
   type ViewId,
 } from "./types";
 
 type CloseBehavior = "hide_to_tray" | "exit";
+
+/** Mirrors DEFAULT_CHART_REGION in gx-metadata. */
+const DEFAULT_CHART_REGION = "cn";
+
+/** Keep a user-chosen playlist name usable as a default file name. */
+function safeFileStem(name: string): string {
+  const cleaned = name.replace(/[\\/:*?"<>|\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+  return cleaned.slice(0, 80) || "playlist";
+}
+
+/** Readable names for the chart storefronts. Unknown codes show as-is. */
+const CHART_REGION_LABELS: Record<string, string> = {
+  cn: "中国",
+  hk: "香港",
+  tw: "台湾",
+  jp: "日本",
+  kr: "韩国",
+  us: "美国",
+  gb: "英国",
+  de: "德国",
+  fr: "法国",
+  sg: "新加坡",
+  my: "马来西亚",
+  au: "澳大利亚",
+  ca: "加拿大",
+};
+
+function chartRegionLabel(region: string): string {
+  return CHART_REGION_LABELS[region] ?? region.toUpperCase();
+}
+
 type AppPreferences = {
   version: number;
   closeBehavior: CloseBehavior;
@@ -94,6 +131,9 @@ type AppPreferences = {
   volume: number;
   outputDevice: string | null;
   dspControl: DspControlState;
+  customEqPresets: CustomEqPreset[];
+  chartRegion: string;
+  chartAutoLoad: boolean;
 };
 type OutputDeviceStatus = {
   devices: string[];
@@ -589,7 +629,20 @@ function App() {
   const [snapshot, setSnapshot] = useEngineSnapshot((error) => {
     setMessageState(String(error));
     setMessageIsError(true);
-  });
+  }, (incoming, current) => (
+    // While a DSP change is still in flight, a snapshot generated before it landed
+    // would briefly revert the optimistic preset/intensity fields.
+    pendingDspControlRef.current || dspApplyRunningRef.current
+      ? {
+        ...incoming,
+        audioMode: current.audioMode,
+        dspSettings: current.dspSettings,
+        activePresetId: current.activePresetId,
+        intensity: current.intensity,
+        spatialAmount: current.spatialAmount,
+      }
+      : incoming
+  ));
   const {
     alwaysOnTop,
     miniMode,
@@ -641,14 +694,17 @@ function App() {
   const [library, setLibrary] = useState<LibraryTrack[]>([]);
   const [favorites, setFavorites] = useState<LibraryTrack[]>([]);
   const [playlists, setPlaylists] = useState<PlaylistSummary[]>([]);
+  const [libraryLoadState, setLibraryLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [activePlaylist, setActivePlaylist] = useState<PlaylistSummary | null>(null);
   const [playlistItems, setPlaylistItems] = useState<LibraryPlaylistItem[]>([]);
+  const [playlistExportBusy, setPlaylistExportBusy] = useState(false);
   const [newPlaylistName, setNewPlaylistName] = useState("");
   const [libraryImportBusy, setLibraryImportBusy] = useState<"files" | "folder" | "relink" | null>(null);
   const [advancedSettings, setAdvancedSettings] = useState(false);
 
   const [sources, setSources] = useState<ListedSource[]>([]);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [sourceLoadState, setSourceLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [draggedSource, setDraggedSource] = useState<string | null>(null);
   const [sourceOrderBusy, setSourceOrderBusy] = useState(false);
   const [sourceActionBusy, setSourceActionBusy] = useState<{ id: string; kind: "toggle" | "reimport" | "remove" } | null>(null);
@@ -658,12 +714,15 @@ function App() {
   const [sourceConfigDraft, setSourceConfigDraft] = useState<SourceConfigDraft | null>(null);
   const [sourceConfigRevealed, setSourceConfigRevealed] = useState(false);
   const [sourceConfigBusy, setSourceConfigBusy] = useState(false);
+  const [sourcePlaylistId, setSourcePlaylistId] = useState("");
+  const [sourcePlaylistBusy, setSourcePlaylistBusy] = useState(false);
   const [backupText, setBackupText] = useState("");
   const [diagnosticLogStatus, setDiagnosticLogStatus] = useState<DiagnosticLogStatus | null>(null);
   const [diagnosticLogEntries, setDiagnosticLogEntries] = useState<DiagnosticLogEntry[]>([]);
   const [diagnosticLogBusy, setDiagnosticLogBusy] = useState<"refresh" | "toggle" | "export" | "clear" | null>(null);
   const diagnosticLogGenerationRef = useRef(0);
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
+  const [cacheLoadState, setCacheLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [cacheLimitGiB, setCacheLimitGiB] = useState("5");
   const cacheLimitDirtyRef = useRef(false);
   const [onlineFavorites, setOnlineFavorites] = useState<CatalogTrack[]>([]);
@@ -674,6 +733,8 @@ function App() {
   );
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
   const [selectedCacheKeys, setSelectedCacheKeys] = useState<string[]>([]);
+  const [cacheExportBusy, setCacheExportBusy] = useState(false);
+  const [cacheExportProgress, setCacheExportProgress] = useState<CacheExportProgress | null>(null);
   const [coverCache, setCoverCache] = useState<Record<string, string>>({});
   const [resolveBanner, setResolveBanner] = useState<{ title: string; detail: string } | null>(null);
   const resolveGenerationRef = useRef(0);
@@ -722,6 +783,13 @@ function App() {
   } = useLibraryView(library, searchQuery, resultsQuery);
   const [chartTracks, setChartTracks] = useState<CatalogTrack[]>([]);
   const [chartLoading, setChartLoading] = useState(false);
+  const [chartRegions, setChartRegions] = useState<string[]>([]);
+  /** Region the current chartTracks came from, so a region change forces a refetch. */
+  const loadedChartRegionRef = useRef<string | null>(null);
+  // Preferences arrive asynchronously; fall back to the same defaults Rust uses.
+  const chartRegion = appPreferences?.chartRegion ?? DEFAULT_CHART_REGION;
+  const chartAutoLoad = appPreferences?.chartAutoLoad ?? true;
+  const chartHeadlineLabel = `${chartRegionLabel(chartRegion)}区热门`;
   const [suggestionOpen, setSuggestionOpen] = useState(false);
   const [suggestionIndex, setSuggestionIndex] = useState(-1);
   const [playingCatalogKey, setPlayingCatalogKey] = useState<string | null>(null);
@@ -755,12 +823,16 @@ function App() {
   const playlistRef = useRef(playlist);
   const playlistIndexRef = useRef(playlistIndex);
   const snapshotRef = useRef(snapshot);
+  const selectedCatalogTrackRef = useRef(selectedCatalogTrack);
+  const currentQualityRef = useRef(currentQuality);
   const mediaActionHandlerRef = useRef<(action: TransportAction) => void>(() => undefined);
   const transportCapabilitiesRef = useRef({ signature: "", revision: 0 });
   const localQueueAvailabilityGenerationRef = useRef(0);
   playlistRef.current = playlist;
   playlistIndexRef.current = playlistIndex;
   snapshotRef.current = snapshot;
+  selectedCatalogTrackRef.current = selectedCatalogTrack;
+  currentQualityRef.current = currentQuality;
   const dspControl = useMemo<DspControlState>(() => ({
     settings: snapshot.dspSettings,
     activePresetId: snapshot.activePresetId,
@@ -826,51 +898,110 @@ function App() {
   };
 
   const refreshLibrary = async (scanMissing = false): Promise<LibraryTrack[]> => {
-    const [tracks, favoriteTracks, nextPlaylists] = await Promise.all([
-      invoke<LibraryTrack[]>(scanMissing ? "library_scan_missing" : "library_tracks"),
-      invoke<LibraryTrack[]>("library_favorites"),
-      invoke<PlaylistSummary[]>("library_playlists"),
-    ]);
-    setLibrary(tracks);
-    setFavorites(favoriteTracks);
-    setPlaylists(nextPlaylists);
-    return tracks;
+    setLibraryLoadState((state) => state === "ready" ? state : "loading");
+    try {
+      const [tracks, favoriteTracks, nextPlaylists] = await Promise.all([
+        invoke<LibraryTrack[]>(scanMissing ? "library_scan_missing" : "library_tracks"),
+        invoke<LibraryTrack[]>("library_favorites"),
+        invoke<PlaylistSummary[]>("library_playlists"),
+      ]);
+      if (!Array.isArray(tracks) || !Array.isArray(favoriteTracks) || !Array.isArray(nextPlaylists)) {
+        throw new Error("曲库返回了无效数据");
+      }
+      setLibrary(tracks);
+      setFavorites(favoriteTracks);
+      setPlaylists(nextPlaylists);
+      setLibraryLoadState("ready");
+      return tracks;
+    } catch (error) {
+      setLibraryLoadState((state) => state === "ready" ? state : "error");
+      throw error;
+    }
   };
 
-  const loadChart = async () => {
-    if (chartLoading || chartTracks.length > 0) return;
+  const loadChart = async (options?: { region?: string; force?: boolean }) => {
+    const region = options?.region ?? chartRegion;
+    if (chartLoading) return;
+    // A region switch has to refetch; otherwise an already-populated chart is kept.
+    if (!options?.force && chartTracks.length > 0 && region === loadedChartRegionRef.current) {
+      return;
+    }
     setChartLoading(true);
     try {
-      setChartTracks(await invoke<CatalogTrack[]>("metadata_chart", { limit: 12 }));
+      const tracks = await invoke<CatalogTrack[]>("metadata_chart", { limit: 12, region });
+      loadedChartRegionRef.current = region;
+      setChartTracks(tracks);
     } catch (error) {
       setChartTracks([]);
+      loadedChartRegionRef.current = null;
       setMessage(`在线榜单暂时不可用：${String(error)}`, true);
     } finally {
       setChartLoading(false);
     }
   };
 
+  const changeChartRegion = (region: string) => {
+    if (region === chartRegion) return;
+    setChartTracks([]);
+    setAppPreferences((preferences) =>
+      preferences ? { ...preferences, chartRegion: region } : preferences,
+    );
+    void invoke<AppPreferences>("app_preferences_set_chart_region", { region })
+      .then(setAppPreferences)
+      .catch((error) => setMessage(`切换榜单地区失败：${String(error)}`, true));
+    void loadChart({ region, force: true });
+  };
+
+  const changeChartAutoLoad = (enabled: boolean) => {
+    setAppPreferences((preferences) =>
+      preferences ? { ...preferences, chartAutoLoad: enabled } : preferences,
+    );
+    void invoke<AppPreferences>("app_preferences_set_chart_auto_load", { enabled })
+      .then(setAppPreferences)
+      .catch((error) => setMessage(`保存榜单设置失败：${String(error)}`, true));
+  };
+
   const refreshSources = async () => {
-    const [nextSources, nextRuntime] = await Promise.all([
-      invoke<ListedSource[]>("source_list"),
-      invoke<RuntimeStatus>("source_status"),
-    ]);
-    setSources(nextSources);
-    setRuntime(nextRuntime);
+    setSourceLoadState((state) => state === "ready" ? state : "loading");
+    try {
+      const [nextSources, nextRuntime] = await Promise.all([
+        invoke<ListedSource[]>("source_list"),
+        invoke<RuntimeStatus>("source_status"),
+      ]);
+      if (!Array.isArray(nextSources) || !nextRuntime || typeof nextRuntime !== "object") {
+        throw new Error("音源返回了无效数据");
+      }
+      setSources(nextSources);
+      setRuntime(nextRuntime);
+      setSourceLoadState("ready");
+    } catch (error) {
+      setSourceLoadState((state) => state === "ready" ? state : "error");
+      throw error;
+    }
   };
 
   const refreshCache = async () => {
-    const [status, favoriteTracks, entries] = await Promise.all([
-      invoke<CacheStatus>("cache_status"),
-      invoke<CatalogTrack[]>("cache_online_favorites"),
-      invoke<CacheEntryView[]>("cache_list_entries"),
-    ]);
-    setCacheStatus(status);
-    if (!cacheLimitDirtyRef.current) {
-      setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
+    setCacheLoadState((state) => state === "ready" ? state : "loading");
+    try {
+      const [status, favoriteTracks, entries] = await Promise.all([
+        invoke<CacheStatus>("cache_status"),
+        invoke<CatalogTrack[]>("cache_online_favorites"),
+        invoke<CacheEntryView[]>("cache_list_entries"),
+      ]);
+      if (!status || typeof status !== "object" || !Array.isArray(favoriteTracks) || !Array.isArray(entries)) {
+        throw new Error("缓存与收藏返回了无效数据");
+      }
+      setCacheStatus(status);
+      if (!cacheLimitDirtyRef.current) {
+        setCacheLimitGiB((status.limitBytes / 1024 / 1024 / 1024).toFixed(2).replace(/\.00$/, ""));
+      }
+      setOnlineFavorites(favoriteTracks);
+      setCacheEntries(entries);
+      setCacheLoadState("ready");
+    } catch (error) {
+      setCacheLoadState((state) => state === "ready" ? state : "error");
+      throw error;
     }
-    setOnlineFavorites(favoriteTracks);
-    setCacheEntries(entries);
   };
 
   const refreshHistory = async () => {
@@ -981,6 +1112,22 @@ function App() {
     pushMessage("已取消解析");
   };
 
+  /**
+   * Quietly invalidate any in-flight online resolve before different playback starts.
+   * Without this, a slow resolve can finish after the user has already started a local
+   * or cached track and hijack the audio back to the online stream.
+   */
+  const supersedeActiveResolve = () => {
+    const requestId = activeResolveRequestRef.current;
+    if (!requestId) return;
+    cancelledResolveRequestsRef.current.add(requestId);
+    resolveAbortRef.current = true;
+    resolveGenerationRef.current += 1;
+    activeResolveRequestRef.current = null;
+    setResolveBanner(null);
+    void invoke("player_cancel_resolve", { requestId }).catch(() => undefined);
+  };
+
   useEffect(() => {
     let disposed = false;
     // Window size is set once in Rust (setup) before first show — do not resize here
@@ -992,6 +1139,13 @@ function App() {
     void invoke<AppPreferences>("app_preferences_get")
       .then(setAppPreferences)
       .catch((error) => setMessage(String(error), true));
+    // Region list is static in Rust; a failure just leaves the picker on the saved region.
+    void invoke<string[]>("metadata_chart_regions")
+      .then((regions) => {
+        // A malformed response must not empty the picker or crash the render.
+        if (!disposed && Array.isArray(regions)) setChartRegions(regions);
+      })
+      .catch((error) => console.warn("[GXPlayer] chart regions unavailable", error));
 
     void refreshLibrary(true).catch((error) => {
       console.warn("[GXPlayer] initial library scan failed", error);
@@ -1114,10 +1268,43 @@ function App() {
       setOutputDeviceStatus((status) => status ? { ...status, selectedDevice: null } : status);
       setAppPreferences((preferences) => preferences ? { ...preferences, outputDevice: null } : preferences);
     });
+    const qualityUnlisten = listen<QualityReportReady>("gx-quality-report", (event) => {
+      if (disposed) return;
+      const { location, report } = event.payload;
+      const currentSnapshot = snapshotRef.current;
+      const currentItem = currentSnapshot.queue[currentSnapshot.queueIndex ?? -1];
+      // The engine stamps each report with the queue location it measured. Only the
+      // frontend knows the provider identity behind an online location, so a report
+      // that no longer matches the current track cannot be attributed and is dropped.
+      if (!currentItem || currentItem.location !== location) return;
+      const reportJson = JSON.stringify(report);
+      if (currentItem.online) {
+        const catalogTrack = selectedCatalogTrackRef.current;
+        if (!catalogTrack) return;
+        void invoke("library_upsert_quality_measurement", {
+          kind: "online",
+          path: null,
+          providerId: catalogTrack.providerId,
+          providerTrackId: catalogTrack.providerTrackId,
+          quality: currentQualityRef.current,
+          reportJson,
+        }).catch((error) => console.error("质量测量落库失败:", error));
+      } else {
+        void invoke("library_upsert_quality_measurement", {
+          kind: "local",
+          path: location,
+          providerId: null,
+          providerTrackId: null,
+          quality: null,
+          reportJson,
+        }).catch((error) => console.error("质量测量落库失败:", error));
+      }
+    });
     return () => {
       disposed = true;
       void closeUnlisten.then((stop) => stop());
       void fallbackUnlisten.then((stop) => stop());
+      void qualityUnlisten.then((stop) => stop());
     };
   }, []);
 
@@ -1368,6 +1555,12 @@ function App() {
     ?? orderedSources.find((source) => source.preferred)
     ?? null;
   const sourceStatus = (() => {
+    if (sourceLoadState === "loading") {
+      return { title: "正在读取音源", copy: "正在连接桌面运行时并读取已导入音源。" };
+    }
+    if (sourceLoadState === "error") {
+      return { title: "音源读取失败", copy: "音源文件没有被清空；请重新读取或彻底退出应用后再打开。" };
+    }
     switch (runtime?.state) {
       case "ready":
         return {
@@ -1408,6 +1601,13 @@ function App() {
   useEffect(() => {
     if (queuePanelOpen && sidebarDrawerOpen) setSidebarDrawerOpen(false);
   }, [queuePanelOpen, sidebarDrawerOpen]);
+
+  // Opt-in only: the chart reaches the network, so it waits for the home view and
+  // the saved preference. loadChart() itself skips a fetch when the region is unchanged.
+  useEffect(() => {
+    if (view !== "discovery" || !chartAutoLoad || !appPreferences) return;
+    void loadChart();
+  }, [view, chartAutoLoad, appPreferences, chartRegion]);
 
   const navigateTo = (next: ViewId) => {
     setSidebarDrawerOpen(false);
@@ -1519,7 +1719,7 @@ function App() {
     setLyrics(null);
   };
 
-  const loadLyricsFor = async (title: string, artist: string, durationMs: number | null, baseMessage: string) => {
+  const loadLyricsFor = async (track: CatalogTrack, baseMessage: string) => {
     const generation = ++lyricsGenerationRef.current;
     const previousRequestId = activeLyricsRequestRef.current;
     activeLyricsRequestRef.current = null;
@@ -1530,12 +1730,17 @@ function App() {
     activeLyricsRequestRef.current = requestId;
     setLyrics(null);
     try {
-      const lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
-        title,
-        artist,
-        durationMs,
+      let lyricDocument = await invoke<LyricDocument | null>("metadata_lyrics", {
+        title: track.title,
+        artist: track.artist,
+        durationMs: track.durationMs,
         requestId,
       });
+      if (!lyricDocument
+        && generation === lyricsGenerationRef.current
+        && activeLyricsRequestRef.current === requestId) {
+        lyricDocument = await invoke<LyricDocument | null>("source_lyric", { track });
+      }
       if (generation === lyricsGenerationRef.current && activeLyricsRequestRef.current === requestId) setLyrics(lyricDocument);
     } catch (lyricError) {
       if (generation === lyricsGenerationRef.current
@@ -1566,7 +1771,9 @@ function App() {
     quality: QualityPreference,
     opts?: { allowPreviewFallback?: boolean; candidates?: CatalogTrack[] },
   ): Promise<PlaybackStartResult> => {
+    supersedeActiveResolve();
     const key = catalogKey(wanted);
+    let failureKind: OnlinePlaybackResult["failureKind"] = null;
     const generation = ++resolveGenerationRef.current;
     const requestId = typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
@@ -1600,6 +1807,7 @@ function App() {
         return { outcome: online.outcome };
       }
       if (online.outcome === "failed") {
+        failureKind = online.failureKind ?? "unknown";
         const diagnostics = formatResolveAttempts(online.attempts);
         throw new Error(`${online.error || "音源未能返回可播放地址"}${diagnostics}`);
       }
@@ -1616,7 +1824,7 @@ function App() {
         ? `已命中本地缓存 · ${online.quality ?? "自动"}，无需再次请求音频直链。`
         : `${sourceLabel} 已解析整首播放${online.quality ? ` · ${online.quality}` : ""}，本次播放会顺手写入缓存。`;
       setMessage(playbackMessage);
-      void loadLyricsFor(online.track.title, online.track.artist, online.track.durationMs, playbackMessage);
+      void loadLyricsFor(online.track, playbackMessage);
       void recordHistory({
         kind: "online",
         title: online.track.title,
@@ -1632,7 +1840,7 @@ function App() {
       console.warn("[GXPlayer] online resolve failed", { key, error: String(onlineError) });
       if (!opts?.allowPreviewFallback) {
         setMessage(formatFailureMessage(onlineError, wanted.title), true);
-        return { outcome: "failed", error: onlineError };
+        return { outcome: "failed", error: onlineError, failureKind: failureKind ?? "unknown" };
       }
       try {
         const preview = await invoke<{ track: CatalogTrack; replacedProviderId: string | null }>("metadata_play_preview", {
@@ -1647,7 +1855,7 @@ function App() {
         clearLyrics();
         const playbackMessage = `LX 整首解析失败，已回退为 ${preview.track.providerId} 官方 30 秒预览。原因：${formatFailureMessage(onlineError)}`;
         setMessage(playbackMessage);
-        void loadLyricsFor(preview.track.title, preview.track.artist, preview.track.durationMs, playbackMessage);
+        void loadLyricsFor(preview.track, playbackMessage);
         void recordHistory({
           kind: "preview",
           title: preview.track.title,
@@ -1661,7 +1869,7 @@ function App() {
         const previewInterrupted = interruptedOutcome();
         if (previewInterrupted) return previewInterrupted;
         setMessage(formatFailureMessage(`${String(onlineError)}; ${String(previewError)}`, wanted.title), true);
-        return { outcome: "failed", error: previewError };
+        return { outcome: "failed", error: previewError, failureKind: failureKind ?? "unknown" };
       }
     } finally {
       cancelledResolveRequestsRef.current.delete(requestId);
@@ -1720,6 +1928,7 @@ function App() {
         setMessage("本地文件暂不可用；接回磁盘后请在播放队列中重试，或重新定位文件。", true);
         return { outcome: "failed", error };
       }
+      supersedeActiveResolve();
       try {
         if (playlistIsLocalOnly(entries)) {
           const paths = entries.map((item) => (item as Extract<PlaylistEntry, { kind: "local" }>).path);
@@ -1738,6 +1947,7 @@ function App() {
       }
     }
     if (entry.kind === "cached") {
+      supersedeActiveResolve();
       try {
         await playCachedEntry(entry);
         void recordHistory({
@@ -1926,6 +2136,62 @@ function App() {
     }
   };
 
+  /**
+   * Write the open playlist as m3u8. Local tracks carry their path so other
+   * players can open them directly; cached online tracks are recorded by text
+   * only, since there is no file to point at.
+   */
+  const exportActivePlaylist = async () => {
+    if (!activePlaylist || !playlistItems.length || playlistExportBusy) return;
+    setPlaylistExportBusy(true);
+    try {
+      const tracks = playlistItems.map((item) => item.kind === "local"
+        ? {
+            title: item.track.title,
+            artist: item.track.artist,
+            durationMs: item.track.durationSeconds === null ? null : item.track.durationSeconds * 1000,
+            path: item.track.path,
+          }
+        : { title: item.title, artist: item.artist, durationMs: null, path: null });
+      const content = buildM3u8(tracks, activePlaylist.name);
+      const path = await save({
+        defaultPath: `${safeFileStem(activePlaylist.name)}.m3u8`,
+        filters: [{ name: "M3U8 歌单", extensions: ["m3u8"] }],
+      });
+      if (!path || Array.isArray(path)) return;
+      await invoke("playlist_write_file", { path, content });
+      const onlineCount = playlistItems.filter((item) => item.kind !== "local").length;
+      const onlineNote = onlineCount ? `，其中 ${onlineCount} 首在线歌曲仅记录歌名` : "";
+      setMessage(`歌单已导出到 ${path}${onlineNote}`);
+    } catch (error) {
+      setMessage(`歌单导出失败：${String(error)}`, true);
+    } finally {
+      setPlaylistExportBusy(false);
+    }
+  };
+
+  /** Read a playlist file the user picks. Parsing happens in the dialog. */
+  const openPlaylistFile = async (): Promise<{ name: string; text: string } | null> => {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [
+        { name: "歌单", extensions: ["m3u", "m3u8", "csv", "tsv", "txt"] },
+        { name: "所有文件", extensions: ["*"] },
+      ],
+    });
+    if (!selected || Array.isArray(selected)) return null;
+    const text = await invoke<string>("playlist_read_file", { path: selected });
+    return { name: selected.split(/[\\/]/).pop() || selected, text };
+  };
+
+  /** Import local files an m3u referenced, so their own tags win over list text. */
+  const importPlaylistLocalPaths = async (paths: string[]): Promise<number> => {
+    const result = await invoke<LibraryImportResult>("library_import_files", { paths });
+    await refreshLibrary();
+    return result.imported.length;
+  };
+
   const relinkMissingTracks = async () => {
     if (libraryImportBusy) return;
     const missingTracks = library.filter((track) => track.missing && (!selectedLibraryIds.length || selectedLibraryIds.includes(track.id)));
@@ -2035,7 +2301,9 @@ function App() {
 
   /** Click a catalog track: queue the whole list as online placeholders; resolve only the clicked one. */
   const playCatalogInList = async (tracks: CatalogTrack[], wanted: CatalogTrack) => {
-    if (playingCatalogKey || advancingRef.current) return;
+    // A click during an in-flight resolve supersedes it (resolveAndPlayOnline does the
+    // invalidation); only an active advance chain still owns the playhead exclusively.
+    if (advancingRef.current) return;
     const list = tracks.length ? tracks : [wanted];
     const startIndex = Math.max(0, list.findIndex((item) => catalogKey(item) === catalogKey(wanted)));
     const entries = list.map((track) => onlineEntryFromCatalog(track, qualityPreference));
@@ -2070,7 +2338,7 @@ function App() {
             : onlineFavorites.some((track) => catalogKey(track) === catalogKey(wanted))
               ? onlineFavorites
               : [wanted];
-    if (playingCatalogKey || advancingRef.current) return;
+    if (advancingRef.current) return;
     await playCatalogInList(context, wanted);
   };
 
@@ -2132,6 +2400,7 @@ function App() {
     shufflePlayedRef.current.add(index);
     setPlaylistIndex(index);
     if (playlistIsLocalOnly(entries) && target.kind === "local") {
+      supersedeActiveResolve();
       try {
         if (engineMatchesLocalQueue(entries, snapshotRef.current.queue)) {
           await invoke("player_jump", { index });
@@ -2160,7 +2429,7 @@ function App() {
   };
 
   const playCacheInList = async (entries: CacheEntryView[], wanted: CacheEntryView) => {
-    if (playingCatalogKey || advancingRef.current) return;
+    if (advancingRef.current) return;
     const startIndex = Math.max(0, entries.findIndex(
       (item) => item.providerId === wanted.providerId
         && item.providerTrackId === wanted.providerTrackId
@@ -2466,6 +2735,68 @@ function App() {
     });
   };
 
+  /**
+   * Copy already-cached audio out under readable names. Nothing is fetched: an
+   * entry that is not fully cached comes back reported, not downloaded.
+   */
+  const exportCacheEntries = async (entries: CacheEntryView[]) => {
+    if (!entries.length || cacheExportBusy) return;
+    const directory = await open({ multiple: false, directory: true });
+    if (!directory || Array.isArray(directory)) return;
+    const keys = entries.map((entry) => ({
+      providerId: entry.providerId,
+      providerTrackId: entry.providerTrackId,
+      quality: entry.quality,
+    }));
+
+    setCacheExportBusy(true);
+    // Seeded before the first tick arrives, so a large batch shows its size immediately
+    // rather than only once the first file is done.
+    setCacheExportProgress({ completed: 0, total: keys.length, current: "" });
+    let stopProgress: (() => void) | null = null;
+    try {
+      // Subscribe before invoking the command. A one-file export can finish before an
+      // effect scheduled from `cacheExportBusy` gets a chance to install its listener.
+      try {
+        stopProgress = await listen<CacheExportProgress>("gx-cache-export-progress", (event) => {
+          setCacheExportProgress(event.payload);
+        });
+      } catch {
+        // Progress is optional; failure to install a listener must not block the copy.
+      }
+      const outcomes = await invoke<CacheExportOutcome[]>("cache_export_entries", {
+        keys,
+        directory,
+      });
+      const written = outcomes.filter((outcome) => outcome.fileName).length;
+      const failed = outcomes.length - written;
+      if (!written) {
+        const reason = outcomes.find((outcome) => outcome.error)?.error;
+        setMessage(`导出失败：${reason ?? "没有可导出的歌曲"}`, true);
+        return;
+      }
+      // Name the first failure rather than only counting it, so the cause is actionable.
+      const firstFailure = outcomes.find((outcome) => outcome.error);
+      const failureNote = failed
+        ? `，${failed} 首未导出（${firstFailure?.error ?? "原因未知"}）`
+        : "";
+      setMessage(`已导出 ${written} 首到 ${directory}${failureNote}`, failed > 0);
+    } catch (error) {
+      setMessage(`导出失败：${String(error)}`, true);
+    } finally {
+      stopProgress?.();
+      setCacheExportBusy(false);
+      setCacheExportProgress(null);
+    }
+  };
+
+  const exportSelectedCache = () => {
+    const selected = new Set(selectedCacheKeys);
+    const entries = cacheEntries.filter((entry) =>
+      selected.has(cachedIdentityKey(entry.providerId, entry.providerTrackId, entry.quality)));
+    return exportCacheEntries(entries);
+  };
+
   const removeCacheByQuality = (quality: string) => {
     actionDialog.openAction({
       title: `清理 ${quality} 缓存`,
@@ -2590,6 +2921,31 @@ function App() {
       setMessage(String(error), true);
     } finally {
       setSourceImportBusy(null);
+    }
+  };
+
+  const importSourcePlaylist = async () => {
+    const id = sourcePlaylistId.trim();
+    if (!id || sourcePlaylistBusy) return;
+    setSourcePlaylistBusy(true);
+    try {
+      const remote = await invoke<SourcePlaylist | null>("source_playlist", { id });
+      if (!remote || !remote.tracks.length) {
+        setMessage("音源没有返回可导入的歌单曲目。", true);
+        return;
+      }
+      const entries = remote.tracks.map((track) => onlineEntryFromCatalog(track, qualityPreference));
+      setPlaylist(entries);
+      setPlaylistIndex(null);
+      setSourcePlaylistId("");
+      seedResults(remote.tracks, remote.name);
+      setSearchQuery(remote.name);
+      navigateTo("search");
+      setMessage("已读取“" + remote.name + "”的 " + remote.tracks.length + " 首歌曲并加入播放队列。");
+    } catch (error) {
+      setMessage("读取远程歌单失败：" + String(error), true);
+    } finally {
+      setSourcePlaylistBusy(false);
     }
   };
 
@@ -2843,6 +3199,26 @@ function App() {
     updateSnapshotDspControl(control);
     pendingDspControlRef.current = control;
     void flushPendingDspControl();
+  };
+
+  const saveCustomEqPreset = (name: string, gainsDb: readonly number[]) => {
+    void invoke<AppPreferences>("player_save_custom_eq_preset", {
+      preset: { name, gainsDb: [...gainsDb] },
+    })
+      .then((preferences) => {
+        setAppPreferences(preferences);
+        setMessage(`已保存均衡预设“${name}”。`);
+      })
+      .catch((error) => setMessage(`保存均衡预设失败：${String(error)}`, true));
+  };
+
+  const deleteCustomEqPreset = (name: string) => {
+    void invoke<AppPreferences>("player_delete_custom_eq_preset", { name })
+      .then((preferences) => {
+        setAppPreferences(preferences);
+        setMessage(`已删除均衡预设“${name}”。`);
+      })
+      .catch((error) => setMessage(`删除均衡预设失败：${String(error)}`, true));
   };
 
   const setAbDry = (enabled: boolean) => {
@@ -3375,21 +3751,36 @@ function App() {
           <div className="section-heading"><div><p className="eyebrow">PLAYLISTS</p><h2>你的歌单</h2></div></div>
           <div className="playlist-cards">
             {playlists.map((playlist) => <button className="playlist-card" key={playlist.id} onClick={() => void openPlaylist(playlist)}><span>♫</span><strong>{playlist.name}</strong><small>{playlist.trackCount} 首</small></button>)}
+            <button className="playlist-card import-card" type="button" onClick={() => setTextPlaylistDialogOpen(true)}><span>↓</span><strong>导入歌单</strong><small>m3u / CSV / 文本</small></button>
             <label className="playlist-card create-card"><span>＋</span><input aria-label="新歌单名称" placeholder="新歌单" value={newPlaylistName} onChange={(event) => setNewPlaylistName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createPlaylist(); }} /><button onClick={() => void createPlaylist()} disabled={!newPlaylistName.trim()}>创建</button></label>
           </div>
         </section>
         <section className="section-block panel-enter delay-2">
           <div className="section-heading">
             <div><p className="eyebrow">DISCOVER</p><h2>正在流行</h2></div>
-            {chartTracks.length > 0 && <button onClick={() => { seedResults(chartTracks, "中国区热门"); setSearchQuery("中国区热门"); navigateTo("search"); }}>查看全部 →</button>}
+            <div className="section-heading-actions">
+              <label className="chart-region-picker">
+                <span className="sr-only">榜单地区</span>
+                <select
+                  value={chartRegion}
+                  disabled={chartLoading || !appPreferences}
+                  onChange={(event) => changeChartRegion(event.target.value)}
+                >
+                  {(chartRegions.length > 0 ? chartRegions : [chartRegion]).map((region) => (
+                    <option key={region} value={region}>{chartRegionLabel(region)}</option>
+                  ))}
+                </select>
+              </label>
+              {chartTracks.length > 0 && <button onClick={() => { seedResults(chartTracks, chartHeadlineLabel); setSearchQuery(chartHeadlineLabel); navigateTo("search"); }}>查看全部 →</button>}
+            </div>
           </div>
           {chartTracks.length > 0
             ? renderCatalogRows(chartTracks.slice(0, 6))
             : <EmptyState
                 title={chartLoading ? "正在加载在线榜单" : "在线榜单尚未加载"}
-                copy="为了保持启动安静，在线内容会在你明确需要时再联网获取。"
+                copy={chartAutoLoad ? "换个地区或稍后重试；榜单只在你打开首页时联网获取。" : "为了保持启动安静，在线内容会在你明确需要时再联网获取。"}
                 action={chartLoading ? undefined : "加载在线榜单"}
-                onAction={() => void loadChart()}
+                onAction={() => void loadChart({ force: true })}
               />}
         </section>
       </div>
@@ -3501,6 +3892,16 @@ function App() {
               {cacheEntries.length > 0 ? (
                 <div className="cache-bulk-actions">
                   <button type="button" className="primary" onClick={() => enqueueCacheEntries(cacheEntries)}>全部入队</button>
+                  <button
+                    type="button"
+                    disabled={cacheExportBusy || !selectedCacheKeys.length}
+                    onClick={() => void exportSelectedCache()}
+                  >
+                    {cacheExportBusy ? "正在导出…" : `导出所选 (${selectedCacheKeys.length})`}
+                  </button>
+                  <button type="button" disabled={cacheExportBusy || !cacheEntries.length} onClick={() => void exportCacheEntries(cacheEntries)}>
+                    导出全部
+                  </button>
                   <button type="button" disabled={!selectedCacheKeys.length} onClick={() => void removeSelectedCache()}>
                     删除所选 ({selectedCacheKeys.length})
                   </button>
@@ -3521,6 +3922,22 @@ function App() {
                 </div>
               ) : null}
             </div>
+            {cacheExportProgress ? (
+              <div className="cache-export-progress">
+                <div className="cache-export-progress-copy">
+                  <strong>正在导出 {cacheExportProgress.completed} / {cacheExportProgress.total}</strong>
+                  <span title={cacheExportProgress.current || undefined}>
+                    {cacheExportProgress.current ? `正在写入 ${cacheExportProgress.current}` : "正在准备缓存文件"}
+                  </span>
+                </div>
+                <progress
+                  aria-label="缓存导出进度"
+                  aria-valuetext={`${cacheExportProgress.completed} / ${cacheExportProgress.total}`}
+                  max={Math.max(cacheExportProgress.total, 1)}
+                  value={Math.min(cacheExportProgress.completed, cacheExportProgress.total)}
+                />
+              </div>
+            ) : null}
             <div className="tip-banner" role="note">
               <strong>缓存说明</strong>
               <span>
@@ -3539,6 +3956,10 @@ function App() {
 
     if (view === "favorites") {
       const tracks = favorites;
+      const favoritesLoading = tracks.length === 0 && onlineFavorites.length === 0
+        && (libraryLoadState === "loading" || cacheLoadState === "loading");
+      const favoritesFailed = tracks.length === 0 && onlineFavorites.length === 0
+        && (libraryLoadState === "error" || cacheLoadState === "error");
       return (
         <div className="page">
           <PageHeading
@@ -3552,7 +3973,11 @@ function App() {
               {renderCatalogRows(onlineFavorites)}
             </section>
           )}
-          {tracks.length ? (
+          {favoritesLoading ? (
+            <EmptyState title="正在读取收藏" copy="正在读取本地收藏与在线收藏。" />
+          ) : favoritesFailed ? (
+            <EmptyState title="收藏读取失败" copy="保存的数据没有被清空；请重新读取。" action="重新读取" onAction={() => void Promise.all([refreshLibrary(true), refreshCache()]).catch((error) => setMessage(String(error), true))} />
+          ) : tracks.length ? (
             <section className="section-block">
               <div className="section-heading"><div><h3>本地收藏</h3></div></div>
               {renderTrackRows(tracks)}
@@ -3603,7 +4028,8 @@ function App() {
                       }
                     }}
                   >
-                    <span className="track-index">{entry.kind.slice(0, 2)}</span>
+                    <span className="track-index" aria-hidden="true">{entry.kind === "local" ? "♪" : entry.kind === "cached" ? "◉" : "☁"}</span>
+                    <span className="sr-only">{entry.kind === "local" ? "本地播放" : entry.kind === "cached" ? "缓存播放" : "在线播放"}</span>
                     <span>
                       <strong>{entry.title}</strong>
                       <small>{entry.artist || "未知歌手"} · {new Date(entry.playedAtMs).toLocaleString()}</small>
@@ -3619,7 +4045,7 @@ function App() {
     }
 
     if (view === "playlist") return (
-      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistItems.length} 首音乐 · 支持本地与已缓存歌曲`} action={activePlaylist ? <button className="danger" onClick={requestDeleteActivePlaylist}>删除歌单</button> : undefined} />{playlistItems.length && activePlaylist ? renderLibraryPlaylistItems(playlistItems, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把本地音乐或已缓存歌曲加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
+      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistItems.length} 首音乐 · 支持本地与已缓存歌曲`} action={activePlaylist ? <div className="page-heading-actions"><button type="button" disabled={!playlistItems.length || playlistExportBusy} onClick={() => void exportActivePlaylist()}>{playlistExportBusy ? "正在导出…" : "导出为 m3u8"}</button><button className="danger" onClick={requestDeleteActivePlaylist}>删除歌单</button></div> : undefined} />{playlistItems.length && activePlaylist ? renderLibraryPlaylistItems(playlistItems, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把本地音乐或已缓存歌曲加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
     );
 
     if (view === "sources") return (
@@ -3635,13 +4061,39 @@ function App() {
             <button type="submit" className="primary" disabled={!sourceUrl.trim() || Boolean(sourceImportBusy)}>{sourceImportBusy === "url" ? "正在导入…" : "导入 URL"}</button>
           </form>
         </section>
+        <section className="source-import-band" aria-labelledby="source-playlist-title">
+          <div className="source-import-copy">
+            <p className="eyebrow">PLAYLIST</p>
+            <h2 id="source-playlist-title">读取远程歌单</h2>
+            <p>使用当前协议 v2 音源读取歌单；ID 的格式由音源自己决定。成功后歌曲会进入当前播放队列和结果页。</p>
+          </div>
+          <form className="inline-form source-url-form" onSubmit={(event) => { event.preventDefault(); void importSourcePlaylist(); }}>
+            <input
+              type="text"
+              aria-label="远程歌单 ID"
+              placeholder="歌单 ID"
+              autoComplete="off"
+              spellCheck={false}
+              value={sourcePlaylistId}
+              disabled={sourcePlaylistBusy}
+              onChange={(event) => setSourcePlaylistId(event.target.value)}
+            />
+            <button type="submit" className="primary" disabled={!sourcePlaylistId.trim() || sourcePlaylistBusy}>
+              {sourcePlaylistBusy ? "正在读取…" : "读取并加入队列"}
+            </button>
+          </form>
+        </section>
         <section className="source-status-card"><span className={`runtime-dot ${runtime?.state ?? "no_source"}`} /><div><strong>{sourceStatus.title}</strong><p>{sourceStatus.copy}</p></div><code>GEN {runtime?.generation ?? 0}</code></section>
         <div className="source-list-heading">
           <div><h2>音源优先序</h2><p>绿灯优先于黄灯、红灯；同一健康档位内按这里的顺序降级。</p></div>
-          <span>{orderedSources.filter((source) => source.enabled).length} / {orderedSources.length} 已启用</span>
+          <span>{sourceLoadState === "loading" ? "正在读取" : sourceLoadState === "error" ? "读取失败" : `${orderedSources.filter((source) => source.enabled).length} / ${orderedSources.length} 已启用`}</span>
         </div>
         <p className="source-health-note">健康度只记录真实解析调用结果，不会主动探测。双击卡片可编辑完整设置。</p>
-        {orderedSources.length ? (
+        {sourceLoadState === "loading" ? (
+          <EmptyState title="正在读取音源" copy="请稍候，正在读取本机保存的音源配置。" />
+        ) : sourceLoadState === "error" ? (
+          <EmptyState title="音源读取失败" copy="保存的数据没有被清空；请重试桌面运行时连接。" action="重新读取" onAction={() => void refreshSources().catch((error) => setMessage(String(error), true))} />
+        ) : orderedSources.length ? (
           <div className="source-list">
             {orderedSources.map((source, index) => (
               <SourceCard
@@ -3679,7 +4131,14 @@ function App() {
           {!advancedSettings && <section className="settings-card dsp-settings-card">
             <h3>音效预设</h3>
             <p>预设与微调会自动保存；原声会关闭整条 DSP 链并保持零 DSP 延迟。</p>
-            <DspPresetControls value={dspControl} onChange={applyDspControl} onAbDryChange={setAbDry} />
+            <DspPresetControls
+              value={dspControl}
+              onChange={applyDspControl}
+              onAbDryChange={setAbDry}
+              customPresets={appPreferences?.customEqPresets ?? []}
+              onSaveCustomPreset={saveCustomEqPreset}
+              onDeleteCustomPreset={deleteCustomEqPreset}
+            />
           </section>}
           {!advancedSettings && <section className="settings-card"><h3>主题</h3><p>切换整体色调；动态强调色仍会随封面自然变化。</p><select value={theme} onChange={(event) => setTheme(event.target.value as ThemeId)}>{THEME_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label} · {option.description}</option>)}</select></section>}
           {advancedSettings && <section className="settings-card proxy-settings">
@@ -3709,6 +4168,20 @@ function App() {
               <button type="button" className={alwaysOnTop ? "primary" : ""} onClick={() => void toggleAlwaysOnTop()}>{alwaysOnTop ? "取消置顶" : "窗口置顶"}</button>
               <button type="button" className={miniMode ? "primary" : ""} onClick={() => void toggleMiniMode()}>{miniMode ? "退出迷你" : "迷你模式"}</button>
             </div>
+          </section>}
+          {!advancedSettings && <section className="settings-card">
+            <h3>热门推荐</h3>
+            <p>首页「正在流行」的榜单地区与联网时机。地区列表来自公开的榜单地区代码。</p>
+            <label className="settings-toggle">
+              <span><strong>打开首页时自动加载</strong><small>关闭后首页只显示一个按钮，完全不联网，直到你点它。</small></span>
+              <input
+                type="checkbox"
+                checked={chartAutoLoad}
+                disabled={!appPreferences}
+                onChange={(event) => changeChartAutoLoad(event.target.checked)}
+              />
+            </label>
+            <label><span>榜单地区</span><select value={chartRegion} disabled={!appPreferences} onChange={(event) => changeChartRegion(event.target.value)}>{(chartRegions.length > 0 ? chartRegions : [chartRegion]).map((region) => <option key={region} value={region}>{chartRegionLabel(region)}</option>)}</select></label>
           </section>}
           {advancedSettings && <section className="settings-card cache-settings"><h3>在线播放缓存</h3><p>只保存自然播放时已经收到的字节，不会预抓或批量下载。批量管理请到「曲库」页的在线缓存分区。</p><dl><div><dt>当前占用</dt><dd>{cacheStatus ? `${formatBytes(cacheStatus.totalBytes)} · ${cacheStatus.entryCount} 项` : "读取中…"}</dd></div><div><dt>收藏钉住</dt><dd>{cacheStatus?.pinnedCount ?? 0} 项</dd></div><div><dt>目录</dt><dd title={cacheStatus?.directory}>{cacheStatus?.directory ?? "读取中…"}</dd></div></dl><label><span>上限（GiB）</span><div className="inline-form"><input type="number" min="0.125" step="0.5" value={cacheLimitGiB} onChange={(event) => { cacheLimitDirtyRef.current = true; setCacheLimitGiB(event.target.value); }} /><button onClick={() => void saveCacheLimit()}>保存</button></div></label><div className="cache-actions"><button onClick={() => void chooseCacheDirectory()}>选择目录</button><button onClick={async () => { const status = await invoke<CacheStatus>("cache_reset_directory"); setCacheStatus(status); setMessage("已恢复默认缓存目录；旧目录内容未迁移。"); }}>恢复默认</button><button onClick={() => requestClearCache(false)}>清未收藏</button><button className="danger" onClick={() => requestClearCache(true)}>清空全部</button></div></section>}
           {advancedSettings && <section className="settings-card diagnostic-log-settings">
@@ -4183,6 +4656,8 @@ function App() {
         open={textPlaylistDialogOpen}
         onClose={() => setTextPlaylistDialogOpen(false)}
         onEnqueue={enqueueCatalogTracks}
+        onOpenFile={openPlaylistFile}
+        onImportLocalPaths={importPlaylistLocalPaths}
         invoke={invoke}
       />
 

@@ -2,13 +2,18 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildDspControlState, DSP_AB_LABEL, DSP_SYSTEM_EFFECTS_HINT } from "../../lib/dspPresets";
+import {
+  buildDspControlState,
+  DSP_AB_LABEL,
+  DSP_PRESETS,
+  DSP_SYSTEM_EFFECTS_HINT,
+} from "../../lib/dspPresets";
 import { DspPresetControls } from "./DspPresetControls";
 
 afterEach(() => cleanup());
 
 describe("DspPresetControls", () => {
-  it("renders the five v1 preset choices and exact guidance copy", () => {
+  it("renders every preset choice and exact guidance copy", () => {
     render(
       <DspPresetControls
         value={buildDspControlState("bypass")}
@@ -17,9 +22,23 @@ describe("DspPresetControls", () => {
       />,
     );
 
-    expect(screen.getAllByRole("radio")).toHaveLength(5);
-    for (const name of ["原声", "耳机日常", "人声", "低音", "空间"]) {
-      expect(screen.getByRole("radio", { name: new RegExp(name) })).toBeInTheDocument();
+    expect(screen.getAllByRole("radio")).toHaveLength(DSP_PRESETS.length);
+    for (const name of [
+      "原声",
+      "耳机日常",
+      /^人声$/,
+      "低音",
+      "空间",
+      "温暖",
+      "明亮",
+      "古典",
+      "电子",
+      "摇滚",
+      "播客",
+      "爵士",
+      "钢琴人声",
+    ]) {
+      expect(screen.getByRole("radio", { name: typeof name === 'string' ? new RegExp(name) : name })).toBeInTheDocument();
     }
     expect(screen.getByText(DSP_SYSTEM_EFFECTS_HINT)).toBeInTheDocument();
     expect(screen.queryByRole("slider")).not.toBeInTheDocument();
@@ -36,7 +55,7 @@ describe("DspPresetControls", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("radio", { name: /人声/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /^人声$/ }));
     expect(onChange).toHaveBeenCalledWith(buildDspControlState("vocal", 0.2, 0.8));
     expect(onChange.mock.calls[0][0].settings.eqBands).toHaveLength(10);
   });
@@ -51,8 +70,8 @@ describe("DspPresetControls", () => {
       />,
     );
 
-    const vocal = screen.getByRole("radio", { name: "人声" });
-    const bass = screen.getByRole("radio", { name: "低音" });
+    const vocal = screen.getByRole("radio", { name: /^人声$/ });
+    const bass = screen.getByRole("radio", { name: /^低音$/ });
     expect(vocal).toHaveAttribute("tabindex", "0");
     expect(bass).toHaveAttribute("tabindex", "-1");
 
@@ -61,12 +80,17 @@ describe("DspPresetControls", () => {
     expect(bass).toHaveFocus();
     expect(onChange).toHaveBeenLastCalledWith(buildDspControlState("bass", 0.2, 0.8));
 
+    // End lands on the last preset in DSP_PRESETS, whatever that currently is.
+    const last = DSP_PRESETS[DSP_PRESETS.length - 1];
     fireEvent.keyDown(bass, { key: "End" });
-    expect(screen.getByRole("radio", { name: "空间" })).toHaveFocus();
-    expect(onChange).toHaveBeenLastCalledWith(buildDspControlState("spatial", 0.2, 0.8));
+    expect(screen.getByRole("radio", { name: last.label })).toHaveFocus();
+    expect(onChange).toHaveBeenLastCalledWith(buildDspControlState(last.id, 0.2, 0.8));
+
+    fireEvent.keyDown(screen.getByRole("radio", { name: last.label }), { key: "Home" });
+    expect(screen.getByRole("radio", { name: DSP_PRESETS[0].label })).toHaveFocus();
   });
 
-  it("shows strength only for headphone, vocal and bass presets", () => {
+  it("shows strength for every intensity-scaled preset, and spatial amount only for spatial", () => {
     const { rerender } = render(
       <DspPresetControls
         value={buildDspControlState("headphone_daily")}
@@ -78,6 +102,19 @@ describe("DspPresetControls", () => {
     expect(screen.getByRole("slider", { name: "强度" })).toHaveAttribute("aria-valuetext", "标准");
     expect(screen.queryByRole("slider", { name: "空间感" })).not.toBeInTheDocument();
 
+    // Voicing presets scale with intensity, so they must expose the control too.
+    for (const presetId of ["warm", "electronic", "podcast", "jazz", "piano_vocal"] as const) {
+      rerender(
+        <DspPresetControls
+          value={buildDspControlState(presetId)}
+          onChange={vi.fn()}
+          onAbDryChange={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("slider", { name: "强度" })).toBeInTheDocument();
+      expect(screen.queryByRole("slider", { name: "空间感" })).not.toBeInTheDocument();
+    }
+
     rerender(
       <DspPresetControls
         value={buildDspControlState("spatial")}
@@ -87,7 +124,123 @@ describe("DspPresetControls", () => {
     );
     expect(screen.queryByRole("slider", { name: "强度" })).not.toBeInTheDocument();
     expect(screen.getByRole("slider", { name: "空间感" })).toBeInTheDocument();
-    expect(screen.getAllByText("固定前方 ±30° 音箱感，可能偏闷；建议不与系统杜比耳机虚拟化同时开。").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("固定前方 ±30° 音箱感，声场向头外展开；建议不与系统杜比耳机虚拟化同时开。").length).toBeGreaterThan(0);
+
+    rerender(
+      <DspPresetControls
+        value={buildDspControlState("bypass")}
+        onChange={vi.fn()}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("slider", { name: "强度" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("slider", { name: "空间感" })).not.toBeInTheDocument();
+  });
+
+  it("renders the advanced editor only when save and delete are both wired", () => {
+    const { rerender } = render(
+      <DspPresetControls
+        value={buildDspControlState("bypass")}
+        onChange={vi.fn()}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText("高级：自定义均衡")).not.toBeInTheDocument();
+
+    rerender(
+      <DspPresetControls
+        value={buildDspControlState("bypass")}
+        onChange={vi.fn()}
+        onAbDryChange={vi.fn()}
+        onSaveCustomPreset={vi.fn()}
+        onDeleteCustomPreset={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("高级：自定义均衡")).toBeInTheDocument();
+    // Collapsed by default: presets stay the product surface. `details` keeps its
+    // content in the DOM either way, so the open state is what actually matters.
+    expect(screen.getByText("高级：自定义均衡").closest("details")).not.toHaveAttribute("open");
+
+    // The compact strip never shows it, regardless of the handlers.
+    rerender(
+      <DspPresetControls
+        value={buildDspControlState("bypass")}
+        onChange={vi.fn()}
+        onAbDryChange={vi.fn()}
+        compact
+        onSaveCustomPreset={vi.fn()}
+        onDeleteCustomPreset={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText("高级：自定义均衡")).not.toBeInTheDocument();
+  });
+
+  it("hides intensity for a custom curve so hand-set gains are never rescaled", () => {
+    const custom = buildDspControlState("custom", 0.5, 0.5, [3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    render(
+      <DspPresetControls
+        value={custom}
+        onChange={vi.fn()}
+        onAbDryChange={vi.fn()}
+        onSaveCustomPreset={vi.fn()}
+        onDeleteCustomPreset={vi.fn()}
+      />,
+    );
+    expect(custom.settings.eqBands[0].gainDb).toBe(3);
+    expect(screen.queryByRole("slider", { name: "强度" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("slider", { name: "空间感" })).not.toBeInTheDocument();
+    expect(screen.getByText("自定义")).toBeInTheDocument();
+  });
+
+  it("carries the live curve when another slider commits", () => {
+    // Regression: rebuilding the control state without the current gains flattened a
+    // hand-edited curve as a side effect of moving an unrelated slider.
+    const onChange = vi.fn();
+    render(
+      <DspPresetControls
+        value={buildDspControlState("spatial", 0.5, 0.4, [0, 0, 5, 0, 0, 0, 0, 0, 0, 0])}
+        onChange={onChange}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+
+    const spatial = screen.getByRole("slider", { name: "空间感" });
+    fireEvent.change(spatial, { target: { value: "0.9" } });
+    fireEvent.pointerUp(spatial);
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const next = onChange.mock.calls[0][0];
+    expect(next.spatialAmount).toBeCloseTo(0.9);
+    // spatial itself does not use the EQ, but the curve must survive the rebuild.
+    expect(next.settings.eqBands.map((band: { gainDb: number }) => band.gainDb)).toEqual(
+      buildDspControlState("spatial", 0.5, 0.9).settings.eqBands.map((band) => band.gainDb),
+    );
+  });
+
+  it("discards a dirty slider draft when the preset changes from elsewhere", () => {
+    // This is what protects a custom curve: an external change resets the drafts,
+    // so a half-finished drag cannot commit against a preset it was never aimed at.
+    const onChange = vi.fn();
+    const curve = [0, 0, 6, 0, 0, 0, -3, 0, 0, 0];
+    const { rerender } = render(
+      <DspPresetControls
+        value={buildDspControlState("bass", 0.5, 0.5)}
+        onChange={onChange}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByRole("slider", { name: "强度" }), { target: { value: "0.8" } });
+    rerender(
+      <DspPresetControls
+        value={buildDspControlState("custom", 0.5, 0.5, curve)}
+        onChange={onChange}
+        onAbDryChange={vi.fn()}
+      />,
+    );
+    fireEvent(window, new Event("blur"));
+
+    expect(onChange).not.toHaveBeenCalled();
   });
 
   it("keeps pointer range input local and commits the final draft once", () => {

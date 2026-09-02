@@ -498,8 +498,12 @@ impl SourceRuntime {
 
     pub fn begin_request(&self, payload: &Value) -> Result<RuntimeRequest, String> {
         ensure_json_size(payload, MAX_RUNTIME_PAYLOAD_BYTES, "resolver payload")?;
-        if payload.get("action").and_then(Value::as_str) != Some("musicUrl") {
-            return Err("LX runtime only accepts the 'musicUrl' action".into());
+        let action = payload
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "LX runtime request must contain an action".to_owned())?;
+        if !matches!(action, "musicUrl" | "search" | "lyric" | "playlist") {
+            return Err(format!("LX runtime does not support the '{action}' action"));
         }
         let mut inner = self.inner.lock().unwrap();
         if inner.status.state != RuntimeState::Ready {
@@ -746,16 +750,18 @@ fn reject_all_pending(inner: &mut RuntimeInner, reason: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
 
     fn runtime() -> (SourceRuntime, std::path::PathBuf) {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("gx-runtime-test-{nanos}"));
+        // A wall-clock timestamp is not unique: on Windows the clock is coarse
+        // enough that two parallel tests can read the same value and then share
+        // a directory. A per-process counter cannot collide.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "gx-runtime-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let store = SourceStore::open(&root).unwrap();
         (SourceRuntime::new(store), root)
     }
@@ -920,6 +926,15 @@ mod tests {
         assert_eq!(resolved.headers.len(), 1);
         assert_eq!(resolved.expires_at_ms, Some(123));
         assert!(!resolved.redacted_for_log().contains("secret"));
+        let search = runtime
+            .begin_request(&serde_json::json!({"action":"search","info":{"keyword":"Track"}}))
+            .unwrap();
+        runtime.cancel_request(&search.request_id, "test complete");
+        assert!(
+            runtime
+                .begin_request(&serde_json::json!({"action":"filesystem"}))
+                .is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

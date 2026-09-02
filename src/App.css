@@ -13,9 +13,16 @@
   --shell-end: #0b0c12;
   --ambient-secondary: rgba(90, 100, 170, 0.045);
   --chrome-bg: rgba(10, 10, 15, 0.55);
-  --content-bg: rgba(15, 16, 23, 0.5);
+  /* Depth ladder: shell/sidebar/top bar -> content -> list container -> card.
+     A dark translucent fill over a dark base composites to within one 8-bit step
+     of its backdrop, so the old dark-on-dark surfaces all measured flat (adjacent
+     contrast 1.0004-1.0076). Each layer lifts toward the theme tint instead.
+     These are composited alphas, not colours you can compare by eye — retune them
+     against src/lib/surfaceLadder.test.ts, which fails if any rung goes flat. */
+  --content-bg: rgba(255, 255, 255, 0.035);
   --sidebar-bg: rgba(12, 13, 19, 0.66);
-  --panel-bg: rgba(18, 18, 26, 0.42);
+  --list-bg: rgba(255, 255, 255, 0.0455);
+  --panel-bg: rgba(255, 255, 255, 0.055);
   --panel-strong: rgba(18, 18, 26, 0.94);
   --field-bg: rgba(20, 20, 28, 0.85);
   --scrim: rgba(4, 4, 9, 0.72);
@@ -80,6 +87,15 @@
   --radius-md: 12px;
   --radius-lg: 16px;
   --radius-xl: 20px;
+  /* Type ladder, ~1.25 per step. Text used to cluster at 11-13px with unstyled
+     copy inheriting the 16px browser default, so description text outranked every
+     label and nothing read as one level down from a heading. */
+  --text-display: 40px;
+  --text-title: 24px;
+  --text-section: 18px;
+  --text-body: 14px;
+  --text-small: 12px;
+  --text-micro: 11px;
   /* Spacing scale */
   --space-1: 4px;
   --space-2: 8px;
@@ -108,9 +124,12 @@
   --shell-end: #e7ecf4;
   --ambient-secondary: rgba(78, 100, 142, 0.08);
   --chrome-bg: rgba(255, 255, 255, 0.78);
-  --content-bg: rgba(255, 255, 255, 0.62);
+  /* Light runs the ladder downward: the base is already near-white, so the content
+     wash seats lower and panels return to near-white. */
+  --content-bg: rgba(226, 232, 242, 0.55);
   --sidebar-bg: rgba(255, 255, 255, 0.72);
-  --panel-bg: rgba(255, 255, 255, 0.72);
+  --list-bg: rgba(255, 255, 255, 0.5);
+  --panel-bg: rgba(255, 255, 255, 0.96);
   --panel-strong: rgba(255, 255, 255, 0.96);
   --field-bg: rgba(255, 255, 255, 0.9);
   --scrim: rgba(15, 23, 42, 0.42);
@@ -177,9 +196,11 @@
   --shell-end: #100c11;
   --ambient-secondary: rgba(170, 106, 112, 0.06);
   --chrome-bg: rgba(20, 13, 18, 0.62);
-  --content-bg: rgba(24, 16, 23, 0.58);
+  /* Warm lift keeps the rose cast; a neutral white would desaturate the theme. */
+  --content-bg: rgba(255, 236, 244, 0.034);
   --sidebar-bg: rgba(22, 14, 20, 0.72);
-  --panel-bg: rgba(34, 23, 32, 0.58);
+  --list-bg: rgba(255, 236, 244, 0.046);
+  --panel-bg: rgba(255, 236, 244, 0.057);
   --panel-strong: rgba(30, 20, 28, 0.95);
   --field-bg: rgba(29, 20, 28, 0.9);
   --scrim: rgba(8, 4, 8, 0.76);
@@ -209,9 +230,11 @@
   --shell-end: #091113;
   --ambient-secondary: rgba(70, 164, 166, 0.065);
   --chrome-bg: rgba(8, 20, 22, 0.64);
-  --content-bg: rgba(10, 26, 29, 0.58);
+  /* Cool lift keeps the cyan cast, same reason as warm. */
+  --content-bg: rgba(230, 250, 255, 0.031);
   --sidebar-bg: rgba(9, 23, 26, 0.72);
-  --panel-bg: rgba(18, 40, 43, 0.58);
+  --list-bg: rgba(230, 250, 255, 0.043);
+  --panel-bg: rgba(230, 250, 255, 0.054);
   --panel-strong: rgba(14, 31, 34, 0.95);
   --field-bg: rgba(14, 32, 35, 0.9);
   --scrim: rgba(3, 10, 12, 0.78);
@@ -238,12 +261,28 @@
 }
 
 * { box-sizing: border-box; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 html, body, #root {
   width: 100%;
   height: 100%;
   margin: 0;
   overflow: hidden;
-  background: transparent;
+  /* The window is opaque and is shown before React paints, so a transparent
+     value here would flash webview white on the first frame. This is the dark
+     theme's base, matching "backgroundColor" in tauri.conf.json; .app-shell
+     covers it entirely once painted, so a light-theme user sees this for the
+     same single frame rather than a mismatched surface. */
+  background: #0f1016;
 }
 button, input, select, textarea { font: inherit; }
 button { color: inherit; }
@@ -267,22 +306,19 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   width: 100%;
   height: 100%;
   overflow: hidden;
-  border: 1px solid var(--soft-border);
-  border-radius: var(--radius-md);
+  /* No frame or radius here: DWM clips the window itself, so a CSS curve would only
+     add a second edge inside the real one. See src-tauri/src/window_corners.rs. */
   /* Theme tokens live on this element, so inherited text must resolve here too. */
   color: var(--text-hi);
+  /* Anchor the ladder: unstyled copy inherited 16px and outranked labelled text. */
+  font-size: var(--text-body);
   /* Quieter base: soft wash, not neon flood */
   background:
     radial-gradient(90% 70% at 70% -5%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 52%),
     radial-gradient(70% 50% at 0% 100%, var(--ambient-secondary), transparent 48%),
     linear-gradient(165deg, var(--shell-start) 0%, var(--base) 44%, var(--shell-end) 100%);
   isolation: isolate;
-  transition: --accent 800ms var(--ease-soft), border-radius 180ms var(--ease-soft);
-}
-
-.app-shell.is-maximized {
-  border: 0;
-  border-radius: 0;
+  transition: --accent 800ms var(--ease-soft);
 }
 
 .app-shell.app-idle,
@@ -855,8 +891,16 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .sidebar nav button.active,
 .sidebar-playlists button.active {
   color: var(--text-hi);
-  background: color-mix(in srgb, var(--accent-readable) 11%, var(--control-hover));
+  background: color-mix(in srgb, var(--accent-readable) 14%, var(--control-hover));
   box-shadow: inset 2px 0 0 var(--accent-contrast);
+}
+
+/* The active glyph itself lights up in accent — the selection reads on the
+   icon, not just a thin edge rail (which detaches from the centred icon when
+   the sidebar is collapsed). */
+.sidebar nav button.active span,
+.sidebar-playlists button.active span {
+  color: var(--accent-readable);
 }
 
 .sidebar nav button span {
@@ -963,6 +1007,13 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   text-align: center;
 }
 
+/* Collapsed: the edge rail detaches from the centred icon, so drop it and let
+   the accent glyph + fill carry the selection instead. */
+.sidebar-collapsed .sidebar nav button.active,
+.sidebar-collapsed .sidebar-playlists button.active {
+  box-shadow: none;
+}
+
 /* ── Content / pages ───────────────────────────────────── */
 
 .content {
@@ -1047,7 +1098,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .eyebrow {
   margin: 0 0 9px;
   color: var(--accent-readable);
-  font: 650 11px "Geist Mono Variable", monospace;
+  font: 650 var(--text-micro) "Geist Mono Variable", monospace;
   letter-spacing: 0.15em;
   text-shadow: 0 0 20px color-mix(in srgb, var(--accent) 35%, transparent);
 }
@@ -1065,12 +1116,16 @@ h1 {
 
 h2 {
   margin: 0;
-  font-size: 24px;
+  font-size: var(--text-title);
   letter-spacing: -0.02em;
 }
 
+/* h3 is the most-used heading in the app and had no size of its own, so it fell to
+   the browser default and each context re-invented one. */
 h3 {
   margin: 0;
+  font-size: var(--text-section);
+  letter-spacing: -0.01em;
 }
 
 .page-heading {
@@ -1356,6 +1411,19 @@ select {
   white-space: nowrap;
 }
 
+.section-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.chart-region-picker select {
+  width: auto;
+  min-width: 96px;
+  padding: 6px 10px;
+  font-size: var(--text-small);
+}
+
 .playlist-cards {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
@@ -1420,7 +1488,8 @@ select {
   border: 1px solid var(--soft-border);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  background: color-mix(in srgb, var(--panel-bg) 72%, var(--base));
+  /* One rung below a card: mixing --panel-bg toward --base would subtract the lift. */
+  background: var(--list-bg);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), var(--shadow-sm);
   backdrop-filter: blur(20px);
 }
@@ -1611,6 +1680,72 @@ select {
   flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+}
+
+.cache-export-progress {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 16px;
+}
+
+.cache-export-progress-copy {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.cache-export-progress-copy strong {
+  flex: 0 0 auto;
+  color: var(--text-hi);
+  font-size: 12px;
+}
+
+.cache-export-progress-copy span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cache-export-progress progress {
+  display: block;
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: var(--control-bg);
+  color: var(--accent);
+}
+
+.cache-export-progress progress::-webkit-progress-bar {
+  background: var(--control-bg);
+}
+
+.cache-export-progress progress::-webkit-progress-value {
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+.cache-export-progress progress::-moz-progress-bar {
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+@media (max-width: 900.98px) {
+  .cache-export-progress-copy {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .cache-export-progress-copy span {
+    width: 100%;
+  }
 }
 
 .resolve-banner {
@@ -2516,7 +2651,7 @@ select {
   overflow: auto;
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--panel-bg) 72%, var(--base));
+  background: var(--list-bg);
   list-style: none;
   scrollbar-width: thin;
   scrollbar-color: var(--scrollbar-thumb) transparent;
@@ -3080,6 +3215,26 @@ select {
   background: transparent;
   font: inherit;
   white-space: normal;
+}
+
+.lyric .lyric-text {
+  display: grid;
+  gap: 4px;
+  justify-items: center;
+}
+
+.lyric small {
+  display: block;
+  font-size: 0.68em;
+  font-weight: 500;
+  line-height: 1.35;
+  opacity: 0.78;
+}
+
+.lyric small.romanization {
+  font-family: var(--font-mono);
+  font-size: 0.58em;
+  opacity: 0.58;
 }
 
 .lyric.active {

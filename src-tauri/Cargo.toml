@@ -21,6 +21,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
 serde.workspace = true
 serde_json.workspace = true
 gx-contracts = { path = "../crates/gx-contracts" }
@@ -40,6 +41,7 @@ souvlaki = "0.8"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
   "Win32_System_Com",
   "Win32_System_WinRT",

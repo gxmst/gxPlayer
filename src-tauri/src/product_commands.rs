@@ -18,6 +18,8 @@ const MAX_LOCAL_PATH_CHECKS: usize = 10_000;
 const MAX_LOCAL_PATH_BYTES: usize = 32 * 1024;
 const MAX_LOCAL_PATH_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BACKUP_FILE_BYTES: usize = 32 * 1024 * 1024;
+/// Playlists are line-oriented text; a legitimate one never approaches this.
+const MAX_PLAYLIST_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STAGING_PATH_ATTEMPTS: usize = 128;
 static BACKUP_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -47,7 +49,9 @@ pub struct LocalPathAvailability {
     pub available: bool,
 }
 
-fn validate_local_path_batch(paths: &[String]) -> Result<(), String> {
+/// Bound a caller-supplied path batch. Paths can come from a playlist file the
+/// user opened, not only from the native picker, so every entry is checked.
+pub(crate) fn validate_local_path_batch(paths: &[String]) -> Result<(), String> {
     if paths.len() > MAX_LOCAL_PATH_CHECKS {
         return Err(format!("单次最多检查 {MAX_LOCAL_PATH_CHECKS} 个本地路径"));
     }
@@ -157,7 +161,7 @@ mod tests {
         fs::write(&staged, b"new backup").unwrap();
         let mut rename_count = 0;
 
-        replace_staged_file_with(&staged, &path, |from, to| {
+        replace_staged_file_with(&staged, &path, "备份", |from, to| {
             rename_count += 1;
             fs::rename(from, to)
         })
@@ -179,7 +183,7 @@ mod tests {
         fs::write(&staged, b"new backup").unwrap();
         let mut rename_count = 0;
 
-        let error = replace_staged_file_with(&staged, &path, |from, to| {
+        let error = replace_staged_file_with(&staged, &path, "备份", |from, to| {
             assert_eq!(from, staged);
             assert_eq!(to, path);
             rename_count += 1;
@@ -232,8 +236,57 @@ mod tests {
 
     #[test]
     fn limited_reader_detects_a_file_that_grows_after_metadata() {
-        let error = read_bytes_limited(Cursor::new(b"123456789"), 8, 8).unwrap_err();
+        let error = read_bytes_limited(Cursor::new(b"123456789"), 8, 8, "备份").unwrap_err();
         assert!(error.contains("读取时超过"));
+    }
+
+    #[test]
+    fn playlist_read_refuses_a_directory_and_says_so_in_playlist_terms() {
+        let root = backup_test_root("playlist-dir");
+        let path = root.join("playlist.m3u8");
+        fs::create_dir_all(&path).unwrap();
+
+        let error = read_text_file_limited(&path, MAX_PLAYLIST_FILE_BYTES, "歌单").unwrap_err();
+
+        assert!(error.contains("歌单"), "{error}");
+        assert!(error.contains("普通文件"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn playlist_write_is_atomic_and_leaves_no_staging_file() {
+        let root = backup_test_root("playlist-write");
+        let path = root.join("playlist.m3u8");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&path, b"#EXTM3U\nold\n").unwrap();
+
+        write_text_file_atomic(&path, b"#EXTM3U\nnew\n", "歌单").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"#EXTM3U\nnew\n");
+        let entries = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [path.file_name().unwrap().to_os_string()]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn playlist_read_enforces_its_own_smaller_limit() {
+        let root = backup_test_root("playlist-oversized");
+        let path = root.join("huge.m3u8");
+        fs::create_dir_all(&root).unwrap();
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_PLAYLIST_FILE_BYTES as u64 + 1)
+            .unwrap();
+
+        // Well under the backup limit, so this only fails if the playlist limit applies.
+        const { assert!(MAX_PLAYLIST_FILE_BYTES < MAX_BACKUP_FILE_BYTES) };
+        let error = read_text_file_limited(&path, MAX_PLAYLIST_FILE_BYTES, "歌单").unwrap_err();
+
+        assert!(error.contains("过大"), "{error}");
+        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -487,14 +540,19 @@ fn cleanup_staging_after_error(message: String, staged: &Path) -> String {
     }
 }
 
-fn replace_staged_file_with<F>(staged: &Path, target: &Path, mut rename: F) -> Result<(), String>
+fn replace_staged_file_with<F>(
+    staged: &Path,
+    target: &Path,
+    kind: &str,
+    mut rename: F,
+) -> Result<(), String>
 where
     F: FnMut(&Path, &Path) -> io::Result<()>,
 {
     match fs::symlink_metadata(target) {
         Ok(metadata) if !metadata.file_type().is_file() => {
             return Err(cleanup_staging_after_error(
-                "备份目标不是普通文件，已拒绝覆盖".into(),
+                format!("{kind}目标不是普通文件，已拒绝覆盖"),
                 staged,
             ));
         }
@@ -502,7 +560,7 @@ where
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(cleanup_staging_after_error(
-                format!("无法检查现有备份: {error}"),
+                format!("无法检查现有{kind}: {error}"),
                 staged,
             ));
         }
@@ -511,31 +569,33 @@ where
     match rename(staged, target) {
         Ok(()) => Ok(()),
         Err(error) => Err(cleanup_staging_after_error(
-            format!("无法原子提交备份文件，目标未改动: {error}"),
+            format!("无法原子提交{kind}文件，目标未改动: {error}"),
             staged,
         )),
     }
 }
 
-fn replace_staged_file(staged: &Path, target: &Path) -> Result<(), String> {
-    replace_staged_file_with(staged, target, |from, to| fs::rename(from, to))
+fn replace_staged_file(staged: &Path, target: &Path, kind: &str) -> Result<(), String> {
+    replace_staged_file_with(staged, target, kind, |from, to| fs::rename(from, to))
 }
 
-fn write_backup_file_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+/// Atomic, symlink-refusing write shared by every user-visible file export.
+/// `kind` only shapes the error text; the safety checks are identical.
+fn write_text_file_atomic(path: &Path, content: &[u8], kind: &str) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
-            return Err("备份目标不是普通文件，已拒绝覆盖".into());
+            return Err(format!("{kind}目标不是普通文件，已拒绝覆盖"));
         }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("无法检查备份目标: {error}")),
+        Err(error) => return Err(format!("无法检查{kind}目标: {error}")),
     }
 
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent).map_err(|error| format!("无法创建备份目录: {error}"))?;
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建{kind}目录: {error}"))?;
     }
 
     let (staged_path, mut staged_file) = create_backup_staging_file(path)?;
@@ -548,50 +608,61 @@ fn write_backup_file_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
 
     if let Err(error) = write_result {
         return Err(cleanup_staging_after_error(
-            format!("无法完整写入备份临时文件: {error}"),
+            format!("无法完整写入{kind}临时文件: {error}"),
             &staged_path,
         ));
     }
 
-    replace_staged_file(&staged_path, path)
+    replace_staged_file(&staged_path, path, kind)
+}
+
+fn write_backup_file_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+    write_text_file_atomic(path, content, "备份")
 }
 
 fn read_bytes_limited<R: Read>(
     reader: R,
     metadata_len: u64,
     limit: usize,
+    kind: &str,
 ) -> Result<Vec<u8>, String> {
     if metadata_len > limit as u64 {
-        return Err("备份文件过大".into());
+        return Err(format!("{kind}文件过大"));
     }
 
     let mut bytes = Vec::with_capacity(metadata_len as usize);
     reader
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("无法读取备份文件: {error}"))?;
+        .map_err(|error| format!("无法读取{kind}文件: {error}"))?;
     if bytes.len() > limit {
-        return Err("备份文件读取时超过大小限制".into());
+        return Err(format!("{kind}文件读取时超过大小限制"));
     }
     Ok(bytes)
 }
 
-fn read_backup_file_limited(path: &Path) -> Result<String, String> {
+/// Metadata is re-checked after the open so a swap between the two cannot slip a
+/// directory or symlink past the first check.
+fn read_text_file_limited(path: &Path, limit: usize, kind: &str) -> Result<String, String> {
     let path_metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !path_metadata.file_type().is_file() {
-        return Err("备份路径不是普通文件".into());
+        return Err(format!("{kind}路径不是普通文件"));
     }
-    if path_metadata.len() > MAX_BACKUP_FILE_BYTES as u64 {
-        return Err("备份文件过大".into());
+    if path_metadata.len() > limit as u64 {
+        return Err(format!("{kind}文件过大"));
     }
 
     let file = File::open(path).map_err(|error| error.to_string())?;
     let file_metadata = file.metadata().map_err(|error| error.to_string())?;
     if !file_metadata.file_type().is_file() {
-        return Err("备份路径不是普通文件".into());
+        return Err(format!("{kind}路径不是普通文件"));
     }
-    let bytes = read_bytes_limited(file, file_metadata.len(), MAX_BACKUP_FILE_BYTES)?;
+    let bytes = read_bytes_limited(file, file_metadata.len(), limit, kind)?;
     String::from_utf8(bytes).map_err(|error| error.to_string())
+}
+
+fn read_backup_file_limited(path: &Path) -> Result<String, String> {
+    read_text_file_limited(path, MAX_BACKUP_FILE_BYTES, "备份")
 }
 
 #[tauri::command]
@@ -615,6 +686,30 @@ pub fn backup_read_file(window: WebviewWindow, path: String) -> Result<String, S
         return Err("路径过长".into());
     }
     read_backup_file_limited(Path::new(&path))
+}
+
+/// Read a playlist file the user picked. Text only: the contents are parsed in
+/// the frontend and never used to reach the network.
+#[tauri::command]
+pub fn playlist_read_file(window: WebviewWindow, path: String) -> Result<String, String> {
+    require_window(&window, "main")?;
+    if path.len() > 1024 {
+        return Err("路径过长".into());
+    }
+    read_text_file_limited(Path::new(&path), MAX_PLAYLIST_FILE_BYTES, "歌单")
+}
+
+#[tauri::command]
+pub fn playlist_write_file(
+    window: WebviewWindow,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    if path.len() > 1024 || content.len() > MAX_PLAYLIST_FILE_BYTES {
+        return Err("歌单内容或路径超出限制".into());
+    }
+    write_text_file_atomic(Path::new(&path), content.as_bytes(), "歌单")
 }
 
 /// Soft media-command bridge used by future SMTC / hotkeys.

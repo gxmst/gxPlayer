@@ -22,6 +22,7 @@ mod app_preferences;
 mod artwork;
 mod backup_commands;
 mod cache_commands;
+mod cache_export;
 mod diagnostic_log;
 mod library_commands;
 mod media_session;
@@ -33,6 +34,7 @@ mod source_commands;
 mod source_runtime;
 mod taskbar_toolbar;
 mod transport;
+mod window_corners;
 mod window_state;
 mod windows_identity;
 
@@ -40,10 +42,10 @@ use app_preferences::{AppPreferences, AppPreferencesState, CloseAction, CloseBeh
 use artwork::artwork_get;
 use backup_commands::{backup_preview_restore, backup_restore_atomic};
 use cache_commands::{
-    cache_clear, cache_list_entries, cache_online_favorites, cache_remove_by_quality,
-    cache_remove_entries, cache_remove_entry, cache_reset_directory, cache_set_directory,
-    cache_set_limit, cache_set_online_favorite, cache_status, player_play_cache_entry,
-    player_play_history_cache, preview_cache_clear, preview_cache_status,
+    cache_clear, cache_export_entries, cache_list_entries, cache_online_favorites,
+    cache_remove_by_quality, cache_remove_entries, cache_remove_entry, cache_reset_directory,
+    cache_set_directory, cache_set_limit, cache_set_online_favorite, cache_status,
+    player_play_cache_entry, player_play_history_cache, preview_cache_clear, preview_cache_status,
 };
 use diagnostic_log::{
     DiagnosticLogState, diagnostic_log_clear, diagnostic_log_export, diagnostic_log_recent,
@@ -52,23 +54,25 @@ use diagnostic_log::{
 use library_commands::{library_import_folders, library_relink_tracks, library_remove_tracks};
 use metadata_commands::{
     MetadataCancellationRegistry, maybe_start_phase3_smoke, metadata_cancel_request,
-    metadata_chart, metadata_find_replacements, metadata_lyrics, metadata_play_preview,
-    metadata_read_local_lyrics, metadata_search,
+    metadata_chart, metadata_chart_regions, metadata_find_replacements, metadata_lyrics,
+    metadata_play_preview, metadata_read_local_lyrics, metadata_search,
 };
 use network_settings::{network_proxy_status, network_set_proxy_mode};
 use product_commands::{
     backup_read_file, backup_write_file, library_check_local_paths, library_clear_history,
     library_embedded_cover, library_history, library_record_history, library_scan_missing,
-    player_media_action, window_force_show, window_get_state, window_save_state,
-    window_set_always_on_top, window_set_mini_mode,
+    player_media_action, playlist_read_file, playlist_write_file, validate_local_path_batch,
+    window_force_show, window_get_state, window_save_state, window_set_always_on_top,
+    window_set_mini_mode,
 };
 use source_commands::{
-    LxHttpConcurrencyLimiter, ResolveCancellationRegistry, lx_http_request, lx_runtime_failure,
-    lx_runtime_result, lx_send, player_cancel_resolve, player_play_online_track, source_activate,
-    source_export_backup, source_get_config, source_get_fallback_config, source_import_file,
-    source_import_url, source_list, source_reimport, source_reload, source_remove, source_resolve,
-    source_restore_backup, source_set_config, source_set_enabled, source_set_fallback_config,
-    source_set_order, source_set_updates_enabled, source_status,
+    LxHttpConcurrencyLimiter, OptionalActionGate, ResolveCancellationRegistry, lx_http_request,
+    lx_runtime_failure, lx_runtime_result, lx_send, player_cancel_resolve,
+    player_play_online_track, source_activate, source_export_backup, source_get_config,
+    source_get_fallback_config, source_import_file, source_import_url, source_list, source_lyric,
+    source_playlist, source_reimport, source_reload, source_remove, source_resolve,
+    source_restore_backup, source_search, source_set_config, source_set_enabled,
+    source_set_fallback_config, source_set_order, source_set_updates_enabled, source_status,
 };
 use source_runtime::SourceRuntime;
 
@@ -231,6 +235,9 @@ async fn library_import_files(
     if paths.len() > MAX_LIBRARY_TRACKS {
         return Err(format!("单次最多导入 {MAX_LIBRARY_TRACKS} 个本地音频文件"));
     }
+    // Paths may originate from an opened playlist file rather than the native
+    // picker, so bound each entry's length and the batch total as well.
+    validate_local_path_batch(&paths)?;
     let app = window.app_handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let library = app.state::<LibraryStore>();
@@ -401,9 +408,9 @@ fn library_tracks(
     library: tauri::State<LibraryStore>,
 ) -> Result<Vec<LibraryTrack>, String> {
     require_window(&window, "main")?;
-    library
-        .list_tracks(MAX_LIBRARY_TRACKS)
-        .map_err(|error| error.to_string())
+    // Unbounded on purpose: legacy libraries may exceed MAX_LIBRARY_TRACKS, and the
+    // UI needs the full list so users can delete their way back under the limit.
+    library.list_all_tracks().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -577,6 +584,53 @@ fn library_restore_backup(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn library_upsert_quality_measurement(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    kind: String,
+    path: Option<String>,
+    provider_id: Option<String>,
+    provider_track_id: Option<String>,
+    quality: Option<String>,
+    report_json: String,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    library
+        .upsert_quality_measurement(
+            &kind,
+            path.as_deref(),
+            provider_id.as_deref(),
+            provider_track_id.as_deref(),
+            quality.as_deref(),
+            &report_json,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_get_quality_measurement(
+    window: WebviewWindow,
+    library: tauri::State<LibraryStore>,
+    kind: String,
+    path: Option<String>,
+    provider_id: Option<String>,
+    provider_track_id: Option<String>,
+    quality: Option<String>,
+) -> Result<Option<String>, String> {
+    require_window(&window, "main")?;
+    library
+        .get_quality_measurement(
+            &kind,
+            path.as_deref(),
+            provider_id.as_deref(),
+            provider_track_id.as_deref(),
+            quality.as_deref(),
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn player_load_resolved(
     window: WebviewWindow,
     engine: tauri::State<LocalAudioEngine>,
@@ -657,6 +711,46 @@ fn player_set_dsp_settings(
 ) -> Result<AppPreferences, String> {
     require_window(&window, "main")?;
     apply_persisted_dsp_control(&engine, &preferences, control)
+}
+
+#[tauri::command]
+fn player_save_custom_eq_preset(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    preset: app_preferences::CustomEqPreset,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    preferences.save_custom_eq_preset(preset)
+}
+
+#[tauri::command]
+fn player_delete_custom_eq_preset(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    name: String,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    preferences.delete_custom_eq_preset(&name)
+}
+
+#[tauri::command]
+fn app_preferences_set_chart_region(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    region: String,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    preferences.set_chart_region(&region)
+}
+
+#[tauri::command]
+fn app_preferences_set_chart_auto_load(
+    window: WebviewWindow,
+    preferences: tauri::State<AppPreferencesState>,
+    enabled: bool,
+) -> Result<AppPreferences, String> {
+    require_window(&window, "main")?;
+    preferences.set_chart_auto_load(enabled)
 }
 
 #[tauri::command]
@@ -1253,10 +1347,14 @@ pub fn run() {
     windows_identity::initialize();
     let audio_engine = LocalAudioEngine::new().expect("failed to create local audio engine");
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(audio_engine)
         .manage(LxHttpConcurrencyLimiter::default())
         .manage(ResolveCancellationRegistry::default())
+        .manage(OptionalActionGate::default())
         .manage(MetadataClient::default())
         .manage(MetadataCancellationRegistry::default())
         .manage(media_session::MediaSessionState::default())
@@ -1391,6 +1489,8 @@ pub fn run() {
             }
 
             if let Some(main) = app.get_webview_window("main") {
+                // Round before the first paint so no square-cornered frame is shown.
+                window_corners::apply_rounded(&main);
                 // Fail soft: still show with tauri.conf fallback size if monitor probe fails.
                 if let Err(error) = place_and_show_main_window(&main, &app_data) {
                     eprintln!("main window placement failed: {error}");
@@ -1425,6 +1525,8 @@ pub fn run() {
             player_set_audio_mode,
             player_set_play_mode,
             player_set_dsp_settings,
+            player_save_custom_eq_preset,
+            player_delete_custom_eq_preset,
             player_set_ab_dry,
             player_next,
             player_previous,
@@ -1461,6 +1563,8 @@ pub fn run() {
             library_remove_cached_from_playlist,
             library_export_backup,
             library_restore_backup,
+            library_upsert_quality_measurement,
+            library_get_quality_measurement,
             library_scan_missing,
             library_check_local_paths,
             library_history,
@@ -1474,6 +1578,8 @@ pub fn run() {
             window_set_mini_mode,
             backup_write_file,
             backup_read_file,
+            playlist_read_file,
+            playlist_write_file,
             backup_preview_restore,
             backup_restore_atomic,
             sandbox_ready,
@@ -1495,9 +1601,15 @@ pub fn run() {
             source_export_backup,
             source_restore_backup,
             source_resolve,
+            source_search,
+            source_lyric,
+            source_playlist,
             metadata_search,
             metadata_cancel_request,
             metadata_chart,
+            metadata_chart_regions,
+            app_preferences_set_chart_region,
+            app_preferences_set_chart_auto_load,
             metadata_lyrics,
             metadata_read_local_lyrics,
             metadata_find_replacements,
@@ -1520,6 +1632,7 @@ pub fn run() {
             cache_list_entries,
             cache_remove_entry,
             cache_remove_entries,
+            cache_export_entries,
             cache_remove_by_quality,
             cache_online_favorites,
             cache_set_online_favorite,

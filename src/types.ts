@@ -126,6 +126,22 @@ export type DiagnosticLogExportResult = {
   entryCount: number;
 };
 
+/** Per-track export result. `fileName` is a basename, never a full path. */
+export type CacheExportOutcome = {
+  providerId: string;
+  providerTrackId: string;
+  quality: string;
+  fileName: string | null;
+  error: string | null;
+};
+
+/** Progress emitted while cached audio is copied to a user-selected directory. */
+export type CacheExportProgress = {
+  completed: number;
+  total: number;
+  current: string;
+};
+
 export type CacheStatus = {
   revision: number;
   directory: string;
@@ -164,7 +180,20 @@ export type CacheEntryView = {
 
 export type LyricDocument = {
   instrumental: boolean;
-  lines: Array<{ timestampMs: number | null; text: string }>;
+  lines: Array<{
+    timestampMs: number | null;
+    text: string;
+    translation?: string | null;
+    romanization?: string | null;
+  }>;
+};
+
+export type SourcePlaylist = {
+  id: string;
+  name: string;
+  coverUrl: string | null;
+  creator: string | null;
+  tracks: CatalogTrack[];
 };
 
 export type LibraryTrack = {
@@ -228,11 +257,34 @@ export type DspSettings = {
   eqEnabled: boolean;
   eqBands: EqBand[];
   crossfeed: { enabled: boolean; amount: number; delayMs: number; cutoffHz: number };
+  /** Early reflections, applied before the HRTF so they are spatialised too. */
+  room: { enabled: boolean; amount: number; size: number };
   hrtf: { enabled: boolean; mix: number; outputGainDb: number };
   limiter: { enabled: boolean; ceilingDb: number; releaseMs: number };
 };
 
-export type DspPresetId = "bypass" | "headphone_daily" | "vocal" | "bass" | "spatial";
+/** Mirrors gx_audio::engine::DspPresetId, which serializes snake_case. */
+export type DspPresetId =
+  | "bypass"
+  | "headphone_daily"
+  | "vocal"
+  | "bass"
+  | "spatial"
+  | "warm"
+  | "bright"
+  | "classical"
+  | "electronic"
+  | "rock"
+  | "podcast"
+  | "jazz"
+  | "piano_vocal"
+  | "custom";
+
+/** A user-saved EQ curve. Gains only; frequency, Q and kind are fixed by the product EQ. */
+export type CustomEqPreset = {
+  name: string;
+  gainsDb: number[];
+};
 
 export type DspControlState = {
   settings: DspSettings;
@@ -266,6 +318,17 @@ export type EngineSnapshot = {
   outputDevice?: string | null;
 };
 
+export type QualityReport = {
+  peakFrequencyHz: number;
+  effectiveBandwidthHz: number;
+  avgMagnitudeDbfs: number;
+};
+
+export type QualityReportReady = {
+  location: string;
+  report: QualityReport;
+};
+
 export type ViewId =
   | "discovery"
   | "search"
@@ -292,7 +355,8 @@ export const EMPTY_ENGINE: EngineSnapshot = {
     eqEnabled: false,
     eqBands: [{ enabled: true, kind: "peak", frequencyHz: 1000, gainDb: 0, q: 1 }],
     crossfeed: { enabled: false, amount: 0.18, delayMs: 0.28, cutoffHz: 700 },
-    hrtf: { enabled: false, mix: 0.72, outputGainDb: -6 },
+    room: { enabled: false, amount: 0.22, size: 0.45 },
+    hrtf: { enabled: false, mix: 0.72, outputGainDb: 0 },
     limiter: { enabled: false, ceilingDb: -1, releaseMs: 80 },
   },
   activePresetId: "bypass",

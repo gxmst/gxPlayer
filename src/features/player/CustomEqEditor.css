@@ -1,0 +1,159 @@
+.custom-eq-editor {
+  display: grid;
+  gap: 14px;
+}
+
+.custom-eq-plot-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.custom-eq-plot {
+  flex: 1 1 auto;
+  height: 96px;
+  min-width: 0;
+  border: 1px solid var(--soft-border);
+  border-radius: var(--radius-md);
+  background: var(--list-bg);
+}
+
+.custom-eq-zero-line {
+  stroke: var(--divider);
+  stroke-width: 1;
+}
+
+.custom-eq-curve {
+  fill: none;
+  stroke: var(--accent-contrast);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.custom-eq-scale {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  color: var(--text-dim);
+  font-size: var(--text-micro);
+  font-variant-numeric: tabular-nums;
+}
+
+.custom-eq-bands {
+  display: grid;
+  grid-template-columns: repeat(10, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.custom-eq-band {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Vertical sliders: one per band, so the control mirrors the curve above it. */
+.custom-eq-range {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 20px;
+  height: 104px;
+  margin: 0;
+  accent-color: var(--accent-contrast);
+}
+
+.custom-eq-band-gain,
+.custom-eq-band-frequency {
+  font-size: var(--text-micro);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.custom-eq-band-gain {
+  color: var(--text-mute);
+}
+
+.custom-eq-band-frequency {
+  color: var(--text-dim);
+}
+
+.custom-eq-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.custom-eq-name {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.custom-eq-name input {
+  width: 100%;
+}
+
+.custom-eq-saved {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.custom-eq-saved li {
+  display: flex;
+  align-items: stretch;
+  overflow: hidden;
+  border: 1px solid var(--soft-border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-bg);
+}
+
+.custom-eq-saved li.is-active {
+  border-color: color-mix(in srgb, var(--accent-contrast) 55%, var(--interactive-border));
+  background: color-mix(in srgb, var(--accent) 14%, var(--glass));
+}
+
+.custom-eq-saved button {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.custom-eq-saved-apply {
+  padding: 5px 10px;
+  font-size: var(--text-small);
+}
+
+.custom-eq-saved-delete {
+  padding: 5px 8px;
+  border-left: 1px solid var(--soft-border);
+  color: var(--text-dim);
+}
+
+.custom-eq-saved-delete:hover {
+  color: var(--danger-fg);
+}
+
+.custom-eq-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 900.98px) {
+  .custom-eq-bands {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    row-gap: 12px;
+  }
+}

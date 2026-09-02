@@ -1,7 +1,7 @@
 use gx_audio::engine::LocalAudioEngine;
 use gx_cache::{CacheEntryView, CacheKey, CacheStatus, CacheStore};
 use gx_metadata::CatalogTrack;
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 use crate::diagnostic_log::record_diagnostic;
 use crate::preview_cache::{PreviewCacheStatus, PreviewCacheStore};
@@ -241,6 +241,86 @@ pub fn cache_remove_entries(
         record_cache_operation_failure(window.app_handle(), "remove_entries", error);
     }
     result
+}
+
+/// Per-track outcome, so one unwritable file does not hide the rest.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheExportOutcome {
+    pub provider_id: String,
+    pub provider_track_id: String,
+    pub quality: String,
+    /// Basename actually written, for the report. Never a full path.
+    pub file_name: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Progress tick for a running export, so a large batch is not a frozen button.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheExportProgressEvent {
+    completed: usize,
+    total: usize,
+    /// Readable name of the track about to be written; empty on the final tick and for
+    /// entries that have no cached file to name.
+    current: String,
+}
+
+const MAX_EXPORT_BATCH: usize = 2_000;
+
+/// Copy already-cached audio into a directory the user picked, under a readable
+/// name. Nothing is fetched: an entry that is not fully cached is reported as
+/// such, so this cannot become a downloader that reaches the network.
+#[tauri::command]
+pub async fn cache_export_entries(
+    window: WebviewWindow,
+    cache: tauri::State<'_, CacheStore>,
+    keys: Vec<CacheKey>,
+    directory: String,
+) -> Result<Vec<CacheExportOutcome>, String> {
+    require_window(&window, "main")?;
+    if keys.is_empty() {
+        return Err("没有选择要导出的歌曲".into());
+    }
+    if keys.len() > MAX_EXPORT_BATCH {
+        return Err(format!("一次最多导出 {MAX_EXPORT_BATCH} 首"));
+    }
+    if directory.len() > 1024 {
+        return Err("导出目录路径过长".into());
+    }
+
+    // Resolve every plan under the store's lock before any file work, so a
+    // concurrent eviction cannot leave a half-resolved batch.
+    let mut planned = Vec::with_capacity(keys.len());
+    for key in keys {
+        let plan = cache.export_plan(&key);
+        planned.push((key, plan));
+    }
+
+    let directory = std::path::PathBuf::from(directory);
+    let app = window.app_handle().clone();
+    let progress_app = app.clone();
+    let outcomes = tauri::async_runtime::spawn_blocking(move || {
+        crate::cache_export::write_exports(&directory, planned, |progress| {
+            // Best-effort: a listener that has gone away must not fail the export that is
+            // already writing files.
+            let _ = progress_app.emit(
+                "gx-cache-export-progress",
+                CacheExportProgressEvent {
+                    completed: progress.completed,
+                    total: progress.total,
+                    current: progress.current.to_owned(),
+                },
+            );
+        })
+    })
+    .await
+    .map_err(|error| format!("导出任务失败: {error}"))?;
+
+    if let Some(failure) = outcomes.iter().find_map(|outcome| outcome.error.as_deref()) {
+        record_cache_operation_failure(&app, "export_entries", failure);
+    }
+    Ok(outcomes)
 }
 
 #[tauri::command]

@@ -9,7 +9,8 @@ use gx_audio::engine::LocalAudioEngine;
 use gx_cache::{CacheKey, CacheStore};
 use gx_contracts::{NetworkRoute, ResolvedMediaRequest};
 use gx_metadata::{
-    CatalogTrack, find_replacements, search_all, search_kugou, search_kuwo, search_netease,
+    CatalogTrack, LyricDocument, find_replacements, search_all, search_kugou, search_kuwo,
+    search_netease,
 };
 use gx_source::network_policy::source_route_attempts;
 use gx_source::safe_http::{SafeHttpError, SafeHttpRequest, execute, execute_on_route};
@@ -101,6 +102,16 @@ pub struct OnlinePlaybackResult {
     pub cache_hit: bool,
     pub attempts: Vec<ResolveAttemptDiagnostic>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePlaylist {
+    pub id: String,
+    pub name: String,
+    pub cover_url: Option<String>,
+    pub creator: Option<String>,
+    pub tracks: Vec<CatalogTrack>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -249,6 +260,52 @@ impl ResolveCancellationRegistry {
             if inner.current_request_id.as_deref() == Some(token.request_id.as_str()) {
                 inner.current_request_id = None;
             }
+        }
+    }
+}
+
+/// Lets playback take the source runtime back from an in-flight optional action.
+///
+/// Optional actions (search fallback, lyrics, playlist reads) share one sandbox and
+/// one operation lock with playback resolution. Audio is what the user is waiting
+/// for, so an optional action never gets to hold that lock across a playback
+/// request: playback calls [`OptionalActionGate::preempt`] before it queues for the
+/// lock, and the optional action's wait loops observe the cancelled token within one
+/// poll interval and release it.
+#[derive(Default)]
+pub struct OptionalActionGate {
+    active: Mutex<Option<Arc<AtomicU8>>>,
+}
+
+impl OptionalActionGate {
+    /// Register an optional action, superseding any previous one, and hand back the
+    /// token its wait loops must poll.
+    fn begin(&self, action: &str) -> ResolveToken {
+        let state = Arc::new(AtomicU8::new(RESOLVE_ACTIVE));
+        let mut active = self.active.lock().unwrap();
+        if let Some(previous) = active.replace(state.clone()) {
+            previous.store(RESOLVE_STALE, Ordering::Release);
+        }
+        ResolveToken {
+            request_id: format!("optional:{action}"),
+            state,
+        }
+    }
+
+    fn finish(&self, token: &ResolveToken) {
+        let mut active = self.active.lock().unwrap();
+        if active
+            .as_ref()
+            .is_some_and(|state| Arc::ptr_eq(state, &token.state))
+        {
+            *active = None;
+        }
+    }
+
+    /// Cancel whatever optional action is running so playback can proceed.
+    pub(crate) fn preempt(&self) {
+        if let Some(state) = self.active.lock().unwrap().take() {
+            state.store(RESOLVE_CANCELLED, Ordering::Release);
         }
     }
 }
@@ -641,6 +698,7 @@ pub async fn source_resolve(
 ) -> Result<ResolvedMediaRequest, String> {
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
+    app.state::<OptionalActionGate>().preempt();
     let diagnostic_source_id = source_id.clone();
     let app_for_worker = app.clone();
     let worker_result = tauri::async_runtime::spawn_blocking(move || {
@@ -667,6 +725,341 @@ pub async fn source_resolve(
         );
     }
     result
+}
+
+#[tauri::command]
+pub async fn source_search(
+    window: WebviewWindow,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<CatalogTrack>, String> {
+    require_window(&window, "main")?;
+    let query = query.trim().to_owned();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    if query.chars().count() > 256 {
+        return Err("source search query cannot exceed 256 characters".into());
+    }
+    let limit = limit.unwrap_or(20).clamp(1, 50);
+    let app = window.app_handle().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        request_optional_source_action(&app, "search", |_| {
+            json!({
+                "action": "search",
+                "info": {
+                    "keyword": query,
+                    "limit": limit,
+                    "offset": 0
+                }
+            })
+        })
+    })
+    .await
+    .map_err(|error| format!("source search task failed: {error}"))??;
+    let Some(result) = result else {
+        return Ok(Vec::new());
+    };
+    parse_source_tracks(result, limit, "source search")
+}
+
+#[tauri::command]
+pub async fn source_lyric(
+    window: WebviewWindow,
+    track: CatalogTrack,
+) -> Result<Option<LyricDocument>, String> {
+    require_window(&window, "main")?;
+    let app = window.app_handle().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let (source, music_info) = lx_identity(&track)
+            .map(|(source, info)| (source.to_owned(), info.clone()))
+            .unwrap_or_else(|| {
+                (
+                    track.provider_id.clone(),
+                    json!({
+                        "songmid": track.provider_track_id,
+                        "name": track.title,
+                        "singer": track.artist,
+                        "albumName": track.album,
+                    }),
+                )
+            });
+        request_optional_source_action(&app, "lyric", |_| {
+            json!({
+                "action": "lyric",
+                "source": source,
+                "info": {
+                    "musicInfo": music_info,
+                    "durationMs": track.duration_ms,
+                }
+            })
+        })
+    })
+    .await
+    .map_err(|error| format!("source lyric task failed: {error}"))??;
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    if result.is_null() {
+        return Ok(None);
+    }
+    let document: LyricDocument = serde_json::from_value(result)
+        .map_err(|error| format!("source lyric result is invalid: {error}"))?;
+    if document.lines.len() > 20_000 {
+        return Err("source lyric result contains too many lines".into());
+    }
+    Ok((document.instrumental || !document.lines.is_empty()).then_some(document))
+}
+
+#[tauri::command]
+pub async fn source_playlist(
+    window: WebviewWindow,
+    id: String,
+) -> Result<Option<SourcePlaylist>, String> {
+    require_window(&window, "main")?;
+    let id = id.trim().to_owned();
+    if id.is_empty() || id.len() > 160 {
+        return Err("source playlist id must contain 1 to 160 characters".into());
+    }
+    let app = window.app_handle().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        request_optional_source_action(&app, "playlist", |capabilities| {
+            let mut payload = json!({
+                "action": "playlist",
+                "info": { "id": id }
+            });
+            // The platform is whatever the source advertised for this action; the
+            // host never assumes one. Sources that ignore the field are unaffected.
+            if let Some(platform) = advertised_platform_for_action(capabilities, "playlist") {
+                payload["source"] = Value::String(platform);
+            }
+            payload
+        })
+    })
+    .await
+    .map_err(|error| format!("source playlist task failed: {error}"))??;
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    let playlist: SourcePlaylist = serde_json::from_value(result)
+        .map_err(|error| format!("source playlist result is invalid: {error}"))?;
+    if playlist.tracks.len() > 2_000 {
+        return Err("source playlist contains more than 2000 tracks".into());
+    }
+    Ok(Some(playlist))
+}
+
+fn parse_source_tracks(
+    result: Value,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<CatalogTrack>, String> {
+    let tracks = match result {
+        Value::Array(tracks) => tracks,
+        Value::Object(mut object) => object
+            .remove("tracks")
+            .and_then(|value| value.as_array().cloned())
+            .ok_or_else(|| format!("{label} result must contain a tracks array"))?,
+        _ => return Err(format!("{label} result must be an array or object")),
+    };
+    let offered = tracks.len();
+    // Skip malformed entries instead of discarding the batch: one unusable row in a
+    // page of results should not cost the user every other result on the page.
+    let parsed: Vec<CatalogTrack> = tracks
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<CatalogTrack>(value).ok())
+        .filter(|track| {
+            !track.provider_id.trim().is_empty()
+                && !track.provider_track_id.trim().is_empty()
+                && !track.title.trim().is_empty()
+        })
+        .take(limit)
+        .collect();
+    if parsed.is_empty() && offered > 0 {
+        return Err(format!(
+            "{label} returned {offered} tracks but none had usable providerId, providerTrackId and title"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn source_supports_action(source: &gx_source::ManagedSource, action: &str) -> bool {
+    capabilities_support_action(&source.capabilities, action)
+}
+
+/// Pick the platform key a source advertised for `action` in its `inited` report.
+///
+/// The host keeps no platform table of its own: keys, names and quality labels all
+/// originate from the source's own capability report. Returns `None` when nothing
+/// was advertised, in which case the payload carries no platform at all.
+fn advertised_platform_for_action(capabilities: &Value, action: &str) -> Option<String> {
+    let sources = capabilities.get("sources")?.as_object()?;
+    let mut advertised: Vec<&String> = sources
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .get("actions")
+                .and_then(Value::as_array)
+                .is_some_and(|actions| actions.iter().any(|value| value.as_str() == Some(action)))
+        })
+        .map(|(key, _)| key)
+        .collect();
+    advertised.sort();
+    advertised.first().map(|key| (*key).to_owned())
+}
+
+fn capabilities_support_action(capabilities: &Value, action: &str) -> bool {
+    let protocol = capabilities
+        .get("protocolVersion")
+        .or_else(|| capabilities.get("protocol"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    protocol >= 2
+        && capabilities
+            .get("actions")
+            .and_then(Value::as_array)
+            .is_some_and(|actions| actions.iter().any(|value| value.as_str() == Some(action)))
+}
+
+fn request_optional_source_action(
+    app: &AppHandle,
+    action: &str,
+    build_payload: impl FnOnce(&Value) -> Value,
+) -> Result<Option<Value>, String> {
+    let runtime = app.state::<SourceRuntime>();
+    let candidates = runtime
+        .resolution_source_ids(None)
+        .map_err(|error| error.to_string())?;
+    let supported = |id: &str| {
+        runtime
+            .source(id)
+            .ok()
+            .filter(|source| source_supports_action(source, action))
+            .map(|source| source.capabilities.clone())
+    };
+    // Prefer the source already loaded in the sandbox. Reloading the realm for an
+    // optional action would cost two runtime initializations per request while the
+    // user is listening, so a ready source that advertises the action always wins.
+    let status = runtime.status();
+    let selected = status
+        .active_source_id
+        .as_deref()
+        .filter(|active| {
+            status.state == crate::source_runtime::RuntimeState::Ready
+                && candidates.iter().any(|id| id == active)
+        })
+        .and_then(|active| supported(active).map(|caps| (active.to_owned(), caps)))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find_map(|id| supported(id).map(|caps| (id.clone(), caps)))
+        });
+    let Some((source_id, capabilities)) = selected else {
+        return Ok(None);
+    };
+    let payload = build_payload(&capabilities);
+    let preferred_route = runtime
+        .preferred_route(&source_id)
+        .map_err(|error| error.to_string())?;
+    let route = source_route_attempts(preferred_route)
+        .into_iter()
+        .next()
+        .unwrap_or(NetworkRoute::Direct);
+    let gate = app.state::<OptionalActionGate>();
+    let token = gate.begin(action);
+    let result = runtime.serialized(|| {
+        // Playback may have preempted us while we queued for the lock.
+        if token.outcome().is_some() {
+            return Err(OPTIONAL_ACTION_PREEMPTED.to_owned());
+        }
+        let persistent_active = runtime
+            .list()
+            .into_iter()
+            .find(|source| source.active)
+            .map(|source| source.source.id);
+        let temporary = persistent_active.as_deref() != Some(source_id.as_str());
+        let status = runtime.status();
+        let current_route = runtime
+            .source_id_and_route_for_generation(status.generation)
+            .ok()
+            .filter(|(current_source_id, _)| current_source_id == &source_id)
+            .map(|(_, current_route)| current_route);
+        let needs_launch = status.active_source_id.as_deref() != Some(source_id.as_str())
+            || status.state != crate::source_runtime::RuntimeState::Ready
+            || current_route != Some(route);
+        if needs_launch {
+            let switched = (|| {
+                let launch = runtime
+                    .prepare_reload_for_route(&source_id, route)
+                    .map_err(|error| error.to_string())?;
+                let sandbox = app
+                    .get_webview_window(SANDBOX_LABEL)
+                    .ok_or_else(|| "LX sandbox window is unavailable".to_owned())?;
+                evaluate_launch(&sandbox, &launch)?;
+                wait_until_ready(
+                    &runtime,
+                    launch.generation,
+                    RUNTIME_INIT_TIMEOUT,
+                    Some(&token),
+                )
+            })();
+            if let Err(error) = switched {
+                if temporary {
+                    let _ = restore_persistent_runtime_background(app, &runtime);
+                }
+                return Err(error);
+            }
+        }
+        let result = dispatch_raw_and_wait(app, &runtime, &payload, Some(&token));
+        // Restore in the background: holding the operation lock through another
+        // initialization would put a playback request behind this optional one.
+        if temporary
+            && let Err(restore_error) = restore_persistent_runtime_background(app, &runtime)
+        {
+            return match result {
+                Ok(_) => Err(restore_error),
+                Err(request_error) => Err(format!(
+                    "{request_error}; additionally failed to restore active source: {restore_error}"
+                )),
+            };
+        }
+        result
+    });
+    gate.finish(&token);
+    match result {
+        Ok(value) => Ok(Some(value)),
+        // A preempted optional action is not a failure the user needs to see.
+        Err(error) if is_optional_action_preempted(&error) => Ok(None),
+        Err(error) => {
+            // Optional actions deliberately stay out of the health window: that window
+            // ranks sources for resolution, and a source whose paid search is out of
+            // quota can still play audio. Failures land in diagnostics instead, so an
+            // exhausted key is visible without demoting a working source.
+            record_diagnostic(
+                app,
+                "source_optional_action_failed",
+                Some(&source_id),
+                format!("action={action} code={}", diagnostic_error_code(&error)),
+            );
+            Err(error)
+        }
+    }
+}
+
+const OPTIONAL_ACTION_PREEMPTED: &str = "optional source action preempted by playback";
+
+/// The exact terminal messages a preempted optional action can surface: the pre-lock
+/// check plus the two wait loops that poll the gate token. Matching these instead of
+/// scanning for "cancelled" keeps real upstream failures visible.
+fn is_optional_action_preempted(error: &str) -> bool {
+    matches!(
+        error,
+        OPTIONAL_ACTION_PREEMPTED
+            | "LX resolver request cancelled"
+            | "LX resolver request superseded"
+            | "LX runtime initialization cancelled"
+            | "LX runtime initialization superseded"
+    )
 }
 
 fn resolve_with_fallback(
@@ -755,7 +1148,7 @@ fn should_record_terminal_failure(error: &str) -> bool {
 }
 
 fn should_record_http_status(status: u16) -> bool {
-    matches!(status, 401 | 403 | 408 | 429 | 500..=599)
+    matches!(status, 401 | 402 | 403 | 408 | 429 | 500..=599)
 }
 
 fn safe_http_error_code(error: &SafeHttpError) -> &'static str {
@@ -794,7 +1187,11 @@ fn diagnostic_error_code(error: &str) -> &'static str {
         "upstream_auth_rejected"
     } else if error.contains("http 408") {
         "upstream_timeout"
-    } else if error.contains("http 429") || error.contains("rate_limited") {
+    } else if error.contains("http 402")
+        || error.contains("http 429")
+        || error.contains("rate_limited")
+        || error.contains("quota_exhausted")
+    {
         "upstream_rate_limited"
     } else if error.contains("upstream_not_found") || error.contains("http 404") {
         "upstream_not_found"
@@ -916,6 +1313,9 @@ pub async fn player_play_online_track(
 ) -> Result<OnlinePlaybackResult, String> {
     require_window(&window, "main")?;
     let app = window.app_handle().clone();
+    // Audio outranks enrichment: drop any in-flight optional action before queueing
+    // for the shared source runtime lock.
+    app.state::<OptionalActionGate>().preempt();
     let token = request_id
         .map(|request_id| {
             app.state::<ResolveCancellationRegistry>()
@@ -1477,8 +1877,11 @@ fn public_attempt_error(stage: &str, error: &str) -> String {
     if error.contains("http 404") {
         return "upstream_not_found".into();
     }
-    if error.contains("http 429") {
+    if error.contains("http 402") || error.contains("http 429") {
         return "upstream_rate_limited".into();
+    }
+    if error.contains("http 503") {
+        return "upstream_server_error".into();
     }
     if error.contains("preview-sized") || error.contains("minimum full-track") {
         return "preview_or_truncated_media".into();
@@ -1501,8 +1904,10 @@ fn should_skip_source(error: &str) -> bool {
     error.contains("timed out")
         || error.contains("timeout")
         || error.contains("http 401")
+        || error.contains("http 402")
         || error.contains("http 403")
         || error.contains("http 429")
+        || error.contains("http 503")
         || error.contains("runtime failed")
         || error.contains("sandbox window is unavailable")
 }
@@ -2701,6 +3106,16 @@ fn dispatch_and_wait(
     quality: Option<&str>,
     cancellation: Option<&ResolveToken>,
 ) -> Result<ResolvedMediaRequest, String> {
+    let raw = dispatch_raw_and_wait(app, runtime, payload, cancellation)?;
+    normalize_media_request(raw, quality)
+}
+
+fn dispatch_raw_and_wait(
+    app: &AppHandle,
+    runtime: &SourceRuntime,
+    payload: &Value,
+    cancellation: Option<&ResolveToken>,
+) -> Result<Value, String> {
     let pending = runtime.begin_request(payload)?;
     let request_id = pending.request_id.clone();
     let generation = pending.generation;
@@ -2746,7 +3161,7 @@ fn dispatch_and_wait(
             }
         }
     };
-    normalize_media_request(raw, quality)
+    Ok(raw)
 }
 
 fn abort_runtime_request(
@@ -3461,5 +3876,141 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, script);
+    }
+
+    #[test]
+    fn playback_preempts_an_in_flight_optional_action() {
+        let gate = OptionalActionGate::default();
+        let token = gate.begin("lyric");
+        assert!(token.outcome().is_none());
+
+        // Playback arrives: the optional action's wait loops must see a terminal
+        // outcome so they abort and release the shared operation lock.
+        gate.preempt();
+        assert_eq!(token.outcome(), Some(ResolveOutcome::Cancelled));
+        assert!(is_optional_action_preempted(
+            "LX resolver request cancelled"
+        ));
+        assert!(is_optional_action_preempted(OPTIONAL_ACTION_PREEMPTED));
+        assert!(!is_optional_action_preempted("upstream_rate_limited"));
+
+        // A newer optional action supersedes the older one, and finishing a token
+        // that no longer owns the slot must not clear the newer registration.
+        let first = gate.begin("search");
+        let second = gate.begin("search");
+        assert_eq!(first.outcome(), Some(ResolveOutcome::Stale));
+        assert!(second.outcome().is_none());
+        gate.finish(&first);
+        gate.preempt();
+        assert_eq!(second.outcome(), Some(ResolveOutcome::Cancelled));
+    }
+
+    #[test]
+    fn advertised_platform_comes_only_from_the_capability_report() {
+        let capabilities = json!({
+            "protocolVersion": 2,
+            "actions": ["musicUrl", "playlist"],
+            "sources": {
+                "zz": { "actions": ["musicUrl", "playlist"] },
+                "aa": { "actions": ["musicUrl"] }
+            }
+        });
+        assert_eq!(
+            advertised_platform_for_action(&capabilities, "playlist").as_deref(),
+            Some("zz")
+        );
+        assert_eq!(advertised_platform_for_action(&capabilities, "lyric"), None);
+        // Nothing advertised at all means the payload carries no platform.
+        assert_eq!(
+            advertised_platform_for_action(&json!({ "protocolVersion": 2 }), "playlist"),
+            None
+        );
+    }
+
+    #[test]
+    fn protocol_v2_actions_are_explicit_and_version_gated() {
+        let v2 = json!({
+            "protocolVersion": 2,
+            "actions": ["musicUrl", "search", "lyric", "playlist"]
+        });
+        assert!(capabilities_support_action(&v2, "search"));
+        assert!(capabilities_support_action(&v2, "playlist"));
+        assert!(!capabilities_support_action(&v2, "unknown"));
+        assert!(!capabilities_support_action(
+            &json!({ "actions": ["search"] }),
+            "search"
+        ));
+    }
+
+    #[test]
+    fn source_search_tracks_are_normalized_and_bounded() {
+        let result = json!({
+            "tracks": [
+                {
+                    "providerId": "wy",
+                    "providerTrackId": "42",
+                    "title": "Track",
+                    "artist": "Artist",
+                    "album": "Album",
+                    "durationMs": 180000,
+                    "artworkUrl": null,
+                    "resolverPayload": {
+                        "source": "wy",
+                        "musicInfo": { "songmid": "42" }
+                    },
+                    "preview": null
+                },
+                {
+                    "providerId": "wy",
+                    "providerTrackId": "43",
+                    "title": "Ignored",
+                    "artist": "Artist",
+                    "album": "Album",
+                    "durationMs": null,
+                    "artworkUrl": null,
+                    "resolverPayload": {},
+                    "preview": null
+                }
+            ]
+        });
+        let tracks = parse_source_tracks(result, 1, "test").unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].provider_track_id, "42");
+    }
+
+    #[test]
+    fn source_search_skips_unusable_tracks_instead_of_losing_the_page() {
+        let usable = json!({
+            "providerId": "wy",
+            "providerTrackId": "42",
+            "title": "Track",
+            "artist": "Artist",
+            "album": "Album",
+            "durationMs": 180000,
+            "artworkUrl": null,
+            "resolverPayload": { "source": "wy", "musicInfo": { "songmid": "42" } },
+            "preview": null
+        });
+        let result = json!({
+            "tracks": [
+                { "providerId": "wy", "providerTrackId": "1" },
+                { "providerId": "wy", "providerTrackId": "", "title": "Blank id" },
+                usable,
+                "not an object"
+            ]
+        });
+        let tracks = parse_source_tracks(result, 40, "test").unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].provider_track_id, "42");
+
+        // A page where nothing is usable is still an error worth surfacing.
+        let unusable = json!({ "tracks": [{ "providerId": "wy", "providerTrackId": "" }] });
+        assert!(parse_source_tracks(unusable, 40, "test").is_err());
+        // An empty page is a legitimate "no results", not a failure.
+        assert!(
+            parse_source_tracks(json!({ "tracks": [] }), 40, "test")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

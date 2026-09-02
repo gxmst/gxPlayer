@@ -2,6 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CatalogTrack } from "../types";
 import { TEXT_PLAYLIST_CONFIDENCE_THRESHOLD } from "../lib/textPlaylistImport";
 import {
+  normalizePlaylistText,
+  playlistFormatLabel,
+  PLAYLIST_DETECTION_CONFIDENCE_THRESHOLD,
+  toImportableText,
+  toLocalPaths,
+  type NormalizedPlaylist,
+} from "../lib/playlistFormats";
+import {
   buildTextPlaylistUnmatchedText,
   collectIncludedTextPlaylistTracks,
   createTextPlaylistSearch,
@@ -18,6 +26,10 @@ export type TextPlaylistImportDialogProps = {
   onClose: () => void;
   onEnqueue: (tracks: CatalogTrack[]) => void | Promise<void>;
   onExportUnmatched?: (text: string) => void | Promise<void>;
+  /** Let the user pick a playlist file; resolves to its text, or null if cancelled. */
+  onOpenFile?: () => Promise<{ name: string; text: string } | null>;
+  /** Import local files an m3u referenced, reading their real tags. Returns how many landed. */
+  onImportLocalPaths?: (paths: string[]) => Promise<number>;
   /** Inject a search function in tests or alternate frontends. */
   search?: TextPlaylistSearch;
   /** Convenience injection for the existing Tauri invoke API. */
@@ -61,6 +73,8 @@ export function TextPlaylistImportDialog({
   onClose,
   onEnqueue,
   onExportUnmatched,
+  onOpenFile,
+  onImportLocalPaths,
   search,
   invoke,
   searchLimit = 5,
@@ -76,9 +90,13 @@ export function TextPlaylistImportDialog({
   const [enqueueError, setEnqueueError] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [fileBusy, setFileBusy] = useState(false);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [localImportNote, setLocalImportNote] = useState<string | null>(null);
   const initialFocusRef = useRef<HTMLTextAreaElement>(null);
   const enqueueLockRef = useRef(false);
   const exportLockRef = useRef(false);
+  const fileLockRef = useRef(false);
 
   useEffect(() => {
     if (!open) {
@@ -89,23 +107,88 @@ export function TextPlaylistImportDialog({
       setEnqueueError(null);
       setExportBusy(false);
       setExportError(null);
+      setFileBusy(false);
+      setFileName(null);
+      setLocalImportNote(null);
       enqueueLockRef.current = false;
       exportLockRef.current = false;
+      fileLockRef.current = false;
     }
   }, [cancel, open, reset]);
+
+  // Detection is pure and cheap, so it can follow the textarea directly.
+  const normalized: NormalizedPlaylist | null = useMemo(
+    () => (text.trim() ? normalizePlaylistText(text) : null),
+    [text],
+  );
 
   if (!open) return null;
 
   const matchedTracks = collectIncludedTextPlaylistTracks(state.rows);
   const unmatchedText = buildTextPlaylistUnmatchedText(state.rows);
   const running = state.phase === "running";
-  const submissionBusy = enqueueBusy || exportBusy;
-  const canStart = text.trim().length > 0 && !running && !submissionBusy;
+  const submissionBusy = enqueueBusy || exportBusy || fileBusy;
+  const localPaths = normalized ? toLocalPaths(normalized.entries) : [];
+  const searchableText = normalized ? toImportableText(normalized.entries) : "";
+  const canStart = Boolean(normalized?.entries.length) && !running && !submissionBusy;
 
   const close = () => {
-    if (enqueueLockRef.current || exportLockRef.current || submissionBusy) return;
+    if (
+      enqueueLockRef.current
+      || exportLockRef.current
+      || fileLockRef.current
+      || submissionBusy
+    ) return;
     if (running) cancel();
     onClose();
+  };
+
+  const replaceText = (next: string, name: string | null) => {
+    if (state.phase !== "idle") reset();
+    setLocalImportNote(null);
+    setEnqueueError(null);
+    setExportError(null);
+    setFileName(name);
+    setText(next);
+  };
+
+  const openFile = async () => {
+    if (!onOpenFile || fileLockRef.current || submissionBusy || running) return;
+    fileLockRef.current = true;
+    setFileBusy(true);
+    setExportError(null);
+    try {
+      const picked = await onOpenFile();
+      if (picked) replaceText(picked.text, picked.name);
+    } catch (error) {
+      setExportError(String(error).slice(0, 240) || "读取文件失败");
+    } finally {
+      fileLockRef.current = false;
+      setFileBusy(false);
+    }
+  };
+
+  /**
+   * Local files are imported through the library so their own tags are used.
+   * Only entries without a local path go on to the online search.
+   */
+  const startMatching = async () => {
+    if (!canStart || !normalized) return;
+    if (localPaths.length && onImportLocalPaths) {
+      fileLockRef.current = true;
+      setFileBusy(true);
+      setLocalImportNote(null);
+      try {
+        const imported = await onImportLocalPaths(localPaths);
+        setLocalImportNote(`已从本地文件导入 ${imported} 首到曲库。`);
+      } catch (error) {
+        setLocalImportNote(`本地文件导入失败：${String(error).slice(0, 160)}`);
+      } finally {
+        fileLockRef.current = false;
+        setFileBusy(false);
+      }
+    }
+    if (searchableText.trim()) void start(searchableText);
   };
 
   const enqueue = async () => {
@@ -155,9 +238,9 @@ export function TextPlaylistImportDialog({
   return (
     <Dialog
       open={open}
-      title="导入文本列表"
-      eyebrow="TEXT LIST"
-      description="每行一首，支持“歌名 - 歌手”或纯歌名。这里只做搜索匹配，不会提前解析音频。"
+      title="导入歌单"
+      eyebrow="PLAYLIST"
+      description="可以粘贴文本，也可以打开 m3u/m3u8 或 CSV 文件。格式会自动识别；这里只做搜索匹配，不会提前解析音频。"
       actions={(
         <>
           <button type="button" disabled={submissionBusy} onClick={close}>{running ? "取消" : "关闭"}</button>
@@ -184,26 +267,58 @@ export function TextPlaylistImportDialog({
       initialFocusRef={initialFocusRef}
       onRequestClose={close}
     >
-      <label className="text-playlist-input-label" htmlFor="text-playlist-input">歌曲列表</label>
+      <div className="text-playlist-input-header">
+        <label className="text-playlist-input-label" htmlFor="text-playlist-input">歌曲列表</label>
+        {onOpenFile && (
+          <button type="button" disabled={running || submissionBusy} onClick={() => void openFile()}>
+            {fileBusy ? "正在读取…" : "打开歌单文件…"}
+          </button>
+        )}
+      </div>
       <textarea
         ref={initialFocusRef}
         id="text-playlist-input"
         className="text-playlist-input"
         value={text}
-        onChange={(event) => {
-          if (state.phase !== "idle") reset();
-          setText(event.target.value);
-        }}
-        placeholder={'例如：\n歌曲名 - 歌手\n另一首歌'}
+        onChange={(event) => replaceText(event.target.value, null)}
+        placeholder={'例如：\n歌曲名 - 歌手\n另一首歌\n\n也可以直接粘贴 m3u 或 CSV 内容'}
         maxLength={50_000}
         disabled={running || submissionBusy}
         rows={8}
       />
 
+        {/* The detection summary is deliberately not a live region: it changes on
+            every keystroke, and announcing each edit would drown out the progress
+            region during matching. */}
+        {normalized && normalized.entries.length > 0 && (
+          <div className="text-playlist-detection" aria-label="已识别的歌单格式">
+            <strong>{fileName ? `${fileName}：` : "已识别："}</strong>
+            <span>
+              {normalized.confidence >= PLAYLIST_DETECTION_CONFIDENCE_THRESHOLD
+                ? playlistFormatLabel(normalized.format)
+                : `可能是${playlistFormatLabel(normalized.format)}`}
+              {` · ${normalized.entries.length} 条`}
+            </span>
+            {localPaths.length > 0 && <span>{localPaths.length} 条本地文件</span>}
+            {searchableText.trim() && localPaths.length > 0 && (
+              <span>{normalized.entries.length - localPaths.length} 条需联网匹配</span>
+            )}
+            {normalized.skipped.length > 0 && <span>已跳过 {normalized.skipped.length} 条</span>}
+          </div>
+        )}
+
+        {normalized && normalized.notes.length > 0 && (
+          <ul className="text-playlist-notes">
+            {normalized.notes.map((note) => <li key={note}>{note}</li>)}
+          </ul>
+        )}
+
+        {localImportNote && <p className="text-playlist-local-note" role="status">{localImportNote}</p>}
+
         <div className="text-playlist-toolbar">
           <span>{text.length.toLocaleString()} / 50,000 字符</span>
-          <button type="button" className="primary" disabled={!canStart} onClick={() => void start(text)}>
-            {running ? "正在匹配…" : "开始匹配"}
+          <button type="button" className="primary" disabled={!canStart} onClick={() => void startMatching()}>
+            {running ? "正在匹配…" : fileBusy ? "正在导入本地文件…" : "开始匹配"}
           </button>
         </div>
 

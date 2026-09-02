@@ -38,7 +38,13 @@ pub struct CacheKey {
 #[serde(rename_all = "camelCase")]
 pub struct CacheEntry {
     pub key: CacheKey,
+    /// Absolute at runtime, but persisted as a bare file name — see
+    /// `serialize_file_name` and `CacheEntry::relocate`. Storing the absolute
+    /// path made the whole cache directory unmovable: every entry was dropped
+    /// as "outside the root" once the folder was relocated.
+    #[serde(serialize_with = "serialize_file_name")]
     pub audio_path: PathBuf,
+    #[serde(serialize_with = "serialize_file_name")]
     pub sidecar_path: PathBuf,
     pub media_type: MediaType,
     pub source_sample_rate: Option<u32>,
@@ -54,6 +60,33 @@ pub struct CacheEntry {
     /// Display artist captured at complete time (optional for older manifests).
     #[serde(default)]
     pub artist: String,
+}
+
+/// Persist only the basename, so the cache directory stays portable. Older
+/// records hold a full absolute path; `relocate` normalises both forms.
+fn serialize_file_name<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    serializer.serialize_str(name)
+}
+
+impl CacheEntry {
+    /// Rebind the entry to `root`, keeping only the file names it was stored
+    /// with. Accepts a legacy absolute path recorded by an older build, which is
+    /// how a moved cache directory recovers instead of being discarded.
+    fn relocate(&mut self, root: &Path) {
+        if let Some(name) = self.audio_path.file_name() {
+            self.audio_path = root.join(name);
+        }
+        if let Some(name) = self.sidecar_path.file_name() {
+            self.sidecar_path = root.join(name);
+        }
+    }
 }
 
 /// Frontend-safe cache row — never exposes absolute disk paths.
@@ -76,6 +109,16 @@ pub struct CacheEntryView {
     pub completed_at_ms: u64,
     /// Basename only (e.g. `abc123.flac`), never a full path.
     pub file_name: String,
+}
+
+/// What an export needs: where the bytes are, and what to call them.
+#[derive(Debug, Clone)]
+pub struct CacheExportPlan {
+    pub source_path: PathBuf,
+    /// Readable base name without extension, already stripped of path syntax.
+    pub file_stem: String,
+    pub extension: String,
+    pub byte_len: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -158,6 +201,12 @@ impl CacheStore {
                 default_root.clone()
             });
         ensure_writable_directory(&root)?;
+        // Writer tokens live in memory, so nothing that survived the last process can be
+        // in flight now: a `.part` or `.ready` file here is the remains of a download that
+        // was interrupted, and it will never be completed or committed. Startup is the one
+        // moment that can be said for certain, which is why the sweep belongs here as well
+        // as on a directory change.
+        cleanup_part_files(&root);
         let (manifest, initial_diagnostics) = load_manifest(&root);
         let diagnostics = initial_diagnostics
             .into_iter()
@@ -371,6 +420,24 @@ impl CacheStore {
             .collect::<Vec<_>>();
         views.sort_by_key(|entry| std::cmp::Reverse(entry.last_accessed_at_ms));
         views
+    }
+
+    /// Details needed to export one entry, resolved under the store's lock.
+    ///
+    /// Only fully cached entries are exportable: the caller gets `None` when the
+    /// key is unknown, so exporting never reaches the network or completes a
+    /// partial download.
+    pub fn export_plan(&self, key: &CacheKey) -> Option<CacheExportPlan> {
+        let state = self.inner.lock().unwrap();
+        let entry = state.manifest.entries.get(&cache_id(key))?;
+        let favorites = &state.settings.online_favorites;
+        let view = entry_to_view(entry, favorites);
+        Some(CacheExportPlan {
+            source_path: entry.audio_path.clone(),
+            file_stem: export_file_stem(&view.artist, &view.title, &entry.key),
+            extension: media_extension(&entry.media_type).to_owned(),
+            byte_len: entry.byte_len,
+        })
     }
 
     /// Remove one cache entry: audio file + sidecar + manifest row.
@@ -752,7 +819,7 @@ impl CacheStore {
             let state = self.inner.lock().unwrap();
             (state.root.clone(), state.epoch)
         };
-        let recovered = recover_manifest_from_sidecars(&root);
+        let recovered = recover_from_sidecars(&root, &scan_payload_paths(&root));
         let mut state = self.inner.lock().unwrap();
         if state.epoch != epoch || state.root != root {
             return Ok(());
@@ -1048,6 +1115,75 @@ fn favorite_id(provider_id: &str, provider_track_id: &str) -> String {
     format!("{provider_id}\0{provider_track_id}")
 }
 
+/// Longest base name we will produce, in characters. Well inside the usual 255
+/// byte limit even after multi-byte encoding, with room for the extension.
+const MAX_EXPORT_STEM_CHARS: usize = 120;
+
+/// Build `Artist - Title` as a file name.
+///
+/// Track metadata comes from a source, so it is untrusted: it may contain path
+/// separators, `..`, reserved device names, or control characters. Rather than
+/// escaping, every character that carries meaning to a filesystem is replaced,
+/// and the result is checked for the Windows reserved names. A record with no
+/// usable text falls back to its identifier so the export is still traceable.
+fn export_file_stem(artist: &str, title: &str, key: &CacheKey) -> String {
+    let joined = match (sanitize_name_part(artist), sanitize_name_part(title)) {
+        (Some(artist), Some(title)) => format!("{artist} - {title}"),
+        (None, Some(title)) => title,
+        (Some(artist), None) => artist,
+        (None, None) => format!("{}-{}", key.provider_id, key.provider_track_id),
+    };
+
+    let truncated: String = joined.chars().take(MAX_EXPORT_STEM_CHARS).collect();
+    // A trailing dot or space is silently dropped by Windows, which would make the
+    // written name differ from the one reported back to the user.
+    let trimmed = truncated.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() || is_reserved_device_name(trimmed) {
+        return format!("{}-{}", key.provider_id, key.provider_track_id);
+    }
+    trimmed.to_owned()
+}
+
+fn sanitize_name_part(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut last_was_space = false;
+    for character in value.chars() {
+        let replacement = match character {
+            // Path syntax and the Windows-invalid set.
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            // Control characters, including the newlines that would split a name.
+            c if c.is_control() => ' ',
+            c => c,
+        };
+        if replacement == ' ' {
+            if !last_was_space && !out.is_empty() {
+                out.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            out.push(replacement);
+            last_was_space = false;
+        }
+    }
+    let trimmed = out.trim();
+    // "." and ".." survive the character filter but are directory references.
+    if trimmed.is_empty() || trimmed.chars().all(|c| c == '.') {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// CON, PRN, AUX, NUL, COM1-9, LPT1-9 — reserved on Windows with any extension.
+fn is_reserved_device_name(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    let base = upper.split('.').next().unwrap_or(&upper);
+    matches!(base, "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && base.as_bytes()[3].is_ascii_digit()
+            && base.as_bytes()[3] != b'0')
+}
+
 fn media_extension(media_type: &MediaType) -> &'static str {
     match media_type {
         MediaType::Mp3 => "mp3",
@@ -1140,42 +1276,55 @@ fn load_manifest(root: &Path) -> (Manifest, Vec<CacheDiagnostic>) {
     let path = root.join(MANIFEST_FILE_NAME);
     let backup = json_backup_path(&path);
     let legacy = root.join("manifest.json");
-    let (mut manifest, primary_valid): (Manifest, bool) = match read_json(&path) {
-        Ok(manifest) => (manifest, true),
+    let mut manifest: Manifest = match read_json(&path) {
+        Ok(manifest) => manifest,
         Err(error) => {
             if error.kind() != io::ErrorKind::NotFound {
                 quarantine_corrupt_json(&path);
             }
-            (
-                read_json(&backup)
-                    .or_else(|_| read_json(&legacy))
-                    .unwrap_or_default(),
-                false,
-            )
+            read_json(&backup)
+                .or_else(|_| read_json(&legacy))
+                .unwrap_or_default()
         }
     };
-    if !primary_valid {
-        for (id, entry) in recover_manifest_from_sidecars(root).entries {
+    // Reconcile when the index accounts for fewer payloads than the directory
+    // holds, rather than only when the manifest failed to parse: a syntactically
+    // valid but empty manifest used to be believed outright, leaving a cache whose
+    // index was lost or written empty permanently invisible.
+    //
+    // The comparison costs one directory scan. Startup deliberately does not stat
+    // each entry — that is what deep_validate is for — so recovery, which does read
+    // per-file metadata, stays off the common path.
+    let payloads = scan_payload_paths(root);
+    if manifest.entries.len() < payloads.len() {
+        for (id, entry) in recover_from_sidecars(root, &payloads).entries {
             manifest.entries.entry(id).or_insert(entry);
         }
     }
     let mut diagnostics = Vec::new();
+    let mut relocated = 0usize;
+    // Rebind every entry to the current root. A record written by an older build
+    // holds an absolute path and the directory may since have moved; the file names
+    // identify the data, not the path around them. Entries are not stat-ed here —
+    // startup trusts the index, and deep_validate prunes what has gone missing.
     let entries = manifest
         .entries
         .into_iter()
-        .filter(|(_, entry)| {
-            let in_root =
-                entry.audio_path.starts_with(root) && entry.sidecar_path.starts_with(root);
-            if !in_root {
-                diagnostics.push(CacheDiagnostic {
-                    category: "cache_read_failed",
-                    source: "cache",
-                    summary: "stage=manifest_reconcile code=outside_root".into(),
-                });
+        .map(|(id, mut entry)| {
+            if !entry.audio_path.starts_with(root) {
+                relocated += 1;
             }
-            in_root
+            entry.relocate(root);
+            (id, entry)
         })
         .collect();
+    if relocated > 0 {
+        diagnostics.push(CacheDiagnostic {
+            category: "cache_relocated",
+            source: "cache",
+            summary: format!("stage=manifest_reconcile relocated={relocated}"),
+        });
+    }
     (Manifest { entries }, diagnostics)
 }
 
@@ -1184,7 +1333,34 @@ fn persist_settings(state: &CacheState) -> Result<()> {
 }
 
 fn persist_manifest(state: &CacheState) -> Result<()> {
-    write_json_atomic(&state.root.join(MANIFEST_FILE_NAME), &state.manifest)
+    let path = state.root.join(MANIFEST_FILE_NAME);
+    // Writing an empty index while payloads are still on disk means something went
+    // wrong upstream, not that the cache is empty. Rotating that write into the
+    // backup slot would destroy the last good copy — it took two launches to lose
+    // a real index that way. Recovery reads the sidecars, so the manifest may be
+    // written; the backup is what must survive.
+    let suspicious = state.manifest.entries.is_empty() && root_holds_payloads(&state.root);
+    write_json_atomic_with_backup(&path, &state.manifest, !suspicious)
+}
+
+/// True when the directory still holds cache payloads, whatever the index says.
+fn root_holds_payloads(root: &Path) -> bool {
+    let Ok(read) = fs::read_dir(root) else {
+        return false;
+    };
+    read.flatten().any(|entry| {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if !name.starts_with(CACHE_FILE_PREFIX) || name == MANIFEST_FILE_NAME {
+            return false;
+        }
+        !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("json") | Some("part") | Some("ready") | Some("bak") | Some("gxpart") | None
+        )
+    })
 }
 
 fn write_sidecar(entry: &CacheEntry) -> Result<()> {
@@ -1252,6 +1428,16 @@ fn non_empty(value: &str) -> Option<String> {
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_json_atomic_with_backup(path, value, true)
+}
+
+/// `rotate_backup` false keeps the existing backup untouched: the outgoing file is
+/// still replaced atomically, but it is not promoted over a copy worth keeping.
+fn write_json_atomic_with_backup(
+    path: &Path,
+    value: &impl Serialize,
+    rotate_backup: bool,
+) -> Result<()> {
     let parent = path.parent().context("JSON path has no parent")?;
     fs::create_dir_all(parent)?;
     let name = path
@@ -1274,12 +1460,19 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     drop(file);
 
     let backup = json_backup_path(path);
+    let mut rotated = false;
     if path.exists() {
-        let _ = fs::remove_file(&backup);
-        fs::rename(path, &backup)?;
+        if rotate_backup {
+            let _ = fs::remove_file(&backup);
+            fs::rename(path, &backup)?;
+            rotated = true;
+        } else {
+            // Keep the backup as-is; the outgoing file is simply dropped.
+            let _ = fs::remove_file(path);
+        }
     }
     if let Err(error) = fs::rename(&temporary, path) {
-        if backup.exists() {
+        if rotated && backup.exists() {
             let _ = fs::rename(&backup, path);
         }
         let _ = fs::remove_file(&temporary);
@@ -1304,30 +1497,59 @@ fn quarantine_corrupt_json(path: &Path) {
     }
 }
 
-fn recover_manifest_from_sidecars(root: &Path) -> Manifest {
-    let mut manifest = Manifest::default();
-    let Ok(entries) = fs::read_dir(root) else {
-        return manifest;
+/// Cache payloads present in `root`, keyed by the file stem they share with their
+/// sidecar. One directory scan, no per-file metadata.
+///
+/// A payload is any `gx-cache-` file that is not the manifest, a sidecar, or a
+/// transient: extensions vary because older builds wrote everything as `.media`
+/// while current ones use the real container extension.
+fn scan_payload_paths(root: &Path) -> BTreeMap<String, PathBuf> {
+    let mut payloads = BTreeMap::new();
+    let Ok(read) = fs::read_dir(root) else {
+        return payloads;
     };
-    for path in entries.flatten().map(|entry| entry.path()) {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        if !name.starts_with(CACHE_FILE_PREFIX)
-            || path.extension().and_then(|value| value.to_str()) != Some("json")
-        {
-            continue;
-        }
-        let Ok(entry) = read_json::<CacheEntry>(&path) else {
+    for path in read.flatten().map(|entry| entry.path()) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if entry.audio_path.starts_with(root)
-            && entry.sidecar_path == path
-            && entry.audio_path.is_file()
-        {
-            manifest.entries.insert(cache_id(&entry.key), entry);
+        if !name.starts_with(CACHE_FILE_PREFIX) || name == MANIFEST_FILE_NAME {
+            continue;
         }
+        match path.extension().and_then(|value| value.to_str()) {
+            Some("json") | Some("part") | Some("ready") | Some("bak") | Some("gxpart") | None => {}
+            Some(_) => {
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    payloads.insert(stem.to_owned(), path);
+                }
+            }
+        }
+    }
+    payloads
+}
+
+/// Rebuild index records from the sidecars sitting beside the given payloads.
+///
+/// The sidecars, not the manifest, are the durable record. Paths recorded *inside*
+/// a sidecar are ignored in favour of where the file actually is, because they may
+/// name a directory the cache has since moved out of — precisely the case this
+/// recovers. Pairing is by shared file stem, so the payload's extension does not
+/// have to be guessed.
+fn recover_from_sidecars(root: &Path, payloads: &BTreeMap<String, PathBuf>) -> Manifest {
+    let mut manifest = Manifest::default();
+    for (stem, audio) in payloads {
+        let sidecar = root.join(format!("{stem}.json"));
+        let Ok(mut entry) = read_json::<CacheEntry>(&sidecar) else {
+            continue;
+        };
+        entry.sidecar_path = sidecar;
+        entry.audio_path = audio.clone();
+        // Trust the bytes on disk: a truncated payload would otherwise be indexed
+        // at its recorded length and play as a broken file.
+        let Ok(metadata) = fs::metadata(audio) else {
+            continue;
+        };
+        entry.byte_len = metadata.len();
+        manifest.entries.insert(cache_id(&entry.key), entry);
     }
     manifest
 }
@@ -1636,6 +1858,43 @@ mod tests {
     }
 
     #[test]
+    fn opening_clears_intermediates_a_killed_process_left_behind() {
+        // A download that was interrupted leaves its `.part` behind, and a commit that was
+        // interrupted between the rename and the manifest write leaves a `.ready`. Neither
+        // can be resumed, so both are dead weight until something removes them — and only
+        // startup can be sure no writer owns them.
+        let app_data = temporary_root();
+        let root = app_data.join("cache");
+        fs::create_dir_all(&root).unwrap();
+        let orphans = [
+            root.join(format!("{CACHE_FILE_PREFIX}abc-1-1.part")),
+            root.join(format!("{CACHE_FILE_PREFIX}abc-1-1.ready")),
+            root.join(format!("{CACHE_FILE_PREFIX}def-2-2.gxpart")),
+        ];
+        for orphan in &orphans {
+            fs::write(orphan, b"interrupted").unwrap();
+        }
+        // Files that are not ours, and finished cache files, must survive.
+        let unrelated = root.join("someone-elses.part");
+        let finished = root.join(format!("{CACHE_FILE_PREFIX}abc-1-1.mp3"));
+        fs::write(&unrelated, b"not ours").unwrap();
+        fs::write(&finished, b"a complete download").unwrap();
+
+        let store = CacheStore::open(&app_data, None).unwrap();
+
+        for orphan in &orphans {
+            assert!(!orphan.exists(), "{} survived startup", orphan.display());
+        }
+        assert!(
+            unrelated.is_file(),
+            "swept a file outside the cache's naming"
+        );
+        assert!(finished.is_file(), "swept a completed download");
+        drop(store);
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
     fn directory_epoch_invalidates_in_flight_writer() {
         let app_data = temporary_root();
         let selected = temporary_root().with_extension("new-root");
@@ -1705,5 +1964,240 @@ mod tests {
             "gx-cache-test-{}-{nanos}-{sequence}",
             std::process::id()
         ))
+    }
+
+    /// Write one entry, then delete the manifest so only the durable
+    /// sidecar/payload pair is left — the state a moved or index-damaged cache is
+    /// actually in.
+    ///
+    /// Returns the app-data directory to reopen with and clean up, plus the cache
+    /// root beneath it: `open` takes app data, and puts the cache in `<app>/cache`.
+    fn root_with_orphaned_payload(quality: &str) -> (PathBuf, PathBuf, CacheKey) {
+        let app_data = temporary_root();
+        let store = CacheStore::open(&app_data, None).unwrap();
+        let cache_root = store.status().directory;
+        let entry_key = key("survivor", quality);
+        let plan = store.prepare(entry_key.clone(), MediaType::Mp3);
+        let mut writer = plan.begin().unwrap();
+        writer.append(b"real audio bytes");
+        writer.finish(Some(16));
+        plan.commit().unwrap();
+        drop(store);
+        let manifest = cache_root.join(MANIFEST_FILE_NAME);
+        fs::remove_file(&manifest).unwrap();
+        let _ = fs::remove_file(json_backup_path(&manifest));
+        (app_data, cache_root, entry_key)
+    }
+
+    #[test]
+    fn export_names_neutralise_path_syntax_from_source_metadata() {
+        let probe = key("probe", "320k");
+
+        // Separators and traversal must not survive into a file name.
+        let escaped = export_file_stem("../../etc", "passwd", &probe);
+        assert!(
+            !escaped.contains('/') && !escaped.contains('\\'),
+            "{escaped}"
+        );
+        assert!(!escaped.contains(".."), "{escaped}");
+
+        let windows = export_file_stem("C:\\Windows", "System32\\cmd", &probe);
+        assert!(
+            !windows.contains(':') && !windows.contains('\\'),
+            "{windows}"
+        );
+
+        // A newline would otherwise split the name or forge a second one.
+        let multiline = export_file_stem("Artist\nEvil", "Title\r\nMore", &probe);
+        assert!(
+            !multiline.contains('\n') && !multiline.contains('\r'),
+            "{multiline}"
+        );
+
+        // Reserved device names are refused whatever case they arrive in.
+        assert_eq!(export_file_stem("", "nul", &probe), "kg-probe");
+        assert_eq!(export_file_stem("", "CoM1", &probe), "kg-probe");
+        // COM0 is not reserved, so it stays.
+        assert_eq!(export_file_stem("", "COM0", &probe), "COM0");
+
+        // Nothing usable at all still yields a traceable name.
+        assert_eq!(export_file_stem("   ", "...", &probe), "kg-probe");
+        assert_eq!(export_file_stem("", "", &probe), "kg-probe");
+
+        // Trailing dots and spaces are dropped by Windows, so drop them ourselves
+        // rather than report a name that differs from what lands on disk.
+        assert_eq!(export_file_stem("Band", "Song. ", &probe), "Band - Song");
+
+        // Ordinary names, including non-Latin script, pass through intact.
+        assert_eq!(export_file_stem("周杰伦", "花海", &probe), "周杰伦 - 花海");
+        assert_eq!(
+            export_file_stem("A&B", "C'D (Live)", &probe),
+            "A&B - C'D (Live)"
+        );
+    }
+
+    #[test]
+    fn export_names_stay_within_a_filesystem_safe_length() {
+        let probe = key("probe", "320k");
+        let stem = export_file_stem(&"歌".repeat(200), &"名".repeat(200), &probe);
+
+        assert!(
+            stem.chars().count() <= MAX_EXPORT_STEM_CHARS,
+            "{}",
+            stem.chars().count()
+        );
+        // Multi-byte truncation must not split a character.
+        assert!(
+            stem.chars()
+                .all(|c| c == '歌' || c == '名' || c == ' ' || c == '-')
+        );
+    }
+
+    #[test]
+    fn export_plan_resolves_only_fully_cached_entries() {
+        let app_data = temporary_root();
+        let store = CacheStore::open(&app_data, None).unwrap();
+        let cached = key("exportable", "320k");
+
+        // Nothing cached yet: there is no plan, so export cannot reach the network.
+        assert!(store.export_plan(&cached).is_none());
+
+        let plan = store.prepare(cached.clone(), MediaType::Mp3);
+        let mut writer = plan.begin().unwrap();
+        writer.append(b"audio payload");
+        writer.finish(Some(13));
+        // Still uncommitted, so still not exportable.
+        assert!(store.export_plan(&cached).is_none());
+        plan.commit().unwrap();
+
+        let resolved = store
+            .export_plan(&cached)
+            .expect("committed entry is exportable");
+        assert_eq!(resolved.extension, "mp3");
+        assert_eq!(resolved.byte_len, 13);
+        assert_eq!(fs::read(&resolved.source_path).unwrap(), b"audio payload");
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn sidecars_persist_only_a_file_name_so_the_directory_can_move() {
+        let app_data = temporary_root();
+        let store = CacheStore::open(&app_data, None).unwrap();
+        let entry_key = key("portable", "320k");
+        let plan = store.prepare(entry_key.clone(), MediaType::Mp3);
+        let mut writer = plan.begin().unwrap();
+        writer.append(b"bytes");
+        writer.finish(Some(5));
+        plan.commit().unwrap();
+        let sidecar = store.lookup(&entry_key).unwrap().sidecar_path;
+
+        let raw = fs::read_to_string(&sidecar).unwrap();
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        let recorded = parsed["audioPath"].as_str().unwrap();
+
+        assert!(
+            !recorded.contains('\\') && !recorded.contains('/'),
+            "sidecar recorded a path, not a name: {recorded}"
+        );
+        assert!(recorded.starts_with(CACHE_FILE_PREFIX), "{recorded}");
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn a_moved_cache_directory_is_recovered_from_its_sidecars() {
+        // Simulates the real failure: the folder was relocated, so every path
+        // recorded by the old build names a directory that no longer exists.
+        let (source_app_data, source_root, entry_key) = root_with_orphaned_payload("320k");
+        let target_app_data = temporary_root();
+        let target_root = target_app_data.join("cache");
+        fs::create_dir_all(&target_root).unwrap();
+        for file in fs::read_dir(&source_root).unwrap().flatten() {
+            let name = file.file_name();
+            fs::rename(file.path(), target_root.join(name)).unwrap();
+        }
+        fs::remove_dir_all(&source_app_data).unwrap();
+
+        let store = CacheStore::open(&target_app_data, None).unwrap();
+        let hit = store
+            .lookup(&entry_key)
+            .expect("moved entry was not recovered");
+
+        assert_eq!(hit.audio_path.parent().unwrap(), target_root.as_path());
+        assert_eq!(fs::read(&hit.audio_path).unwrap(), b"real audio bytes");
+        assert_eq!(store.status().entry_count, 1);
+        fs::remove_dir_all(target_app_data).unwrap();
+    }
+
+    #[test]
+    fn an_empty_but_valid_manifest_still_reconciles_against_sidecars() {
+        // The manifest parsed fine and simply said "nothing here", which used to be
+        // believed outright while the payloads sat on disk unreachable.
+        let (app_data, cache_root, entry_key) = root_with_orphaned_payload("flac");
+        fs::write(
+            cache_root.join(MANIFEST_FILE_NAME),
+            b"{\n  \"entries\": {}\n}",
+        )
+        .unwrap();
+
+        let store = CacheStore::open(&app_data, None).unwrap();
+
+        assert!(
+            store.lookup(&entry_key).is_some(),
+            "empty manifest was taken at face value"
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn an_empty_manifest_write_does_not_consume_the_backup() {
+        let (app_data, cache_root, _) = root_with_orphaned_payload("320k");
+        let manifest_path = cache_root.join(MANIFEST_FILE_NAME);
+        let backup_path = json_backup_path(&manifest_path);
+        fs::write(&backup_path, b"{\n  \"entries\": {\"keep\": 1}\n}").unwrap();
+
+        // Persisting an empty index while payloads exist must leave the backup alone.
+        let state = CacheState {
+            settings_path: app_data.join("cache-settings.json"),
+            default_root: cache_root.clone(),
+            root: cache_root.clone(),
+            settings: PersistentSettings::default(),
+            manifest: Manifest::default(),
+            epoch: 1,
+            next_writer_token: 0,
+            active_writers: BTreeMap::new(),
+        };
+        persist_manifest(&state).unwrap();
+
+        assert!(
+            fs::read_to_string(&backup_path).unwrap().contains("keep"),
+            "an empty write rotated over the last good backup"
+        );
+        fs::remove_dir_all(app_data).unwrap();
+    }
+
+    #[test]
+    fn recovery_reads_the_payload_length_from_disk_and_accepts_legacy_extensions() {
+        let (app_data, cache_root, entry_key) = root_with_orphaned_payload("320k");
+        // Older builds wrote every payload as `.media` regardless of container.
+        let mut renamed = None;
+        for file in fs::read_dir(&cache_root).unwrap().flatten() {
+            let path = file.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("mp3") {
+                let target = path.with_extension("media");
+                fs::rename(&path, &target).unwrap();
+                renamed = Some(target);
+            }
+        }
+        let payload = renamed.expect("no payload to rename");
+        let real_len = fs::metadata(&payload).unwrap().len();
+
+        let store = CacheStore::open(&app_data, None).unwrap();
+        let hit = store
+            .lookup(&entry_key)
+            .expect("legacy extension was not recovered");
+
+        assert_eq!(hit.audio_path, payload);
+        assert_eq!(hit.byte_len, real_len);
+        fs::remove_dir_all(app_data).unwrap();
     }
 }

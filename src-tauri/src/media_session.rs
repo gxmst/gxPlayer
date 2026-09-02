@@ -262,6 +262,11 @@ fn spawn_diagnostic_drain(app: AppHandle) {
                             eprintln!("output device fallback event failed: {error}");
                         }
                     }
+                    for report in engine.drain_quality_reports() {
+                        if let Err(error) = app.emit("gx-quality-report", &report) {
+                            eprintln!("quality report event failed: {error}");
+                        }
+                    }
                     let snapshot = engine.snapshot();
                     if snapshot.status == PlaybackStatus::Failed
                         && mark_failed_generation_once(

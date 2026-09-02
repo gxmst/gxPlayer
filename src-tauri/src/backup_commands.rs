@@ -83,7 +83,9 @@ fn restore_backup_atomically(
         if let Err(error) = runtime.restore_backup(rollback_sources) {
             rollback_errors.push(format!("音源回滚失败：{error}"));
         }
-        if let Err(error) = library.restore_backup(&rollback_library) {
+        // The rollback variant skips the track-count cap so an oversized legacy
+        // library snapshot can always be reinstated exactly.
+        if let Err(error) = library.restore_backup_for_rollback(&rollback_library) {
             rollback_errors.push(format!("曲库回滚失败：{error}"));
         }
         if let Err(error) = reload() {
@@ -260,6 +262,54 @@ mod tests {
                 .unwrap_err()
                 .contains("版本 2 与曲库备份版本 1 不匹配")
         );
+    }
+
+    #[test]
+    fn runtime_failure_rolls_back_an_oversized_legacy_library() {
+        let (library, runtime, root) = stores();
+        // Seed an oversized legacy library (older builds only limited single imports).
+        let oversized = LibraryBackup {
+            version: 2,
+            tracks: (0..=gx_library::MAX_LIBRARY_TRACKS)
+                .map(|index| LibraryTrack {
+                    id: index as i64 + 1,
+                    path: format!("C:/Legacy/track-{index}.flac"),
+                    title: format!("Track {index}"),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_seconds: None,
+                    favorite: false,
+                    // Descending timestamps keep export order equal to insert order, so
+                    // row ids survive the rollback round trip and exports compare equal.
+                    added_at_ms: (gx_library::MAX_LIBRARY_TRACKS - index) as i64,
+                    missing: false,
+                })
+                .collect(),
+            playlists: Vec::new(),
+        };
+        library.restore_backup_for_rollback(&oversized).unwrap();
+        let before_library = library.export_backup().unwrap();
+        let reload_count = AtomicUsize::new(0);
+        let backup = ApplicationBackup {
+            version: 1,
+            library: library_backup("C:/Music/replacement.flac", "Replacement"),
+            sources: source_backup("lx.on('request', () => 'replacement')", "Replacement"),
+        };
+
+        let error = restore_backup_atomically(&library, &runtime, backup, || {
+            if reload_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("sandbox unavailable".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.contains("已回滚到恢复前状态"));
+        assert_eq!(library.export_backup().unwrap(), before_library);
+        drop(runtime);
+        drop(library);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

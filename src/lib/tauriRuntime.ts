@@ -14,5 +14,9 @@ type TauriGlobal = typeof globalThis & {
  */
 export function hasTauriWindowRuntime(): boolean {
   const runtime = globalThis as TauriGlobal;
-  return typeof runtime.__TAURI_INTERNALS__?.invoke === "function";
+  const tauriHost = runtime.location?.hostname?.toLowerCase() === "tauri.localhost";
+  const tauriProtocol = runtime.location?.protocol === "tauri:";
+  return tauriHost
+    || tauriProtocol
+    || typeof runtime.__TAURI_INTERNALS__?.invoke === "function";
 }

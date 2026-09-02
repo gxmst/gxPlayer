@@ -18,4 +18,10 @@ describe("hasTauriWindowRuntime", () => {
     });
     expect(hasTauriWindowRuntime()).toBe(true);
   });
+
+  it("recognizes the packaged Tauri host before IPC globals finish initializing", () => {
+    vi.stubGlobal("__TAURI_INTERNALS__", undefined);
+    vi.stubGlobal("location", { hostname: "tauri.localhost", protocol: "http:" });
+    expect(hasTauriWindowRuntime()).toBe(true);
+  });
 });

@@ -14,6 +14,10 @@ type TauriGlobal = typeof globalThis & {
  */
 export function hasTauriWindowRuntime(): boolean {
   const runtime = globalThis as TauriGlobal;
+  // The packaged bundle is always hosted by Tauri. Keeping this production
+  // guard avoids a first-paint race where WebView2 has not exposed its IPC
+  // globals yet and the app incorrectly switches to browser demo data.
+  if (import.meta.env.PROD) return true;
   const tauriHost = runtime.location?.hostname?.toLowerCase() === "tauri.localhost";
   const tauriProtocol = runtime.location?.protocol === "tauri:";
   return tauriHost

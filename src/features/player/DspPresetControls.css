@@ -16,6 +16,7 @@
   align-content: start;
   gap: 5px;
   min-width: 0;
+  max-width: 100%;
   padding: 12px;
   text-align: left;
 }
@@ -23,6 +24,8 @@
 .dsp-preset-grid button small {
   color: var(--text-dim);
   line-height: 1.45;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 
 .dsp-preset-grid button.active {

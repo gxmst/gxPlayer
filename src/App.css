@@ -793,7 +793,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   align-items: stretch;
   height: 50px;
   flex-shrink: 0;
-  margin-left: 6px;
+  margin-left: 0;
   -webkit-app-region: no-drag;
 }
 
@@ -869,7 +869,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   grid-template-columns: 32px 1fr;
   align-items: center;
   min-height: 42px;
-  padding: 0 10px;
+  padding: 0 8px;
   border: 0;
   border-radius: 12px;
   text-align: left;
@@ -1059,7 +1059,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .sidebar-collapsed .sidebar-playlists button[data-tooltip]:focus-visible::after {
   content: attr(data-tooltip);
   position: absolute;
-  z-index: 120;
+  z-index: 9999;
   left: calc(100% + 12px);
   top: 50%;
   transform: translateY(-50%) scale(0.96);

@@ -839,10 +839,11 @@ function App() {
   const [chartRegions, setChartRegions] = useState<string[]>([]);
   /** Region the current chartTracks came from, so a region change forces a refetch. */
   const loadedChartRegionRef = useRef<string | null>(null);
-  // Render state is stale inside rapid consecutive calls; the refs serialize
-  // in-flight fetches and let superseded responses drop instead of clobbering.
+  // Render state is stale inside rapid consecutive calls; the generation token
+  // lets a newer region request supersede an older response safely.
   const chartLoadingRef = useRef(false);
   const chartGenerationRef = useRef(0);
+  const chartRequestRegionRef = useRef<string | null>(null);
   // Preferences arrive asynchronously; fall back to the same defaults Rust uses.
   const chartRegion = appPreferences?.chartRegion ?? DEFAULT_CHART_REGION;
   const chartAutoLoad = appPreferences?.chartAutoLoad ?? true;
@@ -994,12 +995,13 @@ function App() {
 
   const loadChart = async (options?: { region?: string; force?: boolean }) => {
     const region = options?.region ?? chartRegion;
-    if (chartLoadingRef.current) return;
+    if (chartLoadingRef.current && chartRequestRegionRef.current === region) return;
     // A region switch has to refetch; otherwise an already-populated chart is kept.
     if (!options?.force && chartTracks.length > 0 && region === loadedChartRegionRef.current) {
       return;
     }
     chartLoadingRef.current = true;
+    chartRequestRegionRef.current = region;
     const generation = ++chartGenerationRef.current;
     setChartLoading(true);
     try {
@@ -1016,6 +1018,7 @@ function App() {
     } finally {
       if (generation === chartGenerationRef.current) {
         chartLoadingRef.current = false;
+        chartRequestRegionRef.current = null;
         setChartLoading(false);
       }
     }

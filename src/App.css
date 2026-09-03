@@ -952,6 +952,12 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   font-variant-numeric: tabular-nums;
 }
 
+/* Collapsed playlists are rendered as a short icon rail. Keep the rail out of
+   a horizontal scroll container so its right-facing tooltips can escape. */
+.sidebar-collapsed .sidebar-playlists {
+  overflow: visible;
+}
+
 .engine-health-diagnostic {
   display: flex;
   align-items: center;
@@ -4505,9 +4511,14 @@ select {
 
 @media (max-width: 1200.98px) {
   .top-bar {
-    grid-template-columns: auto minmax(160px, 420px) minmax(74px, 1fr);
     gap: 10px;
-    padding-right: 164px;
+  }
+
+  /* The two-column stage has a 280px + 220px minimum before padding and gap;
+     stack it before the parent grid reaches the 901-1200px squeeze range. */
+  .stage-panel {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 18px;
   }
 
   .mode-pill {

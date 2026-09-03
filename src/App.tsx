@@ -35,9 +35,13 @@ import { useActionDialog, type ActionErrorClassifier } from "./components/Action
 import { QueuePanel, type QueueAvailabilityStatus } from "./components/QueuePanel";
 import { ResolveBanner } from "./components/ResolveBanner";
 import { TextPlaylistImportDialog } from "./components/TextPlaylistImportDialog";
+import { CacheExportProgress as CacheExportProgressComponent } from "./components/CacheExportProgress";
+import { VirtualTrackList as VirtualTrackListComponent } from "./components/VirtualTrackList";
+import { LibraryFacetGrid } from "./components/LibraryFacetGrid";
 import { useLibraryView, type LibraryScope, type LibrarySort } from "./features/library/useLibraryView";
 import { DspPresetControls } from "./features/player/DspPresetControls";
 import { LyricsPanel } from "./features/player/LyricsPanel";
+import { HistoryPage } from "./pages/HistoryPage";
 import { isRemoteArtworkUrl, useArtworkUrl } from "./hooks/useArtwork";
 import { useBackupRestore } from "./hooks/useBackupRestore";
 import { useCatalogSearch } from "./hooks/useCatalogSearch";
@@ -57,7 +61,7 @@ import { diagnosticEntryDisplay } from "./lib/diagnosticDisplay";
 import { createApplicationBackup } from "./lib/backupRestore";
 import { getDspPreset } from "./lib/dspPresets";
 import { buildM3u8 } from "./lib/playlistFormats";
-import { groupConsecutiveHistory } from "./lib/historyGrouping";
+import { getImportLabel, isTruthy } from "./lib/uiHelpers";
 import {
   engineMatchesLocalQueue,
   localQueuePaths,
@@ -1616,7 +1620,6 @@ function App() {
   const selectedOnlineFavorite = selectedCatalogTrack
     ? onlineFavorites.some((track) => track.providerId === selectedCatalogTrack.providerId && track.providerTrackId === selectedCatalogTrack.providerTrackId)
     : false;
-  const groupedHistoryEntries = useMemo(() => groupConsecutiveHistory(historyEntries), [historyEntries]);
   const orderedSources = useMemo(
     () => [...sources].sort((left, right) => left.userPriority - right.userPriority),
     [sources],
@@ -3621,8 +3624,8 @@ function App() {
   );
 
   const renderTrackRows = (tracks: LibraryTrack[], playlistId?: number, selectable = false) =>
-    tracks.length > 120 ? (
-      <VirtualTrackList tracks={tracks} renderRow={(track, index) => renderTrackRow(track, index, tracks, playlistId, selectable)} />
+    tracks.length > 80 ? (
+      <VirtualTrackListComponent tracks={tracks} renderRow={(track, index) => renderTrackRow(track, index, tracks, playlistId, selectable)} />
     ) : (
       <div className={`track-list ${selectable ? "selectable-track-list" : ""}`} role="list">{tracks.map((track, index) => renderTrackRow(track, index, tracks, playlistId, selectable))}</div>
     );
@@ -3945,7 +3948,7 @@ function App() {
             eyebrow="LIBRARY"
             title="曲库"
             copy={`${library.length} 首本地音乐 · ${cacheEntries.length} 首在线缓存。支持文件夹递归、拖放导入、筛选和批量管理。`}
-            action={<div className="page-heading-actions"><button type="button" onClick={() => setTextPlaylistDialogOpen(true)}>导入文本列表</button><button type="button" disabled={Boolean(libraryImportBusy)} onClick={() => void importFolders()}>{libraryImportBusy === "folder" ? "正在扫描…" : "导入文件夹"}</button><button className="primary" disabled={Boolean(libraryImportBusy)} onClick={chooseFiles}>{libraryImportBusy === "files" ? "正在导入…" : "导入音乐"}</button></div>}
+            action={<div className="page-heading-actions"><button type="button" onClick={() => setTextPlaylistDialogOpen(true)}>导入文本列表</button><button type="button" disabled={isTruthy(libraryImportBusy)} onClick={() => void importFolders()}>{getImportLabel(libraryImportBusy, "folder", "导入文件夹", "正在扫描…")}</button><button className="primary" disabled={isTruthy(libraryImportBusy)} onClick={chooseFiles}>{getImportLabel(libraryImportBusy, "files", "导入音乐", "正在导入…")}</button></div>}
           />
           <section className="section-block">
             <div className="section-heading">
@@ -3966,17 +3969,31 @@ function App() {
               ))}
             </div>
             {libraryScope === "artists" && (
-              <div className="library-facet-grid">{libraryArtists.map(([name, count]) => <button type="button" key={name} onClick={() => { setLibraryQuery(name === "未知歌手" ? "" : name); setLibraryScope("all"); }}><strong>{name}</strong><small>{count} 首</small></button>)}</div>
+              <LibraryFacetGrid
+                items={libraryArtists}
+                onSelect={(name) => {
+                  setLibraryQuery(name);
+                  setLibraryScope("all");
+                }}
+                emptyLabel="未知歌手"
+              />
             )}
             {libraryScope === "albums" && (
-              <div className="library-facet-grid">{libraryAlbums.map(([name, count]) => <button type="button" key={name} onClick={() => { setLibraryQuery(name === "未知专辑" ? "" : name); setLibraryScope("all"); }}><strong>{name}</strong><small>{count} 首</small></button>)}</div>
+              <LibraryFacetGrid
+                items={libraryAlbums}
+                onSelect={(name) => {
+                  setLibraryQuery(name);
+                  setLibraryScope("all");
+                }}
+                emptyLabel="未知专辑"
+              />
             )}
             {libraryScope !== "artists" && libraryScope !== "albums" && library.length > 0 && (
               <div className="library-bulk-bar">
                 <label><input type="checkbox" checked={filteredLibrary.length > 0 && filteredLibrary.every((track) => selectedLibraryIds.includes(track.id))} onChange={(event) => setSelectedLibraryIds(event.target.checked ? filteredLibrary.map((track) => track.id) : [])} />选择当前结果</label>
                 <span>{filteredLibrary.length} 首{selectedLibraryIds.length ? ` · 已选 ${selectedLibraryIds.length}` : ""}</span>
                 <button type="button" disabled={!selectedLibraryIds.length} onClick={() => void enqueueLocalTracks(library.filter((track) => selectedLibraryIds.includes(track.id) && !track.missing))}>加入队列</button>
-                <button type="button" disabled={!library.some((track) => track.missing && (!selectedLibraryIds.length || selectedLibraryIds.includes(track.id))) || Boolean(libraryImportBusy)} onClick={() => void relinkMissingTracks()}>{libraryImportBusy === "relink" ? "正在定位…" : "批量重新定位"}</button>
+                <button type="button" disabled={!library.some((track) => track.missing && (!selectedLibraryIds.length || selectedLibraryIds.includes(track.id))) || isTruthy(libraryImportBusy)} onClick={() => void relinkMissingTracks()}>{getImportLabel(libraryImportBusy, "relink", "批量重新定位", "正在定位…")}</button>
                 <button type="button" className="danger" disabled={!selectedLibraryIds.length} onClick={requestRemoveSelectedLibraryTracks}>移出曲库</button>
               </div>
             )}
@@ -4023,22 +4040,7 @@ function App() {
                 </div>
               ) : null}
             </div>
-            {cacheExportProgress ? (
-              <div className="cache-export-progress">
-                <div className="cache-export-progress-copy">
-                  <strong>正在导出 {cacheExportProgress.completed} / {cacheExportProgress.total}</strong>
-                  <span title={cacheExportProgress.current || undefined}>
-                    {cacheExportProgress.current ? `正在写入 ${cacheExportProgress.current}` : "正在准备缓存文件"}
-                  </span>
-                </div>
-                <progress
-                  aria-label="缓存导出进度"
-                  aria-valuetext={`${cacheExportProgress.completed} / ${cacheExportProgress.total}`}
-                  max={Math.max(cacheExportProgress.total, 1)}
-                  value={Math.min(cacheExportProgress.completed, cacheExportProgress.total)}
-                />
-              </div>
-            ) : null}
+            {cacheExportProgress && <CacheExportProgressComponent progress={cacheExportProgress} />}
             <div className="tip-banner" role="note">
               <strong>缓存说明</strong>
               <span>
@@ -4092,65 +4094,23 @@ function App() {
 
     if (view === "history") {
       return (
-        <div className="page">
-          <PageHeading
-            eyebrow="HISTORY"
-            title="播放历史"
-            copy={`${historyEntries.length} 条原始播放记录，连续同曲合并显示为 ${groupedHistoryEntries.length} 行（读取最近 500 条）。`}
-            action={<button type="button" className="danger" disabled={!historyEntries.length} onClick={requestClearHistory}>清空历史</button>}
-          />
-          {historyEntries.length === 0 ? (
-            <EmptyState title="还没有播放记录" copy="听歌后会出现在这里，方便找回昨晚那首。" />
-          ) : (
-            <div className="track-list" role="list">
-              {groupedHistoryEntries.map(({ entry, count }) => (
-                <div className="track-row history-row" role="listitem" key={entry.id}>
-                  <button
-                    type="button"
-                    className="track-main"
-                    onClick={() => {
-                      if (entry.kind === "local" && entry.path) {
-                        void playLocalInList(
-                          [{ id: -1, path: entry.path, title: entry.title, artist: entry.artist, album: "", durationSeconds: null, favorite: false, addedAtMs: 0 }],
-                          { id: -1, path: entry.path, title: entry.title, artist: entry.artist, album: "", durationSeconds: null, favorite: false, addedAtMs: 0 },
-                        );
-                      } else if (entry.providerId && entry.providerTrackId) {
-                        void playCatalog({
-                          providerId: entry.providerId,
-                          providerTrackId: entry.providerTrackId,
-                          title: entry.title,
-                          artist: entry.artist,
-                          album: "",
-                          durationMs: null,
-                          artworkUrl: null,
-                          resolverPayload: {},
-                          preview: null,
-                        });
-                      }
-                    }}
-                  >
-                    <span className="track-index" aria-hidden="true">{entry.kind === "local" ? "♪" : entry.kind === "cached" ? "◉" : "☁"}</span>
-                    <span className="sr-only">{entry.kind === "local" ? "本地播放" : entry.kind === "cached" ? "缓存播放" : "在线播放"}</span>
-                    <span>
-                      <strong>{entry.title}</strong>
-                      <small>{entry.artist || "未知歌手"} · {new Date(entry.playedAtMs).toLocaleString()}</small>
-                    </span>
-                  </button>
-                  {count > 1 && <span className="history-count" aria-label={`连续播放 ${count} 次`}>×{count}</span>}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+        <HistoryPage
+          historyEntries={historyEntries}
+          onClearHistory={requestClearHistory}
+          onPlayLocal={(tracks, track) => void playLocalInList(tracks, track)}
+          onPlayCatalog={(track) => void playCatalog(track)}
+        />
       );
     }
 
     if (view === "playlist") return (
-      <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistItems.length} 首音乐 · 支持本地与已缓存歌曲`} action={activePlaylist ? <div className="page-heading-actions"><button type="button" disabled={!playlistItems.length || playlistExportBusy} onClick={() => void exportActivePlaylist()}>{playlistExportBusy ? "正在导出…" : "导出为 m3u8"}</button><button className="danger" onClick={requestDeleteActivePlaylist}>删除歌单</button></div> : undefined} />{playlistItems.length && activePlaylist ? renderLibraryPlaylistItems(playlistItems, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把本地音乐或已缓存歌曲加进来。" action="去曲库" onAction={() => navigateTo("library")} />}</div>
+        <div className="page"><PageHeading eyebrow="PLAYLIST" title={activePlaylist?.name ?? "歌单"} copy={`${playlistItems.length} 首音乐 · 支持本地与已缓存歌曲`} action={activePlaylist ? <div className="page-heading-actions"><button type="button" disabled={!playlistItems.length || playlistExportBusy} onClick={() => void exportActivePlaylist()}>{playlistExportBusy ? "正在导出…" : "导出为 m3u8"}</button><button className="danger" onClick={requestDeleteActivePlaylist}>删除歌单</button></div> : undefined} />
+          {playlistItems.length && activePlaylist ? renderLibraryPlaylistItems(playlistItems, activePlaylist.id) : <EmptyState title="这个歌单还没有歌" copy="回到曲库，把本地音乐或已缓存歌曲加进来。" action="去曲库" onAction={() => navigateTo("library")} />}
+        </div>
     );
 
     if (view === "sources") return (
-      <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="拖动卡片设置偏好顺序；实际请求会先按健康状态分档，再按你的顺序选择。" action={<button disabled={Boolean(sourceImportBusy)} onClick={() => void importSourceFile()}>{sourceImportBusy === "file" ? "正在导入…" : "从本地文件导入"}</button>} />
+      <div className="page"><PageHeading eyebrow="MUSIC SOURCES" title="管理音源" copy="拖动卡片设置偏好顺序；实际请求会先按健康状态分档，再按你的顺序选择。" action={<button disabled={isTruthy(sourceImportBusy)} onClick={() => void importSourceFile()}>{getImportLabel(sourceImportBusy, "file", "从本地文件导入", "正在导入…")}</button>} />
         <section className="source-import-band" aria-labelledby="source-import-title">
           <div className="source-import-copy">
             <p className="eyebrow">IMPORT</p>
@@ -4158,8 +4118,8 @@ function App() {
             <p>应用不内置任何音源目录或链接。仅下载你主动提供的脚本，并在隔离沙箱中运行。</p>
           </div>
           <form className="inline-form source-url-form" onSubmit={(event) => { event.preventDefault(); void importSourceUrl(); }}>
-            <input type="url" aria-label="音源脚本 URL" placeholder="https://example.com/source.js" autoComplete="off" spellCheck={false} value={sourceUrl} disabled={Boolean(sourceImportBusy)} onChange={(event) => setSourceUrl(event.target.value)} />
-            <button type="submit" className="primary" disabled={!sourceUrl.trim() || Boolean(sourceImportBusy)}>{sourceImportBusy === "url" ? "正在导入…" : "导入 URL"}</button>
+            <input type="url" aria-label="音源脚本 URL" placeholder="https://example.com/source.js" autoComplete="off" spellCheck={false} value={sourceUrl} disabled={isTruthy(sourceImportBusy)} onChange={(event) => setSourceUrl(event.target.value)} />
+            <button type="submit" className="primary" disabled={!sourceUrl.trim() || isTruthy(sourceImportBusy)}>{getImportLabel(sourceImportBusy, "url", "导入 URL", "正在导入…")}</button>
           </form>
         </section>
         <section className="source-import-band" aria-labelledby="source-playlist-title">
@@ -5206,16 +5166,6 @@ function SourceHealthIndicator({ health }: Pick<ListedSource, "health">) {
       <span>{stateLabels[health.state]}</span>
     </span>
   );
-}
-
-function VirtualTrackList({ tracks, renderRow }: { tracks: LibraryTrack[]; renderRow: (track: LibraryTrack, index: number) => ReactNode }) {
-  const rowHeight = 68;
-  const viewportHeight = 544;
-  const [scrollTop, setScrollTop] = useState(0);
-  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - 4);
-  const visibleCount = Math.ceil(viewportHeight / rowHeight) + 8;
-  const end = Math.min(tracks.length, start + visibleCount);
-  return <div className="track-list virtual-track-list" role="list" style={{ height: viewportHeight }} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}><div className="virtual-track-space" style={{ height: tracks.length * rowHeight }}><div className="virtual-track-window" style={{ transform: `translateY(${start * rowHeight}px)` }}>{tracks.slice(start, end).map((track, offset) => renderRow(track, start + offset))}</div></div></div>;
 }
 
 export default App;

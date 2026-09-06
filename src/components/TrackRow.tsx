@@ -1,4 +1,5 @@
 import type { LibraryTrack, PlaylistSummary } from "../types";
+import { Heart, ListPlus, X } from "lucide-react";
 
 type TrackRowProps = {
   track: LibraryTrack;
@@ -30,7 +31,7 @@ export function TrackRow({
   formatTime,
 }: TrackRowProps) {
   return (
-    <div className="track-row" role="listitem">
+    <div className={`track-row ${selected ? "is-selected" : ""}`} role="listitem">
       {onToggleSelect && (
         <label className="library-select">
           <input
@@ -63,18 +64,19 @@ export function TrackRow({
         title={track.missing ? "文件缺失，无法添加" : "添加到队列"}
         disabled={Boolean(track.missing)}
       >
-        ＋
+        <ListPlus size={17} />
       </button>
       <button
         className={`icon-button ${track.favorite ? "active" : ""}`}
         onClick={onToggleFavorite}
         aria-label={track.favorite ? "取消收藏" : "收藏"}
+        title={track.favorite ? "取消收藏" : "收藏"}
       >
-        {track.favorite ? "♥" : "♡"}
+        <Heart size={17} fill={track.favorite ? "currentColor" : "none"} />
       </button>
       {playlistId && onRemoveFromPlaylist ? (
         <button className="icon-button" aria-label="从歌单移除" onClick={() => onRemoveFromPlaylist(playlistId, track.id)}>
-          ×
+          <X size={16} />
         </button>
       ) : playlists && onAddToPlaylist ? (
         <select

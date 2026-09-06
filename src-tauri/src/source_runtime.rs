@@ -582,7 +582,7 @@ impl SourceRuntime {
     }
 }
 
-fn public_source_capabilities(capabilities: &Value) -> Vec<PublicSourceCapability> {
+pub(crate) fn public_source_capabilities(capabilities: &Value) -> Vec<PublicSourceCapability> {
     let Some(sources) = capabilities.get("sources").and_then(Value::as_object) else {
         return Vec::new();
     };
@@ -593,6 +593,7 @@ fn public_source_capabilities(capabilities: &Value) -> Vec<PublicSourceCapabilit
             let values = details
                 .get("qualitys")
                 .or_else(|| details.get("qualities"))
+                .or_else(|| details.is_array().then_some(details))
                 .and_then(Value::as_array);
             let mut qualities = Vec::new();
             for quality in values.into_iter().flatten().filter_map(Value::as_str) {
@@ -616,7 +617,7 @@ fn public_source_capabilities(capabilities: &Value) -> Vec<PublicSourceCapabilit
     result
 }
 
-fn public_capability_label(value: &str) -> Option<String> {
+pub(crate) fn public_capability_label(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty() && value.chars().count() <= 64 && !value.chars().any(char::is_control))
         .then(|| value.to_owned())
@@ -666,7 +667,13 @@ pub fn normalize_media_request(
         url,
         headers,
         media_type,
-        quality: quality.or_else(|| requested_quality.map(str::to_owned)),
+        quality: quality
+            .or_else(|| requested_quality.map(str::to_owned))
+            .map(|value| {
+                public_capability_label(&value)
+                    .ok_or_else(|| "resolved quality must be a bounded capability label".to_owned())
+            })
+            .transpose()?,
         expires_at_ms,
         network_route: None,
     })

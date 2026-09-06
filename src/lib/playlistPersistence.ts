@@ -6,9 +6,7 @@ const PLAYLIST_SESSION_VERSION = 1;
 const MAX_PLAYLIST_ENTRIES = 10_000;
 const MAX_SERIALIZED_LENGTH = 5 * 1024 * 1024;
 const PLAY_MODES: readonly PlayMode[] = ["sequential", "repeat_all", "repeat_one", "shuffle"];
-const QUALITY_PREFERENCES = ["auto", "128k", "320k", "flac", "flac24bit"] as const;
-
-export type QualityPreference = (typeof QUALITY_PREFERENCES)[number];
+export type QualityPreference = string;
 
 /** Matches App's logical queue. It never contains a resolved online media request. */
 export type PersistablePlaylistEntry =
@@ -82,8 +80,9 @@ function isPlayMode(value: unknown): value is PlayMode {
   return PLAY_MODES.some((mode) => mode === value);
 }
 
-function isQualityPreference(value: unknown): value is QualityPreference {
-  return QUALITY_PREFERENCES.some((quality) => quality === value);
+export function isQualityPreference(value: unknown): value is QualityPreference {
+  return typeof value === "string" && value.trim() === value && value.length > 0
+    && [...value].length <= 64 && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
 }
 
 function cloneJsonValue(value: unknown): { ok: true; value: unknown } | { ok: false } {

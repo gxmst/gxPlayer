@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,8 @@ const DEFAULT_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const CACHE_DIRECTORY_NAME: &str = "GXPlayerCache";
 const CACHE_FILE_PREFIX: &str = "gx-cache-";
 const MANIFEST_FILE_NAME: &str = "gx-cache-manifest.json";
+pub const MAX_CACHE_PAGE_SIZE: usize = 200;
+const MAX_CACHE_QUALITY_LABELS: usize = 256;
 const DIAGNOSTIC_CAPACITY: usize = 128;
 static JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -111,6 +113,16 @@ pub struct CacheEntryView {
     pub file_name: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEntryPage {
+    pub entries: Vec<CacheEntryView>,
+    pub total_count: usize,
+    pub offset: usize,
+    /// At most 256 distinct labels, always including those on this page.
+    pub qualities: Vec<String>,
+}
+
 /// What an export needs: where the bytes are, and what to call them.
 #[derive(Debug, Clone)]
 pub struct CacheExportPlan {
@@ -169,6 +181,7 @@ struct CacheState {
     epoch: u64,
     next_writer_token: u64,
     active_writers: BTreeMap<String, u64>,
+    access_dirty: bool,
 }
 
 #[derive(Clone)]
@@ -223,6 +236,7 @@ impl CacheStore {
                 epoch: 1,
                 next_writer_token: 0,
                 active_writers: BTreeMap::new(),
+                access_dirty: false,
             })),
             diagnostics: Arc::new(Mutex::new(diagnostics.into_iter().rev().collect())),
             revision: Arc::new(AtomicU64::new(1)),
@@ -278,15 +292,41 @@ impl CacheStore {
         }
         entry.last_accessed_at_ms = now_ms();
         let result = entry.clone();
-        if persist_manifest(&state).is_err() {
-            self.push_diagnostic(
-                "cache_write_failed",
-                "cache",
-                "stage=touch code=manifest_persist_failed".into(),
-            );
-        }
-        self.mark_changed();
+        state.access_dirty = true;
         Some(result)
+    }
+
+    /// Access times affect in-memory eviction immediately; the background worker
+    /// persists them in one batch instead of blocking every cache hit on JSON I/O.
+    pub fn flush_accesses(&self) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        if state.access_dirty {
+            persist_manifest(&state)?;
+            state.access_dirty = false;
+        }
+        Ok(())
+    }
+
+    pub fn track_qualities(&self, provider_id: &str, provider_track_id: &str) -> Vec<String> {
+        let state = self.inner.lock().unwrap();
+        state
+            .manifest
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.key.provider_id == provider_id
+                    && entry.key.provider_track_id == provider_track_id
+            })
+            .map(|entry| entry.key.quality.clone())
+            .collect()
+    }
+
+    pub fn available_keys(&self, keys: &[CacheKey]) -> Vec<CacheKey> {
+        let state = self.inner.lock().unwrap();
+        keys.iter()
+            .filter(|key| state.manifest.entries.contains_key(&cache_id(key)))
+            .cloned()
+            .collect()
     }
 
     pub fn lookup_track(
@@ -418,8 +458,59 @@ impl CacheStore {
             .values()
             .map(|entry| entry_to_view(entry, &state.settings.online_favorites))
             .collect::<Vec<_>>();
-        views.sort_by_key(|entry| std::cmp::Reverse(entry.last_accessed_at_ms));
+        views.sort_by(|left, right| {
+            right
+                .last_accessed_at_ms
+                .cmp(&left.last_accessed_at_ms)
+                .then_with(|| {
+                    (&left.provider_id, &left.provider_track_id, &left.quality).cmp(&(
+                        &right.provider_id,
+                        &right.provider_track_id,
+                        &right.quality,
+                    ))
+                })
+        });
         views
+    }
+
+    pub fn list_entries_page(&self, offset: usize, limit: usize) -> CacheEntryPage {
+        let state = self.inner.lock().unwrap();
+        let mut entries = state.manifest.entries.values().collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            right
+                .last_accessed_at_ms
+                .cmp(&left.last_accessed_at_ms)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        let limit = limit.clamp(1, MAX_CACHE_PAGE_SIZE);
+        let total_count = entries.len();
+        let offset = offset.min(total_count.saturating_sub(1) / limit * limit);
+        // Keep every visible quality available for cleanup without returning an
+        // unbounded set of labels from the rest of a large cache.
+        let mut qualities = entries
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|entry| entry.key.quality.as_str())
+            .collect::<BTreeSet<_>>();
+        for entry in &entries {
+            if qualities.len() >= MAX_CACHE_QUALITY_LABELS {
+                break;
+            }
+            qualities.insert(entry.key.quality.as_str());
+        }
+        let qualities = qualities.into_iter().map(str::to_owned).collect();
+        CacheEntryPage {
+            entries: entries
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|entry| entry_to_view(entry, &state.settings.online_favorites))
+                .collect(),
+            total_count,
+            offset,
+            qualities,
+        }
     }
 
     /// Details needed to export one entry, resolved under the store's lock.
@@ -547,6 +638,7 @@ impl CacheStore {
             state.settings.custom_directory = Some(selected_directory);
             state.root = directory;
             state.manifest = manifest;
+            state.access_dirty = false;
             persist_settings(&state)?;
             persist_manifest(&state)?;
         }
@@ -572,6 +664,7 @@ impl CacheStore {
             state.settings.custom_directory = None;
             state.root = default_root;
             state.manifest = manifest;
+            state.access_dirty = false;
             persist_settings(&state)?;
             persist_manifest(&state)?;
         }
@@ -815,28 +908,19 @@ impl CacheStore {
     /// Expensive filesystem reconciliation runs after startup so a GB-scale cache never blocks
     /// the first window. The manifest remains the fast-path source of truth until this completes.
     pub fn deep_validate(&self) -> Result<()> {
-        let (root, epoch) = {
+        let (root, epoch, observed) = {
             let state = self.inner.lock().unwrap();
-            (state.root.clone(), state.epoch)
+            (
+                state.root.clone(),
+                state.epoch,
+                state.manifest.entries.clone(),
+            )
         };
-        let recovered = recover_from_sidecars(&root, &scan_payload_paths(&root));
-        let mut state = self.inner.lock().unwrap();
-        if state.epoch != epoch || state.root != root {
-            return Ok(());
-        }
-
-        let mut changed = false;
-        for (id, entry) in recovered.entries {
-            if let std::collections::btree_map::Entry::Vacant(slot) =
-                state.manifest.entries.entry(id)
-            {
-                slot.insert(entry);
-                changed = true;
-            }
-        }
-        let invalid = state
-            .manifest
-            .entries
+        let mut recovered = recover_from_sidecars(&root, &scan_payload_paths(&root));
+        recovered.entries.retain(|id, _| !observed.contains_key(id));
+        // Filesystem probes can stall on removable media. Do them outside the
+        // store lock, then only prune entries that still name the checked file.
+        let invalid = observed
             .iter()
             .filter_map(|(id, entry)| {
                 let in_root =
@@ -846,10 +930,33 @@ impl CacheStore {
                 } else {
                     Some("outside_root")
                 };
-                code.map(|code| (id.clone(), code))
+                code.map(|code| (id.clone(), entry, code))
             })
             .collect::<Vec<_>>();
-        for (id, code) in invalid {
+        let mut state = self.inner.lock().unwrap();
+        if state.epoch != epoch || state.root != root {
+            return Ok(());
+        }
+
+        let mut changed = false;
+        for (id, mut entry) in recovered.entries {
+            entry.pinned = state.settings.online_favorites.contains_key(&favorite_id(
+                &entry.key.provider_id,
+                &entry.key.provider_track_id,
+            ));
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                state.manifest.entries.entry(id)
+            {
+                slot.insert(entry);
+                changed = true;
+            }
+        }
+        for (id, checked, code) in invalid {
+            if !state.manifest.entries.get(&id).is_some_and(|entry| {
+                entry.audio_path == checked.audio_path && entry.byte_len == checked.byte_len
+            }) {
+                continue;
+            }
             state.manifest.entries.remove(&id);
             self.push_diagnostic(
                 "cache_read_failed",
@@ -1287,18 +1394,17 @@ fn load_manifest(root: &Path) -> (Manifest, Vec<CacheDiagnostic>) {
                 .unwrap_or_default()
         }
     };
-    // Reconcile when the index accounts for fewer payloads than the directory
-    // holds, rather than only when the manifest failed to parse: a syntactically
-    // valid but empty manifest used to be believed outright, leaving a cache whose
-    // index was lost or written empty permanently invisible.
-    //
-    // The comparison costs one directory scan. Startup deliberately does not stat
-    // each entry — that is what deep_validate is for — so recovery, which does read
-    // per-file metadata, stays off the common path.
-    let payloads = scan_payload_paths(root);
-    if manifest.entries.len() < payloads.len() {
-        for (id, entry) in recover_from_sidecars(root, &payloads).entries {
-            manifest.entries.entry(id).or_insert(entry);
+    // A populated manifest is the normal startup path and needs no directory scan.
+    // An empty index is ambiguous: it may be a genuinely empty cache, or a valid
+    // but truncated manifest left beside payloads after an interrupted write.
+    // Only that recovery case pays for a directory scan; deep validation remains
+    // available separately for callers that want to inspect every payload.
+    if manifest.entries.is_empty() {
+        let payloads = scan_payload_paths(root);
+        if !payloads.is_empty() {
+            for (id, entry) in recover_from_sidecars(root, &payloads).entries {
+                manifest.entries.entry(id).or_insert(entry);
+            }
         }
     }
     let mut diagnostics = Vec::new();
@@ -1936,6 +2042,145 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn cache_hits_batch_access_writes_without_reloading_the_library() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        let cached = key("touch", "studio");
+        write_entry(&store, cached.clone(), 32);
+        {
+            let mut state = store.inner.lock().unwrap();
+            state
+                .manifest
+                .entries
+                .get_mut(&cache_id(&cached))
+                .unwrap()
+                .last_accessed_at_ms = 0;
+            persist_manifest(&state).unwrap();
+        }
+        let manifest_path = store.status().directory.join(MANIFEST_FILE_NAME);
+        let before = fs::read(&manifest_path).unwrap();
+        let revision = store.revision();
+        let hit = store.lookup(&cached).unwrap();
+        assert!(hit.last_accessed_at_ms > 0);
+        assert_eq!(store.track_qualities("kg", "touch"), ["studio"]);
+        assert_eq!(store.revision(), revision);
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+        store.flush_accesses().unwrap();
+        let persisted: Manifest = read_json(&manifest_path).unwrap();
+        assert_eq!(
+            persisted.entries[&cache_id(&cached)].last_accessed_at_ms,
+            hit.last_accessed_at_ms
+        );
+        let backup = fs::read(json_backup_path(&manifest_path)).unwrap();
+        store.flush_accesses().unwrap();
+        assert_eq!(fs::read(json_backup_path(&manifest_path)).unwrap(), backup);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_pages_have_a_stable_order_and_clamp_after_removal() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        for track in ["c", "a", "b"] {
+            write_entry(&store, key(track, "studio"), 4);
+        }
+        {
+            let mut state = store.inner.lock().unwrap();
+            for entry in state.manifest.entries.values_mut() {
+                entry.last_accessed_at_ms = 1;
+            }
+        }
+        let first = store.list_entries_page(0, 2);
+        assert_eq!(first.total_count, 3);
+        assert_eq!(first.qualities, ["studio"]);
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.provider_track_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(
+            store.list_entries_page(2, 2).entries[0].provider_track_id,
+            "c"
+        );
+        store.remove_entry(&key("c", "studio")).unwrap();
+        assert_eq!(store.list_entries_page(2, 2).offset, 0);
+        assert_eq!(
+            store.available_keys(&[key("c", "studio"), key("a", "studio")]),
+            [key("a", "studio")]
+        );
+        assert!(
+            store
+                .list_entries_page(usize::MAX, usize::MAX)
+                .entries
+                .len()
+                <= MAX_CACHE_PAGE_SIZE
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn background_validation_recovers_an_incomplete_populated_manifest() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        write_entry(&store, key("indexed", "320k"), 4);
+        write_entry(&store, key("orphaned", "studio"), 4);
+        {
+            let mut state = store.inner.lock().unwrap();
+            state
+                .manifest
+                .entries
+                .remove(&cache_id(&key("orphaned", "studio")));
+            persist_manifest(&state).unwrap();
+        }
+        drop(store);
+        let reopened = CacheStore::open(&root, None).unwrap();
+        assert_eq!(reopened.status().entry_count, 1);
+        reopened.deep_validate().unwrap();
+        assert_eq!(reopened.status().entry_count, 2);
+        assert!(reopened.lookup(&key("orphaned", "studio")).is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_pages_bound_quality_labels_and_preserve_visible_choices() {
+        let root = temporary_root();
+        let store = CacheStore::open(&root, None).unwrap();
+        write_entry(&store, key("seed", "studio"), 4);
+        let total = MAX_CACHE_QUALITY_LABELS + MAX_CACHE_PAGE_SIZE;
+        {
+            let mut state = store.inner.lock().unwrap();
+            let seed = state.manifest.entries.values().next().unwrap().clone();
+            state.manifest.entries.clear();
+            for index in 0..total {
+                let mut entry = seed.clone();
+                entry.key = key(&format!("{index:04}"), &format!("quality-{index:04}"));
+                state.manifest.entries.insert(cache_id(&entry.key), entry);
+            }
+        }
+        let first = store.list_entries_page(0, usize::MAX);
+        assert_eq!(first.total_count, total);
+        assert_eq!(first.entries.len(), MAX_CACHE_PAGE_SIZE);
+        assert_eq!(first.qualities.len(), MAX_CACHE_QUALITY_LABELS);
+        let last = store.list_entries_page(usize::MAX, usize::MAX);
+        assert!(last.offset > MAX_CACHE_QUALITY_LABELS);
+        assert_eq!(last.offset + last.entries.len(), total);
+        for page in [&first, &last] {
+            assert_eq!(page.qualities.len(), MAX_CACHE_QUALITY_LABELS);
+            assert!(page.qualities.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(
+                page.entries
+                    .iter()
+                    .all(|entry| page.qualities.contains(&entry.quality))
+            );
+        }
+        assert_eq!(store.list_entries_page(0, 0).entries.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn write_entry(store: &CacheStore, key: CacheKey, size: usize) {
         let plan = store.prepare(key, MediaType::Mp3);
         let mut writer = plan.begin().unwrap();
@@ -2165,6 +2410,7 @@ mod tests {
             epoch: 1,
             next_writer_token: 0,
             active_writers: BTreeMap::new(),
+            access_dirty: false,
         };
         persist_manifest(&state).unwrap();
 

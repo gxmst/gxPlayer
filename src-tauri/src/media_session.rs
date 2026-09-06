@@ -205,8 +205,20 @@ fn spawn_diagnostic_drain(app: AppHandle) {
         .spawn(move || {
             let mut logged_failed_generation = None;
             let mut cache_revision = 0;
+            let mut last_cache_flush = std::time::Instant::now();
             loop {
                 if let Some(cache) = app.try_state::<gx_cache::CacheStore>() {
+                    if last_cache_flush.elapsed() >= Duration::from_secs(30) {
+                        if cache.flush_accesses().is_err() {
+                            crate::diagnostic_log::record_diagnostic(
+                                &app,
+                                "cache_write_failed",
+                                Some("cache"),
+                                "stage=touch_flush code=manifest_persist_failed",
+                            );
+                        }
+                        last_cache_flush = std::time::Instant::now();
+                    }
                     for diagnostic in cache.drain_diagnostics() {
                         crate::diagnostic_log::record_diagnostic(
                             &app,

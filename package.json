@@ -23,6 +23,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "buffer": "^6.0.3",
     "crypto-js": "^4.2.0",
+    "lucide-react": "^1.41.0",
     "node-forge": "^1.4.0",
     "pako": "^3.0.1",
     "react": "^19.1.0",
@@ -39,6 +40,7 @@
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "jsdom": "^29.1.1",
+    "postcss": "8.5.28",
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
     "vitest": "^4.1.10"

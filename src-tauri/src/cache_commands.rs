@@ -1,5 +1,5 @@
 use gx_audio::engine::LocalAudioEngine;
-use gx_cache::{CacheEntryView, CacheKey, CacheStatus, CacheStore};
+use gx_cache::{CacheEntryPage, CacheEntryView, CacheKey, CacheStatus, CacheStore};
 use gx_metadata::CatalogTrack;
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
@@ -200,6 +200,38 @@ pub fn cache_list_entries(
 ) -> Result<Vec<CacheEntryView>, String> {
     require_window(&window, "main")?;
     Ok(cache.list_entries())
+}
+
+#[tauri::command]
+pub async fn cache_list_page(
+    window: WebviewWindow,
+    cache: tauri::State<'_, CacheStore>,
+    offset: usize,
+    limit: usize,
+) -> Result<CacheEntryPage, String> {
+    require_window(&window, "main")?;
+    let cache = cache.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cache.list_entries_page(offset, limit))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn cache_available_keys(
+    window: WebviewWindow,
+    cache: tauri::State<'_, CacheStore>,
+    keys: Vec<CacheKey>,
+) -> Result<Vec<CacheKey>, String> {
+    require_window(&window, "main")?;
+    if keys.len() > 10_000 {
+        return Err("单次最多检查 10000 条缓存".into());
+    }
+    ensure_json_size(
+        &serde_json::to_value(&keys).map_err(|error| error.to_string())?,
+        MAX_RUNTIME_PAYLOAD_BYTES,
+        "cache keys",
+    )?;
+    Ok(cache.available_keys(&keys))
 }
 
 #[tauri::command]

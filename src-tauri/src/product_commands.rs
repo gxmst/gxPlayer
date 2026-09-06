@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use gx_library::{HistoryEntry, LibraryStore, LibraryTrack, NewHistoryEntry};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State, WebviewWindow};
+use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::require_window;
 use crate::transport::{TransportAction, dispatch};
@@ -94,12 +94,16 @@ pub async fn library_check_local_paths(
 }
 
 #[tauri::command]
-pub fn library_scan_missing(
-    window: WebviewWindow,
-    library: State<'_, LibraryStore>,
-) -> Result<Vec<LibraryTrack>, String> {
+pub async fn library_scan_missing(window: WebviewWindow) -> Result<Vec<LibraryTrack>, String> {
     require_window(&window, "main")?;
-    library.scan_missing().map_err(|e| e.to_string())
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<LibraryStore>()
+            .scan_missing()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("缺失文件扫描任务失败: {error}"))?
 }
 
 #[cfg(test)]

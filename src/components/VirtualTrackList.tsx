@@ -1,15 +1,22 @@
-import { useState, type ReactNode } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { LibraryTrack } from "../types";
 
 type VirtualTrackListProps = {
   tracks: LibraryTrack[];
   renderRow: (track: LibraryTrack, index: number) => ReactNode;
+  className?: string;
 };
 
-export function VirtualTrackList({ tracks, renderRow }: VirtualTrackListProps) {
+export function VirtualTrackList({ tracks, renderRow, className = "" }: VirtualTrackListProps) {
   const rowHeight = 68;
   const viewportHeight = 544;
   const [scrollTop, setScrollTop] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const trackOrder = useMemo(() => tracks.map((track) => track.id).join(","), [tracks]);
+  useLayoutEffect(() => {
+    if (containerRef.current) containerRef.current.scrollTop = 0;
+    setScrollTop(0);
+  }, [trackOrder]);
   const start = Math.max(0, Math.floor(scrollTop / rowHeight) - 4);
   const visibleCount = Math.ceil(viewportHeight / rowHeight) + 8;
   const end = Math.min(tracks.length, start + visibleCount);
@@ -19,7 +26,8 @@ export function VirtualTrackList({ tracks, renderRow }: VirtualTrackListProps) {
 
   return (
     <div
-      className="track-list virtual-track-list"
+      ref={containerRef}
+      className={`track-list virtual-track-list ${className}`.trim()}
       role="list"
       style={{ height: `${viewportHeight}px`, overflowY: "auto" }}
       onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}

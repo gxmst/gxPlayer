@@ -1,5 +1,6 @@
 import type { CatalogTrack, HistoryEntry, LibraryTrack } from "../types";
 import { groupConsecutiveHistory } from "../lib/historyGrouping";
+import { PageHeading, EmptyState } from "../components/PageChrome";
 
 type HistoryPageProps = {
   historyEntries: HistoryEntry[];
@@ -8,32 +9,6 @@ type HistoryPageProps = {
   onPlayCatalog: (track: CatalogTrack) => void;
 };
 
-function PageHeading({ eyebrow, title, copy, action }: {
-  eyebrow: string;
-  title: string;
-  copy: string;
-  action?: React.ReactNode;
-}) {
-  return (
-    <div className="page-heading">
-      <div>
-        <p className="eyebrow">{eyebrow}</p>
-        <h1>{title}</h1>
-        <p>{copy}</p>
-      </div>
-      {action && <div className="page-heading-actions">{action}</div>}
-    </div>
-  );
-}
-
-function EmptyState({ title, copy }: { title: string; copy: string }) {
-  return (
-    <div className="empty-state">
-      <strong>{title}</strong>
-      <p>{copy}</p>
-    </div>
-  );
-}
 
 export function HistoryPage({ historyEntries, onClearHistory, onPlayLocal, onPlayCatalog }: HistoryPageProps) {
   const groupedHistoryEntries = groupConsecutiveHistory(historyEntries);

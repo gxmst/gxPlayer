@@ -1,5 +1,6 @@
 import type { CatalogTrack } from "../types";
 import { splitArtistNames } from "../lib/artistNames";
+import { ListPlus, LoaderCircle, Play } from "lucide-react";
 
 type CatalogCardProps = {
   track: CatalogTrack;
@@ -55,7 +56,7 @@ function ArtistLinks({
 
 export function CatalogCard({ track, resolving = false, onPlay, onEnqueue, onSelectArtist, Cover }: CatalogCardProps) {
   return (
-    <div className="catalog-card-wrap">
+    <div className="catalog-card-wrap" role="listitem">
       <div className="catalog-card" aria-busy={resolving}>
         <Cover artwork={track.artworkUrl} title={track.title} />
         <strong>{track.title}</strong>
@@ -68,7 +69,7 @@ export function CatalogCard({ track, resolving = false, onPlay, onEnqueue, onSel
           onClick={onPlay}
           aria-label={`播放 ${track.title}`}
         >
-          <i aria-hidden="true">{resolving ? "…" : "▶"}</i>
+        {resolving ? <LoaderCircle size={19} className="spin" /> : <Play size={18} fill="currentColor" />}
         </button>
       </div>
       <button
@@ -78,7 +79,7 @@ export function CatalogCard({ track, resolving = false, onPlay, onEnqueue, onSel
         aria-label={`将 ${track.title} 添加到队列`}
         title="添加到队列（播放到时再解析）"
       >
-        ＋ 队列
+        <ListPlus size={18} />
       </button>
     </div>
   );

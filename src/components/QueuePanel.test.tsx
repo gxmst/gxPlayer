@@ -107,6 +107,19 @@ describe("QueuePanel ordering", () => {
 });
 
 describe("QueuePanel accessible context", () => {
+  it("focuses the close control and restores the opener after Escape closes the panel", () => {
+    const opener = document.createElement("button");
+    document.body.append(opener);
+    opener.focus();
+    const props = renderPanel();
+    expect(screen.getByRole("button", { name: "关闭播放队列" })).toHaveFocus();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(props.onClose).toHaveBeenCalledOnce();
+    cleanup();
+    expect(opener).toHaveFocus();
+    opener.remove();
+  });
+
   it("names the panel, current track, positions, and track-specific actions", () => {
     renderPanel({
       rows: [
@@ -117,7 +130,7 @@ describe("QueuePanel accessible context", () => {
     });
 
     expect(screen.getByRole("complementary", { name: "播放队列" })).toHaveAccessibleDescription(
-      "2 首 · 列表循环 · 支持拖拽与键盘排序",
+      "2 首 · 列表循环",
     );
     expect(screen.getByRole("list", { name: "队列曲目" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "当前播放《正在听》，歌手 · 本地，第 1 首，共 2 首" }))

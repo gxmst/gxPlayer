@@ -87,6 +87,7 @@ function mockResult(command: string, args?: Record<string, unknown>): unknown {
     case "library_playlist_items":
     case "cache_online_favorites":
     case "cache_list_entries":
+    case "cache_available_keys":
     case "source_list":
     case "diagnostic_log_recent":
       return [];
@@ -112,10 +113,13 @@ function mockResult(command: string, args?: Record<string, unknown>): unknown {
           { timestampMs: 8_000, text: "桌面端会连接真实曲库与播放引擎", romanization: "zhuo mian duan hui lian jie zhen shi qu ku yu bo fang yin qing" },
         ],
       };
+    case "source_status":
     case "source_runtime_status":
       return { state: "ready", generation: 1, detail: "浏览器演示模式" };
     case "cache_status":
       return { directory: "浏览器演示", totalBytes: 0, entryCount: 0, pinnedCount: 0, limitBytes: 5 * 1024 ** 3 };
+    case "cache_list_page":
+      return { entries: [], totalCount: 0, offset: 0, qualities: [] };
     case "preview_cache_status":
       return { totalBytes: 0, entryCount: 0, limitBytes: 256 * 1024 ** 2 };
     case "app_preferences_get":

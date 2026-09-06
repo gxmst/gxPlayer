@@ -23,7 +23,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use crate::diagnostic_log::record_diagnostic;
 use crate::source_runtime::{
     ListedSource, PublicSource, RuntimeStatus, ScriptLaunch, SourceRuntime, ensure_json_size,
-    normalize_media_request,
+    normalize_media_request, public_capability_label, public_source_capabilities,
 };
 use crate::{LxHttpResponse, LxPocState, SANDBOX_LABEL, require_window};
 
@@ -1157,7 +1157,9 @@ fn safe_http_error_code(error: &SafeHttpError) -> &'static str {
         | SafeHttpError::CredentialsDenied
         | SafeHttpError::MissingHost
         | SafeHttpError::InvalidHeader(_) => "invalid_request",
-        SafeHttpError::DisallowedPort(_) | SafeHttpError::PrivateDestination => "blocked_destination",
+        SafeHttpError::DisallowedPort(_) | SafeHttpError::PrivateDestination => {
+            "blocked_destination"
+        }
         SafeHttpError::Dns(_) => "dns_failed",
         SafeHttpError::Request(message) => diagnostic_error_code(message),
         SafeHttpError::Cancelled => "cancelled",
@@ -1410,8 +1412,12 @@ fn play_online_track(
 
     // A direct catalog identity lets us reuse an already verified cache without doing metadata
     // replacement searches or starting a JavaScript runtime.
-    if let Some((provider, _)) = lx_identity(&track) {
-        for attempt in cache_quality_attempts(provider, quality.as_deref()) {
+    if lx_identity(&track).is_some() {
+        for attempt in cache_quality_attempts(
+            app.state::<CacheStore>()
+                .track_qualities(&track.provider_id, &track.provider_track_id),
+            quality.as_deref(),
+        ) {
             if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
                 return Ok(terminal_playback_result(
                     original_track,
@@ -1456,10 +1462,11 @@ fn play_online_track(
     // Cache entries are source-independent after verification, so check every candidate once
     // before paying the cost of switching community runtimes.
     for candidate in &candidates {
-        let provider = lx_identity(candidate)
-            .map(|(provider, _)| provider)
-            .ok_or_else(|| "candidate lost its LX source identity".to_owned())?;
-        for attempt in cache_quality_attempts(provider, quality.as_deref()) {
+        for attempt in cache_quality_attempts(
+            app.state::<CacheStore>()
+                .track_qualities(&candidate.provider_id, &candidate.provider_track_id),
+            quality.as_deref(),
+        ) {
             if let Some(outcome) = cancellation.and_then(ResolveToken::outcome) {
                 return Ok(terminal_playback_result(
                     original_track,
@@ -2209,58 +2216,80 @@ fn resolve_candidates_on_route(
 
 const QUALITY_ORDER: [&str; 4] = ["flac24bit", "flac", "320k", "128k"];
 
-fn cache_quality_attempts(source: &str, preference: Option<&str>) -> Vec<String> {
-    let mut attempts = quality_attempts(&Value::Null, source, preference);
-    for quality in QUALITY_ORDER {
-        if !attempts.iter().any(|attempt| attempt == quality) {
-            attempts.push(quality.to_owned());
+fn cache_quality_attempts(mut cached: Vec<String>, preference: Option<&str>) -> Vec<String> {
+    let preferred = preference.map(str::trim).filter(|value| *value != "auto");
+    let start = preferred
+        .and_then(|value| QUALITY_ORDER.iter().position(|quality| *quality == value))
+        .unwrap_or(0);
+    cached.sort_by_key(|quality| {
+        if preferred == Some(quality.as_str()) {
+            return 0;
         }
-    }
-    attempts
+        QUALITY_ORDER
+            .iter()
+            .position(|known| *known == quality)
+            .map(|index| (index + QUALITY_ORDER.len() - start) % QUALITY_ORDER.len() + 1)
+            .unwrap_or(QUALITY_ORDER.len() + 1)
+    });
+    cached.dedup();
+    cached
 }
 
 fn quality_attempts(capabilities: &Value, source: &str, preference: Option<&str>) -> Vec<String> {
     let supported = advertised_qualities(capabilities, source);
     let preference = preference
         .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != "auto")
-        .filter(|value| QUALITY_ORDER.contains(value));
-    let start = preference
-        .and_then(|value| QUALITY_ORDER.iter().position(|quality| *quality == value))
-        .unwrap_or(0);
-    let mut attempts = QUALITY_ORDER[start..]
-        .iter()
-        .filter(|quality| {
-            supported
-                .as_ref()
-                .is_none_or(|supported| supported.iter().any(|value| value == **quality))
-        })
-        .map(|quality| (*quality).to_owned())
-        .collect::<Vec<_>>();
-    if attempts.is_empty() {
-        attempts = if preference == Some("128k") {
-            vec!["128k".into()]
-        } else {
-            vec!["320k".into(), "128k".into()]
-        };
+        .filter(|value| !value.is_empty() && *value != "auto");
+    if let Some(mut supported) = supported {
+        if let Some(preference) = preference {
+            if let Some(start) = QUALITY_ORDER
+                .iter()
+                .position(|quality| *quality == preference)
+            {
+                let lower = supported
+                    .iter()
+                    .filter(|quality| {
+                        QUALITY_ORDER
+                            .iter()
+                            .position(|known| *known == quality.as_str())
+                            .is_none_or(|index| index >= start)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !lower.is_empty() {
+                    return lower;
+                }
+            } else if let Some(index) = supported.iter().position(|quality| quality == preference) {
+                let preferred = supported.remove(index);
+                supported.insert(0, preferred);
+            }
+        }
+        supported
+    } else {
+        let start = preference
+            .and_then(|value| QUALITY_ORDER.iter().position(|quality| *quality == value))
+            .unwrap_or(0);
+        QUALITY_ORDER[start..]
+            .iter()
+            .map(|quality| (*quality).to_owned())
+            .collect::<Vec<_>>()
     }
-    attempts
 }
 
 fn advertised_qualities(capabilities: &Value, source: &str) -> Option<Vec<String>> {
-    let source = capabilities.get("sources")?.get(source)?;
-    let values = source
-        .get("qualitys")
-        .or_else(|| source.get("qualities"))
-        .unwrap_or(source)
-        .as_array()?;
-    let qualities = values
-        .iter()
-        .filter_map(Value::as_str)
-        .filter(|quality| QUALITY_ORDER.contains(quality))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    (!qualities.is_empty()).then_some(qualities)
+    capabilities.get("sources")?.as_object()?;
+    let mut qualities = public_source_capabilities(capabilities)
+        .into_iter()
+        .find(|capability| capability.platform == source)
+        .map(|capability| capability.qualities)
+        .unwrap_or_default();
+    qualities.sort_by_key(|quality| {
+        QUALITY_ORDER
+            .iter()
+            .position(|known| known == quality)
+            .unwrap_or(QUALITY_ORDER.len())
+    });
+    Some(qualities)
 }
 
 fn select_lx_candidates(track: CatalogTrack) -> Result<Vec<CatalogTrack>, String> {
@@ -2439,10 +2468,8 @@ fn lx_music_url_payload(track: &CatalogTrack, quality: &str) -> Result<Value, St
 }
 
 fn lx_identity(track: &CatalogTrack) -> Option<(&str, &Value)> {
-    let source = track.resolver_payload.get("source")?.as_str()?;
-    if !matches!(source, "kw" | "wy" | "tx" | "kg" | "mg") {
-        return None;
-    }
+    let source = track.resolver_payload.get("source")?.as_str()?.trim();
+    public_capability_label(source)?;
     let music_info = track.resolver_payload.get("musicInfo")?;
     music_info.is_object().then_some((source, music_info))
 }
@@ -3697,6 +3724,51 @@ mod tests {
     }
 
     #[test]
+    fn accepts_runtime_defined_lx_platform_labels() {
+        let track = CatalogTrack {
+            provider_id: "custom-provider".into(),
+            provider_track_id: "track-1".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: String::new(),
+            duration_ms: None,
+            artwork_url: None,
+            resolver_payload: json!({
+                "source": "community-source",
+                "musicInfo": { "id": "track-1" }
+            }),
+            preview: None,
+        };
+        assert_eq!(
+            lx_identity(&track).map(|(source, _)| source),
+            Some("community-source")
+        );
+        assert_eq!(
+            lx_music_url_payload(&track, "lossless").unwrap()["info"]["type"],
+            "lossless"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_platform_labels() {
+        let track = CatalogTrack {
+            provider_id: "custom-provider".into(),
+            provider_track_id: "track-1".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: String::new(),
+            duration_ms: None,
+            artwork_url: None,
+            resolver_payload: json!({
+                "source": "\n",
+                "musicInfo": { "id": "track-1" }
+            }),
+            preview: None,
+        };
+        assert!(lx_identity(&track).is_none());
+    }
+
+    #[test]
     fn preview_guard_scales_with_catalog_duration() {
         assert_eq!(minimum_full_track_bytes(None, None), 512 * 1024);
         assert_eq!(
@@ -3734,7 +3806,7 @@ mod tests {
         });
         assert_eq!(
             quality_attempts(&capabilities, "wy", None),
-            ["flac", "320k", "128k"]
+            ["flac", "320k", "128k", "hires"]
         );
         assert_eq!(
             quality_attempts(&capabilities, "kg", None),
@@ -3742,12 +3814,36 @@ mod tests {
         );
         assert_eq!(
             quality_attempts(&capabilities, "wy", Some("flac24bit")),
-            ["flac", "320k", "128k"]
+            ["flac", "320k", "128k", "hires"]
         );
         assert_eq!(
             quality_attempts(&capabilities, "legacy", Some("flac")),
             ["320k", "128k"]
         );
+        assert_eq!(
+            quality_attempts(&capabilities, "wy", Some("hires")),
+            ["hires", "flac", "320k", "128k"]
+        );
+    }
+
+    #[test]
+    fn dynamic_qualities_are_bounded_unique_and_do_not_invent_platform_support() {
+        let capabilities = json!({"sources": {
+            "custom": {"qualities": [" studio ", "standard", "studio", "", "bad\u{0000}", "x".repeat(65), 2]},
+            "many": {"qualities": (0..100).map(|index| format!("q{index}")).collect::<Vec<_>>()},
+            "empty": {"qualitys": []}
+        }});
+        assert_eq!(
+            quality_attempts(&capabilities, "custom", None),
+            ["studio", "standard"]
+        );
+        assert_eq!(
+            quality_attempts(&capabilities, "custom", Some("standard")),
+            ["standard", "studio"]
+        );
+        assert_eq!(quality_attempts(&capabilities, "many", None).len(), 32);
+        assert!(quality_attempts(&capabilities, "missing", None).is_empty());
+        assert!(quality_attempts(&capabilities, "empty", None).is_empty());
     }
 
     #[test]
@@ -3818,20 +3914,33 @@ mod tests {
 
     #[test]
     fn cache_lookup_enumerates_every_quality_without_capability_filtering() {
+        let cached = || {
+            ["128k", "studio", "320k", "flac", "flac24bit"]
+                .map(str::to_owned)
+                .to_vec()
+        };
         assert_eq!(
-            cache_quality_attempts("wy", None),
-            ["flac24bit", "flac", "320k", "128k"]
+            cache_quality_attempts(cached(), None),
+            ["flac24bit", "flac", "320k", "128k", "studio"]
         );
         assert_eq!(
-            cache_quality_attempts("wy", Some("320k")),
-            ["320k", "128k", "flac24bit", "flac"]
+            cache_quality_attempts(cached(), Some("320k")),
+            ["320k", "128k", "flac24bit", "flac", "studio"]
+        );
+        assert_eq!(
+            cache_quality_attempts(vec!["studio".into()], None),
+            ["studio"]
+        );
+        assert_eq!(
+            cache_quality_attempts(cached(), Some("studio"))[0],
+            "studio"
         );
 
         let advertised = json!({
             "sources": { "wy": { "qualitys": ["128k"] } }
         });
         assert_eq!(quality_attempts(&advertised, "wy", None), ["128k"]);
-        assert!(cache_quality_attempts("wy", None).contains(&"flac".into()));
+        assert!(cache_quality_attempts(cached(), None).contains(&"flac".into()));
     }
 
     #[test]

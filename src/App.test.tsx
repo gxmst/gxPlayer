@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildDspControlState } from "./lib/dspPresets";
-import { EMPTY_ENGINE } from "./types";
+import { EMPTY_ENGINE, type CatalogTrack, type EngineSnapshot } from "./types";
+import { loadPlaylistSession, savePlaylistSession, type PersistablePlaylistEntry } from "./lib/playlistPersistence";
 
 const runtime = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -51,6 +52,19 @@ const defaultDspControl = buildDspControlState("bypass");
 let cacheEntries: Array<Record<string, unknown>> = [];
 let cacheExportResult: Promise<Array<Record<string, unknown>>> = Promise.resolve([]);
 
+function cacheFixture(index: number) {
+  return {
+    providerId: "custom", providerTrackId: String(index), quality: "studio", title: `Cached ${index}`,
+    artist: "Artist", album: "Album", byteLen: 32, sourceSampleRate: null, sourceBitDepth: null,
+    sourceChannels: null, mediaType: "flac", pinned: false, lastAccessedAtMs: 1,
+    completedAtMs: 1, fileName: `cache-${index}.flac`,
+  };
+}
+
+const restoredLocal: PersistablePlaylistEntry = {
+  kind: "local", path: localTrack.path, title: localTrack.title, artist: localTrack.artist, durationSeconds: 248,
+};
+
 function appPreferences(dspControl = defaultDspControl) {
   return {
     version: 2,
@@ -79,7 +93,8 @@ beforeEach(() => {
     },
   });
   runtime.invoke.mockReset();
-  runtime.listen.mockClear();
+  runtime.listen.mockReset();
+  runtime.listen.mockImplementation(async () => () => undefined);
   runtime.open.mockReset();
   runtime.open.mockResolvedValue(null);
   runtime.save.mockReset();
@@ -99,6 +114,12 @@ beforeEach(() => {
       case "diagnostic_log_recent":
       case "metadata_search": return [];
       case "cache_list_entries": return cacheEntries;
+      case "cache_list_page": {
+        const offset = Number(args?.offset ?? 0);
+        return { entries: cacheEntries.slice(offset, offset + Number(args?.limit ?? 100)), totalCount: cacheEntries.length, offset, qualities: [...new Set(cacheEntries.map((entry) => entry.quality))] };
+      }
+      case "cache_available_keys": return args?.keys ?? [];
+      case "library_check_local_paths": return (args?.paths as string[] ?? []).map((path) => ({ path, available: true }));
       case "source_status": return { state: "ready", generation: 1, activeSourceId: null, capabilities: null, error: null, updateAlert: null };
       case "cache_status": return { directory: "mock", totalBytes: 0, entryCount: 0, pinnedCount: 0, limitBytes: 5 * 1024 ** 3 };
       case "app_preferences_get": return appPreferences();
@@ -120,6 +141,142 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("App shell", () => {
+  it("defers filesystem scans, cache rows, sources and history until their views need them", async () => {
+    render(<App />);
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("library_tracks"));
+    for (const command of ["library_scan_missing", "cache_list_entries", "cache_list_page", "library_history", "source_list"]) {
+      expect(runtime.invoke.mock.calls.some(([name]) => name === command)).toBe(false);
+    }
+    fireEvent.click(screen.getByTitle("曲库"));
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("cache_list_page", { offset: 0, limit: 100 }));
+    expect(runtime.invoke.mock.calls.filter(([name]) => name === "library_scan_missing")).toHaveLength(1);
+    expect(runtime.invoke.mock.calls.some(([name]) => name === "cache_list_entries")).toBe(false);
+  });
+
+  it("keeps cache selections across pages and exports keys from both pages", async () => {
+    cacheEntries = Array.from({ length: 101 }, (_, index) => cacheFixture(index));
+    runtime.open.mockResolvedValue("C:/Exports");
+    render(<App />);
+    fireEvent.click(screen.getByTitle("曲库"));
+    fireEvent.click(await screen.findByRole("tab", { name: /在线缓存/ }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: "选择 Cached 0" }));
+    expect(screen.queryByRole("checkbox", { name: "选择 Cached 100" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "下一页缓存" }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: "选择 Cached 100" }));
+    expect(screen.queryByRole("checkbox", { name: "选择 Cached 0" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "导出所选 (2)" }));
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("cache_export_entries", {
+      keys: [{ providerId: "custom", providerTrackId: "0", quality: "studio" }, { providerId: "custom", providerTrackId: "100", quality: "studio" }],
+      directory: "C:/Exports",
+    }));
+    expect(runtime.invoke.mock.calls.some(([name]) => name === "cache_list_entries")).toBe(false);
+  });
+
+  it("loads saved favorites when an online queue resumes from the home player", async () => {
+    const track: CatalogTrack = {
+      providerId: "custom", providerTrackId: "1", title: "Online", artist: "Artist", album: "Album",
+      durationMs: 180000, artworkUrl: null, preview: null, resolverPayload: { source: "custom", musicInfo: { id: "1" } },
+    };
+    savePlaylistSession({ playlist: [{ kind: "online", quality: "studio", track }], currentIndex: 0, playMode: "sequential" });
+    let pushSnapshot: ((event: { payload: EngineSnapshot }) => void) | undefined;
+    runtime.listen.mockImplementation(async (event, handler) => {
+      if (event === "gx-player-snapshot") pushSnapshot = handler;
+      return () => undefined;
+    });
+    let finishFavorites!: (favorites: CatalogTrack[]) => void;
+    let favoriteRead: Promise<CatalogTrack[]> | null = new Promise((resolve) => { finishFavorites = resolve; });
+    let favorites = [track];
+    const baseInvoke = runtime.invoke.getMockImplementation();
+    runtime.invoke.mockImplementation(async (command, args) => {
+      if (command === "cache_online_favorites") return favoriteRead ?? favorites;
+      if (command === "cache_set_online_favorite") { favorites = []; return; }
+      if (command === "player_play_online_track") {
+        pushSnapshot?.({ payload: {
+          ...EMPTY_ENGINE, status: "playing", queueIndex: 0,
+          queue: [{ title: track.title, location: "https://example.test/song", durationSeconds: 180, online: true }],
+        } });
+        return { outcome: "started", track, quality: "studio", cacheHit: true, sourceId: null, sourceName: null, attempts: [], failureKind: null };
+      }
+      return baseInvoke?.(command, args);
+    });
+    render(<App />);
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("player_set_play_mode", { mode: "sequential" }));
+    expect(runtime.invoke).not.toHaveBeenCalledWith("cache_online_favorites");
+    fireEvent.click(screen.getByRole("button", { name: "播放" }));
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("cache_online_favorites"));
+    expect(screen.getByRole("heading", { name: "正在流行" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "正在读取在线收藏" })).toBeDisabled();
+    await act(async () => { favoriteRead = null; finishFavorites(favorites); });
+    fireEvent.click(await screen.findByRole("button", { name: "取消在线收藏" }));
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("cache_set_online_favorite", { track, favorite: false }));
+    expect(await screen.findByRole("button", { name: "收藏在线歌曲" })).toBeEnabled();
+    expect(runtime.invoke.mock.calls.some(([name]) => ["cache_list_page", "cache_list_entries"].includes(name))).toBe(false);
+  });
+
+  it("reorders and removes a restored local queue before the engine has loaded it", async () => {
+    savePlaylistSession({ playlist: [restoredLocal, { ...restoredLocal, path: "C:/Music/Second.flac", title: "Second" }], currentIndex: 0, playMode: "sequential" });
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "播放队列" }));
+    fireEvent.click(await screen.findByRole("button", { name: "将《City Lights》下移至第 2 位" }));
+    await waitFor(() => expect(loadPlaylistSession().currentIndex).toBe(1));
+    expect(loadPlaylistSession().playlist.map((entry) => entry.kind === "local" && entry.title)).toEqual(["Second", "City Lights"]);
+    fireEvent.click(screen.getByRole("button", { name: "从队列移除《Second》" }));
+    await waitFor(() => expect(loadPlaylistSession().playlist).toHaveLength(1));
+    for (const command of ["player_reorder_queue", "player_remove_queue_item", "player_load_local"]) {
+      expect(runtime.invoke.mock.calls.some(([name]) => name === command)).toBe(false);
+    }
+  });
+
+  it("uses the reordered mixed queue for media keys and resumes it after restart", async () => {
+    const online: PersistablePlaylistEntry = {
+      kind: "online", quality: "studio", track: {
+        providerId: "custom", providerTrackId: "1", title: "Online", artist: "Artist", album: "Album", durationMs: 180000,
+        artworkUrl: null, preview: null, resolverPayload: { source: "custom", musicInfo: { id: "1" } },
+      },
+    };
+    const cached: PersistablePlaylistEntry = { kind: "cached", providerId: "custom", providerTrackId: "2", quality: "studio", title: "Cached", artist: "Artist" };
+    savePlaylistSession({ playlist: [restoredLocal, online, cached], currentIndex: 0, playMode: "sequential" });
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+    runtime.listen.mockImplementation(async (event, handler) => {
+      handlers.set(event, handler);
+      return () => { if (handlers.get(event) === handler) handlers.delete(event); };
+    });
+    const baseInvoke = runtime.invoke.getMockImplementation();
+    runtime.invoke.mockImplementation(async (command, args) => command === "player_play_online_track"
+      ? { outcome: "started", track: args?.track, quality: "studio", cacheHit: false, sourceId: null, sourceName: null, attempts: [], failureKind: null }
+      : baseInvoke?.(command, args));
+    const app = render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "播放队列" }));
+    fireEvent.click(await screen.findByRole("button", { name: "将《Online》下移至第 3 位" }));
+    await waitFor(() => expect(loadPlaylistSession().playlist[1].kind).toBe("cached"));
+    await act(async () => { handlers.get("gx-media")?.({ payload: "next" }); });
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("player_play_cache_entry", { providerId: "custom", providerTrackId: "2", quality: "studio", title: "Cached" }));
+    expect(runtime.invoke.mock.calls.some(([name]) => name === "player_play_online_track")).toBe(false);
+    await act(async () => { handlers.get("gx-media")?.({ payload: "next" }); });
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("player_play_online_track", expect.objectContaining({ track: online.track, quality: "studio" })));
+    await waitFor(() => expect(loadPlaylistSession().currentIndex).toBe(2));
+    app.unmount();
+    runtime.invoke.mockClear();
+    render(<App />);
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("player_set_play_mode", { mode: "sequential" }));
+    expect(runtime.invoke.mock.calls.some(([name]) => name === "player_play_online_track")).toBe(false);
+    await act(async () => { handlers.get("gx-media")?.({ payload: "play" }); });
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("player_play_online_track", expect.objectContaining({ track: online.track, quality: "studio" })));
+    fireEvent.click(screen.getByRole("button", { name: "播放队列" }));
+    expect(within(screen.getByRole("list", { name: "队列曲目" })).getAllByRole("listitem")).toHaveLength(3);
+  });
+
+  it("appends to a restored local queue without giving the empty engine a partial queue", async () => {
+    savePlaylistSession({ playlist: [restoredLocal], currentIndex: 0, playMode: "sequential" });
+    render(<App />);
+    fireEvent.click(screen.getByTitle("曲库"));
+    fireEvent.click(await screen.findByRole("button", { name: "将 City Lights 添加到队列" }));
+    await waitFor(() => expect(loadPlaylistSession().playlist).toHaveLength(2));
+    expect(runtime.invoke.mock.calls.some(([name]) => name === "player_enqueue_local")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "播放" }));
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("player_load_local", { paths: [localTrack.path, localTrack.path], startIndex: 0 }));
+  });
+
   it("navigates to the daily-use library controls", async () => {
     render(<App />);
     fireEvent.click(await screen.findByTitle("曲库"));
@@ -171,6 +328,7 @@ describe("App shell", () => {
   it("keeps preset persistence and momentary A/B on separate command paths", async () => {
     render(<App />);
     fireEvent.click((await screen.findAllByTitle("设置与备份"))[0]);
+    fireEvent.click(await screen.findByRole("tab", { name: "音效" }));
     expect(await screen.findByRole("heading", { name: "音效预设" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("radio", { name: "人声" }));
@@ -283,6 +441,7 @@ describe("App shell", () => {
 
     render(<App />);
     fireEvent.click(await screen.findByTitle("曲库"));
+    fireEvent.click(await screen.findByRole("tab", { name: /在线缓存/ }));
     fireEvent.click(await screen.findByRole("button", { name: "导出全部" }));
 
     await waitFor(() => expect(reportProgress).not.toBeNull());

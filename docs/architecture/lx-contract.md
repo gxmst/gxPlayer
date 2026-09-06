@@ -4,10 +4,10 @@ The runtime targets the factual `window.lx` contract used by community LX source
 
 ## Adapters live outside this repository
 
-This repository implements the host side of the contract only. The host knows
-nothing about any specific platform, endpoint, or quality table: every platform
-name, quality label, and provider identifier reaches it at runtime through a
-source's `inited` capability report.
+This repository implements the host side of the contract only. The LX runtime
+does not embed adapter endpoints or platform-specific quality mappings. Supported
+platform names and quality labels reach it at runtime through a source's `inited`
+capability report; normalized tracks supply their provider and track identifiers.
 
 Source scripts themselves are user-owned and are never committed here. `/sources/`
 is git-ignored so an imported adapter and its local test can sit next to each
@@ -40,6 +40,19 @@ in the source manager. GXPlayer caches each source's reported `sources` keys and
 its `qualitys`/`qualities` strings after that source initializes. It never scans
 or evaluates script text to infer support, and an absent or malformed report is
 displayed as unavailable rather than guessed.
+
+Platform and quality labels are trimmed, limited to 64 Unicode characters, and
+must not contain control characters. Each platform exposes at most 32 distinct
+quality labels. Playback uses the same normalized labels as the source manager,
+including labels unknown to the host. An explicitly reported empty or unsupported
+platform is skipped. A legacy source with no `sources` object retains the existing
+generic quality fallback.
+
+The standard playback preferences retain their existing ordering for compatibility.
+Other reported labels keep their report order; an explicitly selected custom label
+is attempted first, followed by the other advertised labels on failure. Cache
+lookup enumerates qualities actually stored for the track, independently of the
+currently installed sources. Custom labels also survive playback-queue persistence.
 
 ## Protocol v2 optional actions
 

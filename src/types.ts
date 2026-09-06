@@ -178,6 +178,16 @@ export type CacheEntryView = {
   fileName: string;
 };
 
+export type CacheKey = Pick<CacheEntryView, "providerId" | "providerTrackId" | "quality">;
+
+export type CacheEntryPage = {
+  entries: CacheEntryView[];
+  totalCount: number;
+  offset: number;
+  /** At most 256 distinct labels, including every quality on this page. */
+  qualities: string[];
+};
+
 export type LyricDocument = {
   instrumental: boolean;
   lines: Array<{

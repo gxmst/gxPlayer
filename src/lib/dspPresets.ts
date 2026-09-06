@@ -27,7 +27,47 @@ export const DSP_PRESETS = [
   {
     id: "spatial",
     label: "空间",
-    description: "固定前方 ±30° 音箱感，可能偏闷；建议不与系统杜比耳机虚拟化同时开。",
+    description: "固定前方 ±30° 音箱感，声场向头外展开；建议不与系统杜比耳机虚拟化同时开。",
+  },
+  {
+    id: "warm",
+    label: "温暖",
+    description: "抬一点中低频、收一点高频，久听不累。",
+  },
+  {
+    id: "bright",
+    label: "明亮",
+    description: "抬高频细节和空气感，适合闷一点的耳机。",
+  },
+  {
+    id: "classical",
+    label: "古典",
+    description: "两端轻抬、中频略收，还原大编制的层次和厅堂感。",
+  },
+  {
+    id: "electronic",
+    label: "电子",
+    description: "低频下潜配高频亮度，中频退后半步，避免糊成一团。",
+  },
+  {
+    id: "rock",
+    label: "摇滚",
+    description: "低中频力度加高频咬合，250 Hz 让位以免人声被吉他埋掉。",
+  },
+  {
+    id: "podcast",
+    label: "播客",
+    description: "重收低频隆隆声、抬人声清晰度，长时间说话内容不累耳。",
+  },
+  {
+    id: "jazz",
+    label: "爵士",
+    description: "中频温润、保留高频空气感，低频基本不动。",
+  },
+  {
+    id: "piano_vocal",
+    label: "钢琴人声",
+    description: "纯减法，收低频和高频刺激，适合开放式耳机听钢琴曲和女声。",
   },
 ] as const satisfies ReadonlyArray<{
   id: DspPresetId;
@@ -42,22 +82,35 @@ const EQ_FREQUENCIES = [31, 62, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_00
 const VOCAL_GAINS = [0, 0, -2, -1, 0, 2, 2.5, 0, 0, 0] as const;
 const BASS_GAINS = [2, 3, 2, 0, 0, 0, 0, 0, 0, 0] as const;
 
-// Future-only restrained curves. They intentionally stay outside DSP_PRESETS,
-// so v1 exposes exactly the five product choices above without a hidden editor.
-export const DSP_INTERNAL_EQ_PRESETS = {
-  warm: {
-    label: "温暖",
-    gains: [0, 0.5, 1.25, 0.75, 0, 0, -0.25, -0.5, -0.75, -0.5],
-  },
-  bright: {
-    label: "明亮",
-    gains: [0, 0, 0, -0.25, 0, 0.25, 0.75, 1.25, 1.5, 1],
-  },
-  classical: {
-    label: "古典",
-    gains: [0.5, 0.5, 0, -0.5, -0.25, 0, 0.5, 0.75, 0.75, 0.5],
-  },
-} as const;
+// Restrained voicing curves, ordered 31 Hz -> 16 kHz. Peak gain stays well inside
+// the engine's +-12 dB product limit even after intensityScale's 1.4x ceiling, so a
+// preset at full intensity still validates.
+const WARM_GAINS = [0, 0.5, 1.25, 0.75, 0, 0, -0.25, -0.5, -0.75, -0.5] as const;
+const BRIGHT_GAINS = [0, 0, 0, -0.25, 0, 0.25, 0.75, 1.25, 1.5, 1] as const;
+const CLASSICAL_GAINS = [0.5, 0.5, 0, -0.5, -0.25, 0, 0.5, 0.75, 0.75, 0.5] as const;
+// Sub weight plus air, with the middle stepped back so the mix does not turn muddy.
+const ELECTRONIC_GAINS = [2.5, 2, 1, -0.5, -1, -0.5, 0, 1, 1.75, 1.25] as const;
+// Body and bite together; the 250 Hz dip keeps vocals from being buried by guitars.
+const ROCK_GAINS = [1.5, 1.75, 1, -1, -0.5, 0.5, 1.5, 1.75, 1, 0.25] as const;
+// Speech: cut rumble hard, lift articulation, stay flat on top to avoid sibilance.
+const PODCAST_GAINS = [-3.5, -3, -1.5, 0, 1, 2, 2.25, 1.25, 0, -0.5] as const;
+// Warm midrange with air retained; bass is left essentially untouched.
+const JAZZ_GAINS = [0.5, 0.75, 0.75, 0.25, -0.25, 0.25, 0.5, 0.75, 1, 0.75] as const;
+// Subtractive only: tame the sub-bass rumble on open-backs and ease treble fatigue,
+// leaving presence untouched so piano attack and vocal clarity stay intact.
+const PIANO_VOCAL_GAINS = [0, 0, -2.5, -1.5, 0, 0, 0, 0, -0.5, 0] as const;
+
+/** Curve per voicing preset. These share one code path; only the gains differ. */
+const VOICING_GAINS = {
+  warm: WARM_GAINS,
+  bright: BRIGHT_GAINS,
+  classical: CLASSICAL_GAINS,
+  electronic: ELECTRONIC_GAINS,
+  rock: ROCK_GAINS,
+  podcast: PODCAST_GAINS,
+  jazz: JAZZ_GAINS,
+  piano_vocal: PIANO_VOCAL_GAINS,
+} as const satisfies Record<string, readonly number[]>;
 
 const CROSSFEED_LIGHT = 0.13;
 const CROSSFEED_MEDIUM = 0.18;
@@ -68,7 +121,27 @@ const CROSSFEED_CUTOFF_HZ = 700;
 const HRTF_LIGHT = 0.3;
 const HRTF_MEDIUM = 0.55;
 const HRTF_STRONG = 0.72;
-const HRTF_OUTPUT_GAIN_DB = -6;
+// Unity: the engine equalises the head model to flat broadband gain, so a trim here
+// would only make the spatial preset quieter than bypass and invite compensating
+// with the volume control.
+const HRTF_OUTPUT_GAIN_DB = 0;
+
+/**
+ * Early reflections are tuned for headphones, which is the only case where
+ * virtualising a room makes sense: over speakers your own head already applies
+ * the real thing and the two fight.
+ *
+ * The amounts are held well below the HRTF's: reflections are a supporting cue,
+ * and open-back headphones already have a wide, airy presentation that turns
+ * muddy long before a closed-back pair would. Size stays in the small-room range
+ * because long pre-delays start reading as an effect rather than a space.
+ */
+const ROOM_LIGHT = 0.12;
+const ROOM_MEDIUM = 0.2;
+const ROOM_STRONG = 0.3;
+const ROOM_SIZE_LIGHT = 0.3;
+const ROOM_SIZE_MEDIUM = 0.42;
+const ROOM_SIZE_STRONG = 0.55;
 
 const LIMITER_CEILING_DB = -1;
 const LIMITER_RELEASE_MS = 80;
@@ -104,7 +177,34 @@ function eqBands(gains: readonly number[], scale = 1): EqBand[] {
 }
 
 function zeroEqBands(): EqBand[] {
-  return eqBands(EQ_FREQUENCIES.map(() => 0));
+  return eqBands(zeroGains());
+}
+
+/** Band centre frequencies of the fixed product EQ, low to high. */
+export const DSP_EQ_FREQUENCIES = EQ_FREQUENCIES;
+/** Engine limit from `DspControlState::validate_product`; the editor clamps to it. */
+export const DSP_EQ_MAX_GAIN_DB = 12;
+
+export function zeroGains(): number[] {
+  return EQ_FREQUENCIES.map(() => 0);
+}
+
+/**
+ * Force a curve into the shape the engine accepts: exactly one gain per band, finite,
+ * within +-12 dB. The editor clamps as you drag, but a curve can also arrive from
+ * stored preferences, so it is normalized on the way in too.
+ */
+export function clampCustomGains(gains: readonly number[]): number[] {
+  return EQ_FREQUENCIES.map((_, index) => {
+    const gain = gains[index];
+    if (typeof gain !== "number" || !Number.isFinite(gain)) return 0;
+    return Math.min(DSP_EQ_MAX_GAIN_DB, Math.max(-DSP_EQ_MAX_GAIN_DB, gain));
+  });
+}
+
+/** Read the curve back off a control state, for seeding the editor from any preset. */
+export function gainsFromSettings(settings: DspSettings): number[] {
+  return clampCustomGains(settings.eqBands.map((band) => band.gainDb));
 }
 
 function settings({
@@ -112,6 +212,9 @@ function settings({
   bands,
   crossfeedEnabled,
   crossfeedAmount,
+  roomEnabled = false,
+  roomAmount = 0,
+  roomSize = ROOM_SIZE_MEDIUM,
   hrtfEnabled,
   hrtfMix,
   limiterEnabled,
@@ -120,11 +223,14 @@ function settings({
   bands: EqBand[];
   crossfeedEnabled: boolean;
   crossfeedAmount: number;
+  roomEnabled?: boolean;
+  roomAmount?: number;
+  roomSize?: number;
   hrtfEnabled: boolean;
   hrtfMix: number;
   limiterEnabled: boolean;
 }): DspSettings {
-  const enabled = eqEnabled || crossfeedEnabled || hrtfEnabled || limiterEnabled;
+  const enabled = eqEnabled || crossfeedEnabled || roomEnabled || hrtfEnabled || limiterEnabled;
   return {
     enabled,
     eqEnabled,
@@ -134,6 +240,11 @@ function settings({
       amount: crossfeedAmount,
       delayMs: CROSSFEED_DELAY_MS,
       cutoffHz: CROSSFEED_CUTOFF_HZ,
+    },
+    room: {
+      enabled: roomEnabled,
+      amount: roomAmount,
+      size: roomSize,
     },
     hrtf: {
       enabled: hrtfEnabled,
@@ -152,11 +263,24 @@ export function buildDspSettings(
   presetId: DspPresetId,
   intensity = DSP_DEFAULT_INTENSITY,
   spatialAmount = DSP_DEFAULT_SPATIAL_AMOUNT,
+  customGains: readonly number[] = zeroGains(),
 ): DspSettings {
   const normalizedIntensity = clampDspAmount(intensity);
   const normalizedSpatialAmount = clampDspAmount(spatialAmount);
 
   switch (presetId) {
+    case "custom":
+      // A hand-edited curve is used as authored: intensity would silently rescale
+      // gains the user set by hand, so it is deliberately not applied here.
+      return settings({
+        eqEnabled: true,
+        bands: eqBands(clampCustomGains(customGains)),
+        crossfeedEnabled: true,
+        crossfeedAmount: CROSSFEED_LIGHT,
+        hrtfEnabled: false,
+        hrtfMix: HRTF_MEDIUM,
+        limiterEnabled: true,
+      });
     case "bypass":
       return settings({
         eqEnabled: false,
@@ -208,6 +332,21 @@ export function buildDspSettings(
         bands: zeroEqBands(),
         crossfeedEnabled: true,
         crossfeedAmount: CROSSFEED_MEDIUM,
+        // Reflections track the same slider as the head model: raising one without
+        // the other gives either a dry head or a room with nothing placed in it.
+        roomEnabled: true,
+        roomAmount: interpolateThreeAnchors(
+          normalizedSpatialAmount,
+          ROOM_LIGHT,
+          ROOM_MEDIUM,
+          ROOM_STRONG,
+        ),
+        roomSize: interpolateThreeAnchors(
+          normalizedSpatialAmount,
+          ROOM_SIZE_LIGHT,
+          ROOM_SIZE_MEDIUM,
+          ROOM_SIZE_STRONG,
+        ),
         hrtfEnabled: true,
         hrtfMix: interpolateThreeAnchors(
           normalizedSpatialAmount,
@@ -215,6 +354,26 @@ export function buildDspSettings(
           HRTF_MEDIUM,
           HRTF_STRONG,
         ),
+        limiterEnabled: true,
+      });
+    case "warm":
+    case "bright":
+    case "classical":
+    case "electronic":
+    case "rock":
+    case "podcast":
+    case "jazz":
+    case "piano_vocal":
+      // Voicing presets differ only by curve: EQ on, light crossfeed to soften the
+      // headphone split, HRTF off because the engine reserves it for `spatial`, and
+      // the limiter on to catch the boosted peaks.
+      return settings({
+        eqEnabled: true,
+        bands: eqBands(VOICING_GAINS[presetId], intensityScale(normalizedIntensity)),
+        crossfeedEnabled: true,
+        crossfeedAmount: CROSSFEED_LIGHT,
+        hrtfEnabled: false,
+        hrtfMix: HRTF_MEDIUM,
         limiterEnabled: true,
       });
     default:
@@ -226,17 +385,35 @@ export function buildDspControlState(
   activePresetId: DspPresetId,
   intensity = DSP_DEFAULT_INTENSITY,
   spatialAmount = DSP_DEFAULT_SPATIAL_AMOUNT,
+  customGains: readonly number[] = zeroGains(),
 ): DspControlState {
   const normalizedIntensity = clampDspAmount(intensity);
   const normalizedSpatialAmount = clampDspAmount(spatialAmount);
   return {
-    settings: buildDspSettings(activePresetId, normalizedIntensity, normalizedSpatialAmount),
+    settings: buildDspSettings(
+      activePresetId,
+      normalizedIntensity,
+      normalizedSpatialAmount,
+      customGains,
+    ),
     activePresetId,
     intensity: normalizedIntensity,
     spatialAmount: normalizedSpatialAmount,
   };
 }
 
+/**
+ * The custom curve is reachable from the advanced editor rather than the preset shelf,
+ * so it is described here instead of in DSP_PRESETS. Without an entry, lookups would
+ * fall back to the first preset and the summary would name the wrong thing.
+ */
+export const DSP_CUSTOM_PRESET = {
+  id: "custom",
+  label: "自定义",
+  description: "你自己调的曲线，强度不再二次缩放，所听即所调。",
+} as const satisfies { id: DspPresetId; label: string; description: string };
+
 export function getDspPreset(presetId: DspPresetId) {
+  if (presetId === "custom") return DSP_CUSTOM_PRESET;
   return DSP_PRESETS.find((preset) => preset.id === presetId) ?? DSP_PRESETS[0];
 }

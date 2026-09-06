@@ -42,11 +42,25 @@ export function LyricsPanel({
             ref={(element) => { lyricRefs.current[index] = element; }}
           >
             {line.timestampMs === null
-              ? line.text
-              : <button type="button" onClick={() => onSeek(Math.max(0, (line.timestampMs! - offsetMs) / 1000))}>{line.text}</button>}
+              ? <LyricText line={line} />
+              : (
+                <button type="button" onClick={() => onSeek(Math.max(0, (line.timestampMs! - offsetMs) / 1000))}>
+                  <LyricText line={line} />
+                </button>
+              )}
           </p>
         )) : <div className="lyrics-empty"><strong>歌词会出现在这里</strong><span>在线歌曲会自动匹配，也可以载入本地 LRC。</span></div>}
       </div>
     </section>
+  );
+}
+
+function LyricText({ line }: { line: LyricDocument["lines"][number] }) {
+  return (
+    <span className="lyric-text">
+      <span>{line.text}</span>
+      {line.translation && <small>{line.translation}</small>}
+      {line.romanization && <small className="romanization">{line.romanization}</small>}
+    </span>
   );
 }

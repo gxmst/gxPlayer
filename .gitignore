@@ -9,8 +9,13 @@ lerna-debug.log*
 
 node_modules
 .phase1-cache/
+/cache/
 /js/
 /icon/
+
+# Imported LX source adapters are user-owned and stay out of the repository.
+# Keep scripts and their local tests here; the host protocol is platform-neutral.
+/sources/
 target/
 dist
 dist-ssr

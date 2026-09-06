@@ -8,6 +8,13 @@ use serde::{Deserialize, Serialize};
 
 const PREFERENCES_VERSION: u32 = 2;
 const MAX_DEVICE_NAME_BYTES: usize = 500;
+const MAX_CUSTOM_EQ_PRESETS: usize = 24;
+const MAX_CUSTOM_EQ_NAME_CHARS: usize = 40;
+/// The product EQ is a fixed 10-band dictionary, so a stored curve carries exactly
+/// that many gains. Mirrors `DspControlState::validate_product`, which caps bands at
+/// 10 and gain at +-12 dB; a curve outside that would be rejected on restore.
+const CUSTOM_EQ_BAND_COUNT: usize = 10;
+const MAX_CUSTOM_EQ_GAIN_DB: f32 = 12.0;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +22,16 @@ pub enum CloseBehavior {
     #[default]
     HideToTray,
     Exit,
+}
+
+/// A user-saved EQ curve. Only the gains are stored: frequencies, Q and filter kind
+/// are fixed by the product EQ, so a stored curve cannot smuggle in a band shape the
+/// preset path would never build.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomEqPreset {
+    pub name: String,
+    pub gains_db: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -26,6 +43,11 @@ pub struct AppPreferences {
     pub volume: f32,
     pub output_device: Option<String>,
     pub dsp_control: DspControlState,
+    pub custom_eq_presets: Vec<CustomEqPreset>,
+    /// Storefront for the public chart feed, validated against the supported list.
+    pub chart_region: String,
+    /// Whether opening the home view may fetch the chart without being asked.
+    pub chart_auto_load: bool,
 }
 
 impl Default for AppPreferences {
@@ -37,6 +59,9 @@ impl Default for AppPreferences {
             volume: 1.0,
             output_device: None,
             dsp_control: DspControlState::default(),
+            custom_eq_presets: Vec::new(),
+            chart_region: gx_metadata::DEFAULT_CHART_REGION.to_owned(),
+            chart_auto_load: true,
         }
     }
 }
@@ -51,6 +76,9 @@ struct RawAppPreferences {
     output_device: Option<String>,
     dsp_control: Option<serde_json::Value>,
     audio_mode: Option<serde_json::Value>,
+    custom_eq_presets: Option<Vec<serde_json::Value>>,
+    chart_region: Option<String>,
+    chart_auto_load: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +153,58 @@ impl AppPreferencesState {
             .validate_product()
             .map_err(|error| error.to_string())?;
         self.update(|preferences| preferences.dsp_control = dsp_control)
+    }
+
+    /// Save a curve under `name`, replacing an existing entry with the same name so
+    /// re-saving edits in place rather than accumulating duplicates.
+    pub fn save_custom_eq_preset(&self, preset: CustomEqPreset) -> Result<AppPreferences, String> {
+        let preset = sanitize_custom_eq_preset(preset)?;
+        let existing = self.get().custom_eq_presets;
+        let replaces = existing.iter().any(|entry| entry.name == preset.name);
+        if !replaces && existing.len() >= MAX_CUSTOM_EQ_PRESETS {
+            return Err(format!(
+                "cannot store more than {MAX_CUSTOM_EQ_PRESETS} custom presets"
+            ));
+        }
+        self.update(|preferences| {
+            match preferences
+                .custom_eq_presets
+                .iter_mut()
+                .find(|entry| entry.name == preset.name)
+            {
+                Some(entry) => entry.gains_db = preset.gains_db,
+                None => preferences.custom_eq_presets.push(preset),
+            }
+        })
+    }
+
+    pub fn set_chart_region(&self, region: &str) -> Result<AppPreferences, String> {
+        let normalized = gx_metadata::normalize_chart_region(Some(region));
+        if normalized != region.trim().to_ascii_lowercase() {
+            return Err("unsupported chart region".into());
+        }
+        self.update(|preferences| preferences.chart_region = normalized.to_owned())
+    }
+
+    pub fn set_chart_auto_load(&self, enabled: bool) -> Result<AppPreferences, String> {
+        self.update(|preferences| preferences.chart_auto_load = enabled)
+    }
+
+    pub fn delete_custom_eq_preset(&self, name: &str) -> Result<AppPreferences, String> {
+        let name = name.trim();
+        if !self
+            .get()
+            .custom_eq_presets
+            .iter()
+            .any(|entry| entry.name == name)
+        {
+            return Err("no custom preset with that name".into());
+        }
+        self.update(|preferences| {
+            preferences
+                .custom_eq_presets
+                .retain(|entry| entry.name != name);
+        })
     }
 
     pub(crate) fn lock_dsp_transaction(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -233,9 +313,25 @@ fn read_preferences(path: &Path) -> ReadPreferences {
         volume: raw.volume.unwrap_or(1.0),
         output_device: raw.output_device,
         dsp_control: load_dsp_control(raw.dsp_control, raw.audio_mode),
+        custom_eq_presets: load_custom_eq_presets(raw.custom_eq_presets),
+        chart_region: gx_metadata::normalize_chart_region(raw.chart_region.as_deref()).to_owned(),
+        chart_auto_load: raw.chart_auto_load.unwrap_or(true),
     };
     normalize_preferences(&mut preferences);
     ReadPreferences::Loaded(preferences)
+}
+
+/// Drop individually unusable entries instead of failing the whole file: a single bad
+/// saved curve should not cost the user every other preset, or their whole settings.
+fn load_custom_eq_presets(raw: Option<Vec<serde_json::Value>>) -> Vec<CustomEqPreset> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.into_iter()
+        .filter_map(|value| serde_json::from_value::<CustomEqPreset>(value).ok())
+        .filter_map(|preset| sanitize_custom_eq_preset(preset).ok())
+        .take(MAX_CUSTOM_EQ_PRESETS)
+        .collect()
 }
 
 fn normalize_preferences(preferences: &mut AppPreferences) {
@@ -246,6 +342,9 @@ fn normalize_preferences(preferences: &mut AppPreferences) {
         1.0
     };
     preferences.output_device = normalize_device_name(preferences.output_device.take());
+    // Re-validate on every load and save: the region reaches a URL path.
+    preferences.chart_region =
+        gx_metadata::normalize_chart_region(Some(&preferences.chart_region)).to_owned();
 }
 
 fn load_dsp_control(
@@ -261,6 +360,34 @@ fn load_dsp_control(
                 .map(DspControlState::from_audio_mode)
         })
         .unwrap_or_default()
+}
+
+/// Normalize a saved curve and reject anything the engine would refuse on restore.
+fn sanitize_custom_eq_preset(mut preset: CustomEqPreset) -> Result<CustomEqPreset, String> {
+    preset.name = preset.name.trim().to_owned();
+    if preset.name.is_empty() {
+        return Err("preset name cannot be empty".into());
+    }
+    if preset.name.chars().count() > MAX_CUSTOM_EQ_NAME_CHARS {
+        return Err(format!(
+            "preset name cannot exceed {MAX_CUSTOM_EQ_NAME_CHARS} characters"
+        ));
+    }
+    if preset.gains_db.len() != CUSTOM_EQ_BAND_COUNT {
+        return Err(format!(
+            "preset must carry exactly {CUSTOM_EQ_BAND_COUNT} band gains"
+        ));
+    }
+    if preset
+        .gains_db
+        .iter()
+        .any(|gain| !gain.is_finite() || gain.abs() > MAX_CUSTOM_EQ_GAIN_DB)
+    {
+        return Err(format!(
+            "preset gains must be finite and within +-{MAX_CUSTOM_EQ_GAIN_DB} dB"
+        ));
+    }
+    Ok(preset)
 }
 
 fn normalize_device_name(name: Option<String>) -> Option<String> {
@@ -515,6 +642,147 @@ mod tests {
 
         let reopened = AppPreferencesState::open(&root);
         assert_eq!(reopened.get().dsp_control, expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn curve(gain: f32) -> Vec<f32> {
+        vec![gain; CUSTOM_EQ_BAND_COUNT]
+    }
+
+    #[test]
+    fn custom_eq_presets_persist_and_resave_in_place() {
+        let root = test_root("custom-eq-persist");
+        let state = AppPreferencesState::open(&root);
+        state
+            .save_custom_eq_preset(CustomEqPreset {
+                name: "  夜听  ".into(),
+                gains_db: curve(2.0),
+            })
+            .unwrap();
+        // The name is trimmed, so re-saving the trimmed form edits rather than adds.
+        let saved = state
+            .save_custom_eq_preset(CustomEqPreset {
+                name: "夜听".into(),
+                gains_db: curve(3.0),
+            })
+            .unwrap();
+        assert_eq!(saved.custom_eq_presets.len(), 1);
+        assert_eq!(saved.custom_eq_presets[0].name, "夜听");
+        assert_eq!(saved.custom_eq_presets[0].gains_db, curve(3.0));
+        drop(state);
+
+        let reopened = AppPreferencesState::open(&root);
+        assert_eq!(reopened.get().custom_eq_presets, saved.custom_eq_presets);
+        let after_delete = reopened.delete_custom_eq_preset("夜听").unwrap();
+        assert!(after_delete.custom_eq_presets.is_empty());
+        assert!(reopened.delete_custom_eq_preset("夜听").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_eq_presets_reject_what_the_engine_would_refuse() {
+        let root = test_root("custom-eq-reject");
+        let state = AppPreferencesState::open(&root);
+        for (label, preset) in [
+            (
+                "empty name",
+                CustomEqPreset {
+                    name: "   ".into(),
+                    gains_db: curve(1.0),
+                },
+            ),
+            (
+                "wrong band count",
+                CustomEqPreset {
+                    name: "短".into(),
+                    gains_db: vec![1.0; 9],
+                },
+            ),
+            (
+                "gain past the product limit",
+                CustomEqPreset {
+                    name: "过响".into(),
+                    gains_db: curve(12.5),
+                },
+            ),
+            (
+                "non-finite gain",
+                CustomEqPreset {
+                    name: "非数".into(),
+                    gains_db: curve(f32::NAN),
+                },
+            ),
+        ] {
+            assert!(
+                state.save_custom_eq_preset(preset).is_err(),
+                "{label} should be rejected"
+            );
+        }
+        assert!(state.get().custom_eq_presets.is_empty());
+
+        // A curve at exactly the limit is valid, and the engine agrees.
+        state
+            .save_custom_eq_preset(CustomEqPreset {
+                name: "边界".into(),
+                gains_db: curve(MAX_CUSTOM_EQ_GAIN_DB),
+            })
+            .unwrap();
+        let control = DspControlState {
+            settings: gx_dsp::DspSettings {
+                enabled: true,
+                eq_enabled: true,
+                eq_bands: (0..CUSTOM_EQ_BAND_COUNT)
+                    .map(|index| {
+                        gx_dsp::EqBand::peak(
+                            125.0 * (index as f32 + 1.0),
+                            MAX_CUSTOM_EQ_GAIN_DB,
+                            1.0,
+                        )
+                    })
+                    .collect(),
+                limiter: gx_dsp::LimiterSettings {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            active_preset_id: gx_audio::engine::DspPresetId::Custom,
+            intensity: 0.5,
+            spatial_amount: 0.5,
+        };
+        control.validate_product().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_single_corrupt_saved_curve_does_not_cost_the_rest() {
+        let root = test_root("custom-eq-corrupt");
+        let state = AppPreferencesState::open(&root);
+        state
+            .save_custom_eq_preset(CustomEqPreset {
+                name: "好".into(),
+                gains_db: curve(1.5),
+            })
+            .unwrap();
+        drop(state);
+
+        // Hand-edit the file to include one unusable entry alongside the good one.
+        let path = root.join("app-preferences.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        document["customEqPresets"] = serde_json::json!([
+            { "name": "坏", "gainsDb": [1.0, 2.0] },
+            { "name": "好", "gainsDb": curve(1.5) },
+            { "name": "", "gainsDb": curve(1.0) },
+        ]);
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let reopened = AppPreferencesState::open(&root);
+        let presets = reopened.get().custom_eq_presets;
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].name, "好");
+        // The rest of the settings survived too.
+        assert_eq!(reopened.get().volume, 1.0);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,4 +1,5 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { ChevronDown, ChevronUp, ListMusic, Trash2, X } from "lucide-react";
 import type { PlayMode } from "../types";
 import "./QueuePanel.css";
 
@@ -50,6 +51,28 @@ export function QueuePanel({
   const headingId = useId();
   const descriptionId = useId();
   const [reorderAnnouncement, setReorderAnnouncement] = useState("");
+  const panelRef = useRef<HTMLElement>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  useEffect(() => {
+    if (!open) return;
+    const opener = document.activeElement;
+    const panel = panelRef.current;
+    panel?.querySelector<HTMLButtonElement>('[aria-label="关闭播放队列"]')?.focus();
+    panel?.querySelector('.queue-list li.active')?.scrollIntoView?.({ block: "nearest" });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented && !document.querySelector('[aria-modal="true"]')) {
+        event.preventDefault();
+        closeRef.current();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      if (opener instanceof HTMLElement && (panel?.contains(document.activeElement) || document.activeElement === document.body)) opener.focus();
+    };
+  }, [open]);
 
   useEffect(() => {
     if (!open) setReorderAnnouncement("");
@@ -73,6 +96,7 @@ export function QueuePanel({
 
   return (
     <aside
+      ref={panelRef}
       className="queue-panel"
       aria-labelledby={headingId}
       aria-describedby={descriptionId}
@@ -83,13 +107,13 @@ export function QueuePanel({
           <h3 id={headingId}>播放队列</h3>
           <small id={descriptionId}>
             {rows.length
-              ? `${rows.length} 首 · ${PLAY_MODE_LABEL[playMode] ?? playMode} · 支持拖拽与键盘排序`
+              ? `${rows.length} 首 · ${PLAY_MODE_LABEL[playMode] ?? playMode}`
               : "队列为空"}
           </small>
         </div>
         <div className="queue-panel-actions">
-          <button type="button" disabled={!rows.length} onClick={onClear} aria-label="清空播放队列">清空</button>
-          <button type="button" onClick={onClose} aria-label="关闭播放队列">×</button>
+          <button type="button" disabled={!rows.length} onClick={onClear} aria-label="清空播放队列" title="清空播放队列"><Trash2 size={16} /></button>
+          <button type="button" onClick={onClose} aria-label="关闭播放队列" title="关闭播放队列"><X size={18} /></button>
         </div>
       </header>
       {(availabilityStatus !== "ready" || unavailableCount > 0) && (
@@ -109,7 +133,7 @@ export function QueuePanel({
       {rows.length === 0 ? (
         <div className="queue-empty" role="status">
           <p>还没有歌曲</p>
-          <span>在曲库或搜索结果里点一首，会把当前列表整队入列。</span>
+          <ListMusic size={28} aria-hidden="true" />
         </div>
       ) : (
         <ul className="queue-list" aria-label="队列曲目">
@@ -174,9 +198,7 @@ export function QueuePanel({
                       : `将《${row.title}》上移至第 ${index} 位`}
                     onClick={() => reorder(index, index - 1)}
                   >
-                    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-                      <path d="M3.5 9.5 8 5l4.5 4.5" />
-                    </svg>
+                    <ChevronUp size={14} />
                   </button>
                   <button
                     type="button"
@@ -187,12 +209,10 @@ export function QueuePanel({
                       : `将《${row.title}》下移至第 ${index + 2} 位`}
                     onClick={() => reorder(index, index + 1)}
                   >
-                    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-                      <path d="m3.5 6.5 4.5 4.5 4.5-4.5" />
-                    </svg>
+                    <ChevronDown size={14} />
                   </button>
                 </span>
-                <button type="button" className="icon-button" aria-label={`从队列移除《${row.title}》`} onClick={() => onRemove(index)}>×</button>
+                <button type="button" className="icon-button" aria-label={`从队列移除《${row.title}》`} title="移出队列" onClick={() => onRemove(index)}><X size={15} /></button>
               </span>
             </li>
           ))}

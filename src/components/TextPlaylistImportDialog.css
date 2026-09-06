@@ -3,6 +3,46 @@
   max-height: min(88vh, 820px);
 }
 
+.text-playlist-input-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.text-playlist-detection {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+  color: var(--text-mute);
+  font-size: 11px;
+}
+
+.text-playlist-detection strong {
+  color: var(--text-hi);
+}
+
+.text-playlist-detection span {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--glass-border) 45%, transparent);
+}
+
+.text-playlist-notes {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.text-playlist-local-note {
+  margin: 8px 0 0;
+  color: var(--text-mute);
+  font-size: 11px;
+}
+
 .text-playlist-input-label {
   display: block;
   margin-bottom: 6px;

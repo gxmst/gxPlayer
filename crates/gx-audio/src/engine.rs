@@ -12,6 +12,7 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use gx_cache::CacheWritePlan;
 use gx_contracts::{MediaType, PlaybackStatus, ResolvedMediaRequest};
+use gx_dsp::quality::{QualityAnalyzer, QualityReport};
 use gx_dsp::{CrossfeedSettings, DspChain, DspSettings, HrtfSettings, LimiterSettings};
 use gx_streaming::{
     HttpMediaSource, StreamInterruption, StreamInterruptionGuard, StreamingDiagnosticQueue,
@@ -110,6 +111,42 @@ impl OutputDeviceEventQueue {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct QualityReportReady {
+    pub location: String,
+    pub report: QualityReport,
+}
+
+#[derive(Clone)]
+struct QualityReportQueue {
+    inner: Arc<Mutex<VecDeque<QualityReportReady>>>,
+}
+
+const QUALITY_REPORT_CAPACITY: usize = 32;
+
+impl Default for QualityReportQueue {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::with_capacity(QUALITY_REPORT_CAPACITY))),
+        }
+    }
+}
+
+impl QualityReportQueue {
+    fn push(&self, event: QualityReportReady) {
+        let mut events = self.inner.lock().unwrap();
+        if events.len() == QUALITY_REPORT_CAPACITY {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    fn drain(&self) -> Vec<QualityReportReady> {
+        self.inner.lock().unwrap().drain(..).collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueItem {
     pub location: String,
     pub title: String,
@@ -185,6 +222,19 @@ pub enum DspPresetId {
     Vocal,
     Bass,
     Spatial,
+    // Voicing presets. Each is an EQ curve over the same chain as `Vocal`/`Bass`;
+    // the identity is carried explicitly so a restart restores what the user picked.
+    Warm,
+    Bright,
+    Classical,
+    Electronic,
+    Rock,
+    Podcast,
+    Jazz,
+    PianoVocal,
+    /// A user-edited curve. The bands travel in `DspSettings` like any other preset,
+    /// so this only marks the origin: nothing here bypasses `validate_product`.
+    Custom,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -269,10 +319,19 @@ impl DspControlState {
             _ if self.settings.hrtf.enabled => {
                 bail!("only the spatial preset may enable HRTF")
             }
+            // Reflections without a head model are just an echo, so they belong to
+            // the same preset as the HRTF rather than being separately switchable.
+            _ if self.settings.room.enabled => {
+                bail!("only the spatial preset may enable early reflections")
+            }
             _ => {}
         }
         if self.settings.hrtf.enabled && !self.settings.limiter.enabled {
             bail!("HRTF requires the limiter to remain enabled");
+        }
+        // Reflections add to the direct signal, so they raise peaks the same way.
+        if self.settings.room.enabled && !self.settings.limiter.enabled {
+            bail!("early reflections require the limiter to remain enabled");
         }
         DspChain::new(48_000, 2, self.settings.clone())?;
         Ok(())
@@ -481,6 +540,7 @@ pub struct LocalAudioEngine {
     diagnostics: EngineDiagnosticQueue,
     streaming_diagnostics: StreamingDiagnosticQueue,
     output_device_events: OutputDeviceEventQueue,
+    quality_reports: QualityReportQueue,
     ab_dry_active: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -498,6 +558,8 @@ impl LocalAudioEngine {
         let interruption_for_worker = stream_interruption.clone();
         let output_device_events = OutputDeviceEventQueue::default();
         let output_device_events_for_worker = output_device_events.clone();
+        let quality_reports = QualityReportQueue::default();
+        let quality_reports_for_worker = quality_reports.clone();
         let ab_dry_active = Arc::new(AtomicBool::new(false));
         let ab_dry_active_for_worker = Arc::clone(&ab_dry_active);
         let worker = thread::Builder::new()
@@ -506,11 +568,14 @@ impl LocalAudioEngine {
                 run_worker(
                     receiver,
                     snapshot_for_worker,
-                    diagnostics_for_worker,
-                    streaming_diagnostics_for_worker,
-                    interruption_for_worker,
-                    output_device_events_for_worker,
-                    ab_dry_active_for_worker,
+                    WorkerRuntime {
+                        diagnostics: diagnostics_for_worker,
+                        streaming_diagnostics: streaming_diagnostics_for_worker,
+                        stream_interruption: interruption_for_worker,
+                        output_device_events: output_device_events_for_worker,
+                        quality_reports: quality_reports_for_worker,
+                        ab_dry_active: ab_dry_active_for_worker,
+                    },
                 )
             })
             .context("failed to spawn local audio engine worker")?;
@@ -521,6 +586,7 @@ impl LocalAudioEngine {
             diagnostics,
             streaming_diagnostics,
             output_device_events,
+            quality_reports,
             ab_dry_active,
             worker: Mutex::new(Some(worker)),
         })
@@ -747,6 +813,10 @@ impl LocalAudioEngine {
 
     pub fn drain_output_device_events(&self) -> Vec<OutputDeviceFallbackEvent> {
         self.output_device_events.drain()
+    }
+
+    pub fn drain_quality_reports(&self) -> Vec<QualityReportReady> {
+        self.quality_reports.drain()
     }
 
     pub fn output_devices(&self) -> Result<Vec<String>> {
@@ -1021,15 +1091,28 @@ fn request_track_change(
     *session = None;
 }
 
-fn run_worker(
-    commands: Receiver<QueuedEngineCommand>,
-    shared_snapshot: Arc<Mutex<EngineSnapshot>>,
+struct WorkerRuntime {
     diagnostics: EngineDiagnosticQueue,
     streaming_diagnostics: StreamingDiagnosticQueue,
     stream_interruption: StreamInterruption,
     output_device_events: OutputDeviceEventQueue,
+    quality_reports: QualityReportQueue,
     ab_dry_active: Arc<AtomicBool>,
+}
+
+fn run_worker(
+    commands: Receiver<QueuedEngineCommand>,
+    shared_snapshot: Arc<Mutex<EngineSnapshot>>,
+    runtime: WorkerRuntime,
 ) {
+    let WorkerRuntime {
+        diagnostics,
+        streaming_diagnostics,
+        stream_interruption,
+        output_device_events,
+        quality_reports,
+        ab_dry_active,
+    } = runtime;
     let mut model = WorkerModel::default();
     let mut session: Option<PlaybackSession> = None;
 
@@ -1062,6 +1145,7 @@ fn run_worker(
                 model.status = PlaybackStatus::Loading;
                 publish_snapshot(&model, None, &shared_snapshot);
                 match PlaybackSession::new(
+                    item.public.location.clone(),
                     &item.source,
                     model.start_seconds,
                     model.volume,
@@ -1070,6 +1154,7 @@ fn run_worker(
                     PlaybackSessionRuntime {
                         streaming_diagnostics: streaming_diagnostics.clone(),
                         stream_interruption: stream_interruption.clone(),
+                        quality_reports: quality_reports.clone(),
                         ab_dry_active: Arc::clone(&ab_dry_active),
                     },
                 ) {
@@ -1679,6 +1764,7 @@ struct AbSample {
 struct PlaybackSessionRuntime {
     streaming_diagnostics: StreamingDiagnosticQueue,
     stream_interruption: StreamInterruption,
+    quality_reports: QualityReportQueue,
     ab_dry_active: Arc<AtomicBool>,
 }
 
@@ -1709,6 +1795,15 @@ struct PlaybackSession {
     output_channels: usize,
     source_sample_rate: u32,
     source_bit_depth: Option<u32>,
+    /// Measures what the decoded stream actually contains, so a mislabelled
+    /// transcode can be told from an honest file. Fed the source PCM before
+    /// resampling or DSP, and dropped once it has seen enough.
+    quality: Option<QualityAnalyzer>,
+    /// Where finished measurements go. Reports outlive this session so the app can
+    /// still persist them after the track ends and the session is torn down.
+    quality_reports: QualityReportQueue,
+    /// Queue item location that identifies this track for persistence.
+    location: String,
     output_sample_rate: u32,
     start_seconds: f64,
     duration_seconds: Option<f64>,
@@ -1728,6 +1823,7 @@ struct PlaybackSession {
 
 impl PlaybackSession {
     fn new(
+        location: String,
         source: &PlaybackSource,
         start_seconds: f64,
         volume: f32,
@@ -1846,7 +1942,13 @@ impl PlaybackSession {
         )
         .context("failed to build output device stream")?;
         let mut rate_adapter = RateAdapter::new(sample_rate, output_sample_rate, channels)?;
-        let mut dsp_chain = DspChain::new(output_sample_rate, output_channels, dsp_settings)?;
+        // Persisted presets are validated at 48 kHz, not at every device rate. On a lower-rate
+        // device, clamp near-Nyquist parameters instead of failing the whole track load.
+        let mut dsp_chain = DspChain::new(
+            output_sample_rate,
+            output_channels,
+            dsp_settings.clamped_for_sample_rate(output_sample_rate),
+        )?;
         let prefetched = std::mem::take(&mut media.prefetched_samples);
         let mut pending = if prefetched.is_empty() {
             Vec::new()
@@ -1874,6 +1976,12 @@ impl PlaybackSession {
             output_channels,
             source_sample_rate: sample_rate,
             source_bit_depth,
+            // Seeking mid-track would leave a spectrum stitched from unrelated
+            // places, so only a playthrough from the start is measured.
+            quality: (seek_discard_frames == 0 && start_seconds == 0.0)
+                .then(|| QualityAnalyzer::new(sample_rate, channels)),
+            quality_reports: runtime.quality_reports,
+            location,
             output_sample_rate,
             start_seconds,
             duration_seconds,
@@ -1931,6 +2039,14 @@ impl PlaybackSession {
             }
             self.maybe_start()?;
             if self.producer.is_empty() {
+                // Stream has ended; finalize any remaining quality measurement so short
+                // tracks and skips also yield reports, not just saturated long tracks.
+                if let Some(report) = self.quality.take().map(QualityAnalyzer::finish) {
+                    self.quality_reports.push(QualityReportReady {
+                        location: self.location.clone(),
+                        report,
+                    });
+                }
                 return Ok(PumpResult::Ended);
             }
             return Ok(PumpResult::Backpressure);
@@ -1974,6 +2090,20 @@ impl PlaybackSession {
                 return Ok(PumpResult::Progress);
             }
         }
+        // Measure the source, before the rate adapter or DSP touch it: resampling
+        // moves the very band limit being looked for, and the DSP would add its own.
+        if let Some(analyzer) = &mut self.quality {
+            analyzer.push(samples);
+            if analyzer.is_saturated() {
+                // Publish once and release the FFT state; further audio adds nothing.
+                if let Some(report) = self.quality.take().map(QualityAnalyzer::finish) {
+                    self.quality_reports.push(QualityReportReady {
+                        location: self.location.clone(),
+                        report,
+                    });
+                }
+            }
+        }
         self.pending = self.rate_adapter.process(samples)?;
         self.pending = remap_channels(&self.pending, self.source_channels, self.output_channels)?;
         self.pending_ab_dry.resize(self.pending.len(), 0.0);
@@ -2014,7 +2144,10 @@ impl PlaybackSession {
     }
 
     fn set_dsp_settings(&mut self, settings: DspSettings) -> Result<()> {
-        self.dsp_chain.set_settings(settings)?;
+        // Same clamp as the session build: the caller validated against a possibly stale output
+        // rate, so a low-rate device must not turn a valid preset into a live-update failure.
+        self.dsp_chain
+            .set_settings(settings.clamped_for_sample_rate(self.output_sample_rate))?;
         Ok(())
     }
 
@@ -2257,9 +2390,17 @@ fn render_output_callback<T>(
     for frame in output.chunks_mut(output_channels) {
         let dry = counters.ab_dry_active.load(Ordering::Relaxed);
         let dry_mix = ab_dry_ramp.advance(dry);
+        // A tail chunk smaller than one interleaved frame cannot carry a complete frame in the
+        // first place, so it is silenced without counting as an underrun.
+        if frame.len() != output_channels {
+            for target in frame {
+                *target = T::from_sample(0.0);
+            }
+            continue;
+        }
         // Never consume a partial interleaved frame. A producer can publish one channel just
         // before backpressure; popping it alone would shift every channel after the underrun.
-        if frame.len() != output_channels || consumer.occupied_len() < output_channels {
+        if consumer.occupied_len() < output_channels {
             starved |= enabled;
             for target in frame {
                 *target = T::from_sample(0.0);
@@ -2539,6 +2680,52 @@ mod tests {
         let error = validate_dsp_control_for_output(&control, Some(32_000)).unwrap_err();
 
         assert!(error.to_string().contains("active 32000 Hz output rate"));
+    }
+
+    #[test]
+    fn voicing_presets_round_trip_and_pass_product_validation() {
+        // The frontend persists these ids verbatim, so a serde mismatch or a rejected
+        // preset would silently lose the user's choice across a restart.
+        for (id, wire) in [
+            (DspPresetId::Warm, "\"warm\""),
+            (DspPresetId::Bright, "\"bright\""),
+            (DspPresetId::Classical, "\"classical\""),
+            (DspPresetId::Electronic, "\"electronic\""),
+            (DspPresetId::Rock, "\"rock\""),
+            (DspPresetId::Podcast, "\"podcast\""),
+            (DspPresetId::Jazz, "\"jazz\""),
+        ] {
+            assert_eq!(serde_json::to_string(&id).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<DspPresetId>(wire).unwrap(), id);
+
+            let control = DspControlState {
+                settings: DspSettings {
+                    enabled: true,
+                    eq_enabled: true,
+                    eq_bands: vec![gx_dsp::EqBand::peak(125.0, 2.5, 1.0)],
+                    limiter: LimiterSettings {
+                        enabled: true,
+                        ..LimiterSettings::default()
+                    },
+                    ..DspSettings::default()
+                },
+                active_preset_id: id,
+                intensity: 1.0,
+                spatial_amount: 0.5,
+            };
+            control.validate_product().unwrap();
+            // Voicing presets are music-mode; only `spatial` maps to cinema.
+            assert_eq!(control.audio_mode(), AudioMode::Music);
+
+            // HRTF stays reserved for `spatial`.
+            let mut with_hrtf = control.clone();
+            with_hrtf.settings.hrtf = HrtfSettings {
+                enabled: true,
+                mix: 0.5,
+                output_gain_db: -6.0,
+            };
+            assert!(with_hrtf.validate_product().is_err());
+        }
     }
 
     #[test]
@@ -3209,6 +3396,37 @@ mod tests {
         render_output_callback(&mut output, &mut consumer, &counters, &mut ramp);
         assert_eq!(output, [0.25, 0.75]);
         assert_eq!(counters.played_samples.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.underruns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn partial_tail_chunk_is_not_counted_as_underrun() {
+        let ring = HeapRb::<AbSample>::new(8);
+        let (mut producer, mut consumer) = ring.split();
+        producer.try_push(AbSample::same(0.25)).unwrap();
+        producer.try_push(AbSample::same(0.75)).unwrap();
+        let counters = OutputCallbackCounters {
+            played_samples: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
+            enabled: Arc::new(AtomicBool::new(true)),
+            volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            ab_dry_active: Arc::new(AtomicBool::new(false)),
+            output_sample_rate: 48_000,
+            output_channels: 2,
+        };
+        let mut ramp = AbDryRamp::new(48_000);
+        // Three samples at two channels: one complete frame plus a sub-frame tail chunk.
+        let mut output = [1.0f32; 3];
+
+        render_output_callback(&mut output, &mut consumer, &counters, &mut ramp);
+
+        assert_eq!(output, [0.25, 0.75, 0.0]);
+        assert_eq!(counters.played_samples.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.underruns.load(Ordering::Relaxed), 0);
+
+        // A complete frame that truly lacks data still counts.
+        render_output_callback(&mut output, &mut consumer, &counters, &mut ramp);
+        assert_eq!(output, [0.0, 0.0, 0.0]);
         assert_eq!(counters.underruns.load(Ordering::Relaxed), 1);
     }
 

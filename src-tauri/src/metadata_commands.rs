@@ -7,6 +7,7 @@ use gx_metadata::{
 use gx_source::safe_http::RequestCancellation;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -225,12 +226,25 @@ pub fn metadata_cancel_request(
 pub async fn metadata_chart(
     window: WebviewWindow,
     limit: Option<usize>,
+    region: Option<String>,
 ) -> Result<Vec<CatalogTrack>, String> {
     require_window(&window, "main")?;
-    tauri::async_runtime::spawn_blocking(move || apple_chart(limit.unwrap_or(25)))
-        .await
-        .map_err(|error| format!("metadata chart task failed: {error}"))?
-        .map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        apple_chart(limit.unwrap_or(25), region.as_deref())
+    })
+    .await
+    .map_err(|error| format!("metadata chart task failed: {error}"))?
+    .map_err(|error| error.to_string())
+}
+
+/// Storefronts the chart can be read from, for populating the region picker.
+#[tauri::command]
+pub fn metadata_chart_regions(window: WebviewWindow) -> Result<Vec<String>, String> {
+    require_window(&window, "main")?;
+    Ok(gx_metadata::CHART_REGIONS
+        .iter()
+        .map(|region| (*region).to_owned())
+        .collect())
 }
 
 #[tauri::command]
@@ -267,11 +281,18 @@ pub async fn metadata_read_local_lyrics(
         return Err("请选择 .lrc 歌词文件".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
-        if metadata.len() > 2 * 1024 * 1024 {
+        const MAX_LRC_BYTES: usize = 2 * 1024 * 1024;
+        // The cap is enforced on the stream itself: a metadata pre-check could pass
+        // and the file grow before the read, defeating the allocation limit.
+        let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(MAX_LRC_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > MAX_LRC_BYTES {
             return Err("LRC 文件不能超过 2 MiB".into());
         }
-        let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
         Ok(parse_lrc(&text))
     })
     .await

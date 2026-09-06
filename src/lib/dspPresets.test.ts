@@ -2,21 +2,44 @@ import { describe, expect, it } from "vitest";
 import {
   buildDspControlState,
   buildDspSettings,
-  DSP_INTERNAL_EQ_PRESETS,
+  clampCustomGains,
+  DSP_EQ_MAX_GAIN_DB,
   DSP_PRESETS,
+  gainsFromSettings,
   getDspPreset,
+  zeroGains,
 } from "./dspPresets";
+import type { DspPresetId } from "../types";
 
 const FREQUENCIES = [31, 62, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000];
 
+const VOICING_PRESETS = [
+  "warm",
+  "bright",
+  "classical",
+  "electronic",
+  "rock",
+  "podcast",
+  "jazz",
+  "piano_vocal",
+] as const satisfies ReadonlyArray<DspPresetId>;
+
 describe("DSP presets", () => {
-  it("defines the five v1 presets and always emits a complete 10-band peak EQ", () => {
+  it("defines every preset and always emits a complete 10-band peak EQ", () => {
     expect(DSP_PRESETS.map((preset) => preset.id)).toEqual([
       "bypass",
       "headphone_daily",
       "vocal",
       "bass",
       "spatial",
+      "warm",
+      "bright",
+      "classical",
+      "electronic",
+      "rock",
+      "podcast",
+      "jazz",
+      "piano_vocal",
     ]);
 
     for (const preset of DSP_PRESETS) {
@@ -28,15 +51,34 @@ describe("DSP presets", () => {
     }
   });
 
-  it("keeps future warm, bright and classical curves internal and restrained", () => {
-    expect(Object.keys(DSP_INTERNAL_EQ_PRESETS)).toEqual(["warm", "bright", "classical"]);
-    expect(DSP_PRESETS.map((preset) => preset.label)).not.toContain("温暖");
-    expect(DSP_PRESETS.map((preset) => preset.label)).not.toContain("明亮");
-    expect(DSP_PRESETS.map((preset) => preset.label)).not.toContain("古典");
-    for (const preset of Object.values(DSP_INTERNAL_EQ_PRESETS)) {
-      expect(preset.gains).toHaveLength(10);
-      expect(Math.max(...preset.gains.map(Math.abs))).toBeLessThanOrEqual(3);
+  it("keeps every voicing curve restrained and inside the engine gain limit", () => {
+    for (const presetId of VOICING_PRESETS) {
+      // Full intensity applies the 1.4x ceiling, which is what the engine validates.
+      const boosted = buildDspSettings(presetId, 1);
+      const peak = Math.max(...boosted.eqBands.map((band) => Math.abs(band.gainDb)));
+      expect(peak).toBeLessThanOrEqual(12);
+      // Restraint is a product rule, not just a validity one.
+      expect(peak).toBeLessThanOrEqual(5);
+      expect(boosted.eqEnabled).toBe(true);
+      expect(boosted.hrtf.enabled).toBe(false);
+      expect(boosted.limiter.enabled).toBe(true);
     }
+  });
+
+  it("gives each voicing preset a distinct curve", () => {
+    const curves = VOICING_PRESETS.map((presetId) =>
+      buildDspSettings(presetId).eqBands.map((band) => band.gainDb).join(","),
+    );
+    expect(new Set(curves).size).toBe(VOICING_PRESETS.length);
+  });
+
+  it("shapes podcast for speech: rumble cut, articulation lifted", () => {
+    const podcast = buildDspSettings("podcast", 0.5);
+    // 31 Hz and 62 Hz cut, 1 kHz and 2 kHz lifted.
+    expect(podcast.eqBands[0].gainDb).toBeLessThan(-2);
+    expect(podcast.eqBands[1].gainDb).toBeLessThan(-2);
+    expect(podcast.eqBands[5].gainDb).toBeGreaterThan(1);
+    expect(podcast.eqBands[6].gainDb).toBeGreaterThan(1);
   });
 
   it("keeps bypass as a true disabled chain", () => {
@@ -55,7 +97,7 @@ describe("DSP presets", () => {
       const result = buildDspSettings(preset.id);
       expect(result.crossfeed.delayMs).toBeCloseTo(0.28);
       expect(result.crossfeed.cutoffHz).toBe(700);
-      expect(result.hrtf.outputGainDb).toBe(-6);
+      expect(result.hrtf.outputGainDb).toBe(0);
       expect(result.limiter.ceilingDb).toBe(-1);
       expect(result.limiter.releaseMs).toBe(80);
     }
@@ -88,6 +130,9 @@ describe("DSP presets", () => {
       const result = buildDspSettings(presetId);
       expect(result.enabled).toBe(true);
       expect(result.hrtf.enabled).toBe(false);
+      // Reflections belong to the spatial preset: without a head model in front of
+      // them they are an echo, and the host rejects that combination outright.
+      expect(result.room.enabled).toBe(false);
       expect(result.limiter.enabled).toBe(true);
     }
 
@@ -102,8 +147,65 @@ describe("DSP presets", () => {
     const dense = buildDspSettings("spatial", 0, 1);
     expect(dense.hrtf.mix).toBeCloseTo(0.72);
     expect(dense.crossfeed.amount).toBeCloseTo(0.18);
-    expect(dense.hrtf.outputGainDb).toBe(-6);
+    expect(dense.hrtf.outputGainDb).toBe(0);
     expect(dense.limiter.enabled).toBe(true);
+  });
+
+  it("grows the room alongside the head model, and keeps it a supporting cue", () => {
+    const sparse = buildDspSettings("spatial", 0, 0);
+    const middle = buildDspSettings("spatial", 0, 0.5);
+    const dense = buildDspSettings("spatial", 0, 1);
+
+    for (const result of [sparse, middle, dense]) {
+      expect(result.room.enabled).toBe(true);
+      // Reflections must stay under the head model, or the space swallows the source.
+      expect(result.room.amount).toBeLessThan(result.hrtf.mix);
+      // Small-room sizes only: longer pre-delays read as an effect, not a space.
+      expect(result.room.size).toBeLessThanOrEqual(0.55);
+    }
+
+    // Both cues move together with the one slider the user actually sees.
+    expect(sparse.room.amount).toBeCloseTo(0.12);
+    expect(middle.room.amount).toBeCloseTo(0.2);
+    expect(dense.room.amount).toBeCloseTo(0.3);
+    expect(sparse.room.size).toBeLessThan(dense.room.size);
+  });
+
+  it("builds a custom curve as authored, without intensity rescaling", () => {
+    const gains = [1, -2, 3, 0, 0, 0, 0, 0, 4, 0];
+    // Same curve at both intensity extremes: a hand-set gain must not be rescaled.
+    for (const intensity of [0, 0.5, 1]) {
+      const result = buildDspSettings("custom", intensity, 0.5, gains);
+      expect(result.eqBands.map((band) => band.gainDb)).toEqual(gains);
+      expect(result.eqEnabled).toBe(true);
+      expect(result.hrtf.enabled).toBe(false);
+      expect(result.limiter.enabled).toBe(true);
+    }
+  });
+
+  it("clamps a custom curve to the shape the engine accepts", () => {
+    // Too short, too long, non-finite and out-of-range all normalize rather than throw.
+    expect(clampCustomGains([1, 2])).toEqual([1, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(clampCustomGains(new Array(14).fill(1))).toHaveLength(10);
+    expect(clampCustomGains([Number.NaN, Number.POSITIVE_INFINITY])[0]).toBe(0);
+    expect(clampCustomGains([99, -99])[0]).toBe(DSP_EQ_MAX_GAIN_DB);
+    expect(clampCustomGains([99, -99])[1]).toBe(-DSP_EQ_MAX_GAIN_DB);
+
+    const built = buildDspSettings("custom", 0.5, 0.5, [99, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(built.eqBands[0].gainDb).toBe(DSP_EQ_MAX_GAIN_DB);
+    expect(built.eqBands).toHaveLength(10);
+  });
+
+  it("names the custom curve instead of falling back to the first preset", () => {
+    // `custom` is not on the shelf, so a plain list lookup would return 原声.
+    expect(getDspPreset("custom").label).toBe("自定义");
+    expect(DSP_PRESETS.map((preset) => preset.id)).not.toContain("custom");
+  });
+
+  it("reads a curve back off any preset for seeding the editor", () => {
+    const bass = buildDspSettings("bass", 1);
+    expect(gainsFromSettings(bass)).toEqual(bass.eqBands.map((band) => band.gainDb));
+    expect(gainsFromSettings(buildDspSettings("bypass"))).toEqual(zeroGains());
   });
 
   it("clamps normalized controls and preserves complete authoritative state", () => {

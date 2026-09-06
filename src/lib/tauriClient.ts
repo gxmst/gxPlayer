@@ -48,6 +48,9 @@ const demoCatalog = [
 ];
 
 let demoDspControl = buildDspControlState("bypass");
+let demoCustomEqPresets: Array<{ name: string; gainsDb: number[] }> = [];
+let demoChartRegion = "cn";
+let demoChartAutoLoad = true;
 
 function demoPreferences() {
   return {
@@ -57,6 +60,9 @@ function demoPreferences() {
     volume: 0.72,
     outputDevice: null,
     dspControl: demoDspControl,
+    customEqPresets: demoCustomEqPresets,
+    chartRegion: demoChartRegion,
+    chartAutoLoad: demoChartAutoLoad,
   };
 }
 
@@ -81,30 +87,78 @@ function mockResult(command: string, args?: Record<string, unknown>): unknown {
     case "library_playlist_items":
     case "cache_online_favorites":
     case "cache_list_entries":
+    case "cache_available_keys":
     case "source_list":
     case "diagnostic_log_recent":
       return [];
     case "metadata_search":
     case "metadata_chart":
       return demoCatalog;
+    case "player_play_online_track":
+      return {
+        outcome: "started",
+        failureKind: null,
+        attempts: [],
+        track: args?.track,
+        sourceId: "browser-mock",
+        sourceName: "浏览器演示音源",
+        quality: args?.quality ?? "demo",
+        cacheHit: false,
+      };
     case "metadata_lyrics":
       return {
         instrumental: false,
         lines: [
-          { timestampMs: 0, text: "浏览器模式使用演示数据" },
-          { timestampMs: 8_000, text: "桌面端会连接真实曲库与播放引擎" },
+          { timestampMs: 0, text: "浏览器模式使用演示数据", translation: "Browser mode uses demo data." },
+          { timestampMs: 8_000, text: "桌面端会连接真实曲库与播放引擎", romanization: "zhuo mian duan hui lian jie zhen shi qu ku yu bo fang yin qing" },
         ],
       };
+    case "source_status":
     case "source_runtime_status":
       return { state: "ready", generation: 1, detail: "浏览器演示模式" };
     case "cache_status":
       return { directory: "浏览器演示", totalBytes: 0, entryCount: 0, pinnedCount: 0, limitBytes: 5 * 1024 ** 3 };
+    case "cache_list_page":
+      return { entries: [], totalCount: 0, offset: 0, qualities: [] };
     case "preview_cache_status":
       return { totalBytes: 0, entryCount: 0, limitBytes: 256 * 1024 ** 2 };
     case "app_preferences_get":
       return demoPreferences();
     case "player_set_dsp_settings":
       demoDspControl = (args?.control as DspControlState | undefined) ?? demoDspControl;
+      return demoPreferences();
+    case "player_save_custom_eq_preset": {
+      const preset = args?.preset as { name: string; gainsDb: number[] } | undefined;
+      if (preset) {
+        demoCustomEqPresets = [
+          ...demoCustomEqPresets.filter((entry) => entry.name !== preset.name),
+          preset,
+        ];
+      }
+      return demoPreferences();
+    }
+    case "player_delete_custom_eq_preset":
+      demoCustomEqPresets = demoCustomEqPresets.filter((entry) => entry.name !== args?.name);
+      return demoPreferences();
+    case "metadata_chart_regions":
+      return ["cn", "hk", "tw", "jp", "kr", "us", "gb", "de", "fr", "sg", "my", "au", "ca"];
+    case "cache_export_entries":
+      return (args?.keys as Array<Record<string, string>> | undefined ?? []).map((key) => ({
+        providerId: key.providerId,
+        providerTrackId: key.providerTrackId,
+        quality: key.quality,
+        fileName: `演示歌手 - 演示歌曲.mp3`,
+        error: null,
+      }));
+    case "playlist_read_file":
+      return "#EXTM3U\n#EXTINF:213,演示歌手 - 演示歌曲\n演示歌手 - 演示歌曲\n";
+    case "playlist_write_file":
+      return undefined;
+    case "app_preferences_set_chart_region":
+      demoChartRegion = typeof args?.region === "string" ? args.region : demoChartRegion;
+      return demoPreferences();
+    case "app_preferences_set_chart_auto_load":
+      demoChartAutoLoad = args?.enabled === true;
       return demoPreferences();
     case "player_set_ab_dry":
       return undefined;

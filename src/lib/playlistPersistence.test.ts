@@ -104,6 +104,20 @@ describe("playlist persistence", () => {
     });
   });
 
+  it("restores runtime-defined qualities without discarding a mixed queue", () => {
+    const storage = new MemoryStorage();
+    const session = mixedSession();
+    const online = session.playlist[1];
+    if (online.kind !== "online") throw new Error("online fixture required");
+    online.quality = "studio";
+    expect(savePlaylistSession(session, storage)).toBe(true);
+    const restored = loadPlaylistSession(storage);
+    expect(restored.playlist).toHaveLength(3);
+    expect(restored.playlist[1]).toMatchObject({ kind: "online", quality: "studio" });
+    online.quality = "x".repeat(65);
+    expect(savePlaylistSession(session, storage)).toBe(false);
+  });
+
   it("discards malformed, unsupported, or unsafe stored data", () => {
     const storage = new MemoryStorage();
     const invalidValues = [

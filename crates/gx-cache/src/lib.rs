@@ -1757,8 +1757,13 @@ mod tests {
         let revision = store.revision();
         plan.commit_in_background();
 
+        // Visibility lands one lock release before the revision bump: keep polling
+        // until both hold, or a loaded runner can observe the entry between the
+        // manifest insert and mark_changed.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while store.lookup(&cache_key).is_none() && std::time::Instant::now() < deadline {
+        while (store.lookup(&cache_key).is_none() || store.revision() <= revision)
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(store.lookup(&cache_key).is_some());
